@@ -1,0 +1,148 @@
+import type { Config } from './schema.js'
+import { cloneProviderPreset } from './provider-presets.js'
+
+export const DEFAULT_CONFIG: Config = {
+  editor: {},
+  provider: {
+    default: 'deepseek',
+    providers: {
+      deepseek: cloneProviderPreset('deepseek'),
+      kimi: {
+        name: 'kimi',
+        apiKeyEnv: 'KIMI_API_KEY',
+        baseUrl: 'https://api.kimi.com/coding/v1',
+        protocol: 'openai' as const,
+        capabilities: {
+          cacheControl: false,
+          stripParams: [],
+          toolJsonBug: false,
+          prefixCache: 'none' as const,
+          prefixCompletion: false,
+        },
+        thinking: 'enabled',
+        maxTokens: 64000,
+        models: [
+          {
+            id: 'kimi-for-coding',
+            alias: 'kimi',
+            contextWindow: 200_000,
+            maxTokens: 64000,
+            reasoningEffort: 'high',
+          },
+        ],
+        unsupported: [],
+      },
+      glm: cloneProviderPreset('glm'),
+      claude: {
+        name: 'claude',
+        apiKeyEnv: 'CLAUDE_API_KEY',
+        baseUrl: 'http://85.137.242.133:8080/v1',
+        protocol: 'openai' as const,
+        capabilities: {
+          cacheControl: false,
+          stripParams: [],
+          toolJsonBug: false,
+          prefixCache: 'none' as const,
+          prefixCompletion: false,
+        },
+        thinking: 'enabled',
+        maxTokens: 128000,
+        models: [
+          {
+            id: 'claude-opus-4-8',
+            alias: 'opus-4-8',
+            contextWindow: 1_000_000,
+            maxTokens: 128000,
+            reasoningEffort: 'max',
+          },
+          {
+            id: 'claude-opus-4-7',
+            alias: 'opus-4-7',
+            contextWindow: 1_000_000,
+            maxTokens: 128000,
+            reasoningEffort: 'max',
+          },
+          {
+            id: 'claude-opus-4-6',
+            alias: 'opus-4-6',
+            contextWindow: 1_000_000,
+            maxTokens: 128000,
+            reasoningEffort: 'max',
+          },
+          {
+            id: 'claude-sonnet-4-5',
+            alias: 'sonnet-4-5',
+            contextWindow: 1_000_000,
+            maxTokens: 128000,
+            reasoningEffort: 'max',
+          },
+        ],
+        unsupported: [],
+      },
+      mimo: cloneProviderPreset('mimo'),
+      minimax: cloneProviderPreset('minimax'),
+      codex: cloneProviderPreset('codex'),
+    },
+  },
+  agent: {
+    approval: 'suggest',
+    maxTurns: 50,
+    mode: 'code',
+    autoReasoning: false,
+    songlineEnabled: false,
+    hearthObserveEnabled: false,
+    antiAnchoring: {
+      enabled: false,
+      blindExploration: true,
+      mctsPlanning: true,
+      branches: 3,
+      planningTurn: 1,
+      projectionThreshold: 0.4,
+      seedMaxTokens: 512,
+    },
+    intentRetrievalRouter: {
+      enabled: true,
+      classifier: 'llm',
+      timeoutMs: 4_000,
+      maxTokens: 600,
+      temperature: 0,
+    },
+    teamSchedulerBanditEnabled: false,
+    modelTierBanditEnabled: false,
+    modelRoutingGatedEnabled: false,
+    permissions: {
+      allow: [],
+      bash: { allowlist: [] },
+    },
+  },
+  compact: {
+    enabled: true,
+    autoThreshold: 800_000,
+    autoFloor: 500_000,
+    model: 'deepseek-v4-flash',
+  },
+  cache: {
+    enabled: true,
+    minSystemTokens: 256,
+    showHitRate: true,
+  },
+  mcp: {
+    enabled: true,
+    servers: {},
+  },
+  workers: {
+    profiles: {
+      cheap: { provider: 'minimax', model: 'MiniMax-M2.7' },
+      'cheap-flash': { provider: 'deepseek', model: 'deepseek-v4-flash' },
+      capable: { provider: 'deepseek', model: 'deepseek-v4-pro' },
+      mimo: { provider: 'mimo', model: 'mimo-v2.5' },
+      'mimo-pro': { provider: 'mimo', model: 'mimo-v2.5-pro' },
+    },
+    routing: {
+      repo_summarization: 'cheap-flash',
+      code_edit: 'cheap-flash',
+      test_failure_diagnosis: 'cheap-flash',
+      risky_refactor: 'cheap-flash',
+    },
+  },
+}

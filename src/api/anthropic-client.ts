@@ -1,0 +1,483 @@
+import type { StreamClient, StreamCallbacks } from './stream-client.js'
+import type { OaiChatRequest, OaiMessage, OaiToolDefinition } from './oai-types.js'
+import { withStructuredRetry } from './retry-engine.js'
+import { parseRetryAfterMs } from './error-classifier.js'
+import { fetchWithTimeout } from './fetch-timeout.js'
+import { wireAbortToReaderCancel } from './abort-reader.js'
+
+export interface AnthropicClientConfig {
+  baseUrl: string
+  apiKey: string
+  model: string
+  maxTokens: number
+  thinkingBudget?: number
+}
+
+interface AnthropicContentBlock {
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result'
+  text?: string
+  thinking?: string
+  id?: string
+  name?: string
+  input?: Record<string, unknown>
+  tool_use_id?: string
+  content?: string
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' }
+}
+
+interface AnthropicMessage {
+  role: 'user' | 'assistant'
+  content: AnthropicContentBlock[]
+}
+
+interface AnthropicRequestBody {
+  model: string
+  max_tokens: number
+  system?: AnthropicContentBlock[]
+  tools?: Array<{
+    name: string
+    description?: string
+    input_schema: Record<string, unknown>
+    cache_control?: { type: 'ephemeral'; ttl?: '1h' }
+  }>
+  messages: AnthropicMessage[]
+  stream: boolean
+  thinking?: { type: 'enabled'; budget_tokens: number }
+}
+
+export class AnthropicClient implements StreamClient {
+  constructor(private config: AnthropicClientConfig) {}
+
+  setReasoningEffort(_effort: string): void {
+    // Anthropic doesn't use reasoning_effort — thinking budget is set at construction
+  }
+
+  setThinking(_mode: 'enabled' | 'disabled'): void {
+    // Anthropic thinking is controlled via budget_tokens, not a toggle
+  }
+
+  async stream(
+    request: OaiChatRequest,
+    callbacks: StreamCallbacks,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const body = this.buildRequestBody(request)
+
+    await withStructuredRetry(async () => {
+      const response = await fetchWithTimeout(`${this.config.baseUrl.replace(/\/+$/, '')}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.config.apiKey,
+          'anthropic-version': '2023-06-01',
+          'Accept': 'text/event-stream',
+        },
+        body: JSON.stringify(body),
+        signal,
+      }, this.config.thinkingBudget && this.config.thinkingBudget > 0 ? 90_000 : 45_000)
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => '')
+        const err = Object.assign(
+          new Error(`Anthropic API error (${response.status}): ${errorBody}`),
+          { status: response.status },
+        )
+        const retryAfter = response.headers.get('retry-after')
+        if (retryAfter) {
+          const retryAfterMs = parseRetryAfterMs(retryAfter)
+          if (retryAfterMs !== undefined) {
+            ;(err as Error & { retryAfterMs?: number }).retryAfterMs = retryAfterMs
+          }
+        }
+        throw err
+      }
+
+      await this.processSSEStream(response, callbacks, signal)
+    }, signal, {
+      maxTotalDurationMs: 10 * 60_000,
+      onRetry: (info) => {
+        if (info.classified.category === 'rate_limit') {
+          callbacks.onRateLimit?.(info.classified.retryDelayMs)
+        }
+      },
+    })
+  }
+
+  /** Exposed for testing. */
+  buildRequestBodyForTest(request: OaiChatRequest): AnthropicRequestBody {
+    return this.buildRequestBody(request)
+  }
+
+  private buildRequestBody(request: OaiChatRequest): AnthropicRequestBody {
+    // Extract system messages to top-level system array
+    let systemText = ''
+    const nonSystemMessages = request.messages.filter(m => {
+      if (m.role === 'system') {
+        systemText += (systemText ? '\n\n' : '') + m.content
+        return false
+      }
+      return true
+    })
+
+    const system: AnthropicContentBlock[] = systemText
+      ? [{ type: 'text', text: systemText }]
+      : []
+
+    // Convert messages
+    const messages = nonSystemMessages.map(m => this.convertMessage(m))
+
+    // Convert tools — sorted by name for deterministic cache
+    const tools: AnthropicRequestBody['tools'] = request.tools && request.tools.length > 0
+      ? [...request.tools]
+          .sort((a, b) => a.function.name.localeCompare(b.function.name))
+          .map(t => ({
+            name: t.function.name,
+            description: t.function.description,
+            input_schema: t.function.parameters,
+          }))
+      : undefined
+
+    const body: AnthropicRequestBody = {
+      model: request.model,
+      max_tokens: request.max_tokens ?? this.config.maxTokens,
+      messages,
+      stream: true,
+    }
+
+    if (system.length > 0) body.system = system
+    if (tools) body.tools = tools
+    if (this.config.thinkingBudget && this.config.thinkingBudget > 0) {
+      body.thinking = { type: 'enabled', budget_tokens: this.config.thinkingBudget }
+    }
+
+    // ── Four cache_control breakpoints ──────────────────────────────
+    // BP1: last tool definition (1h TTL — tools rarely change)
+    if (tools && tools.length > 0) {
+      tools[tools.length - 1]!.cache_control = { type: 'ephemeral', ttl: '1h' }
+    }
+
+    // BP2: last system content block (1h TTL — system prompt is static)
+    if (system.length > 0) {
+      system[system.length - 1]!.cache_control = { type: 'ephemeral', ttl: '1h' }
+    }
+
+    // BP3 & BP4: locate target positions in messages
+    let firstUserIdx = -1
+    let lastUserIdx = -1
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i]!.role === 'user') {
+        if (firstUserIdx === -1) firstUserIdx = i
+        lastUserIdx = i
+      }
+    }
+
+    // BP3: last content block of first user message (project-instructions + session-memory)
+    if (firstUserIdx >= 0) {
+      const blocks = messages[firstUserIdx]!.content
+      if (blocks.length > 0) {
+        blocks[blocks.length - 1]!.cache_control = { type: 'ephemeral' }
+      }
+    }
+
+    // BP4: rolling breakpoint — farthest assistant message whose last content
+    // block is within MAX_LOOKBACK blocks of the end of messages.
+    //
+    // Anthropic's prompt cache has a hard 20-block lookback window: a cached
+    // prefix is only reachable if its last block is within 20 blocks of the
+    // current request end. We use a 15-block placement threshold (rather than
+    // the full 20) because BP4 is re-evaluated on every request — the next
+    // request may grow the message array, and a breakpoint placed at the
+    // boundary (fromEnd=20) would immediately fall out of the window.
+    //
+    // In long multi-turn conversations with many tool_use/tool_result blocks
+    // (each tool call = 2 blocks), this rolling strategy picks the farthest
+    // assistant still safely within the window, maximizing cached prefix.
+    // Excludes the BP3 target message to avoid wasting a breakpoint on overlap.
+    const MAX_LOOKBACK = 15
+
+    let totalBlocks = 0
+    for (const msg of messages) {
+      totalBlocks += msg.content.length
+    }
+
+    let bp4Idx = -1
+    let blockPos = 0
+    for (let i = 0; i < messages.length; i++) {
+      blockPos += messages[i]!.content.length
+      if (messages[i]!.role === 'assistant' && i !== firstUserIdx) {
+        const fromEnd = totalBlocks - blockPos
+        if (fromEnd < MAX_LOOKBACK) {
+          bp4Idx = i
+          break // first qualifying = farthest from end within window
+        }
+      }
+    }
+
+    if (bp4Idx >= 0) {
+      const bp4Blocks = messages[bp4Idx]!.content
+      if (bp4Blocks.length > 0) {
+        bp4Blocks[bp4Blocks.length - 1]!.cache_control = { type: 'ephemeral' }
+      }
+    }
+
+    return body
+  }
+
+  private convertMessage(msg: OaiMessage): AnthropicMessage {
+    if (msg.role === 'user') {
+      return {
+        role: 'user',
+        content: [{ type: 'text', text: msg.content }],
+      }
+    }
+
+    if (msg.role === 'tool') {
+      return {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: msg.tool_call_id, content: msg.content }],
+      }
+    }
+
+    if (msg.role === 'assistant') {
+      const blocks: AnthropicContentBlock[] = []
+
+      // Anthropic API rejects requests that contain `thinking` content blocks
+      // in the message history — they are model-output only. Merge previous
+      // reasoning into the text block instead of sending a `thinking` block.
+      let text = msg.content ?? ''
+      if (msg.reasoning_content) {
+        text = `<thinking>\n${msg.reasoning_content}\n</thinking>\n\n${text}`
+      }
+
+      if (text) {
+        blocks.push({ type: 'text', text })
+      }
+
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          let input: Record<string, unknown> = {}
+          try {
+            input = JSON.parse(tc.function.arguments)
+          } catch { /* keep empty */ }
+          blocks.push({
+            type: 'tool_use',
+            id: tc.id,
+            name: tc.function.name,
+            input,
+          })
+        }
+      }
+
+      return { role: 'assistant', content: blocks }
+    }
+
+    // Fallback — types are exhaustive, this path should be unreachable.
+    // Throw explicitly so new role types added to OaiMessage are caught
+    // at development time rather than silently producing empty messages.
+    throw new Error(`Unsupported message role in AnthropicClient: ${JSON.stringify(msg)}`)
+  }
+
+  private async processSSEStream(
+    response: Response,
+    callbacks: StreamCallbacks,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error('No response body')
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let stopReason: string | null = null
+    let usage: {
+      input_tokens?: number
+      output_tokens?: number
+      cache_read_input_tokens?: number
+      cache_creation_input_tokens?: number
+    } = {}
+
+    // Accumulators for content blocks
+    const textBlocks: string[] = []
+    const thinkingBlocks: string[] = []
+    // Tool use buffering: Anthropic streams tool_use parameters as
+    // incremental input_json_delta chunks. We accumulate by block index
+    // and emit the complete tool_use only on content_block_stop.
+    const toolUseBuffer = new Map<number, { id: string; name: string; partialJson: string }>()
+
+    // SSE idle timeout — same pattern as OpenAIClient and CodexClient.
+    // Non-thinking requests use shorter timeouts (45s/120s) for faster
+    // failure detection; extended-thinking requests use 90s/180s to
+    // accommodate long first-byte delays from reasoning.
+    const FIRST_BYTE_TIMEOUT_MS = (this.config.thinkingBudget && this.config.thinkingBudget > 0) ? 90_000 : 45_000
+    const READ_TIMEOUT_MS = (this.config.thinkingBudget && this.config.thinkingBudget > 0) ? 180_000 : 120_000
+    let streamTimedOut = false
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+    let receivedFirstChunk = false
+
+    // Wire external abort signal to reader.cancel() so that agent.abort()
+    // can interrupt a blocking reader.read() call (same fix as OpenAIClient).
+
+    // Hard timeout guarantee: ensures reader.read() is unblocked even if
+    // reader.cancel() alone cannot break the TCP connection (keep-alive hang).
+    // Matches the OpenAIClient pattern — max stream duration = 10 minutes.
+    const timeoutController = new AbortController()
+    const maxStreamMs = 10 * 60_000
+    const maxStreamTimer = setTimeout(() => timeoutController.abort(), maxStreamMs)
+
+    const signalCleanup = signal
+      ? wireAbortToReaderCancel(AbortSignal.any([signal, timeoutController.signal]), reader)
+      : wireAbortToReaderCancel(timeoutController.signal, reader)
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      const timeout = receivedFirstChunk ? READ_TIMEOUT_MS : FIRST_BYTE_TIMEOUT_MS
+      idleTimer = setTimeout(() => {
+        streamTimedOut = true
+        reader.cancel().catch(() => {})
+      }, timeout)
+    }
+
+    try {
+      resetIdleTimer()
+      while (true) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+        if (timeoutController.signal.aborted) {
+          throw new Error('Anthropic SSE stream hard timeout (10min) — stream exceeded maximum duration')
+        }
+
+        const { done, value } = await reader.read()
+        // Check timeout AFTER read — reader.cancel() from idle timer causes
+        // read() to return done=true, but we must throw, not silently break.
+        if (streamTimedOut) throw new Error('Anthropic SSE stream idle timeout (180s)')
+        if (done) break
+        receivedFirstChunk = true
+        resetIdleTimer()
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+
+          // Skip event: lines — type is in the JSON body
+          if (trimmed.startsWith('event: ')) continue
+
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed.slice(5)
+
+          let parsed: Record<string, unknown>
+          try { parsed = JSON.parse(data) } catch { continue }
+
+          const type = parsed.type as string
+
+          switch (type) {
+            case 'message_start': {
+              const msg = parsed.message as Record<string, unknown> | undefined
+              if (msg?.usage) {
+                const u = msg.usage as Record<string, unknown>
+                usage = {
+                  input_tokens: u.input_tokens as number,
+                  cache_read_input_tokens: u.cache_read_input_tokens as number,
+                  cache_creation_input_tokens: u.cache_creation_input_tokens as number,
+                }
+              }
+              break
+            }
+
+            case 'content_block_start': {
+              const index = parsed.index as number | undefined
+              const block = parsed.content_block as Record<string, unknown> | undefined
+              if (!block) break
+              if (block.type === 'tool_use' && index !== undefined) {
+                const id = block.id as string
+                const name = block.name as string
+                if (id && name) {
+                  toolUseBuffer.set(index, { id, name, partialJson: '' })
+                }
+              }
+              break
+            }
+
+            case 'content_block_delta': {
+              const index = parsed.index as number | undefined
+              const delta = parsed.delta as Record<string, unknown> | undefined
+              if (!delta) break
+              if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+                textBlocks.push(delta.text)
+                callbacks.onTextDelta(delta.text)
+              } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+                thinkingBlocks.push(delta.thinking)
+                callbacks.onThinkingDelta(delta.thinking)
+              } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string' && index !== undefined) {
+                const buf = toolUseBuffer.get(index)
+                if (buf) {
+                  buf.partialJson += delta.partial_json
+                }
+              }
+              break
+            }
+
+            case 'content_block_stop': {
+              const index = parsed.index as number | undefined
+              if (index !== undefined) {
+                const buf = toolUseBuffer.get(index)
+                if (buf) {
+                  let input: Record<string, unknown> = {}
+                  try {
+                    input = JSON.parse(buf.partialJson || '{}')
+                  } catch { /* keep empty */ }
+                  callbacks.onContentBlock({ type: 'tool_use', id: buf.id, name: buf.name, input })
+                  toolUseBuffer.delete(index)
+                }
+              }
+              break
+            }
+
+            case 'message_delta': {
+              const d = parsed.delta as Record<string, unknown> | undefined
+              if (d?.stop_reason) {
+                stopReason = d.stop_reason as string
+              }
+              if (parsed.usage) {
+                const u = parsed.usage as Record<string, unknown>
+                usage.output_tokens = u.output_tokens as number
+              }
+              break
+            }
+
+            case 'message_stop': {
+              break
+            }
+
+            case 'error': {
+              const err = parsed.error as Record<string, unknown> | undefined
+              throw new Error(`Anthropic stream error: ${err?.message ?? 'Unknown error'}`)
+            }
+          }
+        }
+      }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer)
+      if (maxStreamTimer) clearTimeout(maxStreamTimer)
+      if (signalCleanup) signalCleanup()
+      reader.releaseLock()
+    }
+
+    // Emit text content block
+    if (textBlocks.length > 0) {
+      callbacks.onContentBlock({ type: 'text', text: textBlocks.join('') })
+    }
+
+    // Emit thinking content block
+    if (thinkingBlocks.length > 0) {
+      callbacks.onContentBlock({ type: 'thinking', thinking: thinkingBlocks.join('') })
+    }
+
+    callbacks.onStopReason(stopReason ?? 'end_turn', {
+      input_tokens: usage.input_tokens ?? 0,
+      output_tokens: usage.output_tokens ?? 0,
+      cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+    })
+  }
+}

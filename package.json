@@ -1,0 +1,76 @@
+{
+  "name": "rivet",
+  "version": "2.9.0",
+  "description": "Terminal coding agent optimized for DeepSeek V4 prefix cache",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "coding-agent",
+    "terminal",
+    "tui",
+    "deepseek",
+    "ai",
+    "cli"
+  ],
+  "homepage": "https://github.com/huiliyi37/Tianshu#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huiliyi37/Tianshu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/huiliyi37/Tianshu/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "completions/"
+  ],
+  "bin": {
+    "rivet": "./dist/main.js"
+  },
+  "scripts": {
+    "postinstall": "patch-package",
+    "dev": "tsup --watch",
+    "build": "tsup",
+    "start": "node --expose-gc --max-old-space-size=1536 dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx scripts/run-node-tests.ts",
+    "test:unit": "tsx scripts/run-node-tests.ts --unit",
+    "test:integration": "tsx scripts/run-node-tests.ts --integration",
+    "test:fast": "tsx scripts/run-node-tests.ts --exclude-tui",
+    "test:incremental": "tsx scripts/test-incremental.ts",
+    "cache:audit": "tsx src/cache/cache-audit-cli.ts",
+    "benchmark": "tsx scripts/run-benchmark.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "diff": "^9.0.0",
+    "ink": "^6.8.0",
+    "react": "^19.2.6",
+    "string-width": "^8.2.1",
+    "tree-sitter-wasms": "^0.1.13",
+    "turndown": "^7.2.4",
+    "undici": "^8.3.0",
+    "web-tree-sitter": "^0.24.7",
+    "zod": "^3.24.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^12.10.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/diff": "^7.0.2",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.14",
+    "@types/turndown": "^5.0.6",
+    "patch-package": "^8.0.0",
+    "ts-morph": "^28.0.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.7.0"
+  }
+}

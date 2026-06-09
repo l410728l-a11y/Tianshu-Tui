@@ -1,0 +1,28 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts
+!.rivet/commands/
+
+# Runtime data
+.rivet/
+.test-tmp/
+.tmp_*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+*.tgz
+*.tar.gz
+
+# Logs
+*.log
+npm-debug.log*
