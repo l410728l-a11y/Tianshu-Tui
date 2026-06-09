@@ -1,3 +1,5 @@
+> [中文文档](README.zh-CN.md)
+
 # Tianshu (天枢)
 
 A terminal coding agent with intelligent context management, multi-model coordination, and DeepSeek V4 prefix cache optimization.
