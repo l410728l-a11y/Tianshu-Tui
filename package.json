@@ -1,16 +1,18 @@
 {
-  "name": "rivet",
+  "name": "tianshu",
   "version": "2.9.0",
-  "description": "Terminal coding agent optimized for DeepSeek V4 prefix cache",
+  "description": "Terminal coding agent with intelligent context management, multi-model coordination, and DeepSeek V4 prefix cache optimization",
   "license": "MIT",
   "type": "module",
   "keywords": [
-    "coding-agent",
     "terminal",
-    "tui",
+    "coding-agent",
     "deepseek",
-    "ai",
-    "cli"
+    "tui",
+    "ink",
+    "typescript",
+    "ai-agent",
+    "prefix-cache"
   ],
   "homepage": "https://github.com/huiliyi37/Tianshu#readme",
   "repository": {
