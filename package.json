@@ -2,7 +2,7 @@
   "name": "tianshu",
   "version": "2.9.0",
   "description": "Terminal coding agent with intelligent context management, multi-model coordination, and DeepSeek V4 prefix cache optimization",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "keywords": [
     "terminal",
