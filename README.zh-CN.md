@@ -174,6 +174,9 @@ npm run dev          # 监听模式
 | [`docs/dangerously-skip-permissions.md`](docs/dangerously-skip-permissions.md) | 权限跳过说明与安全边界 |
 | [`docs/meridian-architecture.md`](docs/meridian-architecture.md) | Meridian DB 架构（跨会话学习存储） |
 | [`docs/review-discipline.md`](docs/review-discipline.md) | 结构化代码审查规则体系 |
+| [`docs/WINDOWS-INSTALL.md`](docs/WINDOWS-INSTALL.md) | Windows 安装与 Shell 兼容性指南 |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献指南 |
+| [`config.example.toml`](config.example.toml) | 示例 TOML 配置文件 |
 
 ## 统计
 

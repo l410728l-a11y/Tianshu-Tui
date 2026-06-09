@@ -174,6 +174,9 @@ npm run dev          # watch mode
 | [`docs/dangerously-skip-permissions.md`](docs/dangerously-skip-permissions.md) | Permission bypass details and safety boundaries |
 | [`docs/meridian-architecture.md`](docs/meridian-architecture.md) | Meridian DB architecture (cross-session learning store) |
 | [`docs/review-discipline.md`](docs/review-discipline.md) | Structured code review discipline system |
+| [`docs/WINDOWS-INSTALL.md`](docs/WINDOWS-INSTALL.md) | Windows installation and shell compatibility guide |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
+| [`config.example.toml`](config.example.toml) | Example TOML configuration file |
 
 ## Statistics
 
