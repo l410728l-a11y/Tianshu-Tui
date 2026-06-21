@@ -4,6 +4,9 @@ import type { VigorState } from './vigor.js'
 import type { DoomLoopLevel } from './trace-store.js'
 import type { RetrospectFingerprint } from './retrospect-fingerprint.js'
 import { fingerprintSimilarity } from './retrospect-fingerprint.js'
+import type { FailureEntry, FailurePattern } from './failure-journal.js'
+
+export type ExperienceSource = 'review-gate' | 'test-failure' | 'typecheck' | 'delivery-gate' | 'self-correction'
 
 export interface PlaybookBullet {
   id: string
@@ -15,7 +18,10 @@ export interface PlaybookBullet {
   lastUsedAt: number | null
   importance: number
   details?: string
-  bulletIds?: string[] // 用于 REM pattern bullets，引用相关的 NREM bullet IDs
+  bulletIds?: string[]
+  source?: ExperienceSource
+  errorSignal?: string
+  fixApproach?: string
 }
 
 export interface ExtractBulletsOptions {
@@ -25,6 +31,7 @@ export interface ExtractBulletsOptions {
 
 export interface MatchBulletsOptions {
   now?: number
+  minImportance?: number
 }
 
 const SMOOTH_VARIABILITY_CEILING = 0.15
@@ -95,6 +102,35 @@ export function shouldReflect(vigor: VigorState, sensorium: Sensorium, doomLevel
   return false
 }
 
+/**
+ * retrospect.ts sections 3/4 emit a fixed set of canned template lines chosen
+ * by metric thresholds (not session-specific content). Harvested verbatim they
+ * become zero-signal "lessons" ("本次会话表现良好", "策略稳定性下降…") that get
+ * injected into every prompt and inflate useCount without ever teaching
+ * anything. Block these exact template right-hand sides at the gate; real
+ * lessons enter via the remember/claim path, not this auto-harvest.
+ */
+const TEMPLATE_NOISE_FRAGMENTS = [
+  '数据不足，无法判定',
+  '无足够遥测数据',
+  '验证反馈不足 + 策略振荡组合',
+  '上下文压力、任务拆解粒度、工具输出截断策略',
+  '策略稳定性下降（重复操作或振荡）',
+  'doom loop 检测阈值、工具指纹哈希精度',
+  '验证置信度下降（测试未覆盖修改范围）',
+  '文件修改后未及时运行测试、测试覆盖率不足',
+  '上下文压力过高',
+  'compact 触发时机、工具输出长度、消息历史积累',
+  '本次会话表现良好',
+  '考虑在关键修改后手动运行测试验证',
+  '检查 compact 策略是否及时触发',
+  '检查 doom loop 检测阈值是否过于敏感',
+]
+
+function isTemplateNoise(lesson: string): boolean {
+  return TEMPLATE_NOISE_FRAGMENTS.some(frag => lesson.includes(frag))
+}
+
 export function extractBullets(report: string, options: ExtractBulletsOptions = {}): PlaybookBullet[] {
   const now = options.now ?? Date.now()
   const maxBullets = options.maxBullets ?? DEFAULT_MAX_BULLETS
@@ -113,7 +149,8 @@ export function extractBullets(report: string, options: ExtractBulletsOptions = 
 
   const candidates = allRawLines
     .map(lessonFromLine)
-    .filter((lesson): lesson is string => Boolean(lesson && !lesson.includes('无需特别调整') && !lesson.includes('无明显故障模式')))
+    .filter((lesson): lesson is string =>
+      Boolean(lesson && !lesson.includes('无需特别调整') && !lesson.includes('无明显故障模式') && !isTemplateNoise(lesson)))
 
   return unique(candidates)
     .slice(0, maxBullets)
@@ -153,11 +190,15 @@ function isSimilar(a: PlaybookBullet, b: PlaybookBullet): boolean {
 }
 
 function mergeBullet(existing: PlaybookBullet, incoming: PlaybookBullet): PlaybookBullet {
+  const IMPORTANCE_BOOST = 0.15
   return {
     ...existing,
     keywords: unique([...existing.keywords, ...incoming.keywords]).slice(0, 12),
     context: existing.context === incoming.context ? existing.context : `${existing.context}; ${incoming.context}`.slice(0, 160),
-    importance: clamp01(Math.max(existing.importance, incoming.importance) + 0.1),
+    importance: clamp01(Math.max(existing.importance, incoming.importance) + IMPORTANCE_BOOST),
+    source: incoming.source ?? existing.source,
+    errorSignal: incoming.errorSignal ?? existing.errorSignal,
+    fixApproach: incoming.fixApproach ?? existing.fixApproach,
   }
 }
 
@@ -187,18 +228,14 @@ export function matchBullets(
   topK = 3,
   options: MatchBulletsOptions = {},
 ): PlaybookBullet[] {
-  const now = options.now ?? Date.now()
+  const minImportance = options.minImportance ?? 0
   return playbook
+    .filter(b => b.importance >= minImportance)
     .map(b => ({ bullet: b, score: matchScore(b, keywords) }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, topK)
-    .map(({ bullet }) => ({
-      ...bullet,
-      useCount: bullet.useCount + 1,
-      lastUsedAt: now,
-      importance: clamp01(bullet.importance + 0.05),
-    }))
+    .map(({ bullet }) => bullet)
 }
 
 export function decayImportance(playbook: PlaybookBullet[], now = Date.now()): PlaybookBullet[] {
@@ -290,12 +327,19 @@ export function detectCrossSessionPatterns(
       )
 
       if (sharedKeywords.length >= 2) {
-        // 创建新的 PatternBullet
-        const lesson = `跨 session 重复模式：${sharedKeywords.join('、')} 问题反复出现`
+        const recommendations = unique([
+          ...historical.recommendationKeywords,
+          ...currentFingerprint.recommendationKeywords,
+        ]).slice(0, 6)
+        const rootCauses = sharedKeywords.slice(0, 4).join('、')
+        const advice = recommendations.length > 0
+          ? `建议关注：${recommendations.join('、')}`
+          : '尚无具体建议，需进一步诊断'
+        const lesson = `${rootCauses} 跨 ${similarSessions.length + 1} session 重复出现。${advice}`
         patternBullets.push({
           id: hashId(`pattern:${sharedKeywords.join(':')}`),
           createdAt: now,
-          keywords: sharedKeywords,
+          keywords: [...sharedKeywords, ...recommendations.slice(0, 3)],
           lesson,
           context: 'pattern:recurring',
           useCount: 1,
@@ -381,4 +425,104 @@ export function shouldRunREM(
   }
 
   return 'skip'
+}
+
+const DEFENSIVE_WORDS = ['小心', '注意', '确保', '别忘了', 'be careful', 'make sure', 'don\'t forget']
+
+function isDefensiveLesson(lesson: string): boolean {
+  const lower = lesson.toLowerCase()
+  return DEFENSIVE_WORDS.some(w => lower.includes(w))
+}
+
+function classifySource(entry: FailureEntry): ExperienceSource {
+  const err = entry.error.toLowerCase()
+  if (err.includes('ts2') || err.includes('tsc') || err.includes('type error')) return 'typecheck'
+  if (err.includes('test') || err.includes('assert')) return 'test-failure'
+  if (err.includes('review') || err.includes('finding')) return 'review-gate'
+  if (err.includes('delivery') || err.includes('gate')) return 'delivery-gate'
+  return 'self-correction'
+}
+
+/**
+ * Distill FailureJournal entries into diagnostic PlaybookBullets.
+ *
+ * Only entries with detected patterns (anchoring/rework) or repeated
+ * error classes (2+ occurrences) are distilled. Single-occurrence
+ * failures are noise and not worth persisting.
+ *
+ * Output is diagnostic ("when X, root cause is likely Y") not defensive
+ * ("be careful with X"). Defensive lessons are filtered out.
+ */
+export function distillFromFailures(
+  entries: FailureEntry[],
+  patterns: FailurePattern[],
+  options: { now?: number } = {},
+): PlaybookBullet[] {
+  const now = options.now ?? Date.now()
+  if (entries.length === 0) return []
+
+  const bullets: PlaybookBullet[] = []
+  const seen = new Set<string>()
+
+  for (const pattern of patterns) {
+    const representative = pattern.evidence[0]
+    if (!representative) continue
+
+    const lesson = `当 ${representative.error}（在 ${representative.target ?? '未知文件'}），${pattern.suggestion}`
+    if (isDefensiveLesson(lesson)) continue
+
+    const id = hashId(lesson)
+    if (seen.has(id)) continue
+    seen.add(id)
+
+    bullets.push({
+      id,
+      createdAt: now,
+      keywords: extractKeywords(`${representative.error} ${representative.target ?? ''} ${representative.context}`, 10),
+      lesson,
+      context: pattern.type,
+      useCount: 0,
+      lastUsedAt: null,
+      importance: 0.6,
+      source: classifySource(representative),
+      errorSignal: representative.error,
+      fixApproach: representative.hypothesis,
+    })
+  }
+
+  const byError = new Map<string, FailureEntry[]>()
+  for (const entry of entries) {
+    const key = entry.error.slice(0, 80)
+    const list = byError.get(key) ?? []
+    list.push(entry)
+    byError.set(key, list)
+  }
+
+  for (const [errorKey, group] of byError) {
+    if (group.length < 2) continue
+    const first = group[0]!
+
+    const lesson = `当 ${errorKey}（出现 ${group.length} 次），根因大概率是 ${first.hypothesis ?? first.context}。检查 ${first.target ?? '相关文件'}。`
+    if (isDefensiveLesson(lesson)) continue
+
+    const id = hashId(lesson)
+    if (seen.has(id)) continue
+    seen.add(id)
+
+    bullets.push({
+      id,
+      createdAt: now,
+      keywords: extractKeywords(`${errorKey} ${first.target ?? ''} ${first.context}`, 10),
+      lesson,
+      context: 'recurring-error',
+      useCount: 0,
+      lastUsedAt: null,
+      importance: 0.6,
+      source: classifySource(first),
+      errorSignal: errorKey,
+      fixApproach: first.hypothesis,
+    })
+  }
+
+  return bullets
 }

@@ -1,12 +1,13 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { CompactionController } from '../compaction-controller.js'
+import { CompactionController, findSafeSplitPoint } from '../compaction-controller.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { PressureMonitor } from '../../context/pressure-monitor.js'
 import type { TrajectoryEntry } from '../trajectory.js'
-import type { OaiChatRequest } from '../../api/oai-types.js'
+import type { OaiChatRequest, OaiMessage } from '../../api/oai-types.js'
 import type { StreamCallbacks, StreamClient } from '../../api/stream-client.js'
+import { extractTaskContract } from '../../context/task-contract.js'
 
 function makeEngine(): PromptEngine {
   return new PromptEngine({
@@ -57,6 +58,27 @@ describe('CompactionController', () => {
     assert.equal(session.wasCompactedAt(0), true)
     assert.equal(session.getCompactEvents().at(-1)?.tier, 1)
     assert.ok(session.getEstimatedTokens() < 96_000 || session.getMessages().length <= 8)
+  })
+
+  it('skips discretionary compaction when compactEnabled is false', async () => {
+    const session = new SessionContext()
+    const historyMessage = 'x'.repeat(12_000 * 4)
+    session.replaceMessages([
+      { role: 'user', content: historyMessage },
+      { role: 'assistant', content: historyMessage },
+      { role: 'user', content: historyMessage },
+      { role: 'assistant', content: historyMessage },
+      { role: 'user', content: historyMessage },
+      { role: 'assistant', content: historyMessage },
+      { role: 'user', content: historyMessage },
+      { role: 'assistant', content: historyMessage },
+    ])
+    const controller = makeController(session, { compactEnabled: false })
+
+    const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
+
+    assert.equal(result.compacted, false)
+    assert.equal(session.getMessages().length, 8)
   })
 
   it('falls back to cache anchors plus resume state when over the hard ceiling', async () => {
@@ -654,5 +676,344 @@ describe('CompactionController', () => {
       assert.match(String(summaryMsg!.content), /Progress/)
     }
     // If not compacted, still a valid outcome (token estimate might not cross threshold)
+  })
+
+  // ── prefixOverhead 在 AgentLoop 构造时立刻设置 ──────────────────
+  // 根因：旧 _ensurePrefixOverhead 只在 maybeCompact 入口调，
+  // UI 启动到 maybeCompact 之间的窗口期内 getEstimatedTokens() 不含
+  // system prompt + tool definition 的开销 → GlanceBar 显示 ctx 0%、◧ 0/1.0M。
+  // 修复后在 AgentLoop 构造后立即调一次，关闭窗口。
+
+  it('ensurePrefixOverhead is a public method', () => {
+    const session = new SessionContext()
+    const controller = makeController(session)
+    assert.equal(typeof (controller as any).ensurePrefixOverhead, 'function')
+  })
+
+  it('ensurePrefixOverhead sets prefixOverhead on session', () => {
+    const session = new SessionContext()
+    const engine = makeEngine()
+    const controller = new CompactionController({
+      session,
+      promptEngine: engine,
+      contextWindow: 128_000,
+      pressureMonitor: new PressureMonitor(128_000),
+      getTrajectoryEntries: () => [],
+      getStreamedText: () => '',
+      refreshLedger: () => {},
+    })
+
+    // Before: estimatedTokens should be 0 (no messages, no overhead)
+    const before = session.getEstimatedTokens()
+    assert.equal(before, 0)
+
+    // After: overhead should be set
+    controller.ensurePrefixOverhead()
+    const after = session.getEstimatedTokens()
+    assert.ok(after > 0, `expected estimatedTokens > 0 after ensurePrefixOverhead, got ${after}`)
+  })
+
+  it('ensurePrefixOverhead is idempotent', () => {
+    const session = new SessionContext()
+    const engine = makeEngine()
+    const controller = new CompactionController({
+      session,
+      promptEngine: engine,
+      contextWindow: 128_000,
+      pressureMonitor: new PressureMonitor(128_000),
+      getTrajectoryEntries: () => [],
+      getStreamedText: () => '',
+      refreshLedger: () => {},
+    })
+
+    controller.ensurePrefixOverhead()
+    const first = session.getEstimatedTokens()
+
+    // Second call should NOT change the value (idempotent)
+    controller.ensurePrefixOverhead()
+    const second = session.getEstimatedTokens()
+
+    assert.equal(second, first, 'second call must not change prefixOverhead')
+  })
+
+  it('ensurePrefixOverhead reflects PromptEngine tool count', () => {
+    const session = new SessionContext()
+    const engine = makeEngine()
+    // Override getToolCount to simulate more tools
+    const engineWithTools = {
+      ...engine,
+      getToolCount: () => 25,
+      getSystemPrompt: () => engine.getSystemPrompt(),
+    }
+    const controller = new CompactionController({
+      session,
+      promptEngine: engineWithTools as any,
+      contextWindow: 128_000,
+      pressureMonitor: new PressureMonitor(128_000),
+      getTrajectoryEntries: () => [],
+      getStreamedText: () => '',
+      refreshLedger: () => {},
+    })
+
+    controller.ensurePrefixOverhead()
+    const overhead = session.getEstimatedTokens()
+
+    // With 25 tools × 50 tokens/tool = 1250 tool tokens
+    // System prompt + 1250 + 400 volatile should be well above 500
+    assert.ok(overhead > 500, `expected overhead > 500 with 25 tools, got ${overhead}`)
+  })
+
+  // ── C4: authoritative task anchor re-injection ──────────────────────────
+  describe('C4 task anchor re-injection', () => {
+    it('re-injects the authoritative task anchor after the ceiling checkpoint', async () => {
+      const session = new SessionContext()
+      const huge = 'x'.repeat(80_000 * 4)
+      session.replaceMessages([
+        { role: 'user', content: 'anchor user' },
+        { role: 'assistant', content: 'anchor assistant' },
+        { role: 'user', content: huge },
+        { role: 'assistant', content: huge },
+        { role: 'user', content: huge },
+        { role: 'assistant', content: huge },
+      ])
+      const contract = extractTaskContract(
+        '重构 src/auth/middleware.ts 的鉴权逻辑。不要改接口签名。必须向后兼容。',
+        1,
+      )
+      const controller = makeController(session, {
+        getActiveContract: () => contract,
+        getStreamedText: () => 'Completed: wired guard\nRemaining: add tests',
+      })
+
+      await controller.enforceContextCeiling()
+
+      const messages = session.getMessages()
+      // Frozen prefix untouched.
+      assert.equal(messages[0]?.content, 'anchor user')
+      assert.equal(messages[1]?.content, 'anchor assistant')
+      // Task anchor lands at the tail (appendix region), with the verbatim
+      // objective and the forbidden-item constraint preserved.
+      const tail = String(messages.at(-1)?.content)
+      assert.match(tail, /<task-anchor authoritative="true"/)
+      assert.match(tail, /middleware\.ts/)
+      assert.match(tail, /<constraint>/)
+      assert.ok(session.getEstimatedTokens() <= 128_000 * 0.95)
+    })
+
+    it('omits the anchor when there is no actionable contract', async () => {
+      const session = new SessionContext()
+      const huge = 'x'.repeat(80_000 * 4)
+      session.replaceMessages([
+        { role: 'user', content: 'anchor user' },
+        { role: 'assistant', content: 'anchor assistant' },
+        { role: 'user', content: huge },
+        { role: 'assistant', content: huge },
+        { role: 'user', content: huge },
+        { role: 'assistant', content: huge },
+      ])
+      // Non-actionable greeting → renderTaskAnchor returns '' → no appendix.
+      const controller = makeController(session, {
+        getActiveContract: () => extractTaskContract('你好', 1),
+      })
+
+      await controller.enforceContextCeiling()
+
+      const messages = session.getMessages()
+      assert.ok(!messages.some(m => String(m.content).includes('<task-anchor')))
+    })
+
+    it('re-injects the anchor after a tier-2 micro compaction', async () => {
+      const session = new SessionContext()
+      const historyMessage = 'x'.repeat(12_000 * 4)
+      session.replaceMessages(
+        Array.from({ length: 12 }, (_, i) => ({
+          role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+          content: historyMessage,
+        })),
+      )
+      const contract = extractTaskContract('实现 src/foo.ts 的功能。不要破坏现有 API。', 1)
+      const controller = makeController(session, {
+        getActiveContract: () => contract,
+        getStreamedText: () => 'Remaining: finish foo',
+      })
+
+      const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
+
+      if (result.compacted) {
+        const events = session.getCompactEvents()
+        const tier = events.at(-1)?.tier ?? 1
+        // Tier-2+ micro compaction injects both the compact summary AND the
+        // authoritative anchor. Tier-1 paths do not (no message-count drop), so
+        // only assert the anchor when a tier-2 summary fired.
+        if (tier >= 2) {
+          const hasAnchor = session.getMessages().some(m => String(m.content).includes('<task-anchor'))
+          assert.ok(hasAnchor, 'tier-2 compaction should re-inject the task anchor')
+        }
+      }
+    })
+  })
+})
+
+// ── findSafeSplitPoint ──────────────────────────────────────────────────
+
+describe('findSafeSplitPoint', () => {
+  function makeMsg(role: string, content: string, extra?: Record<string, unknown>): OaiMessage {
+    return { role, content, ...extra } as OaiMessage
+  }
+
+  function makeAssistant(content: string, toolCalls?: Array<{ id: string }>): OaiMessage {
+    const msg: Record<string, unknown> = { role: 'assistant', content }
+    if (toolCalls) {
+      msg.tool_calls = toolCalls.map(tc => ({
+        ...tc,
+        type: 'function',
+        function: { name: 'test', arguments: '{}' },
+      }))
+    }
+    return msg as OaiMessage
+  }
+
+  function makeTool(content: string, toolCallId: string): OaiMessage {
+    return { role: 'tool', content, tool_call_id: toolCallId } as OaiMessage
+  }
+
+  it('returns desired split point when no tool calls are involved', () => {
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeMsg('assistant', 'hi'),
+      makeMsg('user', 'task 2'),
+      makeMsg('assistant', 'result 2'),
+      makeMsg('user', 'task 3'),
+      makeMsg('assistant', 'result 3'),
+    ]
+    const result = findSafeSplitPoint(msgs, 5, 2)
+    assert.equal(result, 5)
+  })
+
+  it('moves split point before assistant when a tool result would be orphaned', () => {
+    // assistant(tool_calls=[A]) at index 4, tool(A) at index 5
+    // desired split at 5 → would orphan tool(A) in recentZone
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeMsg('assistant', 'hi'),
+      makeMsg('user', 'do X'),
+      makeAssistant('calling tool', [{ id: 'call_A' }]),
+      makeTool('result A', 'call_A'),
+      makeMsg('assistant', 'text after tool'),
+      makeMsg('user', 'next task'),
+    ]
+    const result = findSafeSplitPoint(msgs, 5, 2)
+    // Should move split before the assistant at index 4
+    assert.equal(result, 4)
+  })
+
+  it('moves split before assistant when tool result is in middle of group', () => {
+    // assistant(tool_calls=[A,B]) at 4, tool(A) at 5, tool(B) at 6
+    // desired split at 6 → tool(B) would be orphaned
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeMsg('assistant', 'hi'),
+      makeMsg('user', 'do X'),
+      makeAssistant('calling tools', [{ id: 'call_A' }, { id: 'call_B' }]),
+      makeTool('result A', 'call_A'),
+      makeTool('result B', 'call_B'),
+      makeMsg('assistant', 'text after tools'),
+    ]
+    const result = findSafeSplitPoint(msgs, 6, 2)
+    assert.equal(result, 4)
+  })
+
+  it('handles consecutive tool call groups correctly', () => {
+    // Group 1: assistant(tool_calls=[A]) at 3, tool(A) at 4
+    // Group 2: assistant(tool_calls=[B]) at 5, tool(B) at 6
+    // desired split at 6 (tool B) → should move before assistant B at 5
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeMsg('assistant', 'hi'),
+      makeAssistant('call A', [{ id: 'call_A' }]),
+      makeTool('result A', 'call_A'),
+      makeAssistant('call B', [{ id: 'call_B' }]),
+      makeTool('result B', 'call_B'),
+      makeMsg('assistant', 'done'),
+    ]
+    const result = findSafeSplitPoint(msgs, 6, 2)
+    assert.equal(result, 5)
+  })
+
+  it('returns desired split when split is after tool group end', () => {
+    // assistant(tool_calls=[A]) at 4, tool(A) at 5, next assistant at 6
+    // desired split at 6 (after tool group) → safe, no adjustment needed
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeMsg('assistant', 'hi'),
+      makeMsg('user', 'do X'),
+      makeAssistant('calling tool', [{ id: 'call_A' }]),
+      makeTool('result A', 'call_A'),
+      makeMsg('assistant', 'after tool text'),
+      makeMsg('user', 'next'),
+    ]
+    const result = findSafeSplitPoint(msgs, 6, 2)
+    assert.equal(result, 6)
+  })
+
+  it('returns desired split when split is on assistant with tool_calls (group intact in recentZone)', () => {
+    // assistant(tool_calls=[A]) at 4, tool(A) at 5
+    // desired split at 4 → assistant + tool are both in recentZone, safe
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeMsg('assistant', 'hi'),
+      makeMsg('user', 'do X'),
+      makeAssistant('calling tool', [{ id: 'call_A' }]),
+      makeTool('result A', 'call_A'),
+      makeMsg('assistant', 'text'),
+    ]
+    const result = findSafeSplitPoint(msgs, 4, 2)
+    assert.equal(result, 4)
+  })
+
+  it('does not move split below minSplit', () => {
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'hello'),
+      makeAssistant('calling tool', [{ id: 'call_A' }]),
+      makeTool('result A', 'call_A'),
+      makeMsg('user', 'another task'),
+      makeMsg('assistant', 'hi'),
+      makeMsg('user', 'third'),
+      makeMsg('assistant', 'done'),
+    ]
+    // desired split at 3 (tool A), minSplit = 3
+    // Should return 3 (at or above minSplit), even though the assistant is at 2
+    const result = findSafeSplitPoint(msgs, 3, 3)
+    assert.equal(result, 3, 'should respect minSplit floor')
+  })
+
+  it('demonstrates the original bug: split between tool results breaks pairing', () => {
+    // Simulate the exact bug pattern:
+    // ...old messages, assistant(tool_calls=[A,B]) at 6, tool(A) at 7, tool(B) at 8, ...
+    // Without fix: desired split at 8 → recentZone starts at tool(B), orphaned
+    const msgs: OaiMessage[] = [
+      makeMsg('system', 'sys'),
+      makeMsg('user', 'initial'),
+      makeMsg('assistant', 'ack'),
+      makeMsg('user', 'task 1'),
+      makeMsg('assistant', 'done 1'),
+      makeMsg('user', 'task 2'),
+      makeAssistant('calling multiple tools', [{ id: 'tc_A' }, { id: 'tc_B' }]),
+      makeTool('result A', 'tc_A'),
+      makeTool('result B', 'tc_B'),
+      makeMsg('assistant', 'after tools'),
+      makeMsg('user', 'task 3'),
+      makeMsg('assistant', 'working'),
+    ]
+    const result = findSafeSplitPoint(msgs, 8, 2)
+    // Should adjust to 6 (before the assistant) to keep the group intact
+    assert.equal(result, 6)
   })
 })

@@ -92,6 +92,114 @@ describe('parseStream / SSE parsing', () => {
   })
 })
 
+describe('final text content block emission', () => {
+  function sseStream(frames: string[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder()
+    return new ReadableStream({
+      start(controller) {
+        for (const f of frames) controller.enqueue(encoder.encode(f))
+        controller.close()
+      },
+    })
+  }
+
+  it('emits a text content block at stream end for text-only replies', async () => {
+    const client = new OpenAIClient(TEST_CONFIG)
+    const response = new Response(sseStream([
+      'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}\n\n',
+      'data: {"choices":[{"delta":{"content":" world"},"index":0,"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]))
+
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: () => {}, onContentBlock: (b: any) => blocks.push(b) },
+    )
+
+    const textBlocks = blocks.filter(b => b.type === 'text')
+    assert.equal(textBlocks.length, 1, 'exactly one text content block must be emitted')
+    assert.equal(textBlocks[0].text, 'Hello world')
+  })
+
+  it('emits text block alongside tool_use when text precedes tool calls', async () => {
+    const client = new OpenAIClient(TEST_CONFIG)
+    const response = new Response(sseStream([
+      'data: {"choices":[{"delta":{"content":"Checking weather. "},"index":0}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"index":0,"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]))
+
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: () => {}, onContentBlock: (b: any) => blocks.push(b) },
+    )
+
+    assert.equal(blocks.filter(b => b.type === 'tool_use').length, 1)
+    const textBlocks = blocks.filter(b => b.type === 'text')
+    assert.equal(textBlocks.length, 1)
+    assert.equal(textBlocks[0].text, 'Checking weather. ')
+  })
+
+  it('does NOT emit text block when content was consumed as tool JSON (hasToolJsonInContentBug)', async () => {
+    const client = new OpenAIClient({
+      ...TEST_CONFIG,
+      capabilities: { hasToolJsonInContentBug: true },
+    })
+    const toolJson = '{"name":"read_file","arguments":{"file_path":"/tmp/x"}}'
+    const response = new Response(sseStream([
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(toolJson)}},"index":0,"finish_reason":"stop"}]}\n\n`,
+      'data: [DONE]\n\n',
+    ]))
+
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: () => {}, onContentBlock: (b: any) => blocks.push(b) },
+    )
+
+    assert.equal(blocks.filter(b => b.type === 'tool_use').length, 1, 'tool JSON must be parsed into tool_use')
+    assert.equal(blocks.filter(b => b.type === 'text').length, 0, 'tool JSON must not also persist as text')
+  })
+
+  it('emits text block from promoted reasoning for GLM thinking-only replies', async () => {
+    const client = new OpenAIClient({ ...TEST_CONFIG, providerName: 'glm' })
+    const response = new Response(sseStream([
+      'data: {"choices":[{"delta":{"reasoning_content":"The answer is 4."},"index":0,"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]))
+
+    const blocks: any[] = []
+    const texts: string[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      {
+        onTextDelta: (t: string) => texts.push(t),
+        onContentBlock: (b: any) => blocks.push(b),
+      },
+    )
+
+    assert.equal(texts.join(''), 'The answer is 4.', 'reasoning promoted to visible text')
+    const textBlocks = blocks.filter(b => b.type === 'text')
+    assert.equal(textBlocks.length, 1, 'promoted text must persist as a text block')
+    assert.equal(textBlocks[0].text, 'The answer is 4.')
+  })
+
+  it('does not emit a text block when no content arrived', async () => {
+    const client = new OpenAIClient(TEST_CONFIG)
+    const response = new Response(sseStream(['data: [DONE]\n\n']))
+
+    const blocks: any[] = []
+    await (client as any).parseStreamFromReader(
+      response.body!.getReader(),
+      { onTextDelta: () => {}, onContentBlock: (b: any) => blocks.push(b) },
+    )
+
+    assert.equal(blocks.filter(b => b.type === 'text').length, 0)
+  })
+})
+
 describe('tool_calls delta buffering', () => {
   it('accumulates fragmented tool_calls deltas into complete tool_use', () => {
     const client = new OpenAIClient(TEST_CONFIG)
@@ -420,5 +528,111 @@ describe('DeepSeek-specific features', () => {
     assert.equal(thoughts.length, 2, 'onThinkingDelta should be called for each reasoning_content delta')
     assert.equal(thoughts.join(''), 'Step 1: analyzeStep 2: conclude')
     assert.equal(stopReason, 'end_turn')
+  })
+
+  it('8: thinking plus tool call is actionable and not text-only', () => {
+    const client = new OpenAIClient(TEST_CONFIG)
+
+    const texts: string[] = []
+    const thoughts: string[] = []
+    const blocks: any[] = []
+    let stopReason: string | undefined
+
+    const callbacks = {
+      onTextDelta: (t: string) => texts.push(t),
+      onThinkingDelta: (t: string) => thoughts.push(t),
+      onContentBlock: (block: any) => blocks.push(block),
+      onStopReason: (reason: string) => { stopReason = reason },
+    }
+
+    client.processDelta(
+      { choices: [{ delta: { reasoning_content: 'Need to submit the plan.' }, finish_reason: null }] },
+      callbacks,
+    )
+    client.processDelta(
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_plan', type: 'function', function: { name: 'plan_submit', arguments: '{"title":"Stepwise Document Writing","plan":"Do it."}' } }] }, finish_reason: 'tool_calls' }] },
+      callbacks,
+    )
+    client.processDelta(
+      { usage: { prompt_tokens: 100, completion_tokens: 20 } },
+      callbacks,
+    )
+
+    assert.deepEqual(texts, [])
+    assert.deepEqual(thoughts, ['Need to submit the plan.'])
+    assert.equal(blocks.length, 1)
+    assert.equal(blocks[0].name, 'plan_submit')
+    assert.equal(stopReason, 'tool_use')
+  })
+})
+
+describe('usage calibration (GLM prompt_tokens inflation)', () => {
+  // Helper: create client with given calibration factor and pre-set messages
+  function makeClient(factor: number | undefined, messages?: object[]): OpenAIClient {
+    const client = new OpenAIClient({
+      ...TEST_CONFIG,
+      usageCalibrationFactor: factor,
+      providerName: factor === 0 ? 'glm' : undefined,
+    })
+    // processDelta reads this.lastRequestMessages for estimation
+    ;(client as any).lastRequestMessages = messages ?? []
+    return client
+  }
+
+  function getUsage(client: OpenAIClient): any {
+    let usage: any = null
+    client.processDelta(
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+      { onStopReason: (_r: string, u: any) => { usage = u } },
+    )
+    client.processDelta(
+      { usage: { prompt_tokens: 1_970_432, completion_tokens: 500, prompt_cache_hit_tokens: 1_778_816, prompt_cache_miss_tokens: 0 } },
+      { onStopReason: (_r: string, u: any) => { usage = u } },
+    )
+    return usage
+  }
+
+  it('GLM factor=0: replaces input_tokens with local estimate', () => {
+    // 1000 chars of content → ~250 tokens estimated
+    const bigText = 'x'.repeat(1000)
+    const client = makeClient(0, [{ role: 'user', content: bigText }])
+
+    const usage = getUsage(client)
+
+    // Should NOT be 1,970,432 (the inflated GLM value)
+    assert.ok(usage.input_tokens < 1_000_000,
+      `input_tokens should be estimated, not 1.97M (got ${usage.input_tokens})`)
+    assert.equal(usage.input_tokens, 250, '1000 chars / 4 = 250 tokens')
+  })
+
+  it('default (no factor): trusts API prompt_tokens as-is', () => {
+    const client = makeClient(undefined, [{ role: 'user', content: 'hi' }])
+
+    const usage = getUsage(client)
+
+    assert.equal(usage.input_tokens, 1_970_432,
+      'without calibration, API value should pass through')
+  })
+
+  it('factor=1: trusts API prompt_tokens as-is', () => {
+    const client = makeClient(1, [{ role: 'user', content: 'hi' }])
+
+    const usage = getUsage(client)
+
+    assert.equal(usage.input_tokens, 1_970_432)
+  })
+
+  it('GLM factor=0: scales cache_read proportionally', () => {
+    const bigText = 'x'.repeat(1000)
+    const client = makeClient(0, [{ role: 'user', content: bigText }])
+
+    const usage = getUsage(client)
+
+    // apiRatio = 250 / 1_970_432 ≈ 0.000127
+    // cache_read = round(1_778_816 * 0.000127) ≈ 226
+    assert.ok(usage.cache_read_input_tokens < usage.input_tokens,
+      'cache_read should be scaled down proportionally')
+    assert.ok(usage.cache_read_input_tokens > 0,
+      'cache_read should be non-zero after proportional scaling')
   })
 })

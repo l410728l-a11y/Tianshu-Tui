@@ -2,7 +2,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { isAuthorizedRequest } from './auth.js'
 import { errorContext, serverLogger } from './logger.js'
 
-const MAX_BODY_BYTES = 1_048_576
+// 10MB — the prompt route carries up to 4 base64 image data URLs. Compressed
+// images are ~256KB each, but the per-image server cap is 1.5MB decoded
+// (~2MB base64), so 4 images plus prompt JSON must fit. The server is a
+// localhost-bound, token-gated sidecar, so a larger ceiling is acceptable.
+const MAX_BODY_BYTES = 10 * 1024 * 1024
 
 export interface RouteResponse {
   status: number
@@ -22,11 +26,11 @@ export type RouteHandler = (
 export function createRouter(routes: Record<string, RouteHandler>) {
   // Build exact match map + parameterized routes
   const exact = new Map<string, RouteHandler>()
-  const parameterized: Array<{ pattern: RegExp; paramNames: string[]; handler: RouteHandler }> = []
+  const parameterized: Array<{ method: string; pattern: RegExp; paramNames: string[]; handler: RouteHandler }> = []
 
   for (const [key, handler] of Object.entries(routes)) {
     const parts = key.split(' ')
-    const method = parts[0]
+    const method = parts[0]!
     const path = parts.slice(1).join(' ')
     if (path.includes(':')) {
       // Parameterized route: /tasks/:id → capture group
@@ -36,6 +40,7 @@ export function createRouter(routes: Record<string, RouteHandler>) {
         return '([^/]+)'
       })
       parameterized.push({
+        method,
         pattern: new RegExp('^' + regexStr + '$'),
         paramNames,
         handler,
@@ -52,19 +57,28 @@ export function createRouter(routes: Record<string, RouteHandler>) {
     reqHeaders?: Record<string, string>,
     res?: ServerResponse,
   ): Promise<RouteResponse> => {
-    // Strip query string from path
-    const cleanPath = path.split('?')[0] ?? path
+    // Strip query string from path, but surface query params to handlers so
+    // routes like `GET /sessions/:id/events?since=N` can read them.
+    const qIdx = path.indexOf('?')
+    const cleanPath = qIdx >= 0 ? path.slice(0, qIdx) : path
+    const query: Record<string, string> = {}
+    if (qIdx >= 0) {
+      for (const [k, v] of new URLSearchParams(path.slice(qIdx + 1))) query[k] = v
+    }
 
     // Try exact match first
     const exactKey = method + ' ' + cleanPath
     const exactHandler = exact.get(exactKey)
-    if (exactHandler) return await exactHandler(body, undefined, reqHeaders, res)
+    if (exactHandler) return await exactHandler(body, query, reqHeaders, res)
 
-    // Try parameterized routes
-    for (const { pattern, paramNames, handler } of parameterized) {
+    // Try parameterized routes. Match on BOTH method and path so a GET and a
+    // POST can share the same parameterized path (e.g. GET/POST
+    // /sessions/:id/skills) without the first-registered one shadowing the other.
+    for (const { method: routeMethod, pattern, paramNames, handler } of parameterized) {
+      if (routeMethod !== method) continue
       const match = cleanPath.match(pattern)
       if (match) {
-        const params: Record<string, string> = {}
+        const params: Record<string, string> = { ...query }
         for (let i = 0; i < paramNames.length; i++) {
           params[paramNames[i]!] = match[i + 1]!
         }
@@ -80,23 +94,39 @@ export function startServer(port: number, routes: Record<string, RouteHandler>, 
   const router = createRouter(routes)
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // CORS: allow Tauri dev mode (localhost:5273 → 127.0.0.1:<port>) and
+    // production (tauri://localhost). Bound to 127.0.0.1 so no external exposure.
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, PATCH, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      })
+      res.end()
+      return
+    }
+
     const reqHeaders = normalizeHeaders(req)
     if (!isAuthorizedRequest({ headers: reqHeaders }, apiToken)) {
-      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.writeHead(401, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({ error: 'Unauthorized' }))
       return
     }
 
     const body = await readBody(req)
     if (body === BODY_TOO_LARGE) {
-      res.writeHead(413, { 'Content-Type': 'application/json' })
+      res.writeHead(413, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({ error: 'Request body too large' }))
       return
     }
 
     const result = await router(req.method ?? 'GET', req.url ?? '/', body, reqHeaders, res)
     if (result.handled) return
-    const headers: Record<string, string> = { 'Content-Type': 'application/json', ...result.headers }
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      ...result.headers,
+    }
     res.writeHead(result.status, headers)
     res.end(result.body ? JSON.stringify(result.body) : '')
   })

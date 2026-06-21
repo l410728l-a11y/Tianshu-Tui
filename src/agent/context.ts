@@ -1,11 +1,18 @@
 import type { ContentBlock, Usage } from '../api/types.js'
-import type { OaiMessage, OaiToolCall } from '../api/oai-types.js'
+import type { OaiMessage, OaiToolCall, OaiContentPart } from '../api/oai-types.js'
 import type { CompactEvent, ContextLedger } from '../context/types.js'
 import { estimateOaiMessageTokens, estimateOaiTokens } from '../compact/micro.js'
 import { stableStringify } from '../api/stable-json.js'
 import { sanitizeForJsonTransport } from '../utils/sanitize.js'
+import { wrapSystemReminder } from '../prompt/system-reminder.js'
 
 import { INLINE_TOOL_RESULT_MAX_CHARS } from '../compact/constants.js'
+import { ToolArgPostProcessorRegistry } from './tool-arg-post-processor.js'
+import { planSubmitArgProcessor } from '../tools/plan-submit-arg-processor.js'
+import { writeFileArgProcessor } from '../tools/write-file-arg-processor.js'
+import { editFileArgProcessor } from '../tools/edit-file-arg-processor.js'
+import { hashEditArgProcessor } from '../tools/hash-edit-arg-processor.js'
+import { applyPatchArgProcessor } from '../tools/apply-patch-arg-processor.js'
 
 const MAX_TRACKED_FILES = 500
 const MAX_TEST_RESULTS = 500
@@ -39,6 +46,14 @@ export interface SessionState {
    *  that are not reflected in per-message token estimates. Set by the
    *  prompt engine after the first request build. */
   prefixOverhead: number
+  /** API 最近一轮请求返回的真实 prompt_tokens（校准基准）。
+   *  由 addUsage() 在每轮 API 响应后写入；0 表示尚无数据。 */
+  lastRealPromptTokens: number
+  /** Ratio between local token estimate and the API's actual prompt_tokens
+   *  from the most recent request. Applied in getEstimatedTokens() so the
+   *  GlanceBar shows "current context occupancy" aligned with real API usage,
+   *  not a stale single-turn value. Starts at 1 (trust local estimate). */
+  contextCalibrationRatio: number
   turnCacheHistory: TurnCacheSnapshot[]
   compactedAtTurns: Set<number>
   contextLedger?: ContextLedger
@@ -60,6 +75,8 @@ export type MessageMutation =
 export class SessionContext {
   private state: SessionState
   private onMutation: ((m: MessageMutation) => void) | null = null
+  /** Tool argument post-processors — intercept large args before entering oaiMessages */
+  private argProcessors: ToolArgPostProcessorRegistry
 
   constructor() {
     this.state = {
@@ -69,6 +86,8 @@ export class SessionContext {
       startTime: Date.now(),
       estimatedTokens: 0,
       prefixOverhead: 0,
+      lastRealPromptTokens: 0,
+      contextCalibrationRatio: 1,
       filesRead: new Set(),
       filesModified: new Set(),
       testResults: [],
@@ -76,6 +95,13 @@ export class SessionContext {
       compactedAtTurns: new Set(),
       compactEvents: [],
     }
+    // Register built-in arg processors
+    this.argProcessors = new ToolArgPostProcessorRegistry()
+    this.argProcessors.register(planSubmitArgProcessor)
+    this.argProcessors.register(writeFileArgProcessor)
+    this.argProcessors.register(editFileArgProcessor)
+    this.argProcessors.register(hashEditArgProcessor)
+    this.argProcessors.register(applyPatchArgProcessor)
   }
 
   /**
@@ -87,12 +113,57 @@ export class SessionContext {
     this.onMutation = fn
   }
 
-  addUserMessage(content: string): void {
-    const msg: OaiMessage = { role: 'user', content: sanitizeForJsonTransport(content) }
+  addUserMessage(content: string, images?: string[]): void {
+    let msg: OaiMessage
+    if (images && images.length > 0) {
+      // Multimodal: construct OpenAI vision content parts (text + image_url).
+      const parts: OaiContentPart[] = [
+        { type: 'text', text: sanitizeForJsonTransport(content) },
+        ...images.map(url => ({ type: 'image_url' as const, image_url: { url } })),
+      ]
+      msg = { role: 'user', content: parts }
+    } else {
+      msg = { role: 'user', content: sanitizeForJsonTransport(content) }
+    }
     this.state.oaiMessages.push(msg)
     this.state.estimatedTokens += estimateOaiMessageTokens(msg)
     this.state.turnCount++
     this.onMutation?.({ type: 'append', message: msg })
+  }
+
+  /**
+   * Inject a system-reminder as an APPEND-ONLY tail entry — never rewrite a
+   * mid-array message.
+   *
+   * DeepSeek's exact-prefix cache keys on the token sequence, not on message
+   * count. Rewriting any earlier message invalidates the prefix from that point
+   * onward, collapsing every cached tool output after it. The previous version
+   * scanned backwards for "the last user message" and edited it in place; during
+   * a turn that message sits mid-array (assistant + tool outputs already follow
+   * it), so the edit detonated the cache for the rest of the turn — the opposite
+   * of its stated goal (regression 5fedd9b6).
+   *
+   * We only ever touch the tail:
+   *   - tail is a string user message → merge into it (still append-only: the
+   *     tail is the newest position, nothing is cached after it, and merging
+   *     avoids producing two consecutive user messages);
+   *   - otherwise (tail is assistant/tool, or non-string) → push a new SR user
+   *     message at the end. The SR marker keeps PromptEngine from treating it as
+   *     a real user boundary.
+   */
+  appendSystemReminder(text: string): void {
+    const wrapped = wrapSystemReminder(text)
+    const msgs = this.state.oaiMessages
+    const last = msgs[msgs.length - 1]
+    if (last && last.role === 'user' && typeof last.content === 'string') {
+      const oldTokens = estimateOaiMessageTokens(last)
+      const merged = { ...last, content: last.content + '\n' + sanitizeForJsonTransport(wrapped) }
+      msgs[msgs.length - 1] = merged
+      this.state.estimatedTokens += estimateOaiMessageTokens(merged) - oldTokens
+      this.onMutation?.({ type: 'replace', messages: msgs.slice() })
+      return
+    }
+    this.addUserMessage(wrapped)
   }
 
   /**
@@ -133,18 +204,38 @@ export class SessionContext {
     this.onMutation?.({ type: 'replace', messages: messages.slice() })
   }
 
+  /**
+   * Rewind-specific message replacement. Unlike {@link replaceMessages} (also
+   * used by compaction, which must NOT clear derived state), this resets all
+   * agent-internal tracking that referenced the removed messages after the
+   * rewind point.
+   */
+  rewindToMessages(messages: OaiMessage[]): void {
+    this.state.oaiMessages = messages
+    this.state.estimatedTokens = estimateOaiTokens(messages)
+    this.state.turnCount = messages.filter(m => m.role === 'user').length
+    this.state.turnCacheHistory = []
+    this.state.compactedAtTurns = new Set()
+    this.state.filesRead = new Set()
+    this.state.filesModified = new Set()
+    this.onMutation?.({ type: 'replace', messages: messages.slice() })
+  }
+
   addAssistantBlocks(blocks: ContentBlock[]): void {
     const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
     const reasoning = blocks.filter(b => b.type === 'thinking').map(b => b.thinking).join('')
     const toolCalls: OaiToolCall[] = blocks
       .filter((b): b is ContentBlock & { type: 'tool_use' } => b.type === 'tool_use')
       .map(b => ({ id: b.id, type: 'function' as const, function: { name: b.name, arguments: stableStringify(b.input) } }))
+    // Intercept large tool call arguments before they enter oaiMessages.
+    // IMPORTANT: operates on the stringified arguments only — never touches b.input.
+    const processedCalls = this.argProcessors.processToolCalls(toolCalls)
 
     const msg: OaiMessage = {
       role: 'assistant',
-      content: text || (toolCalls.length === 0 ? '' : null),
+      content: text || (processedCalls.length === 0 ? '' : null),
       ...(reasoning ? { reasoning_content: reasoning } : {}),
-      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      ...(processedCalls.length > 0 ? { tool_calls: processedCalls } : {}),
     }
     this.state.oaiMessages.push(msg)
     this.state.estimatedTokens += estimateOaiMessageTokens(msg)
@@ -165,34 +256,62 @@ export class SessionContext {
 
   addUsage(usage: Partial<Usage>): void {
     const u = this.state.totalUsage
-    if (usage.input_tokens) u.input_tokens += usage.input_tokens
+    if (usage.input_tokens) {
+      u.input_tokens += usage.input_tokens
+      this.state.lastRealPromptTokens = usage.input_tokens
+      // Calibrate local estimate against the API's real prompt_tokens.
+      // The raw estimatedTokens tracks current messages only; prefixOverhead
+      // is fixed. The ratio captures provider-specific tokenization / overhead
+      // so getEstimatedTokens() stays close to reality between API calls.
+      const localEstimate = this.state.estimatedTokens + this.state.prefixOverhead
+      if (localEstimate > 0) {
+        const apiTokens = usage.input_tokens
+        // Defer: when the local baseline can't explain even 10% of the API
+        // report, the ratio would be wildly off (this happens before
+        // ensurePrefixOverhead runs in maybeCompact on turn 1). Keep ratio=1
+        // — the local estimate is conservative but won't explode.
+        if (localEstimate < apiTokens * 0.1) {
+          // No calibration write — ratio stays at prior value (1 initially).
+        } else {
+          // Clamp the raw ratio to [0.5, 5] before EMA. Tokenization
+          // differences across providers are typically within 2x; 5x is a
+          // generous envelope that still rejects pathological inputs.
+          const rawRatio = apiTokens / localEstimate
+          const ratio = Math.max(0.5, Math.min(5, rawRatio))
+          // Uniform EMA α=0.7: even the first calibration is gradual, so a
+          // single outlier can never permanently poison the ratio.
+          this.state.contextCalibrationRatio = 0.7 * ratio + 0.3 * this.state.contextCalibrationRatio
+        }
+      }
+    }
     if (usage.output_tokens) u.output_tokens += usage.output_tokens
     if (usage.cache_read_input_tokens) u.cache_read_input_tokens += usage.cache_read_input_tokens
     if (usage.cache_creation_input_tokens) u.cache_creation_input_tokens += usage.cache_creation_input_tokens
   }
 
   getCacheHitRate(): number {
-    const total = this.state.totalUsage.cache_read_input_tokens + this.state.totalUsage.cache_creation_input_tokens
-    return total === 0 ? 0 : this.state.totalUsage.cache_read_input_tokens / total
+    // Use total input_tokens as denominator — cache_read / (cacheRead + cacheCreation)
+    // degenerates to 100% when cacheCreation is 0 (provider doesn't report miss tokens).
+    const input = this.state.totalUsage.input_tokens
+    return input === 0 ? 0 : Math.min(1, this.state.totalUsage.cache_read_input_tokens / input)
   }
 
   getLatestTurnHitRate(): number | null {
     const latest = this.state.turnCacheHistory[this.state.turnCacheHistory.length - 1]
     if (!latest) return null
-    const total = latest.cacheRead + latest.cacheCreation
-    return total > 0 ? latest.cacheRead / total : null
+    return latest.inputTokens > 0 ? Math.min(1, latest.cacheRead / latest.inputTokens) : null
   }
 
   getRecentTurnHitRate(lastN: number): number | null {
     const slice = this.state.turnCacheHistory.slice(-lastN)
     if (slice.length === 0) return null
     let totalRead = 0
-    let totalCache = 0
+    let totalInput = 0
     for (const t of slice) {
       totalRead += t.cacheRead
-      totalCache += t.cacheRead + t.cacheCreation
+      totalInput += t.inputTokens
     }
-    return totalCache > 0 ? totalRead / totalCache : null
+    return totalInput > 0 ? Math.min(1, totalRead / totalInput) : null
   }
 
   getMessages(): OaiMessage[] {
@@ -208,7 +327,13 @@ export class SessionContext {
   }
 
   getEstimatedTokens(): number {
-    return this.state.estimatedTokens + this.state.prefixOverhead
+    const base = this.state.estimatedTokens + this.state.prefixOverhead
+    return Math.round(base * this.state.contextCalibrationRatio)
+  }
+
+  /** API 最近一轮返回的真实 prompt_tokens（校准基准）；0 表示尚无数据。 */
+  getLastRealPromptTokens(): number {
+    return this.state.lastRealPromptTokens
   }
 
   /** Set the fixed token overhead from system prompt, tool schemas, static blocks. */

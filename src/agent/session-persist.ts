@@ -1,7 +1,8 @@
 import { appendFile } from 'fs/promises'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, readdirSync, statSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, rmSync, readdirSync, statSync } from 'fs'
 import { writeFileAtomicSync, writeFileAtomicAsync } from '../fs-atomic.js'
-import { join } from 'path'
+import { join, resolve } from 'path'
+import { createHash } from 'crypto'
 import { homedir } from 'os'
 import type { ContentBlock, Message } from '../api/types.js'
 import type { OaiAssistantMessage, OaiMessage, OaiToolCall, OaiToolMessage } from '../api/oai-types.js'
@@ -59,8 +60,21 @@ import type { ContextClaim } from '../context/claims.js'
 import { assertValidSessionId } from '../validation.js'
 import { appendChecksum, verifyAndExtract, verifyLines } from './checksum.js'
 
-function getSessionDir(): string {
-  return process.env.RIVET_SESSION_DIR ?? join(homedir(), '.rivet', 'sessions')
+function dataHome(): string {
+  if (process.platform === 'win32') {
+    return process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
+  }
+  return homedir()
+}
+
+function projectSlug(cwd: string): string {
+  const name = cwd.split('/').filter(Boolean).pop() || 'unknown'
+  const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 6)
+  return `${name}-${hash}`
+}
+
+export function getSessionDir(cwd: string): string {
+  return process.env.RIVET_SESSION_DIR ?? join(dataHome(), '.rivet', 'sessions', projectSlug(cwd))
 }
 
 function ensureDir(dir: string): void {
@@ -129,7 +143,7 @@ function isOaiMessage(value: unknown): value is OaiMessage {
 
 function parseSessionLine(line: string): unknown | null {
   const parsed = JSON.parse(line) as { type?: string }
-  if (parsed.type === 'compact_start' || parsed.type === 'compact_end') {
+  if (parsed.type === 'compact_start' || parsed.type === 'compact_end' || parsed.type === 'model_switch') {
     return null
   }
   return parsed
@@ -139,22 +153,24 @@ export class SessionPersist {
   private filePath: string
   private metadataPath: string
   private sessionId: string
+  private cwd: string
 
   /** Public getter for testing file-path-dependent integrations. */
   getFilePath(): string {
     return this.filePath
   }
 
-  constructor(sessionId: string) {
+  constructor(sessionId: string, cwd: string) {
     assertValidSessionId(sessionId)
-    ensureDir(getSessionDir())
+    this.cwd = cwd
+    ensureDir(getSessionDir(cwd))
     this.sessionId = sessionId
-    this.filePath = join(getSessionDir(), `${sessionId}.jsonl`)
-    this.metadataPath = join(getSessionDir(), `${sessionId}.meta.json`)
+    this.filePath = join(getSessionDir(cwd), `${sessionId}.jsonl`)
+    this.metadataPath = join(getSessionDir(cwd), `${sessionId}.meta.json`)
   }
 
   getBackupDir(): string {
-    const dir = join(getSessionDir(), this.sessionId, 'backups')
+    const dir = join(getSessionDir(this.cwd), this.sessionId, 'backups')
     ensureDir(dir)
     return dir
   }
@@ -175,6 +191,26 @@ export class SessionPersist {
     const json = serializeOaiSessionMessage(message)
     const line = appendChecksum(json) + '\n'
     await appendFile(this.filePath, line)
+  }
+
+  /**
+   * Append a model-switch event to the session transcript.
+   *
+   * Written as a checksummed `type: 'model_switch'` line so it survives
+   * checksum verification, but parseSessionLine skips it on replay (same
+   * pattern as compact_start/compact_end) — it's an audit breadcrumb, not
+   * part of the conversation history. Lets a session JSONL show exactly
+   * when/what the model changed mid-session.
+   */
+  appendModelSwitch(event: { from?: string; to: string; provider?: string }): void {
+    const line = appendChecksum(JSON.stringify({
+      type: 'model_switch',
+      t: Date.now(),
+      from: event.from,
+      to: event.to,
+      provider: event.provider,
+    })) + '\n'
+    appendFileSync(this.filePath, line)
   }
 
   /** Load messages in OpenAI-native format, migrating legacy rows on read. */
@@ -318,6 +354,7 @@ export class SessionPersist {
 
   writeMetadata(metadata: SessionMetadata): void {
     writeFileAtomicSync(this.metadataPath, JSON.stringify(metadata, null, 2) + '\n')
+    SessionPersist.invalidateListCache()
   }
 
   /** Upsert specific metadata fields without overwriting others */
@@ -369,11 +406,11 @@ export class SessionPersist {
   }
 
   loadMemory(): SessionMemoryState {
-    return loadSessionMemory(getSessionDir(), this.sessionId)
+    return loadSessionMemory(getSessionDir(this.cwd), this.sessionId)
   }
 
   appendMemory(input: { text: string; source: SessionMemoryEntry['source']; createdAt: number }): SessionMemoryState {
-    return appendSessionMemory(getSessionDir(), this.sessionId, input)
+    return appendSessionMemory(getSessionDir(this.cwd), this.sessionId, input)
   }
 
   buildMemoryBlock(): string {
@@ -385,7 +422,7 @@ export class SessionPersist {
     if (memory.entries.length === 0) return undefined
     const block = buildSessionMemoryBlock(memory)
     return {
-      path: join(getSessionDir(), `${this.sessionId}.memory.json`),
+      path: join(getSessionDir(this.cwd), `${this.sessionId}.memory.json`),
       lastSummarizedRoundIndex: -1,
       lastUpdatedAt: memory.entries[memory.entries.length - 1]?.createdAt ?? Date.now(),
       digest: block.length > 200 ? block.slice(0, 197) + '...' : block,
@@ -396,24 +433,46 @@ export class SessionPersist {
 
   /** Create a claim store for the current session. */
   createClaimStore(): ContextClaimStore {
-    return new ContextClaimStore(getSessionDir(), this.sessionId)
+    return new ContextClaimStore(getSessionDir(this.cwd), this.sessionId)
   }
 
   /** Load durable claims from the most recent previous session. */
   loadPreviousDurableClaims(): ContextClaim[] {
-    const sessions = SessionPersist.listSessions()
+    const sessions = SessionPersist.listSessions(this.cwd)
     const previous = sessions
       .filter(s => s !== this.sessionId)
       .sort()
       .pop()
     if (!previous) return []
-    return ContextClaimStore.loadDurableClaims(getSessionDir(), previous)
+    return ContextClaimStore.loadDurableClaims(getSessionDir(this.cwd), previous)
   }
 
-  /** Inject durable claims from previous session into a claim store with confidence decay. */
-  injectDurableClaims(store: ContextClaimStore): void {
+  /** Inject durable claims from previous session into a claim store with confidence decay.
+   *  A4: cross-session pollution gate — only inject claims that intersect with current
+   *  project files AND were created within 7 days. */
+  injectDurableClaims(store: ContextClaimStore, cwd?: string): void {
+    const now = Date.now()
+    const TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
     const durableClaims = this.loadPreviousDurableClaims()
     for (const claim of durableClaims) {
+      // A4 TTL gate: skip claims older than 7 days
+      if (now - claim.createdAt > TTL_MS) continue
+      // A4 file intersection gate: skip claims whose evidence files don't
+      // intersect with current project. Normalize relative paths with cwd.
+      // Claims with no file evidence (conceptual/verification) always pass.
+      if (cwd) {
+        const fileEvidence = claim.evidence.filter(e => e.path)
+        if (fileEvidence.length > 0) {
+          const sep = cwd.endsWith('/') ? '' : '/'
+          const cwdPrefix = cwd + sep
+          const hasRelevantFile = fileEvidence.some(e => {
+            const abs = resolve(cwd, e.path!)
+            // P3: exact prefix boundary — /Users/a/proj must not match /Users/a/proj-backup
+            return abs === cwd || abs.startsWith(cwdPrefix)
+          })
+          if (!hasRelevantFile) continue
+        }
+      }
       store.propose({
         kind: claim.kind,
         scope: claim.scope,
@@ -428,11 +487,48 @@ export class SessionPersist {
     }
   }
 
-  /** List all session files */
-  static listSessions(): string[] {
-    ensureDir(getSessionDir())
+  /** Write structured handoff text for this session. */
+  writeHandoff(text: string): void {
+    const handoffPath = join(getSessionDir(this.cwd), `${this.sessionId}.handoff.md`)
+    writeFileAtomicSync(handoffPath, text)
+  }
+
+  /**
+   * Load the most relevant previous session's handoff text.
+   * Routes by domain if both sessions have a domain tag; otherwise falls back
+   * to the most recently updated session. Returns null if none found.
+   */
+  static loadPrevHandoff(cwd: string, currentSessionId: string, currentDomain?: string): string | null {
+    const sessions = SessionPersist.listSessionsWithMetadata(cwd)
+      .filter(s => s.id !== currentSessionId)
+    if (sessions.length === 0) return null
+
+    // Prefer same-domain sessions; fall back to all
+    let candidates = sessions
+    if (currentDomain) {
+      const sameDomain = sessions.filter(s => s.domain === currentDomain)
+      if (sameDomain.length > 0) candidates = sameDomain
+    }
+
+    // listSessionsWithMetadata already sorts by updatedAt desc
+    const prev = candidates[0]
+    if (!prev) return null
+
+    const handoffPath = join(getSessionDir(cwd), `${prev.id}.handoff.md`)
+    if (!existsSync(handoffPath)) return null
     try {
-      return readdirSync(getSessionDir())
+      return readFileSync(handoffPath, 'utf-8')
+    } catch {
+      return null
+    }
+  }
+
+  /** List all session files */
+  static listSessions(cwd: string): string[] {
+    const dir = getSessionDir(cwd)
+    ensureDir(dir)
+    try {
+      return readdirSync(dir)
         .filter((f: string) => f.endsWith('.jsonl'))
         .map((f: string) => f.replace('.jsonl', ''))
     } catch {
@@ -440,13 +536,32 @@ export class SessionPersist {
     }
   }
 
+  /**
+   * Cache for listSessionsWithMetadata — avoids re-reading hundreds of session
+   * meta files on every user boundary when cross-session handoff is requested.
+   * TTL: 60s. Invalidated on write (saveMetadata / saveHandoff).
+   * Keyed by cwd since sessions are per-project.
+   */
+  private static _listCache: Map<string, { ts: number; data: Array<SessionMetadata & { id: string }> }> = new Map()
+  private static readonly LIST_CACHE_TTL_MS = 60_000
+
+  static invalidateListCache(): void {
+    SessionPersist._listCache.clear()
+  }
+
   /** List sessions with metadata, sorted by updatedAt descending (most recent first) */
-  static listSessionsWithMetadata(): Array<SessionMetadata & { id: string }> {
-    const ids = SessionPersist.listSessions()
+  static listSessionsWithMetadata(cwd: string): Array<SessionMetadata & { id: string }> {
+    const now = Date.now()
+    const cached = SessionPersist._listCache.get(cwd)
+    if (cached && (now - cached.ts) < SessionPersist.LIST_CACHE_TTL_MS) {
+      return cached.data
+    }
+
+    const ids = SessionPersist.listSessions(cwd)
     const results: Array<SessionMetadata & { id: string }> = []
     for (const id of ids) {
       try {
-        const p = new SessionPersist(id)
+        const p = new SessionPersist(id, cwd)
         const meta = p.loadMetadata()
         results.push({
           id,
@@ -460,14 +575,84 @@ export class SessionPersist {
         // Skip corrupted sessions
       }
     }
-    return results.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+    results.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+    SessionPersist._listCache.set(cwd, { ts: now, data: results })
+    return results
   }
+
+  /**
+   * Main user-facing sessions only: excludes worker sub-sessions (`worker-*`)
+   * and non-transcript artifacts whose id carries a dotted suffix
+   * (`<id>.claims`, `<id>.memory`, `<id>.snapshot`). Sorted by updatedAt desc.
+   */
+  static listMainSessions(cwd: string): Array<SessionMetadata & { id: string }> {
+    return SessionPersist.listSessionsWithMetadata(cwd)
+      .filter(s => !s.id.startsWith('worker-') && !s.id.includes('.'))
+  }
+
+  /**
+   * Resolve a user-supplied session reference (full id or short prefix) to a
+   * single full session id. Exact match wins; otherwise prefix-match across
+   * main sessions. Returns the resolved id, an ambiguous candidate list, or
+   * null when nothing matches. The id = log id = resume id are the same value.
+   */
+  static resolveSessionId(
+    cwd: string,
+    ref: string,
+  ): { id: string } | { ambiguous: string[] } | null {
+    const ref0 = ref.trim()
+    if (!ref0) return null
+    const sessions = SessionPersist.listMainSessions(cwd)
+    const exact = sessions.find(s => s.id === ref0)
+    if (exact) return { id: exact.id }
+    const matches = sessions.filter(s => s.id.startsWith(ref0))
+    if (matches.length === 1) return { id: matches[0]!.id }
+    if (matches.length > 1) return { ambiguous: matches.map(s => s.id) }
+    return null
+  }
+
+  /**
+   * Render the session list for CLI `--list` and TUI `/sessions`. One row per
+   * main session, numbered to match `listMainSessions` ordering so the index is
+   * stable and aligned with prefix-based resume.
+   */
+  static formatSessionList(cwd: string, currentId?: string): string {
+    const sessions = SessionPersist.listMainSessions(cwd)
+    if (sessions.length === 0) return '没有历史会话。'
+    return sessions.map((s, i) => {
+      const marker = s.id === currentId ? '  ← 当前' : ''
+      const when = formatRelativeTime(s.updatedAt ?? 0)
+      const turns = s.turnCount ?? 0
+      const model = s.model ?? '?'
+      const domain = s.domain ? ` ${s.domain}` : ''
+      const title = (s.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 50)
+      return `${String(i + 1).padStart(2)}. ${s.id.slice(0, 8)}  ${when}  ${turns}轮  ${model}${domain}  ${title}${marker}`
+    }).join('\n')
+  }
+}
+
+/** Compact relative time for session lists, e.g. "刚刚" / "5分钟前" / "3天前". */
+function formatRelativeTime(ts: number): string {
+  if (!ts) return '未知'
+  const diff = Date.now() - ts
+  if (diff < 0) return '刚刚'
+  const sec = Math.floor(diff / 1000)
+  if (sec < 60) return '刚刚'
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}分钟前`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr}小时前`
+  const day = Math.floor(hr / 24)
+  if (day < 30) return `${day}天前`
+  const mon = Math.floor(day / 30)
+  if (mon < 12) return `${mon}个月前`
+  return `${Math.floor(mon / 12)}年前`
 }
 
 const MAX_SESSIONS = 50
 
-export function evictOldSessions(keepSessionId: string): string[] {
-  return evictOldSessionsInternal(getSessionDir(), keepSessionId, MAX_SESSIONS)
+export function evictOldSessions(keepSessionId: string, cwd: string): string[] {
+  return evictOldSessionsInternal(getSessionDir(cwd), keepSessionId, MAX_SESSIONS)
 }
 
 export function evictOldSessionsInternal(dir: string, keepSessionId: string, limit: number): string[] {
@@ -502,6 +687,9 @@ export function evictOldSessionsInternal(dir: string, keepSessionId: string, lim
     try { unlinkSync(join(dir, `${id}.meta.json`)) } catch { /* ignore */ }
     try { unlinkSync(join(dir, `${id}.memory.json`)) } catch { /* ignore */ }
     try { unlinkSync(join(dir, `${id}.claims.jsonl`)) } catch { /* ignore */ }
+    // Clean up same-name session directory (backups/, and any stray files).
+    // Without this, getBackupDir() creates <id>/backups/ that evict never removes.
+    try { rmSync(join(dir, id), { recursive: true, force: true }) } catch { /* ignore */ }
   }
 
   return toEvict

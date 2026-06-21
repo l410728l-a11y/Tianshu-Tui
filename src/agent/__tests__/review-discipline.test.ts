@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { OBJECTIVE_REVIEW_STANCE, PATH_BOUNDARY_REVIEW_STANCE, REVIEW_DISCIPLINES, classifyChangeScale, formatObjectiveReviewStance, formatPathBoundaryReviewStance, isCrossModule, isFixContext, shouldRouteReviewWorkflow } from '../review-discipline.js'
+import { OBJECTIVE_REVIEW_STANCE, PATH_BOUNDARY_REVIEW_STANCE, REVIEW_DISCIPLINES, METHODOLOGY_VERIFICATION_STANCE, classifyChangeScale, formatObjectiveReviewStance, formatPathBoundaryReviewStance, formatMethodologyVerificationStance, isCrossModule, isFixContext, shouldRouteReviewWorkflow } from '../review-discipline.js'
 
 describe('review disciplines', () => {
   it('contains all four review disciplines', () => {
@@ -38,19 +38,29 @@ describe('review disciplines', () => {
     assert.equal(isFixContext('docs: update handoff'), false)
   })
 
-  it('routes large or cross-module changes to L3', () => {
-    assert.equal(classifyChangeScale({ files: ['a.ts', 'b.ts', 'c.ts', 'd.ts'], crossModule: false, isFix: false }), 'L3')
+  it('routes large (≥5 files), cross-module, or security-boundary changes to L3', () => {
+    assert.equal(classifyChangeScale({ files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'], crossModule: false, isFix: false }), 'L3')
     assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: true, isFix: false }), 'L3')
+    assert.equal(classifyChangeScale({ files: ['src/agent/approval-risk.ts'], crossModule: false, isFix: true }), 'L3')
   })
 
-  it('routes fix or code changes to L2', () => {
-    assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: false, isFix: true }), 'L2')
-    assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: false, isFix: false }), 'L2')
+  it('routes single-file non-cross-module code changes to L1 (nudge only, default safe)', () => {
+    assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: false, isFix: true }), 'L1')
+    assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: false, isFix: false }), 'L1')
   })
 
-  it('routes trivial non-fix documentation changes to L1', () => {
+  it('overrides to L2 or L3 when forceLevel is set (manual review trigger)', () => {
+    assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: false, isFix: false, forceLevel: 'L2' }), 'L2')
+    assert.equal(classifyChangeScale({ files: ['src/a.ts'], crossModule: false, isFix: false, forceLevel: 'L3' }), 'L3')
+    // forceLevel takes precedence over structural classification
+    assert.equal(classifyChangeScale({ files: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'], crossModule: false, isFix: false, forceLevel: 'L2' }), 'L2')
+  })
+
+  it('routes trivial documentation or test-only files to L1 (isFix does NOT force L2)', () => {
     assert.equal(classifyChangeScale({ files: ['README.md'], crossModule: false, isFix: false }), 'L1')
     assert.equal(classifyChangeScale({ files: ['docs/notes.txt', 'docs/example.json'], crossModule: false, isFix: false }), 'L1')
+    assert.equal(classifyChangeScale({ files: ['README.md'], crossModule: false, isFix: true }), 'L1')
+    assert.equal(classifyChangeScale({ files: ['src/agent/__tests__/loop.test.ts'], crossModule: false, isFix: true }), 'L1')
   })
 
   it('routes any non-empty delivery through review workflow while leaving L1 advisory', () => {
@@ -69,5 +79,15 @@ describe('review disciplines', () => {
     assert.equal(isCrossModule(['src/agent/a.ts', 'src/tools/b.ts']), true)
     assert.equal(isCrossModule(['src/agent/a.ts', 'src/agent/b.ts']), false)
     assert.equal(isCrossModule(['README.md', 'docs/notes.md']), false)
+  })
+
+  it('captures methodology verification stance from PlanDesignIntentRouter adversarial review lesson', () => {
+    assert.equal(METHODOLOGY_VERIFICATION_STANCE.length, 3)
+    const text = formatMethodologyVerificationStance()
+    assert.match(text, /可执行指令.*grep.*regex.*shell.*命令/)
+    assert.match(text, /在真实代码库中跑一遍/)
+    assert.match(text, /caller.*callee.*并行执行点/)
+    assert.match(text, /沿着操作往下数门/)
+    assert.match(text, /递归.*验证.*自己/)
   })
 })

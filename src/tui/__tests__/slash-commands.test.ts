@@ -1,7 +1,11 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
 import { resolveAppPromptInput, handleSlashCommand, formatVerificationStatus, type SlashHandlerContext } from '../slash-commands.js'
+import { loadConstellation } from '../../constellation/store.js'
+import { distillSkillDraft, persistSkillDraft, listSkillDrafts } from '../../agent/skill-distill.js'
 import type { LogEntry } from '../log-state.js'
+import { makeTestDir, cleanupTestDir } from './_test-tmp.js'
 
 function makeCtx(overrides?: Partial<SlashHandlerContext>): SlashHandlerContext {
   return {
@@ -57,6 +61,35 @@ function makeCtx(overrides?: Partial<SlashHandlerContext>): SlashHandlerContext 
   }
 }
 
+describe('/context 占用明细', () => {
+  it('无参数输出含 cache 命中率与 cost 头（占用明细）', async () => {
+    let captured = ''
+    const ctx = makeCtx({
+      parts: ['/context'],
+      cacheHitRate: 0.8,
+      cost: 1.5,
+      session: {
+        getContextLedger: () => ({
+          tokenBudget: { compactionState: 'healthy', estimatedTokens: 50_000, maxTokens: 200_000 },
+          apiInvariantStatus: { brokenRounds: 0 },
+          rounds: [{}, {}],
+          anchors: [],
+        }),
+        getCompactEvents: () => [],
+        getLastRealPromptTokens: () => 48_000,
+      } as any,
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    assert.ok(captured.includes('Cache hit: 80%'), `应显示缓存命中率: ${captured}`)
+    assert.ok(captured.includes('Cost: $1.50'), `应显示 cost: ${captured}`)
+    assert.ok(captured.includes('50,000/200,000'), `应显示 token 占用: ${captured}`)
+    assert.ok(captured.includes('API (last):'), `应显示 API 实际值: ${captured}`)
+    assert.ok(captured.includes('48,000'), `应显示实值 48,000: ${captured}`)
+  })
+})
+
 describe('resolveAppPromptInput', () => {
   it('returns non-slash input unchanged', async () => {
     assert.equal(resolveAppPromptInput('hello world', '/cwd'), 'hello world')
@@ -74,23 +107,23 @@ describe('resolveAppPromptInput', () => {
     const resolved = resolveAppPromptInput('/plan add workflow aliases', '/cwd')
     assert.ok(resolved !== null)
 
-    assert.ok(resolved.includes('我正在使用 writing-plans 技能创建实现计划。'))
-    assert.ok(resolved.includes('Create a comprehensive implementation plan for: add workflow aliases'))
-    assert.ok(resolved.includes('Do not write implementation code yet.'))
+    assert.ok(resolved.includes('创建实现计划：add workflow aliases'))
+    assert.ok(resolved.includes('计划模板路由'))
     assert.ok(resolved.includes('docs/superpowers/plans/'))
-    assert.ok(resolved.includes('Forbidden placeholders'))
+    assert.ok(resolved.includes('禁用占位符'))
+    assert.ok(resolved.includes('不要写实现代码'))
   })
 
   it('resolves /write-plan into a writing-plans workflow prompt', async () => {
     const resolved = resolveAppPromptInput('/write-plan 你说的很好，把这个内容记录到设计文档。如果行数太长就拆分两个，一个背景说明，一个是设计文档。其次，即便我使用 claude code 也是多个会话来并行执行。', '/cwd')
     assert.ok(resolved !== null)
 
-    assert.ok(resolved.includes('writing-plans'))
-    assert.ok(resolved.includes('Create a comprehensive implementation plan for: 你说的很好，把这个内容记录到设计文档。'))
+    assert.ok(resolved.includes('创建实现计划：你说的很好，把这个内容记录到设计文档。'))
+    assert.ok(resolved.includes('计划模板路由'))
     assert.ok(resolved.includes('docs/superpowers/plans/'))
     assert.ok(resolved.includes('多会话并行开发设计文档.md'))
     assert.ok(!resolved.includes('你说的很好-把这个内容记录到设计文档-如果行数太长'))
-    assert.ok(resolved.includes('Execution handoff'))
+    assert.ok(resolved.includes('收尾'))
   })
 
   it('resolves /plan close into a plan_close workflow prompt', async () => {
@@ -134,6 +167,23 @@ describe('resolveAppPromptInput', () => {
     assert.ok(resolved.includes('/team max'))
     assert.ok(resolved.includes('multi-perspective planning'))
     assert.ok(resolved.includes('risk audit'))
+  })
+
+  it('resolves /council into a council_convene workflow prompt', async () => {
+    const resolved = resolveAppPromptInput('/council 拆分 loop.ts 是否遗漏回滚', '/cwd')
+    assert.ok(resolved !== null)
+
+    assert.ok(resolved.includes('星域议事会'))
+    assert.ok(resolved.includes('council_convene'))
+    assert.ok(resolved.includes('拆分 loop.ts 是否遗漏回滚'))
+    assert.ok(resolved.includes('绝不触发 team_orchestrate'))
+  })
+
+  it('returns council usage prompt for empty /council args', async () => {
+    const resolved = resolveAppPromptInput('/council', '/cwd')
+    assert.ok(resolved !== null)
+    assert.ok(resolved!.includes('Council usage:'))
+    assert.ok(resolved!.includes('--rounds'))
   })
 })
 
@@ -478,5 +528,125 @@ describe('handleSlashCommand', () => {
       assert.ok(entries[0]!.includes('未知星域'))
       assert.ok(entries[0]!.includes('pojun'))
     })
+  })
+
+  describe('/leave', () => {
+    it('seals an agent-chosen mark into the starmap', async () => {
+      const cwd = makeTestDir('leave-')
+      try {
+        const entries: string[] = []
+        const handled = await handleSlashCommand(makeCtx({
+          parts: ['/leave', '⚘', 'wired', 'the', 'starmap'],
+          agent: {
+            ...makeCtx().agent,
+            cwd,
+            getSessionDomain: () => ({ id: 'yaoguang', name: '瑶光', volatileBlock: '', motto: '' }),
+          } as any,
+          currentSessionId: 'sess-leave',
+          pushStatic: (entry) => entries.push(entry.content),
+        }))
+        assert.equal(handled, true)
+        assert.ok(entries[0]!.includes('⚘'))
+        const c = loadConstellation(cwd)
+        assert.ok(c)
+        assert.equal(c!.milestones.length, 1)
+        assert.equal(c!.milestones[0]!.agentMark.symbol, '⚘')
+        assert.equal(c!.milestones[0]!.summary, 'wired the starmap')
+        assert.equal(c!.milestones[0]!.domain, 'yaoguang')
+      } finally {
+        cleanupTestDir(cwd)
+      }
+    })
+
+    it('requires a summary', async () => {
+      const cwd = makeTestDir('leave-')
+      try {
+        const entries: string[] = []
+        const handled = await handleSlashCommand(makeCtx({
+          parts: ['/leave'],
+          agent: { ...makeCtx().agent, cwd, getSessionDomain: () => undefined } as any,
+          pushStatic: (entry) => entries.push(entry.content),
+        }))
+        assert.equal(handled, true)
+        assert.ok(entries[0]!.includes('Usage'))
+        assert.equal(loadConstellation(cwd), null)
+      } finally {
+        cleanupTestDir(cwd)
+      }
+    })
+  })
+})
+
+describe('/skill review|approve|reject — auto-distill drafts', () => {
+  function seedDraft(cwd: string): string {
+    const draft = distillSkillDraft({
+      sessionId: 'feed1234-session',
+      objective: 'parse jsonl session log',
+      decisions: [],
+      trajectory: [
+        { turn: 1, tool: 'read_file', target: 'src/log.ts', durationMs: 1, status: 'success', inputSummary: '', resultSummary: '' },
+        { turn: 1, tool: 'edit_file', target: 'src/log.ts', durationMs: 1, status: 'success', inputSummary: '', resultSummary: '' },
+        { turn: 1, tool: 'run_tests', target: 'src/__tests__/log.test.ts', durationMs: 1, status: 'success', inputSummary: '', resultSummary: '' },
+      ],
+      verifications: [{ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 3, failed: 0, skipped: 0, durationMs: 5 }],
+      filesModified: ['src/log.ts'],
+      existingSkills: [],
+    })!
+    persistSkillDraft(cwd, draft)
+    return draft.slug
+  }
+
+  it('/skill review lists pending drafts', async () => {
+    const cwd = makeTestDir('skill-review-')
+    try {
+      const slug = seedDraft(cwd)
+      const entries: string[] = []
+      const handled = await handleSlashCommand(makeCtx({
+        parts: ['/skill', 'review'],
+        agent: { ...makeCtx().agent, cwd } as any,
+        pushStatic: (entry) => entries.push(entry.content),
+      }))
+      assert.equal(handled, true)
+      assert.ok(entries[0]!.includes(slug), `应列出草稿: ${entries[0]}`)
+      assert.ok(entries[0]!.includes('approve'))
+    } finally {
+      cleanupTestDir(cwd)
+    }
+  })
+
+  it('/skill approve promotes a draft and removes it from drafts', async () => {
+    const cwd = makeTestDir('skill-approve-')
+    try {
+      const slug = seedDraft(cwd)
+      const entries: string[] = []
+      const handled = await handleSlashCommand(makeCtx({
+        parts: ['/skill', 'approve', slug],
+        agent: { ...makeCtx().agent, cwd } as any,
+        pushStatic: (entry) => entries.push(entry.content),
+      }))
+      assert.equal(handled, true)
+      assert.ok(entries[0]!.includes('已入库'), `应报告入库: ${entries[0]}`)
+      assert.equal(listSkillDrafts(cwd).length, 0)
+    } finally {
+      cleanupTestDir(cwd)
+    }
+  })
+
+  it('/skill reject deletes a draft', async () => {
+    const cwd = makeTestDir('skill-reject-')
+    try {
+      const slug = seedDraft(cwd)
+      const entries: string[] = []
+      const handled = await handleSlashCommand(makeCtx({
+        parts: ['/skill', 'reject', slug],
+        agent: { ...makeCtx().agent, cwd } as any,
+        pushStatic: (entry) => entries.push(entry.content),
+      }))
+      assert.equal(handled, true)
+      assert.ok(entries[0]!.includes('已丢弃'), `应报告丢弃: ${entries[0]}`)
+      assert.equal(listSkillDrafts(cwd).length, 0)
+    } finally {
+      cleanupTestDir(cwd)
+    }
   })
 })

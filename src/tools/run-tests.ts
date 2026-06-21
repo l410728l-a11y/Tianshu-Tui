@@ -1,7 +1,7 @@
 import { spawn } from 'child_process'
 import { readFile, stat, glob } from 'node:fs/promises'
 import { join, delimiter } from 'node:path'
-import type { Tool, ToolCallParams, VerificationMetadata } from './types.js'
+import type { Tool, ToolCallParams, ToolResult, VerificationMetadata } from './types.js'
 import { track } from './process-tracker.js'
 import { gracefulKill, forceKill } from '../platform.js'
 import { persistRawOutput, buildUiOutput } from './output-store.js'
@@ -162,14 +162,26 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
 
   const safeFilter = filter.replace(/[`$\\;"'|]/g, '')
   if (runner === 'node-test' && isTestFileFilter(safeFilter)) {
-    if (base.includes('tsx') || base.includes('run-node-tests')) {
-      // Do not spawn `npx tsx ...`: npm 11 can parse that form as an npm
-      // command and fail with `Missing script: "tsx"` / `Unknown command: "tsx"`.
-      // buildExecutionEnv prepends local node_modules/.bin, so invoking `tsx`
-      // directly is both faster and deterministic.
-      return { type: 'run', command: 'tsx', args: ['--test', safeFilter], display: `tsx --test ${safeFilter}`, runner, scope: 'targeted' }
+    // Resolve relative test file names to actual paths.
+    // run_tests(filter="compaction-controller.test.ts") sends the bare filename
+    // to tsx, which fails because the file is in src/agent/__tests__/.
+    // glob for the file first; if the filter IS a valid path, use it directly.
+    let resolvedFilter = safeFilter
+    try {
+      const s = await stat(join(cwd, safeFilter))
+      if (!s.isFile()) {
+        const found = await resolveFilterToTestFile(cwd, safeFilter)
+        if (found) resolvedFilter = found
+      }
+    } catch {
+      // File doesn't exist at the direct path — try glob resolution
+      const found = await resolveFilterToTestFile(cwd, safeFilter)
+      if (found) resolvedFilter = found
     }
-    return { type: 'run', command: 'node', args: ['--test', safeFilter], display: `node --test ${safeFilter}`, runner, scope: 'targeted' }
+    if (base.includes('tsx') || base.includes('run-node-tests')) {
+      return { type: 'run', command: 'tsx', args: ['--test', resolvedFilter], display: `tsx --test ${resolvedFilter}`, runner, scope: 'targeted' }
+    }
+    return { type: 'run', command: 'node', args: ['--test', resolvedFilter], display: `node --test ${resolvedFilter}`, runner, scope: 'targeted' }
   }
 
   // Resolve non-file-path filter to actual test file via find
@@ -429,10 +441,71 @@ Good: run_tests(timeout=300000) — longer timeout for slow suites`,
       }
     }
 
-    return new Promise((resolve) => {
+    const plan = params.verificationSnapshot
+    if (!plan) {
+      // Default in-place verification — unchanged single-phase path.
+      return runTestCommandIn(params.cwd, testCommand, params, filter, timeout)
+    }
+
+    // VSW two-phase: Phase A in the isolated snapshot (blocking gate), Phase B in
+    // the live tree against current HEAD (advisory integration check). Phase A's
+    // result is primary; Phase B rides along as an extra verification so the gate
+    // can flag integration_conflict without blocking delivery.
+    const phaseA = await runTestCommandIn(plan.path, testCommand, params, filter, timeout)
+    tagVerification(phaseA, 'isolated', plan.snapshotRef)
+
+    const phaseB = await runTestCommandIn(params.cwd, testCommand, params, filter, timeout)
+    tagVerification(phaseB, 'integration', plan.snapshotRef)
+
+    const phaseBNote = phaseB.isError
+      ? `\n\n[Phase B · integration on current HEAD] FAILED — owned changes passed in isolation; this is a concurrent-change conflict. Rebase/coordinate before merging. Delivery is NOT blocked by this.`
+      : `\n\n[Phase B · integration on current HEAD] passed.`
+    const result: ToolResult = {
+      ...phaseA,
+      content: `[Phase A · isolated snapshot] ${phaseA.content}${phaseBNote}`,
+      // Phase A governs isError (the blocking gate); Phase B is advisory only.
+      isError: phaseA.isError,
+    }
+    if (phaseB.verification) result.extraVerifications = [phaseB.verification]
+    return result
+  },
+
+  timeoutMs(params?: ToolCallParams): number {
+    const requested = params?.input.timeout
+    const testTimeout = typeof requested === 'number' && Number.isFinite(requested) && requested > 0
+      ? requested
+      : 120_000
+    // Keep the outer tool-pipeline timeout slightly above run_tests' own
+    // timer so timeout results can return structured VerificationMetadata
+    // instead of being converted into an untracked pipeline exception.
+    return testTimeout + 5_000
+  },
+
+  requiresApproval(): boolean {
+    return false
+  },
+
+  isConcurrencySafe: () => false,
+  isEnabled: () => true,
+}
+
+function tagVerification(result: ToolResult, phase: 'isolated' | 'integration', snapshotRef: string): void {
+  if (!result.verification) return
+  result.verification = { ...result.verification, verificationPhase: phase, snapshotRef }
+}
+
+function runTestCommandIn(
+  cwd: string,
+  testCommand: RunnableTestCommand,
+  params: ToolCallParams,
+  filter: string | undefined,
+  timeout: number,
+): Promise<ToolResult> {
+  const startTime = Date.now()
+  return new Promise<ToolResult>((resolve) => {
       const child = track(spawn(testCommand.command, testCommand.args, {
-        cwd: params.cwd,
-        env: buildExecutionEnv(params.cwd),
+        cwd,
+        env: buildExecutionEnv(cwd),
         stdio: ['ignore', 'pipe', 'pipe'],
       }))
 
@@ -483,9 +556,36 @@ Good: run_tests(timeout=300000) — longer timeout for slow suites`,
         })
       }, timeout)
 
-      child.on('close', async (code) => {
+      // 用户中止（per-instance abortSignal）：协作式取消，杀掉本实例的测试进程树。
+      // 因 abortSignal 源自各自 AgentLoop 的 abortController，这天然是"范围化 kill 本实例"——
+      // 中止一个实例不会波及另一个实例的进程，无需全局 killAll 硬锤。
+      const signal = params.abortSignal
+      const onAbort = () => {
         clearTimeout(timer)
+        gracefulKill(child)
+        setTimeout(() => forceKill(child), 3000)
+        resolve({ content: 'Tests aborted by user.', uiContent: '⏹ aborted', isError: false })
+      }
+      if (signal) {
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      child.on('close', async (code, _exitSignal) => {
+        clearTimeout(timer)
+        if (signal) signal.removeEventListener('abort', onAbort)
         const raw = stdout + (stderr ? '\n' + stderr : '')
+
+        // EPERM auto-degradation: tsx IPC pipe fails in sandboxed environments.
+        // When stderr contains EPERM and the runner is tsx, retry once with
+        // node --import tsx (equivalent semantics, no IPC pipe).
+        if (testCommand.command === 'tsx' && raw.includes('EPERM') && testCommand.args[0] === '--test') {
+          const args = ['--import', 'tsx', '--test', ...testCommand.args.slice(1)]
+          const retryCmd: RunnableTestCommand = { ...testCommand, command: 'node', args, display: `node --import tsx --test ${testCommand.args.slice(1).join(' ')}` }
+          resolve(await runTestCommandIn(cwd, retryCmd, params, filter, timeout))
+          return
+        }
+
         const durationMs = Date.now() - startTime
         const exitCode = code ?? 1
 
@@ -546,23 +646,4 @@ Good: run_tests(timeout=300000) — longer timeout for slow suites`,
         })
       })
     })
-  },
-
-  timeoutMs(params?: ToolCallParams): number {
-    const requested = params?.input.timeout
-    const testTimeout = typeof requested === 'number' && Number.isFinite(requested) && requested > 0
-      ? requested
-      : 120_000
-    // Keep the outer tool-pipeline timeout slightly above run_tests' own
-    // timer so timeout results can return structured VerificationMetadata
-    // instead of being converted into an untracked pipeline exception.
-    return testTimeout + 5_000
-  },
-
-  requiresApproval(): boolean {
-    return false
-  },
-
-  isConcurrencySafe: () => false,
-  isEnabled: () => true,
 }

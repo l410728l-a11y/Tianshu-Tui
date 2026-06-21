@@ -1,6 +1,6 @@
-import type { ProviderConfig } from './schema.js'
+import type { ModelConfig, ProviderConfig } from './schema.js'
 
-export type ProviderPresetKey = 'deepseek' | 'glm' | 'mimo' | 'minimax' | 'codex'
+export type ProviderPresetKey = 'deepseek' | 'glm' | 'mimo' | 'mimo-api' | 'minimax' | 'codex'
 
 export interface ProviderPreset {
   key: ProviderPresetKey
@@ -50,7 +50,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
   glm: {
     key: 'glm',
     label: 'GLM',
-    defaultModelId: 'glm-5.1',
+    defaultModelId: 'glm-5.2',
     provider: {
       name: 'glm',
       apiKeyEnv: 'ZHIPU_API_KEY',
@@ -65,11 +65,12 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
       },
       thinking: 'enabled',
       maxTokens: 131072,
+      usageCalibrationFactor: 0,
       models: [
         {
-          id: 'glm-5.1',
+          id: 'glm-5.2',
           alias: 'glm',
-          contextWindow: 200_000,
+          contextWindow: 1_000_000,
           maxTokens: 131072,
           reasoningEffort: 'high',
         },
@@ -84,7 +85,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
     provider: {
       name: 'mimo',
       apiKeyEnv: 'MIMO_API_KEY',
-      baseUrl: 'https://token-plan-sgp.xiaomimimo.com/v1',
+      baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
       protocol: 'openai',
       capabilities: {
         cacheControl: false,
@@ -105,6 +106,35 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
         {
           id: 'mimo-v2.5',
           alias: 'mimo',
+          contextWindow: 1_000_000,
+          maxTokens: 128000,
+        },
+      ],
+      unsupported: ['stream_options'],
+    },
+  },
+  'mimo-api': {
+    key: 'mimo-api',
+    label: 'MiMo API (新)',
+    defaultModelId: 'mimo-v2.5-pro-ultraspeed',
+    provider: {
+      name: 'mimo-api',
+      apiKeyEnv: 'MIMO_PAY_API_KEY',
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      protocol: 'openai',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        prefixCache: 'deepseek-native',
+        prefixCompletion: false,
+      },
+      thinking: 'enabled',
+      maxTokens: 128000,
+      models: [
+        {
+          id: 'mimo-v2.5-pro-ultraspeed',
+          alias: 'mimo-ultra',
           contextWindow: 1_000_000,
           maxTokens: 128000,
         },
@@ -181,4 +211,18 @@ export function cloneProviderPreset(key: ProviderPresetKey): ProviderConfig {
 
 export function isProviderPresetKey(value: string): value is ProviderPresetKey {
   return Object.prototype.hasOwnProperty.call(PROVIDER_PRESETS, value)
+}
+
+/**
+ * Look up a preset model's defaults by provider name and model id/alias.
+ *
+ * Used by CLI setup paths so that known models (e.g. deepseek-v4-pro)
+ * inherit their real context window instead of a silent 128K default —
+ * a wrong small window causes premature compaction tiers on 1M models.
+ */
+export function findPresetModel(providerName: string, modelId: string): ModelConfig | undefined {
+  if (!isProviderPresetKey(providerName)) return undefined
+  return PROVIDER_PRESETS[providerName].provider.models.find(
+    m => m.id === modelId || m.alias === modelId,
+  )
 }

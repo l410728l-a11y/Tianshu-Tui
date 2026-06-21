@@ -40,7 +40,22 @@ export const providerSchema = z.object({
   models: z.array(modelConfigSchema).min(1),
   thinking: z.enum(['enabled', 'disabled']).default('enabled'),
   maxTokens: z.number().int().positive().default(64000),
+  /**
+   * Thinking-stall timeout (ms): once reasoning tokens have arrived but no text/tool
+   * output yet, abort the stream if no further chunk within this window.
+   * 默认 undefined = 取 readMs（禁用）。仅对易卡死的 SLOW_THINKING provider（如 glm）
+   * 建议显式设置一个 < readMs 的值；factory.ts 对 glm 注入了 120s 内置默认。
+   */
+  thinkingStallTimeoutMs: z.number().int().positive().optional(),
   unsupported: z.array(z.string()).default([]),
+  /**
+   * Provider usage calibration factor for `prompt_tokens` (0–1).
+   * 1.0 (default) = trust the API's prompt_tokens as-is.
+   * 0 = discard prompt_tokens entirely; use local estimateOaiTokens instead.
+   * GLM coding API returns prompt_tokens inflated ~20-100x due to server-side
+   * reasoning token re-counting; set to 0 for GLM.
+   */
+  usageCalibrationFactor: z.number().min(0).max(1).optional(),
 })
 
 export const permissionAllowRuleSchema = z.object({
@@ -66,6 +81,13 @@ export const antiAnchoringSchema = z.object({
   planningTurn: z.number().int().positive().default(1),
   projectionThreshold: z.number().min(0).max(1).default(0.4),
   seedMaxTokens: z.number().int().positive().default(512),
+  anchorBreakScout: z.object({
+    enabled: z.boolean().default(false),
+    complexityThreshold: z.number().min(0).max(1).default(0.5),
+    minTurn: z.number().int().positive().default(3),
+    scoutBudgetMs: z.number().int().positive().default(60_000),
+    scoutMaxTokens: z.number().int().positive().default(2048),
+  }).default({}),
 }).default({})
 
 export const intentRetrievalRouterSchema = z.preprocess(
@@ -77,38 +99,87 @@ export const intentRetrievalRouterSchema = z.preprocess(
   },
   z.object({
     enabled: z.boolean().default(true),
-    classifier: z.enum(['heuristic', 'llm']).default('llm'),
+    classifier: z.enum(['heuristic', 'llm']).default('heuristic'),
     timeoutMs: z.number().int().positive().default(4_000),
     maxTokens: z.number().int().positive().default(600),
     temperature: z.number().min(0).max(2).default(0),
   }).default({}),
 )
 
+export const banditPromotionModeSchema = z.enum(['off', 'shadow', 'auto', 'forced'])
+
+/** Per-profile review model override. When set, review workers with the
+ *  matching profile use this provider+model instead of the session's primary
+ *  model. The provider must exist in config.provider.providers. */
+export const reviewProfileOverrideSchema = z.object({
+  provider: z.string(),
+  model: z.string(),
+})
+
+/** Review worker configuration block.
+ *  - profiles: per-profile override map; omitted profiles fall back to session model
+ *  - skipAuto: bypass deliver_task post-commit auto review (per-config equivalent
+ *    of RIVET_REVIEW_DISCIPLINE=0, but scoped to this config file) */
+export const reviewConfigSchema = z.object({
+  profiles: z.record(z.string(), reviewProfileOverrideSchema).default({}),
+  skipAuto: z.boolean().default(false),
+}).default({})
+
+/** Inferred TS type for the review config block. Consumers (e.g. B1Context.reviewConfig)
+ *  should use this instead of redeclaring the shape inline. */
+export type ReviewConfig = z.infer<typeof reviewConfigSchema>
+
 export const agentSchema = z.object({
   approval: z.enum(['auto-accept', 'auto-safe', 'suggest', 'manual', 'dangerously-skip-permissions']).default('auto-safe'),
   maxTurns: z.number().int().positive().default(50),
   mode: z.enum(['code', 'ask', 'plan']).default('code'),
-  autoReasoning: z.boolean().default(false),
+  autoReasoning: z.boolean().default(true),
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. */
   songlineEnabled: z.boolean().default(false),
+  /** Enable cross-session knowledge loading (memory block, playbook, companion presence).
+   *  Default true — injects distilled project knowledge from .rivet/knowledge/.
+   *  Set false for fully isolated sessions. Env RIVET_NO_CROSS_SESSION=1 overrides as force-off. */
+  crossSessionEnabled: z.boolean().default(true),
+  /** T8 桌面化办公工具（create_document 等 7 个）。默认关闭以守住工具数 kernel budget（≤25）。 */
+  desktopTools: z.boolean().default(false),
   /** Explicit opt-in for HEARTH anchor invariant observation (postTurn, diagnostic only). */
   hearthObserveEnabled: z.boolean().default(false),
   /** Explicit opt-in for anti-anchoring harness hooks (prompt-flow intervention). */
   antiAnchoring: antiAnchoringSchema,
+  /** Explicit opt-in for auto-delegation of exploration tasks. Default off — workers cost API budget. */
+  autoDelegateEnabled: z.boolean().default(false),
   /** Explicit opt-in for current-turn intent retrieval route guidance. */
   intentRetrievalRouter: intentRetrievalRouterSchema,
-  /** Explicit opt-in for P4 team scheduler gated influence. Default false keeps scheduler shadow-only. */
+  /** @deprecated Use banditPromotion.teamScheduler ('forced') instead. True still works as forced. */
   teamSchedulerBanditEnabled: z.boolean().default(false),
-  /** Explicit opt-in for P4-d worker model-tier gated influence. Default false keeps tier bandit shadow-only. */
+  /** @deprecated Use banditPromotion.modelTier ('forced') instead. True still works as forced. */
   modelTierBanditEnabled: z.boolean().default(false),
-  /** Reserved opt-in for future ModelRouting/ModelG direct switching. Default false; currently shadow-only. */
+  /** @deprecated Use banditPromotion.modelRouting ('forced') instead. True still works as forced. */
   modelRoutingGatedEnabled: z.boolean().default(false),
+  /** Track 1: 统一 bandit shadow→gated 晋升闸。
+   *  off=一键回退 / shadow=只收证据 / auto=证据达标自动 gated / forced=手动覆盖。 */
+  banditPromotion: z.object({
+    modelTier: banditPromotionModeSchema.default('shadow'),
+    teamScheduler: banditPromotionModeSchema.default('shadow'),
+    modelRouting: banditPromotionModeSchema.default('shadow'),
+    effort: banditPromotionModeSchema.default('shadow'),
+    /** One-key rollback: forces every bandit path off, regardless of modes or legacy flags. */
+    killSwitch: z.boolean().default(false),
+  }).default({}),
   permissions: permissionsSchema.default({}),
+  /** Review worker model routing — see reviewConfigSchema. */
+  review: reviewConfigSchema,
 })
 
 export const compactSchema = z.object({
+  /** Master switch for discretionary compaction (ratio tiers, 1M LLM compact).
+   *  Emergency paths (session split, 95% ceiling) ignore this. */
   enabled: z.boolean().default(true),
+  /** @deprecated Superseded by ratio-based policy (compactPolicyRatios).
+   *  Retained for config compatibility; not read by the runtime. */
   autoThreshold: z.number().int().positive().default(800_000),
+  /** @deprecated Superseded by ratio-based policy (compactPolicyRatios).
+   *  Retained for config compatibility; not read by the runtime. */
   autoFloor: z.number().int().positive().default(500_000),
   model: z.string().default('deepseek-v4-flash'),
 })
@@ -138,6 +209,16 @@ export const workersSchema = z.object({
   routing: workerRoutingSchema,
 }).default({})
 
+export const skillsSchema = z.object({
+  /** Skill names to COPY from .claude/skills/ (project then global ~/.claude)
+   *  into .rivet/skills/ at load time. Only listed skills are imported — avoids
+   *  pulling in all 70+ Claude skills when the user only needs a few. The copy
+   *  is idempotent (existing .rivet/skills entries are never overwritten) and
+   *  the runtime only ever loads from .rivet/skills — external dirs are never
+   *  scanned in place. Empty array (default) = import nothing. */
+  importFromClaude: z.array(z.string()).default([]),
+}).default({})
+
 export const configSchema = z.object({
   provider: z.object({
     default: z.string(),
@@ -149,6 +230,7 @@ export const configSchema = z.object({
   editor: editorSchema.default({}),
   mcp: mcpConfigSchema.default({}),
   workers: workersSchema,
+  skills: skillsSchema,
 })
 
 export type Config = {
@@ -159,6 +241,7 @@ export type Config = {
   editor: EditorConfig
   mcp: McpConfig
   workers: WorkersConfig
+  skills: SkillsConfig
 }
 
 export type ProviderConfig = z.infer<typeof providerSchema>
@@ -170,3 +253,4 @@ export type AgentConfig = z.infer<typeof agentSchema>
 export type CompactConfig = z.infer<typeof compactSchema>
 export type CacheConfig = z.infer<typeof cacheSchema>
 export type WorkersConfig = z.infer<typeof workersSchema>
+export type SkillsConfig = z.infer<typeof skillsSchema>

@@ -105,19 +105,20 @@ ${escapeXml(parsed.content)}
   }
 }
 
-/** 缓存：cwd → 已加载的胶囊列表 */
-let cachedCapsules: SeedCapsule[] | null = null
-let cachedCwd: string | null = null
+/**
+ * 缓存：cwd → 已加载的胶囊列表。多槽 Map（而非单槽 cachedCwd），这样并发
+ * worktree / 多会话在不同 cwd 间交替时不会互相清空缓存（单槽会反复重读 docs/）。
+ */
+const capsuleCacheByCwd = new Map<string, SeedCapsule[]>()
 
 /**
  * 从 docs/ 目录中发现并加载所有 seed-capsule-*.md 胶囊文档。
  * 结果按 sealedAt 排序（最早的在前，保证稳定顺序）。
- * 缓存在内存中——胶囊文档是静态的，session 内不需要重新读取。
+ * 按 cwd 缓存在内存中——胶囊文档是静态的，session 内不需要重新读取。
  */
 export function loadAllCapsules(cwd: string): SeedCapsule[] {
-  if (cachedCapsules !== null && cachedCwd === cwd) {
-    return cachedCapsules
-  }
+  const cached = capsuleCacheByCwd.get(cwd)
+  if (cached) return cached
 
   const docsDir = join(cwd, 'docs')
   if (!existsSync(docsDir)) return []
@@ -139,8 +140,7 @@ export function loadAllCapsules(cwd: string): SeedCapsule[] {
   // 按 sealedAt 排序，保证稳定顺序
   capsules.sort((a, b) => a.sealedAt.localeCompare(b.sealedAt))
 
-  cachedCapsules = capsules
-  cachedCwd = cwd
+  capsuleCacheByCwd.set(cwd, capsules)
   return capsules
 }
 
@@ -155,34 +155,16 @@ export function renderAllCapsulesBlock(cwd: string): string | undefined {
 }
 
 /**
- * 跨星域核心硬护栏——从 5 星 principles 提炼去重的高频行为约束。
- * 置顶常驻，不依赖 agent 主动 recall：护栏起作用的时刻正是 agent
- * 没意识到在跑偏的时刻，按需加载对护栏无效（见 V3.1 回归：撤入 recall
- * 后行动跑偏）。措辞取自各星胶囊原话。
+ * 所有星域胶囊均改为 recall-only：主控冻结前缀只挂 gist 一行索引，
+ * 完整正文经 recall_capsule(star) 按需拉取。
+ * 天璇的换视角核心思维已蒸馏进 static.ts BASE_PROMPT，天权的规划原则
+ * 已由 evidence-scope / workflow 规则覆盖，CORE_GUARDRAILS 的 5 条护栏
+ * 已由 self-verification / external-source-verification / evidence-scope 覆盖。
+ * 不再在冻结前缀常驻任何胶囊全文或护栏——省 ~6K tokens。
  */
-export const CORE_GUARDRAILS: string[] = [
-  '复现才算验证——绿非证明，RED→GREEN 才采信；声称"已修/已验证"前先能复现原缺陷。',
-  '改代码前先读完代码——不猜、不假设；grep 调用方，理解真实数据流。',
-  '意图高于指令——用户要的是问题被解决，不是指令被字面执行。',
-  '中性归因——补正确语义，不写灾难叙事，不加多余兜底。',
-  '以全貌定向——改一行前先理解它在文件/模块/架构中的位置。',
-]
 
-/**
- * 常驻胶囊块 = 核心护栏置顶 + 5 星 principles 全文。
- * 注入冻结前缀（会话内字节稳定，prefix-cache safe）。
- * ledger（缺陷族历史）不在此——仍经 recall_capsule 按需拉取。
- */
 export function renderResidentCapsuleBlock(cwd: string): string | undefined {
-  const capsules = loadAllCapsules(cwd)
-  if (capsules.length === 0) return undefined
-  const guardrails = [
-    '<core-guardrails note="跨星域硬护栏，常驻，无条件适用。">',
-    ...CORE_GUARDRAILS.map(g => `  - ${g}`),
-    '</core-guardrails>',
-  ].join('\n')
-  const bodies = capsules.map(c => c.block).join('\n\n')
-  return `${guardrails}\n\n${bodies}`
+  return renderCapsuleIndexBlock(cwd)
 }
 
 /**
@@ -198,6 +180,7 @@ export function renderCapsuleIndexBlock(cwd: string): string | undefined {
   return [
     '<seed-capsules note="前辈星域封存的方法索引。需要某位的完整原则时调用 recall_capsule(star)。">',
     ...lines,
+    '任务涉及规划/审查/验证/勘探/调校时，调用 recall_capsule(星名) 获取完整方法论。',
     '</seed-capsules>',
   ].join('\n')
 }
@@ -238,8 +221,47 @@ export function renderCapsuleBlock(l1: SeedCapsuleL1): string {
   return l1.block
 }
 
+// ─── Phase 2: Principle Extraction ─────────────────────────────
+
+export interface ExtractedPrinciple {
+  key: string
+  maxim: string
+  actionPrompt: string
+}
+
+const PRINCIPLE_RE = /<principle\s+key="([^"]+)"\s+action="([^"]+)">([^<]+)<\/principle>/g
+
+/**
+ * 从胶囊 raw 文本中提取 <principle> 标记的原则条目。
+ * 标签格式：<principle key="Y1" action="动作提示">格言</principle>
+ * 返回空数组当无标签时（调用方应 fallback 到硬编码池）。
+ */
+export function extractPrinciplesFromRaw(raw: string): ExtractedPrinciple[] {
+  const results: ExtractedPrinciple[] = []
+  let m: RegExpExecArray | null
+  const re = new RegExp(PRINCIPLE_RE.source, PRINCIPLE_RE.flags)
+  while ((m = re.exec(raw)) !== null) {
+    results.push({
+      key: m[1]!,
+      actionPrompt: m[2]!,
+      maxim: m[3]!.trim(),
+    })
+  }
+  return results
+}
+
+/**
+ * 按星名从胶囊文档中提取原则池。
+ * 返回 null 当胶囊不存在或无 <principle> 标签时。
+ */
+export function extractPrinciples(cwd: string, star: string): ExtractedPrinciple[] | null {
+  const capsule = getCapsuleByStar(cwd, star)
+  if (!capsule) return null
+  const principles = extractPrinciplesFromRaw(capsule.raw)
+  return principles.length > 0 ? principles : null
+}
+
 /** 清除缓存（主要用于测试） */
 export function clearCapsuleCache(): void {
-  cachedCapsules = null
-  cachedCwd = null
+  capsuleCacheByCwd.clear()
 }

@@ -1,5 +1,6 @@
 import type { ModelCapabilityCard } from '../model/capability.js'
 import type { WorkOrderKind, WorkerProfile } from './work-order.js'
+import { profileRegistry } from './profile-registry.js'
 
 export type ModelTier = 'cheap' | 'balanced' | 'strong'
 export type ModelRiskTier = 'low' | 'medium' | 'high'
@@ -34,6 +35,12 @@ function isExploration(input: Pick<ModelTierPolicyInput, 'kind' | 'profile' | 'o
 }
 
 export function recommendModelTier(input: ModelTierPolicyInput): ModelTierRecommendation {
+  // tierLock: profile-level override that prevents all escalation (Flash army profiles)
+  const profileDef = profileRegistry.get(input.profile)
+  if (profileDef?.tierLock) {
+    return { tier: profileDef.tierLock, reason: `profile ${input.profile} has tierLock=${profileDef.tierLock} — no escalation` }
+  }
+
   const authority = normalized(input.authority)
   const riskTier = input.riskTier ?? 'medium'
   const consecutiveFailures = Math.max(0, Math.floor(input.consecutiveFailures ?? 0))
@@ -42,13 +49,8 @@ export function recommendModelTier(input: ModelTierPolicyInput): ModelTierRecomm
     return { tier: 'strong', hardFloor: 'strong', reason: 'repeated failure escalates worker tier to strong' }
   }
 
-  if ((authority === 'tianquan' || authority === '天权') &&
-    (input.profile === 'reviewer' || input.profile === 'adversarial_verifier')) {
-    return { tier: 'strong', hardFloor: 'strong', reason: 'tianquan reviewer/verifier has false-green hard floor' }
-  }
-
   if (input.kind === 'verify' || input.profile === 'verifier' || input.profile === 'adversarial_verifier') {
-    return { tier: 'strong', hardFloor: 'strong', reason: 'verification work requires strong model tier' }
+    return { tier: 'cheap', reason: 'verification work uses flash model for fast review throughput' }
   }
 
   if (authority === 'tianfu' || authority === '天府') {
@@ -73,7 +75,7 @@ export function recommendModelTier(input: ModelTierPolicyInput): ModelTierRecomm
 
   if (riskTier === 'high') return { tier: 'strong', hardFloor: 'strong', reason: 'high-risk work uses strong tier by default' }
   if (isExploration(input)) return { tier: 'cheap', reason: 'low-impact exploration defaults to cheap tier' }
-  return { tier: 'balanced', reason: 'default worker tier is balanced' }
+  return { tier: 'cheap', reason: 'default worker tier is cheap (flash model)' }
 }
 
 export function inferModelTierFromCard(card: Pick<ModelCapabilityCard, 'model' | 'contextWindow' | 'toolUseReliability' | 'jsonStability' | 'editSuccessRate' | 'testRepairRate'>): ModelTier {

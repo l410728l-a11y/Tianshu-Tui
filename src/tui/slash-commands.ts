@@ -7,7 +7,7 @@ import { microCompactOai, estimateOaiTokens } from '../compact/micro.js'
 import { rollbackToCheckpoint, getRollbackPreview } from '../agent/checkpoint.js'
 import { runResumePreflightOai } from '../context/resume-preflight.js'
 import { resolveCustomCommand } from '../commands/loader.js'
-import { getTheme, setTheme, getActiveThemeName, type ThemeName } from './theme.js'
+import { getTheme, setTheme, getActiveThemeName, THEMES, type ThemeName } from './theme.js'
 import { PhaseTracker } from './phase-tracker.js'
 import { createLogEntry, type LogEntry } from './log-state.js'
 import { getPaletteCommands } from './command-palette.js'
@@ -27,6 +27,20 @@ import { homedir } from 'node:os'
 import { listPlans, approvePlan, rejectPlan } from '../plan/plan-store.js'
 import { fullRebuild, generateCodebaseIndexBlock, getHeadSha } from '../repo/codebase-index.js'
 import { isDiagramType, buildDiagramDoc, renderDiagramBlock, formatDiagramList } from './diagram-templates.js'
+import { renderRecoveryStack } from '../agent/recovery-stack.js'
+import { skillRegistry, listSkillFiles } from '../skills/skill-loader.js'
+import { listSkillDrafts, approveSkillDraft, rejectSkillDraft } from '../agent/skill-distill.js'
+import { formatReviewHealthLine } from '../agent/review-health.js'
+import {
+  loadConstellation,
+  initConstellation,
+  surveySkeleton,
+  appendMilestone,
+} from '../constellation/store.js'
+import { formatConstellationView, formatConstellationHistory } from '../constellation/format.js'
+import { extractMilestone, buildDepartureMilestone } from '../constellation/milestone.js'
+import { shortHash } from '../constellation/schema.js'
+import { buildAgentMark, VOID_SYMBOL } from '../agent/void-identity.js'
 
 const HELP_TEXT = `Available commands:
 /help — Show this help
@@ -37,7 +51,8 @@ const HELP_TEXT = `Available commands:
 /domain [list|<name>|auto|off] — Show or switch star domain personality
 /verbose — Toggle verbose tool output
 /auto — Toggle auto-approve
-/theme [midnight|pastel|cyberpunk|observatory|starfield] — Switch color theme
+/theme [cobalt|gemini|antigravity|slate|ziwei|tianshu|midnight|pastel|cyberpunk|observatory|starfield|claude] — Switch color theme (default: cobalt)
+/vim — Toggle vim keybindings
 /effort [off|low|medium|high|max] — Set reasoning effort
 /undo [<number>|preview <number>] — Undo file changes with preview
 /clear — Clear screen
@@ -45,6 +60,8 @@ const HELP_TEXT = `Available commands:
 /resume <number> — Restore a saved session
 /memory [text|add|search|forget] — Session memory entries
 /mission — Show current task contract
+/constellation [view|init|update <summary>|history|shift <summary>] — Project blueprint & milestone chronicle
+/leave [symbol] <summary> — Leave your mark in the starmap as you depart
 /context [pin|claims|antibodies|conflicts|reload|export|import] — Context ledger
 /verify — Show verification status
 /evidence — Show last turn evidence summary
@@ -52,17 +69,31 @@ const HELP_TEXT = `Available commands:
 /mcp — Show MCP server status
 /cockpit [summary|trace|verify|context|safety|model|off] — Toggle cockpit panel
 /scroll — Browse session history in pager
-/skill [list|<name>] — List or load Claude skills
+/skill [list|<name>|review|approve <name>|reject <name>] — List/load skills; review auto-distilled drafts
 /interview <topic> — Deep interview before coding
 /plan <feature> — Create implementation plan
 /plan close <file> --tasks <range|all> [--apply] — Close implementation plan tasks
 /team <task|plan> — Run team-mode workflow through team_orchestrate
 /team max <task> — Run team-mode max planning through team_orchestrate
+/council <task> [--seats id1,id2,...] [--rounds 1-2] — Convene a star-domain council (single round; --rounds 2 enables a rebuttal round)
+/review — Manually trigger L2 review (single adversarial verifier) on current changes via deliver_task
+/review max — Manually trigger L3 review (Review Squadron, 5 inspectors) on current changes via deliver_task
+(auto: every non-trivial deliver_task commit runs a single Wiring inspector — short budget, never blocks on infra failure)
 /sensorium — Show 天枢 3D self-awareness state
 /dream — Distill session decisions into project memory
 /index — Rebuild codebase index (modules + CLI entries)
 /diagram [list|<type>] — Generate a mermaid diagram skeleton (architecture|dataflow|sequence|flowchart|comparison|state)
 Ctrl+C — Interrupt current turn (press twice to exit)`
+
+/**
+ * Framework-agnostic mutable ref. Structurally compatible with React's
+ * `MutableRefObject<T>` (`{ current: T }`) AND the T9 engine's plain
+ * `MutableRef` adapter, so the non-React SlashRouter no longer needs to fake a
+ * React type with `as unknown as React.MutableRefObject<...>` / `as any`.
+ */
+export interface MutableRefLike<T> {
+  current: T
+}
 
 export interface SlashHandlerContext {
   parts: string[]
@@ -76,13 +107,20 @@ export interface SlashHandlerContext {
   allProviders: Record<string, { models: Array<{ id: string; alias: string }> }>
   currentProvider: string
   currentSessionId: string
+  /**
+   * Runtime session identity switch for /resume <id>. Rebuilds the agent runtime
+   * against the target session so subsequent messages/logs write to the SAME id.
+   * Returns the loaded message count or an error. Undefined → /resume falls back
+   * to the legacy in-memory-only restore (no identity switch).
+   */
+  onSessionSwitch?: (targetId: string) => { ok: boolean; error?: string; messageCount?: number; repaired?: boolean; safe?: boolean }
   cost: number
   cacheHitRate: number
-  autoSafeRef: React.MutableRefObject<boolean>
-  verboseRef: React.MutableRefObject<boolean>
+  autoSafeRef: MutableRefLike<boolean>
+  verboseRef: MutableRefLike<boolean>
   setVerbose: (v: boolean) => void
   setAutoSafe: (v: boolean) => void
-  rollbackTokenRef: React.MutableRefObject<string | null>
+  rollbackTokenRef: MutableRefLike<string | null>
   setCockpitPanel: (v: Panel | ((prev: Panel) => Panel)) => void
   activeOverlay?: string | null
   surfacePush?: (id: string) => void
@@ -91,10 +129,39 @@ export interface SlashHandlerContext {
   setIsStreaming: (v: boolean) => void
   setCacheHitRate: (v: number) => void
   setSummaryState: (v: SummaryState | ((prev: SummaryState) => SummaryState)) => void
-  mcpManagerRef: React.MutableRefObject<import('../mcp/manager.js').McpManager | null>
-  claimStoreRef: React.MutableRefObject<ContextClaimStore | null>
+  mcpManagerRef: MutableRefLike<import('../mcp/manager.js').McpManager | null>
+  claimStoreRef: MutableRefLike<ContextClaimStore | null>
   setReasoningEffort?: (effort: import('../agent/auto-reasoning.js').ReasoningEffort) => void
   reasoningEffort?: string
+  onDomainChange?: (domainName: string | undefined) => void
+  /** T5: bandit promotion state for /status observability. */
+  banditState?: import('../server/routes.js').BanditStatusEntry[]
+  /** 独立审查回调——/review 不经过 deliver_task 直接调 routeReviewWorkflow。
+   *  未注入时 /review fallback 到 resolveAppPromptInput → deliver_task 旧路径。 */
+  runReview?: (change: import('../agent/review-discipline.js').ChangeSet, mode: import('../agent/review-router.js').ReviewMode, focus?: string) => Promise<import('../agent/review-router.js').ReviewOutcome>
+  /** Submit a prompt directly to the agent pipeline, bypassing slash routing.
+   *  Used by commands that need to transform the input before sending (e.g. /goal). */
+  submitToAgent?: (prompt: string) => void
+  /** Mutable ref to the current GoalTracker. Set when /goal creates a tracker;
+   *  read by deliver_task's B1Context for auto-review gating. */
+  goalTrackerRef?: { current: import('../agent/goal-tracker.js').GoalTracker | null }
+}
+
+/** 收集当前工作区未提交的改动文件（unstaged + staged + untracked）。 */
+async function collectDirtyFiles(cwd: string): Promise<string[]> {
+  const { spawnSync } = await import('node:child_process')
+  const run = (gitArgs: string[]): string[] => {
+    const r = spawnSync('git', ['-c', 'core.quotePath=false', ...gitArgs], { cwd, encoding: 'utf-8', timeout: 5000 })
+    return r.status === 0 ? r.stdout.split('\0').filter(Boolean) : []
+  }
+  try {
+    const unstaged = run(['diff', '--name-only', '-z'])
+    const staged = run(['diff', '--cached', '--name-only', '-z'])
+    const untracked = run(['ls-files', '--others', '--exclude-standard', '-z'])
+    return [...new Set([...unstaged, ...staged, ...untracked])].sort()
+  } catch {
+    return []
+  }
 }
 
 function formatClaimLine(claim: import('../context/claims.js').ContextClaim): string {
@@ -183,6 +250,20 @@ export function resolveAppPromptInput(input: string, cwd: string): string | null
   if (workflow) return workflow.prompt
   const custom = resolveCustomCommand(cwd, input)
   if (custom) return custom
+  // /review [max] [focus description] — map to deliver_task instruction for the agent
+  const reviewMatch = input.match(/^\/review(?:\s+(max))?(?:\s+(.*))?$/i)
+  if (reviewMatch) {
+    const isMax = !!reviewMatch[1]
+    const focusText = reviewMatch[2]?.trim()
+    const level = isMax ? 'L3' : 'L2'
+    const levelLabel = level === 'L3' ? 'L3 Review Squadron (5 inspectors)' : 'L2 adversarial verifier'
+    const focusInstruction = focusText ? ` Focus specifically on: ${focusText}.` : ''
+    return `Run code review on the current uncommitted changes: call deliver_task with commit=true and review_level="${level}". This triggers ${levelLabel}.${focusInstruction}`
+  }
+  // /review typos — don't silently drop user input
+  if (/^\/review/i.test(input)) {
+    return `User typed "${input}" which looks like a /review command but didn't match the expected format. Usage: /review [max] [focus description]. Run /review max to trigger L3 Review Squadron.`
+  }
   // Unrecognized slash command — return null to signal "blocked"
   return null
 }
@@ -196,6 +277,24 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
       pushStatic(createLogEntry({ type: 'system', content: HELP_TEXT }))
       setIsStreaming(false)
       return true
+
+    case '/status': {
+      const lines: string[] = ['Bandit Promotion State', '═══════════════════════']
+      if (ctx.banditState && ctx.banditState.length > 0) {
+        for (const b of ctx.banditState) {
+          lines.push(`${b.source}: ${b.mode} (enabled=${b.enabled})`)
+          lines.push(`  reason: ${b.reason}`)
+          lines.push(`  samples: ${b.totalShadowSamples}`)
+        }
+      } else {
+        lines.push('(no bandit state available — run bootstrap first)')
+      }
+      lines.push('', 'Review Infra Health', '═══════════════════════')
+      lines.push(formatReviewHealthLine())
+      pushStatic(createLogEntry({ type: 'system', content: lines.join('\n') }))
+      setIsStreaming(false)
+      return true
+    }
 
     case '/exit':
     case '/quit':
@@ -232,6 +331,7 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
       pushStatic(createLogEntry({ type: 'system', content: 'Micro-compacting conversation...' }))
       const { messages: compacted, truncated } = microCompactOai(msgs, ctx.maxTokens, beforeTokens)
       ctx.session.replaceMessages(compacted)
+      ctx.agent.config.promptEngine.resetAppendixBaseline()
       const afterTokens = estimateOaiTokens(compacted)
       ctx.session.recordCompactEvent({
         turn: ctx.session.getTurnCount(),
@@ -257,6 +357,70 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
         return true
       }
       return false
+    }
+
+    case '/council': {
+      if (!parts.slice(1).join(' ').trim()) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /council <要会诊的计划/问题> [--seats id1,id2,...] [--rounds 1-2]' }))
+        setIsStreaming(false)
+        return true
+      }
+      return false
+    }
+
+    case '/review': {
+      // /review [max] [focus] — 独立审查入口（不经过 deliver_task）。
+      // 当 ctx.runReview 可用时直接调 routeReviewWorkflow；否则 fallback 到旧路径。
+      const isMax = parts[1]?.toLowerCase() === 'max'
+      const focus = parts.slice(isMax ? 2 : 1).join(' ').trim()
+
+      if (!ctx.runReview) {
+        // Fallback: 让 resolveAppPromptInput 映射为 deliver_task 指令
+        return false
+      }
+
+      // 动态导入避免循环依赖 + 避免顶层 import 增加初始 bundle
+      const { isCrossModule, isFixContext } = await import('../agent/review-discipline.js')
+      const { reviewWorkflowBudgetMs } = await import('../agent/review-router.js')
+      type ChangeSet = import('../agent/review-discipline.js').ChangeSet
+      type ReviewMode = import('../agent/review-router.js').ReviewMode
+
+      // 从 git diff 构造 ChangeSet
+      const dirtyFiles = await collectDirtyFiles(ctx.agent.cwd)
+      if (dirtyFiles.length === 0) {
+        pushStatic(createLogEntry({ type: 'system', content: '没有未提交的改动可以审查。' }))
+        setIsStreaming(false)
+        return true
+      }
+
+      const change: ChangeSet = {
+        files: dirtyFiles,
+        crossModule: isCrossModule(dirtyFiles),
+        isFix: isFixContext(focus || ''),
+        ...(isMax ? { forceLevel: 'L3' as const } : {}),
+      }
+
+      const mode: ReviewMode = 'manual'
+      const budgetSec = Math.round(reviewWorkflowBudgetMs(mode, isMax ? 'L3' : undefined) / 1000)
+      const levelLabel = isMax ? 'L3 Squadron (5 inspectors)' : 'auto-classify'
+      pushStatic(createLogEntry({ type: 'system', content: `⏳ 审查启动中 (${levelLabel}, ≤${budgetSec}s)...\n` }))
+
+      try {
+        const outcome = await ctx.runReview(change, mode, focus || undefined)
+        const icon = outcome.verdict === 'verified' ? '🟢'
+                   : outcome.verdict === 'rejected' ? '🔴' : '🟡'
+        const lines = [`${icon} 审查结果 [${outcome.tier}]: ${outcome.verdict}`]
+        if (typeof outcome.rounds === 'number') lines.push(`   轮次：${outcome.rounds}`)
+        if (outcome.evidence) lines.push(`   证据：${outcome.evidence}`)
+        if (outcome.verdict === 'rejected' || outcome.escalated) {
+          lines.push('   → 请在后续提交中处理审查发现。')
+        }
+        pushStatic(createLogEntry({ type: 'system', content: lines.join('\n') }))
+      } catch (err) {
+        pushStatic(createLogEntry({ type: 'system', content: `审查失败：${(err as Error).message}` }))
+      }
+      setIsStreaming(false)
+      return true
     }
 
     case '/model': {
@@ -297,6 +461,39 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
       return true
     }
 
+    case '/goal': {
+      const goalText = parts.slice(1).join(' ').trim()
+      if (!goalText) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /goal <task description>\nSets a persistent goal. The agent will auto-continue until the goal is achieved or the iteration budget is exhausted.\nCancel with /cancel-goal.' }))
+        setIsStreaming(false)
+        return true
+      }
+      // Dynamic import to avoid circular dependency
+      const { GoalTracker } = await import('../agent/goal-tracker.js')
+      const maxIterations = Math.max(50, Math.floor(ctx.maxTokens / 4000))
+      const tracker = new GoalTracker({
+        goal: goalText,
+        maxIterations,
+        contextWindow: ctx.maxTokens,
+      })
+      ctx.agent.setGoalTracker(tracker)
+      if (ctx.goalTrackerRef) ctx.goalTrackerRef.current = tracker
+      pushStatic(createLogEntry({ type: 'system', content: `🎯 Goal activated: ${goalText}\nMax iterations: ${maxIterations}. Output "GOAL ACHIEVED" to complete, or /cancel-goal to abort.\n\n目标达成后运行 /review max 做最终审查。` }))
+      setIsStreaming(false)
+      // Submit the goal prompt directly to agent pipeline (bypassing raw slash input).
+      const prompt = `[GOAL MODE] ${goalText}\n\nYou are now in goal-driven mode. Work toward this goal continuously. When fully complete, output "GOAL ACHIEVED" on its own line.`
+      ctx.submitToAgent?.(prompt)
+      return true
+    }
+
+    case '/cancel-goal': {
+      ctx.agent.setGoalTracker(null)
+      if (ctx.goalTrackerRef) ctx.goalTrackerRef.current = null
+      pushStatic(createLogEntry({ type: 'system', content: '🚫 Goal cancelled.' }))
+      setIsStreaming(false)
+      return true
+    }
+
     case '/domain': {
       const sub = parts[1]?.toLowerCase()
       if (!sub || sub === 'status') {
@@ -319,9 +516,11 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
         pushStatic(createLogEntry({ type: 'system', content: `星域一览\n\n${lines.join('\n\n')}\n\n使用 /domain <id|名称> 切换，/domain auto 恢复自动检测。` }))
       } else if (sub === 'auto') {
         ctx.agent.resetSessionDomain()
+        ctx.onDomainChange?.(undefined)
         pushStatic(createLogEntry({ type: 'system', content: '星域已重置为自动检测模式。下一次对话将根据输入内容自动匹配星域。' }))
       } else if (sub === 'off' || sub === 'none') {
         ctx.agent.setSessionDomain(null)
+        ctx.onDomainChange?.(undefined)
         pushStatic(createLogEntry({ type: 'system', content: '星域已关闭。本会话将不激活任何星域人格。' }))
       } else {
         // Try to match by id or Chinese name
@@ -330,6 +529,7 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
         if (matched) {
           const domain = { id: matched.id, name: matched.name, volatileBlock: matched.volatileBlock, motto: matched.motto }
           ctx.agent.setSessionDomain(domain)
+          ctx.onDomainChange?.(domain.name)
           pushStatic(createLogEntry({ type: 'system', content: `星域切换: ${domain.name} (${domain.id})\n${domain.motto}\n\n${domain.volatileBlock}` }))
         } else {
           const validNames = allDomains.map(d => `${d.name}|${d.id}`).join(', ')
@@ -409,12 +609,11 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
         return true
       }
 
-      // Inject plan context as session memory so agent can see it
-      ctx.agent.updateSessionMemory(
-        `<approved-plan slug="${slug}">\n${approved.content}\n</approved-plan>\n\nYou are now executing the approved plan above. Follow it step by step. Use /plan-list to review, call plan_close when done.`
-      )
-      ctx.agent.exitPlanMode()
-      pushStatic(createLogEntry({ type: 'system', content: `✅ Plan approved: **${approved.title}** (\`${slug}\`)\n\nPlan content has been loaded into context. Plan Mode exited — execution may now begin.\n\nUse /plan-list to view all plans.` }))
+      // Inject a tiny pointer (slug/title/path) into the dynamic appendix — the
+      // plan body stays on disk to keep the prefix cache intact. setActivePlan
+      // also releases plan mode internally.
+      ctx.agent.setActivePlan({ slug, title: approved.title })
+      pushStatic(createLogEntry({ type: 'system', content: `✅ Plan approved: **${approved.title}** (\`${slug}\`)\n\n方案指针已加载,正文在 \`.rivet/plans/${slug}.md\`。Plan Mode 已退出 — 执行可开始。\n\nUse /plan-list to view all plans.` }))
       setIsStreaming(false)
       return true
     }
@@ -442,7 +641,8 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
 
     case '/theme': {
       const raw = parts[1]?.toLowerCase()
-      const validThemes: ThemeName[] = ['midnight', 'pastel', 'cyberpunk', 'observatory', 'starfield']
+      // validThemes derives from THEMES so theme.ts remains the single source of truth.
+      const validThemes = Object.keys(THEMES) as ThemeName[]
       if (!raw || raw === 'list') {
         const current = getActiveThemeName()
         const list = validThemes.map(t => `  ${t}${t === current ? ' ← current' : ''}`).join('\n')
@@ -511,46 +711,78 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
       return true
 
     case '/sessions': {
-      const sessions = SessionPersist.listSessions()
-      if (sessions.length === 0) {
-        pushStatic(createLogEntry({ type: 'system', content: 'No saved sessions.' }))
-      } else {
-        const list = sessions.map((id, i) => {
-          const marker = id === ctx.currentSessionId ? ' ← current' : ''
-          return `${i + 1}. ${id.slice(0, 8)}...${marker}`
-        }).join('\n')
-        pushStatic(createLogEntry({ type: 'system', content: `Saved sessions:\n${list}\n\n/resume <number> to restore` }))
-      }
+      const list = SessionPersist.formatSessionList(ctx.agent.cwd, ctx.currentSessionId)
+      pushStatic(createLogEntry({
+        type: 'system',
+        content: `会话列表(按最近更新排序):\n${list}\n\n/resume <id前缀 或 序号> 切换会话`,
+      }))
       setIsStreaming(false)
       return true
     }
 
     case '/resume': {
-      const sessions = SessionPersist.listSessions()
       const arg = parts[1]
-      if (!arg || !/^\d+$/.test(arg)) {
-        pushStatic(createLogEntry({ type: 'system', content: `Invalid session number. Use /sessions to see available sessions.` }))
+      if (!arg) {
+        pushStatic(createLogEntry({ type: 'system', content: '用法: /resume <id前缀 或 序号>。用 /sessions 查看会话列表。' }))
         setIsStreaming(false)
         return true
       }
-      const idx = parseInt(arg, 10) - 1
-      if (isNaN(idx) || idx < 0 || idx >= sessions.length) {
-        pushStatic(createLogEntry({ type: 'system', content: `Invalid session number. Use /sessions to see available sessions.` }))
+
+      // 序号(兼容旧习惯)或 id 前缀 → 解析为完整 id。
+      const ordered = SessionPersist.listMainSessions(ctx.agent.cwd)
+      let targetId: string | null = null
+      if (/^\d+$/.test(arg)) {
+        const idx = parseInt(arg, 10) - 1
+        if (idx < 0 || idx >= ordered.length) {
+          pushStatic(createLogEntry({ type: 'system', content: `序号超出范围(共 ${ordered.length} 个会话)。用 /sessions 查看。` }))
+          setIsStreaming(false)
+          return true
+        }
+        targetId = ordered[idx]!.id
+      } else {
+        const resolved = SessionPersist.resolveSessionId(ctx.agent.cwd, arg)
+        if (!resolved) {
+          pushStatic(createLogEntry({ type: 'system', content: `未找到匹配会话: "${arg}"。用 /sessions 查看会话列表。` }))
+          setIsStreaming(false)
+          return true
+        }
+        if ('ambiguous' in resolved) {
+          const cands = resolved.ambiguous.map(id => `  ${id.slice(0, 12)}`).join('\n')
+          pushStatic(createLogEntry({ type: 'system', content: `前缀 "${arg}" 匹配多个会话,请用更长前缀:\n${cands}` }))
+          setIsStreaming(false)
+          return true
+        }
+        targetId = resolved.id
+      }
+
+      if (targetId === ctx.currentSessionId) {
+        pushStatic(createLogEntry({ type: 'system', content: `已经在会话 ${targetId.slice(0, 8)} 中。` }))
         setIsStreaming(false)
         return true
       }
-      const targetId = sessions[idx]!
-      const p = new SessionPersist(targetId)
-      const rawMsgs = p.loadOai()
-      const preflight = runResumePreflightOai(rawMsgs)
+
+      // 真正的身份切换(Phase 4):会话id = 日志id = pointer id 一致。
+      if (ctx.onSessionSwitch) {
+        const res = ctx.onSessionSwitch(targetId)
+        if (!res.ok) {
+          pushStatic(createLogEntry({ type: 'system', content: `切换失败: ${res.error ?? '未知错误'}` }))
+        } else {
+          pushStatic(createLogEntry({
+            type: 'system',
+            content: `🔄 已切换到会话 ${targetId.slice(0, 8)}: 载入 ${res.messageCount ?? 0} 条消息(将重建前缀缓存)${res.repaired ? ' · 已修复孤儿工具调用' : ''}。`,
+          }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+
+      // Fallback:无切换回调时退化为仅内存恢复(身份不切,旧行为)。
+      const p = new SessionPersist(targetId, ctx.agent.cwd)
+      const preflight = runResumePreflightOai(p.loadOai())
       ctx.session.replaceMessages(preflight.messages)
-      if (preflight.repaired) {
-        p.compactOai(preflight.messages)
-      }
-      pushStatic(createLogEntry({ type: 'system', content: `Restored session ${targetId.slice(0, 8)}... (${preflight.messages.length} messages, apiSafe=${preflight.safe})` }))
-      if (preflight.repaired) {
-        pushStatic(createLogEntry({ type: 'system', content: `Resume preflight: repaired ${preflight.syntheticResultsInserted} orphan tool call(s).` }))
-      }
+      ctx.agent.config.promptEngine.resetAppendixBaseline()
+      if (preflight.repaired) p.compactOai(preflight.messages)
+      pushStatic(createLogEntry({ type: 'system', content: `已恢复会话 ${targetId.slice(0, 8)} (${preflight.messages.length} 条消息, apiSafe=${preflight.safe})` }))
       setIsStreaming(false)
       return true
     }
@@ -702,16 +934,25 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
         ? `\n\nPinned Anchors:\n${ledger.anchors.map(a => `  [${a.kind}] ${a.text.slice(0, 60)}`).join('\n')}`
         : ''
 
+      // 占用明细头：cache 命中率 + 本轮 cost（与 GlanceBar 同源），对齐 Claude Code /context。
+      const usagePct = sections.maxTokens > 0 ? Math.round(sections.estimatedTokens / sections.maxTokens * 100) : 0
+      const cacheStr = ctx.cacheHitRate !== undefined ? `${Math.round(ctx.cacheHitRate * 100)}%` : 'n/a'
+      const costStr = `$${(ctx.cost ?? 0).toFixed(2)}`
+      const realTokens = ctx.session.getLastRealPromptTokens()
+      const realStr = realTokens > 0 ? `\nAPI (last): ${realTokens.toLocaleString()} tokens` : ''
+
       pushStatic(createLogEntry({
         type: 'system',
-        content: `Context: ${sections.compactionState}\nTokens: ${sections.estimatedTokens.toLocaleString()}/${sections.maxTokens.toLocaleString()} (${Math.round(sections.estimatedTokens / sections.maxTokens * 100)}%)\nRounds: ${ledger.rounds.length}\n${diagnostics}\n\nCompaction:\n${compactStr}${anchorLines}`,
+        content: `Context: ${sections.compactionState}\nTokens (est): ${sections.estimatedTokens.toLocaleString()}/${sections.maxTokens.toLocaleString()} (${usagePct}%)${realStr}\nCache hit: ${cacheStr}    Cost: ${costStr}\nRounds: ${ledger.rounds.length}\n${diagnostics}\n\nCompaction:\n${compactStr}${anchorLines}`,
       }))
       setIsStreaming(false)
       return true
     }
 
     case '/verify': {
-      pushStatic(createLogEntry({ type: 'system', content: formatVerificationStatus(ctx.agent) }))
+      const verify = formatVerificationStatus(ctx.agent)
+      const recovery = renderRecoveryStack(process.cwd())
+      pushStatic(createLogEntry({ type: 'system', content: `${verify}\n\n${recovery}` }))
       setIsStreaming(false)
       return true
     }
@@ -756,6 +997,119 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
       const snapshot = ctx.agent.getCognitiveSnapshot?.()
       const strip = formatMissionStrip(snapshot)
       pushStatic(createLogEntry({ type: 'system', content: strip ? `Mission\n\n${strip}` : 'Mission\n\nNo actionable task contract is active.' }))
+      setIsStreaming(false)
+      return true
+    }
+
+    case '/constellation': {
+      const cwd = ctx.agent.cwd ?? process.cwd()
+      const sub = (parts[1] ?? 'view').toLowerCase()
+      const now = Date.now()
+
+      if (sub === 'init') {
+        const skeleton = surveySkeleton(cwd)
+        const c = initConstellation(cwd, { skeleton, sessionId: ctx.currentSessionId }, now)
+        pushStatic(createLogEntry({
+          type: 'system',
+          content: `Constellation initialized for ${c.name}\n\n${formatConstellationView(c, { now })}`,
+        }))
+        setIsStreaming(false)
+        return true
+      }
+
+      if (sub === 'shift') {
+        const summary = parts.slice(2).join(' ').trim() || 'skeleton re-surveyed'
+        const skeleton = surveySkeleton(cwd)
+        const c = initConstellation(cwd, { skeleton, sessionId: ctx.currentSessionId, shiftSummary: summary }, now)
+        pushStatic(createLogEntry({
+          type: 'system',
+          content: `Architecture shift recorded (${c.architectureShifts.length} total): ${summary}`,
+        }))
+        setIsStreaming(false)
+        return true
+      }
+
+      if (sub === 'update') {
+        const summary = parts.slice(2).join(' ').trim()
+        if (!summary) {
+          pushStatic(createLogEntry({ type: 'system', content: 'Usage: /constellation update <summary> — records a milestone for current changes.' }))
+          setIsStreaming(false)
+          return true
+        }
+        const dirty = await collectDirtyFiles(cwd)
+        const domain = ctx.agent.getSessionDomain()?.id ?? ''
+        const milestone = extractMilestone({
+          sessionId: ctx.currentSessionId,
+          agentMark: buildAgentMark({ symbol: VOID_SYMBOL, domain }),
+          domain,
+          chronicleEntries: [{ type: 'milestone', turn: 0, timestamp: now, summary, files: dirty }],
+          cycleClose: shortHash(`${ctx.currentSessionId}:${now}`),
+          now,
+          force: true,
+        })
+        if (!milestone) {
+          pushStatic(createLogEntry({ type: 'system', content: 'Nothing to record.' }))
+          setIsStreaming(false)
+          return true
+        }
+        appendMilestone(cwd, milestone, now)
+        pushStatic(createLogEntry({ type: 'system', content: `Milestone recorded: ${milestone.summary} (${milestone.filesChanged.length} files)` }))
+        setIsStreaming(false)
+        return true
+      }
+
+      const c = loadConstellation(cwd)
+      if (!c) {
+        pushStatic(createLogEntry({ type: 'system', content: 'No constellation yet. Use /constellation init to survey this project.' }))
+        setIsStreaming(false)
+        return true
+      }
+
+      if (sub === 'history') {
+        pushStatic(createLogEntry({ type: 'system', content: formatConstellationHistory(c, { now }) }))
+        setIsStreaming(false)
+        return true
+      }
+
+      // default: view
+      pushStatic(createLogEntry({ type: 'system', content: formatConstellationView(c, { now }) }))
+      setIsStreaming(false)
+      return true
+    }
+
+    case '/leave': {
+      // User-triggered departure ritual: seal a mark into the starmap now.
+      // First token may be a single-glyph symbol; the rest is the summary.
+      const cwd = ctx.agent.cwd ?? process.cwd()
+      const now = Date.now()
+      const rest = parts.slice(1)
+      let symbol = VOID_SYMBOL
+      let summaryParts = rest
+      if (rest.length > 0 && [...rest[0]!].length <= 2) {
+        symbol = rest[0]!
+        summaryParts = rest.slice(1)
+      }
+      const summary = summaryParts.join(' ').trim()
+      if (!summary) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /leave [symbol] <summary> — leave your mark in the starmap as you depart.' }))
+        setIsStreaming(false)
+        return true
+      }
+      const domain = ctx.agent.getSessionDomain()?.id ?? ''
+      const dirty = await collectDirtyFiles(cwd)
+      const milestone = buildDepartureMilestone({
+        sessionId: ctx.currentSessionId,
+        agentMark: buildAgentMark({ symbol, domain }),
+        domain,
+        summary,
+        filesChanged: dirty,
+        now,
+      })
+      appendMilestone(cwd, milestone, now)
+      pushStatic(createLogEntry({
+        type: 'system',
+        content: `✶ Mark ${milestone.agentMark.symbol} sealed into the starmap.\n${milestone.summary}`,
+      }))
       setIsStreaming(false)
       return true
     }
@@ -879,71 +1233,104 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
 
     case '/skill': {
       const sub = parts[1]?.toLowerCase()
-      const cwd = process.cwd()
 
-      // Scan .claude/skills/*/SKILL.md in project + home
-      const skillDirs = [
-        { label: 'project', path: join(cwd, '.claude', 'skills') },
-        { label: 'global', path: join(homedir(), '.claude', 'skills') },
-      ]
+      // Single source of truth: the shared skillRegistry (loaded at bootstrap
+      // from .rivet/skills only — external .claude dirs are never scanned in
+      // place; designated skills are copied in via importFromClaude). No
+      // re-scan, no truncation — same Tier-1/Tier-2 model the model uses.
+      const sourceTag = (source?: string): string =>
+        source === 'global-claude' ? '🌐' : '📁'
+      const allSkills = skillRegistry.list()
 
-      const skills: Array<{ name: string; path: string; source: string; desc: string; size: number }> = []
-      for (const dir of skillDirs) {
-        if (!existsSync(dir.path)) continue
-        for (const entry of readdirSync(dir.path, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue
-          const skillFile = join(dir.path, entry.name, 'SKILL.md')
-          if (!existsSync(skillFile)) continue
-          const content = readFileSync(skillFile, 'utf8')
-          // Extract YAML front-matter description
-          const descMatch = content.match(/^---\n([\s\S]*?\n)---/)?.[1] ?? ''
-          const descLine = descMatch.split('\n').find(l => l.startsWith('description:') || l.startsWith('description:'))
-          const desc = descLine
-            ? descLine.replace(/^description:\s*(?:\|\s*)?/, '').replace(/^\s+/, '').slice(0, 120)
-            : ''
-          skills.push({
-            name: entry.name,
-            path: skillFile,
-            source: dir.label,
-            desc: desc || '(no description)',
-            size: content.length,
-          })
-        }
-      }
-
-      if (!sub || sub === 'list' || sub === 'ls') {
-        if (skills.length === 0) {
-          pushStatic(createLogEntry({ type: 'system', content: 'No skills found.\nScanned:\n  .claude/skills/ (project)\n  ~/.claude/skills/ (global)' }))
+      // ── Auto-distilled draft review (human-in-loop) ──
+      if (sub === 'review' || sub === 'drafts') {
+        const drafts = listSkillDrafts(ctx.agent.cwd)
+        if (drafts.length === 0) {
+          pushStatic(createLogEntry({ type: 'system', content: '没有待审核的 skill 草稿。\n会话结束时,验证通过的可复用流程会自动蒸馏到 .rivet/skills/_drafts/。' }))
         } else {
-          const lines = skills.map(s => {
-            const tag = s.source === 'global' ? '🌐' : '📁'
-            const size = s.size > 1024 ? `${(s.size / 1024).toFixed(1)}KB` : `${s.size}B`
-            return `  ${tag} ${s.name} (${size}) — ${s.desc}`
-          })
-          pushStatic(createLogEntry({ type: 'system', content: `Skills (${skills.length}):\n${lines.join('\n')}\n\nUse /skill <name> to load a skill into the conversation.` }))
+          const lines = drafts.map(d => `  📝 ${d.name} — ${(d.description || '(no description)').slice(0, 120)}`)
+          pushStatic(createLogEntry({ type: 'system', content: `待审核 skill 草稿 (${drafts.length}):\n${lines.join('\n')}\n\n/skill approve <name> 入库  ·  /skill reject <name> 丢弃` }))
         }
         setIsStreaming(false)
         return true
       }
 
-      // /skill <name> — inject skill into conversation
-      const skill = skills.find(s => s.name === sub || s.name === parts[1])
+      if (sub === 'approve') {
+        const name = parts[2]
+        if (!name) {
+          pushStatic(createLogEntry({ type: 'system', content: '用法: /skill approve <name>(用 /skill review 查看草稿)' }))
+          setIsStreaming(false)
+          return true
+        }
+        const res = approveSkillDraft(ctx.agent.cwd, name)
+        if (res.ok && res.skill) {
+          skillRegistry.register(res.skill)
+          pushStatic(createLogEntry({ type: 'system', content: `✅ 已入库 skill: ${res.skill.name}\n已注册到本会话发现层,可用 /skill ${res.skill.name} 加载或由模型自动发现。` }))
+        } else {
+          pushStatic(createLogEntry({ type: 'system', content: `❌ 入库失败: ${res.error ?? 'unknown error'}` }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+
+      if (sub === 'reject') {
+        const name = parts[2]
+        if (!name) {
+          pushStatic(createLogEntry({ type: 'system', content: '用法: /skill reject <name>(用 /skill review 查看草稿)' }))
+          setIsStreaming(false)
+          return true
+        }
+        const ok = rejectSkillDraft(ctx.agent.cwd, name)
+        pushStatic(createLogEntry({ type: 'system', content: ok ? `🗑 已丢弃草稿: ${name}` : `草稿 "${name}" 不存在` }))
+        setIsStreaming(false)
+        return true
+      }
+
+      if (!sub || sub === 'list' || sub === 'ls') {
+        if (allSkills.length === 0) {
+          pushStatic(createLogEntry({ type: 'system', content: 'No skills found in .rivet/skills/.\nCopy a skill in with:\n  cp -r ~/.claude/skills/<name> .rivet/skills/<name>\nor list it under skills.importFromClaude in config.' }))
+        } else {
+          const lines = [...allSkills]
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map(s => {
+              const size = s.body.length > 1024 ? `${(s.body.length / 1024).toFixed(1)}KB` : `${s.body.length}B`
+              const desc = (s.description || '(no description)').replace(/\s+/g, ' ').slice(0, 120)
+              return `  ${sourceTag(s.source)} ${s.name} (${size}) — ${desc}`
+            })
+          const draftCount = listSkillDrafts(ctx.agent.cwd).length
+          const draftHint = draftCount > 0 ? `\n📝 ${draftCount} 个自动蒸馏草稿待审核 — /skill review` : ''
+          pushStatic(createLogEntry({ type: 'system', content: `Skills (${allSkills.length}):\n${lines.join('\n')}\n\nUse /skill <name> to load a skill's full instructions into the conversation.${draftHint}` }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+
+      // /skill <name> — load the FULL body into the conversation (no truncation).
+      const skill = skillRegistry.get(parts[1]!) ?? allSkills.find(s => s.name.toLowerCase() === sub)
       if (!skill) {
         pushStatic(createLogEntry({ type: 'system', content: `Skill "${parts[1]}" not found.\nUse /skill list to see available skills.` }))
         setIsStreaming(false)
         return true
       }
 
-      const skillContent = readFileSync(skill.path, 'utf8')
-      // Inject as a user message with skill preamble — the agent will treat it as context
-      pushStatic(createLogEntry({ type: 'system', content: `✅ Loaded skill: ${skill.name} (${(skill.size / 1024).toFixed(1)}KB from ${skill.source})\nThe skill prompt is now active for this conversation.` }))
+      const sizeKb = (skill.body.length / 1024).toFixed(1)
+      pushStatic(createLogEntry({ type: 'system', content: `✅ Loaded skill: ${skill.name} (${sizeKb}KB from ${skill.source ?? 'rivet'})\nThe full skill instructions are now in the conversation.` }))
 
-      // Store the skill content so the next user message can reference it
-      // We inject it as a slash command resolution that returns the skill body
+      // Append-only one-shot: the complete body becomes a normal message in
+      // history (visible all session). We deliberately do NOT use a persistent
+      // anchor — that would re-render the whole body every turn and bloat the
+      // prefix. No slice(): the full body is preserved. For directory skills we
+      // also append the sub-file tree (Tier-3 entry points), matching the
+      // `skill` tool's behaviour.
+      let payload = `[Skill loaded: ${skill.name}]\n<skill name="${skill.name}">\n${skill.body}\n</skill>`
+      if (skill.skillDir) {
+        const files = listSkillFiles(skill.skillDir)
+        if (files.length > 0) {
+          payload += `\n<skill-files dir="${skill.skillDir}" note="Read on demand with read_file/grep/glob; page large sub-files completely with offset/limit.">\n${files.map(f => '  ' + f.path).join('\n')}\n</skill-files>`
+        }
+      }
+      ctx.session.addUserMessage(payload)
       setIsStreaming(false)
-      // Push the skill as the next prompt input by returning false with the skill content
-      // Instead, add it to session as a system-pinned context via anchor
-      ctx.agent.addAnchor('user_preference', `[Active Skill: ${skill.name}]\n${skillContent.slice(0, 8000)}`)
       return true
     }
 
@@ -986,19 +1373,19 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
       const db = indexer.getDb()
       const cwd = ctx.agent.cwd ?? process.cwd()
 
-      // Read main.tsx and headless.ts for CLI extraction
-      let mainTsxSource = ''
+      // Read main.ts and headless.ts for CLI extraction
+      let mainTsSource = ''
       let headlessSource: string | null = null
-      const mainTsxPath = 'src/main.tsx'
+      const mainTsPath = 'src/main.ts'
       const headlessPath = 'src/headless.ts'
       try {
-        mainTsxSource = readFileSync(join(cwd, mainTsxPath), 'utf-8')
+        mainTsSource = readFileSync(join(cwd, mainTsPath), 'utf-8')
       } catch { /* not found */ }
       try {
         headlessSource = readFileSync(join(cwd, headlessPath), 'utf-8')
       } catch { /* not found */ }
 
-      const result = fullRebuild(db, mainTsxSource, headlessSource, mainTsxPath, headlessPath, cwd)
+      const result = fullRebuild(db, mainTsSource, headlessSource, mainTsPath, headlessPath, cwd)
       const indexBlock = generateCodebaseIndexBlock(db, getHeadSha())
 
       pushStatic(createLogEntry({ type: 'system', content: `📚 Codebase Index Rebuilt\n\n${result}\n\nIndex will be injected into agent context on next turn.` }))

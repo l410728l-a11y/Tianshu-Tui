@@ -6,18 +6,31 @@ import { createThetaRuntimeHook } from './hooks/theta-hook.js'
 import { createStigmergyRuntimeHook } from './hooks/stigmergy-hook.js'
 import { createSignalConsumerRuntimeHook } from './hooks/signal-consumer-hook.js'
 import { createPlaybookReflectHook } from './hooks/playbook-reflect-hook.js'
+import { createAnchorBreakShadowHook } from './hooks/anchor-break-shadow-hook.js'
+import { createAnchorBreakScoutHook, type AnchorBreakScoutConfig } from './hooks/anchor-break-scout-hook.js'
+import type { DelegationCoordinator } from './coordinator.js'
 import { createTelemetryFlushHook } from './hooks/telemetry-flush-hook.js'
 import { createPhysarumShadowTelemetryHook } from './hooks/physarum-shadow-telemetry-hook.js'
 import { createDreamHook } from './hooks/dream-hook.js'
+import { createSkillDistillHook } from './hooks/skill-distill-hook.js'
 import { createCourageHook } from './hooks/courage-hook.js'
 import { createRadioHook, type RadioHookDeps } from './hooks/radio-hook.js'
 import { createConsistencyCheckHook } from './hooks/consistency-check-hook.js'
 import { createMeridianHook, type MeridianHookDeps } from './hooks/meridian-hook.js'
 import { createPhysarumFileAccessHook, type PhysarumFileAccessHookDeps } from './hooks/physarum-file-access-hook.js'
 import { createSonglineRuntimeHook } from './hooks/songline-hook.js'
+import { createConstellationRuntimeHook } from './hooks/constellation-hook.js'
 import { createHearthObserveHook } from './hooks/hearth-observe-hook.js'
+import { createDedupGuardHook, type DedupGuardHookDeps } from './hooks/dedup-guard-hook.js'
 import { createBlindExplorationHook } from './hooks/blind-exploration-hook.js'
 import { createMCTSPlanningHook } from './hooks/mcts-planning-hook.js'
+import { createDispatcherHook, type DispatcherHookDeps } from './hooks/dispatcher-hook.js'
+import { createMemoryLearningPostTurnHook, type MemoryLearningHookDeps } from './hooks/memory-learning-hook.js'
+import { createUserHooksBridge, type UserHooksBridgeDeps } from './hooks/user-hooks-bridge.js'
+import { createCompanionHeartbeatHook } from './hooks/companion-heartbeat-hook.js'
+import { createCcrHook, type CcrTriggerEvent } from './hooks/cognitive-capsule-router.js'
+import { createSelfVerifyHook } from './hooks/self-verify-hook.js'
+import type { AdvisoryBus } from './advisory-bus.js'
 import type { AntiAnchoringConfig } from './anti-anchoring-config.js'
 import type { AnchorGraph } from '../prompt/anchor-graph.js'
 import { isStarSoulEnabled } from './star-soul-gate.js'
@@ -27,6 +40,7 @@ import type { DoomLoopLevel } from './trace-store.js'
 import type { TelemetryWriter } from './telemetry-writer.js'
 import type { EvidenceState } from './evidence.js'
 import type { TaskLedgerSummary } from './task-ledger.js'
+import type { ChronicleEntry } from './chronicle.js'
 import type { TrajectoryEntry } from './trajectory.js'
 import type { DomainVoiceId } from './domain-voice.js'
 import type { ContextClaim } from '../context/claims.js'
@@ -54,10 +68,21 @@ export interface RuntimeHookDeps {
     sessionId: string
     getDecisions: () => string[]
     getTrajectory: () => TrajectoryEntry[]
+    getFailureJournal?: () => import('./failure-journal.js').FailureJournal
   }
   playbookStore?: PlaybookStore
+  /** Live registry skills (name+triggers) for skill-distill dedup. */
+  getRegisteredSkills?: () => Array<{ name: string; triggers: RegExp[] }>
+  /** Disable session-end skill draft distillation. Default: enabled when dream deps exist. */
+  skillDistillDisabled?: boolean
   buildRetrospectInput?: () => RetrospectInput
   getDoomLoopLevel?: () => DoomLoopLevel
+  /** Whether convergence detection injected a kick this turn — used for kick-hook mutual exclusion. */
+  wasConvergenceTriggered?: () => boolean
+  /** SessionRegistry for cross-session fingerprint storage (playbook-reflect). */
+  sessionRegistry?: import('./session-registry.js').SessionRegistry
+  /** Current working directory — used for project-scoped fingerprint partitioning. */
+  cwd?: string
   chronicle?: { addRadio: (message: string, turn: number) => void; addPhaseTransition: (input: { fromPhase: string; toPhase: string; turn: number; summary: string }) => void }
   /** Returns current star domain id for radio voice modulation. null when no domain matched. */
   getDomainId?: () => DomainVoiceId
@@ -74,6 +99,28 @@ export interface RuntimeHookDeps {
   /** Optional cycle relay bridge for Songline substrate. */
   setCycleClose?: (sessionId: string, closeHash: string) => void
 
+  // ── Project Constellation (post-session milestone capture) ──
+  /** Explicit opt-in for auto milestone capture. Default: false. */
+  constellationEnabled?: boolean
+  /** Project root for `.rivet/constellation.json`. */
+  constellationCwd?: string
+  /** Optional chronicle entries source for milestone summary/files. */
+  getChronicleEntries?: () => readonly ChronicleEntry[]
+  /** Agent's self-chosen departure mark (leave_mark tool), recorded at close. */
+  getConstellationPendingMark?: () => import('../tools/types.js').LeaveMarkInput | null
+  /** Session numeric id for departure mark consistency. */
+  getConstellationNumericId?: () => number | null
+
+  // ── Companion Presence (postTurn heartbeat → .rivet/presence.json) ──
+  /** Opt-in for companion heartbeat hook. Default: false (only useful with multiple concurrent sessions). */
+  companionPresenceEnabled?: boolean
+  /** Project root for `.rivet/presence.json`. */
+  companionPresenceCwd?: string
+  /** Cognitive state accessor for heartbeat payload. */
+  getCognitiveSnapshot?: () => { vigor: number; stability: number; season: string } | null
+  /** Current task objective for heartbeat. */
+  getObjective?: () => string | null
+
   // ── Anti-anchoring (explicit opt-in, prompt-flow intervention) ──
   /** Explicit opt-in for anti-anchoring harness hooks. Default: disabled. */
   antiAnchoring?: AntiAnchoringConfig
@@ -83,6 +130,16 @@ export interface RuntimeHookDeps {
   callAntiAnchoringSeedModel?: (prompt: string) => Promise<string>
   /** Observe MCTS planning result for diagnostics/tests. */
   onAntiAnchoringMCTSResult?: Parameters<typeof createMCTSPlanningHook>[0]['onResult']
+
+  // ── DEDUP guard (postTurn: detect repeated summaries) ──
+  /** Get the current turn's streamed assistant text. */
+  getStreamedText?: () => string
+  /** Get the previous turn's streamed assistant text. */
+  getPrevStreamedText?: () => string | null
+  /** Store the current turn's streamed text for next turn comparison. */
+  setPrevStreamedText?: (text: string) => void
+  /** Overlap ratio threshold (0-1). Default: 0.6 */
+  dedupGuardThreshold?: number
 
   // ── HEARTH observe (pure diagnostic, no intervention) ──
   /** Explicit opt-in for HEARTH anchor invariant observation. Default: false. */
@@ -97,14 +154,36 @@ export interface RuntimeHookDeps {
   getPrevCycleOpen?: () => string | null
   /** Previous session cycle_close for INV-2 relay check. */
   getPrevSessionCycleClose?: () => string | null
+
+  // ── Auto-delegation (lazy getter, wired by main.tsx via loop.ts) ──
+  /** Optional dispatcher hook deps. When set, enables auto-delegation of exploration tasks. */
+  autoDelegate?: DispatcherHookDeps
+  /** Cross-session memory learning (postTurn observation extraction). */
+  memoryLearning?: MemoryLearningHookDeps
+  /** User-defined .rivet/hooks.json shell scripts. */
+  userHooksBridge?: UserHooksBridgeDeps
+  /** A1: unified advisory bus for noise-gated corrective signals */
+  advisoryBus?: AdvisoryBus
+  /** CCR telemetry callback — invoked on each capsule router trigger for offline analysis. */
+  onCcrTrigger?: (event: CcrTriggerEvent) => void
+  /** Sycophancy trap — courage-hook consumes its cumulative state for constitutional override */
+  sycophancyTrap?: import('./sycophancy-trap.js').SycophancyTrap
+
+  // ── P2 break-anchor scout (preTurn, opt-in real intervention) ──
+  /** Present only when antiAnchoring + anchorBreakScout are both enabled and a coordinator exists. */
+  anchorBreakScout?: {
+    config: AnchorBreakScoutConfig
+    getCoordinator: () => DelegationCoordinator | null
+    getAbortSignal?: () => AbortSignal | undefined
+  }
 }
 
 export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] {
   const hooks: RuntimeHook[] = [
     createPerceptionRuntimeHook(),
-    createSignalConsumerRuntimeHook(),
-    ...(isStarSoulEnabled() ? [createCourageHook({ cooldownTurns: 5, courageThreshold: 0.5 })] : []),
-    createKickRuntimeHook({ deposit: deps.stigmergyDeposit }),
+    createSignalConsumerRuntimeHook({ advisoryBus: deps.advisoryBus }),
+    ...(isStarSoulEnabled() ? [createCourageHook({ cooldownTurns: 5, courageThreshold: 0.5, sycophancyTrap: deps.sycophancyTrap, advisoryBus: deps.advisoryBus })] : []),
+    createKickRuntimeHook({ deposit: deps.stigmergyDeposit, wasConvergenceTriggered: deps.wasConvergenceTriggered, advisoryBus: deps.advisoryBus }),
     createVigorAfterPerceptionHook(),
     createThetaRuntimeHook({
       getThetaState: deps.getThetaState,
@@ -146,6 +225,37 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       store: deps.playbookStore,
       buildRetrospectInput: deps.buildRetrospectInput,
       getDoomLoopLevel: deps.getDoomLoopLevel,
+      registry: deps.sessionRegistry,
+      sessionId: deps.sessionId,
+      cwd: deps.cwd,
+    }))
+  }
+
+  // Anchor-break shadow (P1, observe-only): records "under-explored convergence"
+  // candidates at session end. Always registered when retrospect is available;
+  // no-ops when the meridian DB store is absent. Never mutates the session.
+  if (deps.buildRetrospectInput && deps.sessionId) {
+    hooks.push(createAnchorBreakShadowHook({
+      store: deps.meridianIndexer?.getDb() ?? null,
+      buildRetrospectInput: deps.buildRetrospectInput,
+      getSessionId: () => deps.sessionId,
+      getObjective: deps.getObjective,
+      getActiveDomainId: deps.getDomainId ? () => deps.getDomainId!() ?? null : undefined,
+    }))
+  }
+
+  // P2 break-anchor scout: real orthogonal-domain sub-agent dispatched mid-loop
+  // when a complex task is converging without breadth exploration. Opt-in only.
+  if (deps.anchorBreakScout?.config.enabled && deps.sessionId) {
+    hooks.push(createAnchorBreakScoutHook({
+      config: deps.anchorBreakScout.config,
+      getCoordinator: deps.anchorBreakScout.getCoordinator,
+      getSessionId: () => deps.sessionId,
+      getObjective: deps.getObjective ?? (() => null),
+      getActiveDomainId: deps.getDomainId ? () => deps.getDomainId!() ?? null : undefined,
+      getDoomLoopLevel: deps.getDoomLoopLevel,
+      getAbortSignal: deps.anchorBreakScout.getAbortSignal,
+      store: deps.meridianIndexer?.getDb() ?? null,
     }))
   }
 
@@ -156,7 +266,23 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       getEvidenceState: deps.getEvidenceState,
       getDecisions: deps.dream.getDecisions,
       getTrajectory: deps.dream.getTrajectory,
+      getFailureJournal: deps.dream.getFailureJournal,
+      getPlaybookStore: deps.playbookStore ? () => deps.playbookStore : undefined,
     }))
+
+    // Skill-distill: same postSession source as dream — verified, repeatable
+    // procedures are distilled into review-only SKILL.md drafts.
+    if (!deps.skillDistillDisabled) {
+      hooks.push(createSkillDistillHook({
+        cwd: deps.dream.cwd,
+        sessionId: deps.dream.sessionId,
+        getEvidenceState: deps.getEvidenceState,
+        getDecisions: deps.dream.getDecisions,
+        getTrajectory: deps.dream.getTrajectory,
+        getRegisteredSkills: deps.getRegisteredSkills,
+        getObjective: deps.getObjective,
+      }))
+    }
   }
 
   if (deps.telemetryWriter && deps.getPhysarumShadowStats) {
@@ -189,6 +315,19 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     }))
   }
 
+  if (deps.constellationEnabled && deps.constellationCwd && deps.sessionId) {
+    hooks.push(createConstellationRuntimeHook({
+      enabled: true,
+      cwd: deps.constellationCwd,
+      sessionId: deps.sessionId,
+      getPendingMark: deps.getConstellationPendingMark,
+      getTaskSummary: deps.getTaskSummary,
+      getChronicleEntries: deps.getChronicleEntries,
+      getDomainId: deps.getDomainId,
+      getNumericId: deps.getConstellationNumericId,
+    }))
+  }
+
   if (deps.hearthObserveEnabled && deps.getAnchorGraph && deps.getPrevAnchorGraphHash && deps.setPrevAnchorGraphHash) {
     hooks.push(createHearthObserveHook({
       enabled: true,
@@ -198,6 +337,56 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       getPrevCycleOpen: deps.getPrevCycleOpen ?? (() => null),
       getPrevSessionCycleClose: deps.getPrevSessionCycleClose ?? (() => null),
     }))
+  }
+
+  if (deps.getStreamedText && deps.getPrevStreamedText && deps.setPrevStreamedText) {
+    hooks.push(createDedupGuardHook({
+      getStreamedText: deps.getStreamedText,
+      getPrevStreamedText: deps.getPrevStreamedText,
+      setPrevStreamedText: deps.setPrevStreamedText,
+      threshold: deps.dedupGuardThreshold,
+      advisoryBus: deps.advisoryBus,
+    }))
+  }
+
+  // CCR: Cognitive Capsule Router — star-domain advisory routing
+  if (deps.advisoryBus && isStarSoulEnabled()) {
+    hooks.push(createCcrHook({
+      advisoryBus: deps.advisoryBus,
+      wasConvergenceTriggered: deps.wasConvergenceTriggered ?? (() => false),
+      getEvidenceState: deps.getEvidenceState,
+      cwd: deps.cwd,
+      onTrigger: deps.onCcrTrigger,
+    }))
+  }
+
+  // Self-Verify: postTurn hook — when a turn uses only read-class tools
+  // with no ground-truth verification, inject a reminder for the next turn
+  // to self-verify before building on the conclusions.
+  if (deps.advisoryBus) {
+    hooks.push(createSelfVerifyHook({ advisoryBus: deps.advisoryBus }))
+  }
+
+  if (deps.companionPresenceEnabled && deps.companionPresenceCwd && deps.sessionId) {
+    hooks.push(createCompanionHeartbeatHook({
+      cwd: deps.companionPresenceCwd,
+      getSessionId: () => deps.sessionId,
+      getDomainId: deps.getDomainId ?? (() => null),
+      getCognitiveSnapshot: deps.getCognitiveSnapshot ?? (() => null),
+      getObjective: deps.getObjective ?? (() => null),
+    }))
+  }
+
+  if (deps.autoDelegate) {
+    hooks.push(createDispatcherHook(deps.autoDelegate))
+  }
+
+  if (deps.memoryLearning) {
+    hooks.push(createMemoryLearningPostTurnHook(deps.memoryLearning))
+  }
+
+  if (deps.userHooksBridge) {
+    hooks.push(...createUserHooksBridge(deps.userHooksBridge))
   }
 
   return hooks

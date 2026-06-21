@@ -3,10 +3,19 @@ import { recommendModelForTask } from '../model/capability.js'
 import type { ProviderConfig } from '../config/schema.js'
 import { filterToolRegistry, ToolRegistry } from '../tools/registry.js'
 import { ProviderHealthTracker } from './provider-health.js'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { createHash } from 'node:crypto'
+import { debugLog } from '../utils/debug.js'
+import { CircuitBreakerManager } from './worker-circuit-breaker.js'
+import { InMemoryMailbox, type WorkerMailbox } from './worker-mailbox.js'
+import { profileRegistry } from './profile-registry.js'
 import {
   createReadOnlyWorkOrder,
   createWriteWorkOrder,
   mapWorkOrderKindToCapabilityTask,
+  parseWorkerResult,
   READ_ONLY_WORKER_TOOLS,
   WRITE_WORKER_TOOLS,
   type AggregationPolicy,
@@ -14,10 +23,13 @@ import {
   type WorkOrderKind,
   type WorkerProfile,
   type WorkerResult,
+  type WorkerBudget,
   type WorkOrderScope,
+  clampWorkerMaxTurns,
 } from './work-order.js'
 import { buildPrimaryWorkerPacket } from './worker-prompts.js'
 import { runWorkerSession, type WorkerSessionConfig, type WorkerSessionRun } from './worker-session.js'
+import { WorkerLiveness, EXPLORE_STALL_MS, WRITE_STALL_MS } from './worker-liveness.js'
 import { runHandsSession, type HandsSessionConfig, type HandsSessionRun } from './hands-session.js'
 import { WorktreeCoordinator } from './worktree-coordinator.js'
 import { classifyProfile } from './coordination-policy.js'
@@ -44,6 +56,49 @@ import {
   persistGatedInfluenceAudit,
   type GatedInfluenceAuditEvent,
 } from './gated-influence-audit.js'
+import { buildModelPolicyCandidates, selectModelPolicy } from './model-policy-selection.js'
+import { buildHistoricalModelRewards } from './model-reward-summary.js'
+import type { EFEComponents } from './prediction-error.js'
+import type { Sensorium } from './sensorium.js'
+
+/** Per-turn free-energy signals pulled from the primary loop at delegation time. */
+export interface EFERoutingSignals {
+  efe: EFEComponents
+  sensorium: Pick<Sensorium, 'complexity' | 'pressure' | 'confidence' | 'stability'>
+}
+
+export interface EFERoutingConfig {
+  /** Gated apply. When false, EFE ranking runs shadow-only (audit events, no dispatch effect). */
+  enabled: boolean
+  /** Pull latest EFE + sensorium from the primary loop. Undefined → skip EFE routing this call. */
+  getSignals: () => EFERoutingSignals | undefined
+}
+
+/** Real-time activity event from an in-flight worker (T9 P3 实时上行). */
+export interface WorkerActivityEvent {
+  workOrderId: string
+  profile: string
+  /** 星域 id（星名来源），由 coordinator 从 order.authority 透传。 */
+  authority?: string
+  kind: 'text' | 'thinking' | 'tool_use' | 'tool_result'
+  /** Tool name for tool events; text delta for text/thinking. */
+  detail?: string
+}
+
+/**
+ * Derive a stable WorkOrder id from a parentTurnId that carries a known
+ * scheduling prefix:
+ *  - `team:` — planner/task ids, so WorkOrderQueue can resolve dependency refs;
+ *  - `council:` —议事会席位 id，让 runCouncil 能用 result.workOrderId 把每席
+ *    结果绑回对应席位（=== `council:seat-${seat}`）。
+ * Returns undefined for ad-hoc turns — caller falls back to `wo_<uuid>`.
+ * 取末两段（slice(-2)）以容忍 `prefix:team:T1` / `prefix:council:seat-x` 形态。
+ */
+export function deriveStableWorkOrderId(parentTurnId: string): string | undefined {
+  return /\b(team|council):/.test(parentTurnId)
+    ? parentTurnId.split(':').slice(-2).join(':')
+    : undefined
+}
 
 export interface DelegationRequest {
   parentTurnId: string
@@ -53,6 +108,13 @@ export interface DelegationRequest {
   scope: WorkOrderScope
   /** Review-router re-entrancy depth to pass into worker tool contexts. */
   reviewDepth?: number
+  /** B3: delegation nesting depth (0 = primary → worker). Requests at
+   *  MAX_DELEGATION_DEPTH or deeper are rejected as blocked. */
+  delegationDepth?: number
+  /** Real-time worker activity upstream (T9 P3). Fired for every worker
+   *  text/thinking/tool event so the calling tool can stream live progress
+   *  into the UI tool card. NOT serialized into the WorkOrder. */
+  onActivity?: (event: WorkerActivityEvent) => void
   /** Work order IDs this task depends on — propagated to WorkOrder.dependencies. */
   dependencies?: string[]
   /** Logical group identifier for related tasks (e.g. team wave). */
@@ -64,12 +126,20 @@ export interface DelegationRequest {
   authority?: string
   /** Team planner risk tier for shadow-only model tier recommendation. */
   riskTier?: ModelRiskTier
+  /** B2: current session turn for progressive timeout alignment. */
+  sessionTurn?: number
+  /** Per-request budget overrides (timeout/turns/tokens/retries). Takes
+   *  precedence over profile defaults — used e.g. by the auto wiring review
+   *  to run a reviewer-profile worker on a short, non-blocking budget. */
+  budget?: Partial<WorkerBudget>
 }
 
 export interface CoordinatorRun {
   status: 'completed' | 'skipped'
   order?: WorkOrder
   selectedModel?: string
+  /** True when consecutive failures exceed threshold — primary agent should switch to inline execution. */
+  escalated?: boolean
   /** Batch-only metadata: selected worker model per work order. Telemetry only; never affects dispatch. */
   workerModels?: Array<{ workOrderId: string; model: string }>
   /** Append-only tier recommendation telemetry; shadow-only and never affects dispatch. */
@@ -98,7 +168,12 @@ export interface WorkerRouteConfig {
 export interface DelegationCoordinatorConfig {
   baseToolRegistry: ToolRegistry
   modelCards: ModelCapabilityCard[]
+  /** Global max concurrent workers (cap for both explore and write pools). */
   maxWorkers: number
+  /** Max concurrent explore (read-only) workers. Default: maxWorkers. */
+  maxExploreWorkers?: number
+  /** Max concurrent hands (write) workers. Default: maxWorkers. */
+  maxWriteWorkers?: number
   runtimeFactory: WorkerRuntimeFactory
   routing?: WorkerRouteConfig
   runWorker?: (config: WorkerSessionConfig) => Promise<WorkerSessionRun>
@@ -118,6 +193,13 @@ export interface DelegationCoordinatorConfig {
    *  rejects the outer promise, so zombie workers are cleaned up immediately
    *  instead of waiting for their internal 180s timeout. */
   abortSignal?: AbortSignal
+  /** Review-specific model cards keyed by WorkerProfile name (e.g. 'adversarial_verifier',
+   *  'reviewer', 'verifier', 'patcher'). When a delegated work order's profile matches
+   *  a key, the override card is used directly (bypasses tier filtering and worker
+   *  routing). Lets review workers use a different provider/model from the session's
+   *  primary — key motivation: prevent prefixCache:'none' provider (GLM/Kimi/Codex)
+   *  review workers from evicting the main session's server-side cache. */
+  reviewOverrideCards?: Map<string, ModelCapabilityCard>
   /** V3 Component B: domain knowledge store for precipitate/recall lifecycle.
    *  When provided, coordinator auto-precipitates lessons from worker results. */
   domainKnowledgeStore?: DomainKnowledgeStore
@@ -127,6 +209,22 @@ export interface DelegationCoordinatorConfig {
   modelTierBanditEnabled?: boolean
   /** Append-only unified gated influence audit store. Defaults to modelTierShadowStore when omitted. */
   gatedInfluenceAuditStore?: import('./gated-influence-audit.js').GatedInfluenceAuditStore | null
+  /** Track 1: EFE × provider-health worker model routing.
+   *  Always audited; applied to dispatch only when enabled (explicit user routing
+   *  config still takes precedence over EFE). */
+  efeRouting?: EFERoutingConfig
+  /** A4: silence tolerance before an in-flight worker is considered stalled
+   *  and aborted by the sweep. Defaults to EXPLORE_STALL_MS (write workers
+   *  get WRITE_STALL_MS). Workers die for silence, never for duration. */
+  workerStallMs?: number
+  /** Injectable clock for liveness tests. */
+  livenessClock?: () => number
+  /** T5: enable fingerprint-based result resume. Default false (opt-in); set true in bootstrap. */
+  resumeEnabled?: boolean
+  /** Per-profile circuit breaker — fast-fails delegation to profiles that are
+   *  repeatedly failing, preventing cascade waste. When omitted a default
+   *  instance is created internally. */
+  circuitBreaker?: CircuitBreakerManager
 }
 
 export function shouldDelegateObjective(objective: string, scope: WorkOrderScope): boolean {
@@ -134,7 +232,7 @@ export function shouldDelegateObjective(objective: string, scope: WorkOrderScope
   return words >= 6 || (scope.files?.length ?? 0) >= 2 || (scope.symbols?.length ?? 0) >= 2
 }
 
-function workerFailureResult(order: WorkOrder, error: unknown): WorkerResult {
+function workerFailureResult(order: WorkOrder, error: unknown, nextActions?: string[]): WorkerResult {
   const reason = error instanceof Error ? error.message : String(error)
   return {
     workOrderId: order.id,
@@ -144,9 +242,109 @@ function workerFailureResult(order: WorkOrder, error: unknown): WorkerResult {
     artifacts: [{ kind: 'risk', title: 'Worker execution failed', content: reason }],
     changedFiles: [],
     risks: [`worker failed: ${reason}`],
-    nextActions: ['Primary should continue without trusting this worker result'],
+    nextActions: nextActions ?? ['Primary should continue without trusting this worker result'],
     evidenceStatus: 'blocked',
   }
+}
+
+/**
+ * A3: a task whose dependency failed (or never completed) must be reported as
+ * `blocked`, not silently dropped. Without this, `delegateBatch` returns
+ * "completed" while dependents of a failed worker vanish from `run.results` —
+ * the primary never learns the sub-tree was abandoned.
+ */
+function blockedDependencyResult(order: WorkOrder, unmetDeps: string[], failedDeps: string[]): WorkerResult {
+  const detail = failedDeps.length > 0
+    ? `dependency failed: ${failedDeps.join(', ')}`
+    : `dependency never completed: ${unmetDeps.join(', ')}`
+  return {
+    workOrderId: order.id,
+    status: 'blocked',
+    summary: `Task blocked — ${detail}`,
+    findings: [],
+    artifacts: [{ kind: 'risk', title: 'Dependency unmet', content: detail }],
+    changedFiles: [],
+    risks: [`blocked by unmet dependency: ${detail}`],
+    nextActions: ['Re-dispatch this task after its dependency succeeds, or drop the dependency'],
+    evidenceStatus: 'blocked',
+  }
+}
+
+/** Persist worker result to ~/.rivet/subagents/<orderId>.json for future resume/inspection. */
+function persistWorkerResult(result: WorkerResult, fingerprint?: string): void {
+  try {
+    const dir = join(homedir(), '.rivet', 'subagents')
+    mkdirSync(dir, { recursive: true })
+    const json = JSON.stringify(result, null, 2)
+    writeFileSync(join(dir, `${result.workOrderId}.json`), json, 'utf-8')
+    // T5: also write a fingerprint-indexed copy for resume lookup
+    if (fingerprint) {
+      writeFileSync(join(dir, `${fingerprint}.json`), json, 'utf-8')
+    }
+  } catch {
+    // Best-effort: never block primary session on persistence failure
+  }
+}
+
+/** B1: read back a previously persisted worker result for resume/inspection.
+ *  The persistWorkerResult sink used to have no reader (write-only grave).
+ *  Returns null on cold miss or unparseable content — callers must handle it. */
+export function loadPersistedResult(orderId: string, homeDir = homedir()): WorkerResult | null {
+  try {
+    const path = join(homeDir, '.rivet', 'subagents', `${orderId}.json`)
+    if (!existsSync(path)) return null
+    return parseWorkerResult(readFileSync(path, 'utf-8'), orderId)
+  } catch {
+    return null
+  }
+}
+
+/** T5: fingerprint a delegation request for result reuse. */
+function fingerprintRequest(objective: string, files: string[] | undefined, profile: string): string {
+  const key = `${objective}|${(files ?? []).sort().join(',')}|${profile}`
+  return createHash('sha256').update(key).digest('hex').slice(0, 16)
+}
+
+/** T5: scan ~/.rivet/subagents/ for a matching completed result within the last hour. */
+function tryResumeWorkerResult(
+  objective: string,
+  files: string[] | undefined,
+  profile: string,
+  nowMs: number,
+  homeDir = homedir(),
+): WorkerResult | null {
+  const fp = fingerprintRequest(objective, files, profile)
+  const path = join(homeDir, '.rivet', 'subagents', `${fp}.json`)
+  if (!existsSync(path)) return null
+  try {
+    const stat = statSync(path)
+    if (nowMs - stat.mtimeMs > 3_600_000) return null
+    const result = parseWorkerResult(readFileSync(path, 'utf-8'), fp)
+    if (result && result.status === 'passed') {
+      return { ...result, summary: `[resumed] ${result.summary}` }
+    }
+  } catch {
+    // Corrupt file — skip
+  }
+  return null
+}
+
+/** B3: max delegation nesting depth — primary(0) → worker(1) → grand-worker(2 ✗).
+ *  Aligned with Cursor's "nested but gated" stance rather than Claude's full ban:
+ *  planner profiles legitimately think-then-delegate, but unbounded recursion
+ *  must be impossible. */
+export const MAX_DELEGATION_DEPTH = 2
+
+/** B2: background (async) work order handle — Cursor `is_background` analog.
+ *  The parent is NOT blocked; results are collected later by id (and are also
+ *  persisted to ~/.rivet/subagents/ by the normal dispatch path). */
+export interface BackgroundRunHandle {
+  id: string
+  objective: string
+  startedAt: number
+  status: 'running' | 'completed' | 'failed'
+  run?: CoordinatorRun
+  error?: string
 }
 
 export class DelegationCoordinator {
@@ -154,19 +352,163 @@ export class DelegationCoordinator {
   private runHands: (config: HandsSessionConfig) => Promise<HandsSessionRun>
   private state: CoordinatorState
   private collaboration: CollaborationProtocol | null
+  /** A4: per-worker silence clocks — the runtime primary gate. */
+  private readonly liveness: WorkerLiveness
+  /** A4: per-order controllers so a stall sweep aborts only the wedged worker. */
+  private readonly orderControllers = new Map<string, AbortController>()
+  /** T9 P3: per-order real-time activity upstream (request callback survives
+   *  the zod request→order conversion via this side table). */
+  private readonly activityUpstream = new Map<string, (event: WorkerActivityEvent) => void>()
+  private stallSweep: ReturnType<typeof setInterval> | null = null
+  /** T3: Flash→Pro escalation counter per session. Max 3 Pro upgrades. */
+  private proUpgradeCount = 0
+  private static readonly MAX_PRO_UPGRADES = 3
+  /** Per-profile circuit breaker for fast-failing repeatedly broken profiles. */
+  readonly circuitBreaker: CircuitBreakerManager
+  /** Structured mailbox for inter-agent communication within a delegation wave. */
+  readonly mailbox: WorkerMailbox
 
   constructor(private config: DelegationCoordinatorConfig) {
     this.runWorker = config.runWorker ?? runWorkerSession
     this.runHands = config.runHands ?? runHandsSession
     this.state = new CoordinatorState(config.maxWorkers)
     this.collaboration = config.collaboration ? new CollaborationProtocol(config.collaboration) : null
+    this.liveness = new WorkerLiveness({
+      stallMs: config.workerStallMs ?? EXPLORE_STALL_MS,
+      now: config.livenessClock,
+    })
+    this.circuitBreaker = config.circuitBreaker ?? new CircuitBreakerManager()
+    this.mailbox = new InMemoryMailbox()
+  }
+
+  /** Lazily start the stall sweep; stop it when no workers are in flight. */
+  private ensureStallSweep(): void {
+    if (this.stallSweep) return
+    const stallMs = this.config.workerStallMs ?? EXPLORE_STALL_MS
+    const intervalMs = Math.min(Math.max(Math.floor(stallMs / 2), 50), 15_000)
+    const sweep = setInterval(() => {
+      for (const id of this.liveness.stalled()) {
+        // Abort ONLY the wedged worker — its processNext falls to catch →
+        // workerFailureResult; Promise.all(inflight) is unaffected.
+        this.orderControllers.get(id)?.abort()
+        this.liveness.unregister(id)
+      }
+      if (this.liveness.size() === 0) this.stopStallSweep()
+    }, intervalMs)
+    sweep.unref() // never keep the process alive
+    this.stallSweep = sweep
+  }
+
+  private stopStallSweep(): void {
+    if (this.stallSweep) {
+      clearInterval(this.stallSweep)
+      this.stallSweep = null
+    }
+  }
+
+  /**
+   * 释放进程级资源：用于丢弃 coordinator 时（典型场景是 sidecar
+   * switchModel 重建装配栈）。调用后实例不得复用。
+   *
+   * 副作用：
+   * - clearInterval(stallSweep)——`.unref()` 已防止其阻塞进程退出，但
+   *   sidecar 长驻进程频繁 switchModel 会累积泄漏的 timer。
+   * - abort 所有在途 orderControllers——worker 的 processNext 走 catch
+   *   → workerFailureResult 路径，消费者收到 degraded run。
+   * - 清空 orderControllers / activityUpstream / backgroundRuns / backgroundPromises
+   *   引用，便于 GC 立刻回收（不主动 reject promise，让 worker 自然结算）。
+   *
+   * 不清理 mailbox / circuitBreaker / collaboration——它们不持有 timer/进程级资源。
+   */
+  shutdown(): void {
+    this.stopStallSweep()
+    for (const controller of this.orderControllers.values()) {
+      try { controller.abort() } catch { /* ignore */ }
+    }
+    this.orderControllers.clear()
+    this.activityUpstream.clear()
+    this.backgroundRuns.clear()
+    this.backgroundPromises.clear()
+  }
+
+  // ── B2: background (async) work orders ──
+
+  private readonly backgroundRuns = new Map<string, BackgroundRunHandle>()
+  private readonly backgroundPromises = new Map<string, Promise<CoordinatorRun>>()
+
+  /** Dispatch a worker WITHOUT blocking the caller. Returns a handle id —
+   *  poll with getBackgroundRun() or await with waitBackgroundRun(). */
+  delegateBackground(request: DelegationRequest, abortSignal?: AbortSignal): string {
+    const id = `bg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+    const handle: BackgroundRunHandle = {
+      id,
+      objective: request.objective,
+      startedAt: Date.now(),
+      status: 'running',
+    }
+    this.backgroundRuns.set(id, handle)
+    const promise = this.delegate(request, abortSignal).then(
+      (run) => {
+        // T3 alignment: delegate() now converts worker exceptions into degraded
+        // completed results (Flash→Pro escalation). Detect degraded runs so the
+        // background handle still reflects failure for waitBackgroundRun() callers.
+        const resultStatus = run.results[0]?.status
+        if (run.status === 'completed' && resultStatus && resultStatus !== 'passed') {
+          const reason = run.results[0]?.summary ?? `Worker returned ${resultStatus}`
+          handle.status = 'failed'
+          handle.error = reason
+          handle.run = run
+          throw new Error(reason)
+        }
+        handle.status = 'completed'
+        handle.run = run
+        return run
+      },
+      (error: unknown) => {
+        handle.status = 'failed'
+        handle.error = error instanceof Error ? error.message : String(error)
+        throw error
+      },
+    )
+    // Swallow unhandled rejection — the error is captured on the handle and
+    // re-surfaces when the caller awaits waitBackgroundRun().
+    promise.catch(() => {})
+    this.backgroundPromises.set(id, promise)
+    return id
+  }
+
+  /** Non-blocking status check for a background run. */
+  getBackgroundRun(id: string): BackgroundRunHandle | undefined {
+    return this.backgroundRuns.get(id)
+  }
+
+  /** Await a background run's completion (rethrows its failure). */
+  async waitBackgroundRun(id: string): Promise<CoordinatorRun> {
+    const p = this.backgroundPromises.get(id)
+    if (!p) throw new Error(`Unknown background run: ${id}`)
+    return p
+  }
+
+  /** All background handles, newest first. */
+  listBackgroundRuns(): BackgroundRunHandle[] {
+    return [...this.backgroundRuns.values()].sort((a, b) => b.startedAt - a.startedAt)
   }
 
   getState(): CoordinatorState {
     return this.state
   }
 
-  private selectModelForTask(task: CapabilityTask, preferredTier?: ModelTier): ModelCapabilityCard {
+  private selectModelForTask(task: CapabilityTask, preferredTier?: ModelTier, profile?: string): ModelCapabilityCard {
+    // Review override fast path: when a profile-targeted override card is configured,
+    // use it directly. Bypasses tier filtering + worker routing — review workers
+    // get exactly the user-configured provider/model. Set up by bootstrap.ts from
+    // config.agent.review.profiles. Skip when absent → fall through to normal flow.
+    if (profile && this.config.reviewOverrideCards?.has(profile)) {
+      const overrideCard = this.config.reviewOverrideCards.get(profile)!
+      debugLog(`[worker-model] review-override: profile=${profile} → ${overrideCard.model} ✓`)
+      return overrideCard
+    }
+
     const eligibleCards = preferredTier
       ? this.config.modelCards.filter(card => inferModelTierFromCard(card) === preferredTier)
       : this.config.modelCards
@@ -186,12 +528,131 @@ export class DelegationCoordinator {
           const routeHasCredentials = !provider || provider.auth?.type === 'oauth' || Boolean(provider.apiKey || (provider.apiKeyEnv && process.env[provider.apiKeyEnv]))
           if (routeModelExists && routeHasCredentials) {
             const routed = cards.find(c => c.model === routeProfile.model)
-            if (routed) return routed
+            if (routed) {
+              debugLog(`[worker-model] routing: task=${task} → ${routeName} → ${routeProfile.provider}/${routeProfile.model} ✓`)
+              return routed
+            }
+            debugLog(`[worker-model] routing: task=${task} → ${routeName} → ${routeProfile.model} NOT in cards=[${cards.map(c => c.model).join(',')}]`)
+          } else {
+            debugLog(`[worker-model] routing: task=${task} → ${routeName} skipped (modelExists=${routeModelExists} creds=${routeHasCredentials})`)
           }
+        } else {
+          debugLog(`[worker-model] routing: task=${task} → ${routeName} skipped (provider ${routeProfile.provider} is cold)`)
         }
       }
     }
-    return recommendModelForTask(task, cards)
+    // Track 1: EFE × provider-health routing — consulted after explicit user
+    // routing (user intent wins) but before the static capability heuristic.
+    const efeChoice = this.selectModelByEFE(task, cards)
+    if (efeChoice) {
+      debugLog(`[worker-model] efe-routing: task=${task} → ${efeChoice.model}`)
+      return efeChoice
+    }
+
+    const fallback = recommendModelForTask(task, cards)
+    debugLog(`[worker-model] fallback: task=${task} → ${fallback.model} (routing=${this.config.routing ? 'configured' : 'none'})`)
+    return fallback
+  }
+
+  /**
+   * EFE model selection over the candidate cards, re-ranked by Physarum
+   * provider health: cold-tier providers are excluded, degraded providers pay
+   * an EFE penalty proportional to lost weight. Every evaluation emits a
+   * gated-influence audit event; dispatch is only affected when
+   * `efeRouting.enabled` is true (shadow→gated pattern).
+   */
+  private selectModelByEFE(task: CapabilityTask, cards: ModelCapabilityCard[]): ModelCapabilityCard | undefined {
+    const cfg = this.config.efeRouting
+    if (!cfg) return undefined
+
+    let signals: EFERoutingSignals | undefined
+    try {
+      signals = cfg.getSignals()
+    } catch {
+      return undefined
+    }
+    if (!signals) return undefined
+
+    const weights = this.config.providerHealth?.getWeights() ?? []
+    const healthFor = (model: string) => {
+      const providerId = this.providerIdForModel(model)
+      if (!providerId) return undefined
+      return weights.find(h => h.providerId === providerId)
+    }
+
+    const warmOrHot = cards.filter(card => healthFor(card.model)?.tier !== 'cold')
+    const pool = warmOrHot.length > 0 ? warmOrHot : cards
+
+    let best: { model: string; expectedFreeEnergy: number; adjustedG: number } | undefined
+    try {
+      const historicalRewards = buildHistoricalModelRewards(this.config.modelTierShadowStore)
+      const ranked = selectModelPolicy({
+        candidates: buildModelPolicyCandidates(pool, { historicalRewards }),
+        efe: signals.efe,
+        sensorium: signals.sensorium,
+      })
+      if (ranked.length === 0) return undefined
+
+      const adjusted = ranked
+        .map(sel => {
+          const h = healthFor(sel.model)
+          const penalty = h ? 0.25 * (1 - h.weight) : 0
+          return { model: sel.model, expectedFreeEnergy: sel.expectedFreeEnergy, adjustedG: sel.expectedFreeEnergy + penalty }
+        })
+        .sort((a, b) => a.adjustedG - b.adjustedG || a.model.localeCompare(b.model))
+      best = adjusted[0]!
+    } catch {
+      return undefined
+    }
+
+    const applied = cfg.enabled
+    persistGatedInfluenceAudit(
+      this.config.gatedInfluenceAuditStore ?? this.config.modelTierShadowStore,
+      buildGatedInfluenceAuditEvent({
+        source: 'model_routing',
+        sessionId: this.config.sessionId ?? 'unknown',
+        targetId: `efe_routing:${task}`,
+        gateOpen: cfg.enabled,
+        applied,
+        reason: applied
+          ? `EFE routing selected ${best.model} (G=${best.expectedFreeEnergy}, health-adjusted=${best.adjustedG})`
+          : 'shadow only — efeRouting.enabled=false',
+        evidenceWindow: {
+          task,
+          selectedModel: best.model,
+          expectedFreeEnergy: best.expectedFreeEnergy,
+          healthAdjustedG: best.adjustedG,
+          candidateCount: pool.length,
+          coldExcluded: cards.length - pool.length,
+        },
+      }),
+    )
+
+    if (!applied) return undefined
+    return cards.find(c => c.model === best.model)
+  }
+
+  /** Resolve which routing provider serves a given model id (or alias). */
+  private providerIdForModel(modelId: string): string | undefined {
+    const providers = this.config.routing?.providers
+    if (!providers) return undefined
+    for (const [id, prov] of Object.entries(providers)) {
+      if (prov.models.some(m => m.id === modelId || m.alias === modelId)) return id
+    }
+    return undefined
+  }
+
+  /** Feed worker run outcomes into the Physarum provider health tracker.
+   *  Only API/runtime-level outcomes count — a worker that completes with a
+   *  failed task verdict still proves the provider is healthy. */
+  private recordProviderOutcome(modelId: string, ok: boolean): void {
+    const health = this.config.providerHealth
+    if (!health) return
+    const providerId = this.providerIdForModel(modelId)
+    if (!providerId) return
+    health.registerProvider(providerId)
+    if (ok) health.recordSuccess(providerId)
+    else health.recordFailure(providerId)
   }
 
   private buildTierRecommendation(order: WorkOrder): ModelTierRecommendation {
@@ -219,6 +680,24 @@ export class DelegationCoordinator {
     })
   }
 
+  /** Record a Flash→Pro escalation event: increment quota, persist shadow, return event for caller's array. */
+  private recordEscalation(order: WorkOrder, strongCard: ModelCapabilityCard, errorMsg: string): ModelTierShadowEvent {
+    this.proUpgradeCount++
+    const shadow = buildModelTierShadowEvent({
+      sessionId: this.config.sessionId ?? 'unknown',
+      workOrderId: order.id,
+      authority: order.authority,
+      profile: order.profile,
+      kind: order.kind,
+      recommendedTier: 'strong',
+      actualModel: strongCard.model,
+      actualTier: 'strong',
+      reason: `Flash→Pro 升级重试 #${this.proUpgradeCount}: 上次尝试失败 "${errorMsg.slice(0, 200)}"`,
+    })
+    persistModelTierShadow(this.config.modelTierShadowStore, shadow)
+    return shadow
+  }
+
   private evaluateTierInfluence(recommendation: ModelTierRecommendation): { candidate: ModelTierBanditRecommendation; gate: ModelTierGateDecision } {
     const state = buildHistoricalModelTierState(this.config.modelTierShadowStore)
     const candidate = recommendModelTierArm(state)
@@ -233,27 +712,97 @@ export class DelegationCoordinator {
     return { candidate, gate }
   }
 
+  /** Drain mailbox into run packet and clear. Called after every wave (batch or single). */
+  private async drainMailboxIntoRun(run: CoordinatorRun): Promise<CoordinatorRun> {
+    const findings = this.mailbox.byType('finding')
+    const escalations = this.mailbox.byType('escalation')
+    const notes: string[] = []
+    for (const f of findings) notes.push(`📬 ${f.from}: ${f.payload.summary}`)
+    for (const e of escalations) notes.push(`🚨 ${e.from}: ${e.payload.summary}`)
+    this.mailbox.clear()
+    if (notes.length === 0) return run
+    return { ...run, packet: `${run.packet}\n\nMailbox:\n${notes.join('\n')}` }
+  }
+
   async delegate(request: DelegationRequest, abortSignal?: AbortSignal): Promise<CoordinatorRun> {
     // Per-call abort signal override — allows the tool pipeline to propagate
     // its timeout signal to the coordinator without mutating config.
     const savedSignal = this.config.abortSignal
     if (abortSignal) this.config.abortSignal = abortSignal
     try {
+      // B3: hard depth cap — nesting allowed (planner workers think-then-
+      // delegate) but bounded. Reject, don't throw: the requesting worker
+      // gets a structured blocked result it can act on.
+      const depth = request.delegationDepth ?? 0
+      if (depth >= MAX_DELEGATION_DEPTH) {
+        return {
+          status: 'completed',
+          results: [{
+            workOrderId: `depth-capped-${request.parentTurnId}`,
+            status: 'blocked',
+            summary: `Delegation rejected: max delegation depth (${MAX_DELEGATION_DEPTH}) reached — do the work inline instead of delegating further`,
+            findings: [],
+            artifacts: [],
+            changedFiles: [],
+            risks: ['unbounded delegation recursion prevented'],
+            nextActions: ['Perform the objective directly in this worker session'],
+            evidenceStatus: 'blocked',
+          }],
+          packet: await buildPrimaryWorkerPacket([]),
+        }
+      }
+
       if (!shouldDelegateObjective(request.objective, request.scope)) {
         return {
           status: 'skipped',
           results: [],
-          packet: buildPrimaryWorkerPacket([]),
+          packet: await buildPrimaryWorkerPacket([]),
+        }
+      }
+
+      // Circuit breaker: fast-fail tier-locked profiles (Flash army) that are tripped.
+      // Non-locked profiles use Flash→Pro escalation as their resilience mechanism.
+      const profileDef = profileRegistry.get(request.profile)
+      if (profileDef?.tierLock) {
+        const circuitCheck = this.circuitBreaker.canDelegate(request.profile)
+        if (!circuitCheck.allowed) {
+          return {
+            status: 'completed',
+            results: [{
+              workOrderId: `circuit-open-${request.parentTurnId}`,
+              status: 'blocked',
+              summary: `Circuit breaker open: ${circuitCheck.reason}`,
+              findings: [],
+              artifacts: [{ kind: 'risk', title: 'Circuit breaker tripped', content: circuitCheck.reason ?? 'Profile circuit is open' }],
+              changedFiles: [],
+              risks: [`circuit breaker: ${request.profile} is open`],
+              nextActions: ['Wait for cooldown or use a different profile'],
+              evidenceStatus: 'blocked',
+            }],
+            packet: await buildPrimaryWorkerPacket([]),
+          }
+        }
+      }
+
+      // T5: fingerprint-based resume — only read-only profiles can resume; write results are never safe to replay
+      const _isWrite = classifyProfile(request.profile) === 'hands'
+      const resumeHit = !_isWrite && this.config.resumeEnabled === true
+        ? tryResumeWorkerResult(request.objective, request.scope.files, request.profile, Date.now())
+        : null
+      if (resumeHit) {
+        return {
+          status: 'completed',
+          selectedModel: '[resumed]',
+          modelTierShadows: [],
+          modelTierGatedDecisions: [],
+          gatedInfluenceAudits: [],
+          results: [resumeHit],
+          packet: await buildPrimaryWorkerPacket([resumeHit]),
         }
       }
 
       const isWrite = classifyProfile(request.profile) === 'hands'
-      // Derive stable WorkOrder ID from parentTurnId when it follows the
-      // pattern "prefix:team:T1" — this lets WorkOrderQueue resolve
-      // dependencies that reference stable team task IDs.
-      const stableId = /\bteam:/.test(request.parentTurnId)
-        ? request.parentTurnId.split(':').slice(-2).join(':')
-        : undefined
+      const stableId = deriveStableWorkOrderId(request.parentTurnId)
       const order = isWrite
         ? createWriteWorkOrder({
             id: stableId,
@@ -263,9 +812,12 @@ export class DelegationCoordinator {
             objective: request.objective,
             scope: request.scope,
             reviewDepth: request.reviewDepth,
+            delegationDepth: (request.delegationDepth ?? 0) + 1,
             dependencies: request.dependencies,
             authority: request.authority,
             riskTier: request.riskTier,
+            sessionTurn: request.sessionTurn,
+            budget: request.budget,
           })
         : createReadOnlyWorkOrder({
             id: stableId,
@@ -275,12 +827,18 @@ export class DelegationCoordinator {
             objective: request.objective,
             scope: request.scope,
             reviewDepth: request.reviewDepth,
+            delegationDepth: (request.delegationDepth ?? 0) + 1,
             dependencies: request.dependencies,
             authority: request.authority,
             riskTier: request.riskTier,
+            sessionTurn: request.sessionTurn,
+            budget: request.budget,
           })
 
-      return await this.delegateOrder(order)
+      // T9 P3: callbacks don't survive zod parsing — stash by order id.
+      if (request.onActivity) this.activityUpstream.set(order.id, request.onActivity)
+      const run = await this.delegateOrder(order)
+      return this.drainMailboxIntoRun(run)
     } finally {
       this.config.abortSignal = savedSignal
     }
@@ -295,7 +853,7 @@ export class DelegationCoordinator {
         status: 'completed',
         order,
         results: [workerFailureResult(order, new Error('Delegation aborted: caller signal fired'))],
-        packet: buildPrimaryWorkerPacket([]),
+        packet: await buildPrimaryWorkerPacket([]),
       }
     }
 
@@ -322,14 +880,17 @@ export class DelegationCoordinator {
             nextActions: ['Reduce file scope or increase maxFiles budget'],
             evidenceStatus: 'blocked',
           }],
-          packet: buildPrimaryWorkerPacket([]),
+          packet: await buildPrimaryWorkerPacket([]),
         }
       }
     }
 
     const tierRecommendation = this.buildTierRecommendation(order)
     const tierInfluence = this.evaluateTierInfluence(tierRecommendation)
-    const selected = this.selectModelForTask(task, tierInfluence.gate.applied ? tierInfluence.gate.effectiveTier : undefined)
+    const preferredTier = tierInfluence.gate.applied
+      ? tierInfluence.gate.effectiveTier
+      : tierRecommendation.tier
+    let selected = this.selectModelForTask(task, preferredTier, order.profile)
     const selectedTier = inferModelTierFromCard(selected)
     const tierShadow = this.buildTierShadow(order, selected, tierRecommendation)
     const tierGatedDecision = buildModelTierGatedDecisionEvent({
@@ -367,15 +928,44 @@ export class DelegationCoordinator {
     // Use the work order's allowedTools (from ProfileRegistry) instead of hardcoded sets
     const workerRegistry = filterToolRegistry(this.config.baseToolRegistry, order.allowedTools)
     const workerConfig = this.config.runtimeFactory(order, selected, workerRegistry)
+    // R3.1: the runtime factory returns a generic default maxTurns; clamp it to
+    // the work order's per-profile budget so caps like reviewer=6 actually bite.
+    // Covers both read (runWorker) and write (runHands → runWorker) paths.
+    workerConfig.maxTurns = clampWorkerMaxTurns(workerConfig.maxTurns, order.budget.maxTurns)
     workerConfig.reviewDepth = order.reviewDepth
     workerConfig.domainKnowledgeStore = this.config.domainKnowledgeStore
-    // Propagate parent abort signal so worker stops immediately on abort
+    workerConfig.mailbox = this.mailbox
+
+    // A4: per-order AbortController merged with the parent signal — the stall
+    // sweep can abort ONLY this worker without touching its batch siblings,
+    // while a parent abort still kills everything.
+    const parentSignal = this.config.abortSignal
+    const orderController = new AbortController()
+    const mergedSignal = parentSignal
+      ? AbortSignal.any([parentSignal, orderController.signal])
+      : orderController.signal
+    // Propagate merged signal so worker stops immediately on abort
     // instead of waiting for its internal budget timeout (中间层 #1).
-    workerConfig.abortSignal = this.config.abortSignal
+    workerConfig.abortSignal = mergedSignal
+    // A2: worker liveness signal feeds the stall clock.
+    // T9 P3: …and fans out to the per-request real-time upstream, so the
+    // calling tool can stream live worker progress into the UI.
+    const upstreamActivity = workerConfig.onActivity
+    const requestUpstream = this.activityUpstream.get(order.id)
+    workerConfig.onActivity = (kind, detail) => {
+      this.liveness.tick(order.id)
+      upstreamActivity?.(kind, detail)
+      try {
+        requestUpstream?.({ workOrderId: order.id, profile: order.profile, authority: order.authority, kind, detail })
+      } catch { /* UI upstream must never break dispatch */ }
+    }
 
     this.state.recordEvent({ type: 'running', workOrderId: order.id, timestamp: Date.now() })
 
-    let run: { result: WorkerResult; transcript?: WorkerSessionRun['transcript'] }
+    let run: { result: WorkerResult; transcript?: WorkerSessionRun['transcript'] } | undefined
+
+    // T3: escalation shadow events collected during retry
+    const escalationShadows: ModelTierShadowEvent[] = []
 
     // Wrap worker execution with abort signal so the caller unblocks immediately
     // when the tool-level timeout fires, instead of waiting for the worker's
@@ -385,14 +975,21 @@ export class DelegationCoordinator {
     // IMPORTANT: wrapAbort guarantees listener cleanup. If the worker resolves
     // before the signal fires, the 'abort' listener is removed to prevent
     // accumulation across repeated delegate calls in a long session.
-    const abortSignal = this.config.abortSignal
+    const abortSignal = mergedSignal
 
     const wrapAbort = <T>(p: Promise<T>): Promise<T> => {
       if (!abortSignal) return p
       if (abortSignal.aborted) return Promise.reject(new Error('Delegation aborted: caller signal already fired'))
 
       return new Promise<T>((resolve, reject) => {
-        const onAbort = () => reject(new Error('Delegation aborted: caller signal fired'))
+        const onAbort = () => {
+          // Distinguish a stall-sweep abort (per-order controller fired, parent
+          // did not) from a caller abort — stalls ARE provider-relevant faults.
+          const stallAbort = orderController.signal.aborted && !parentSignal?.aborted
+          reject(new Error(stallAbort
+            ? `Worker ${order.id} stalled: silent past liveness tolerance — aborted by stall sweep`
+            : 'Delegation aborted: caller signal fired'))
+        }
         abortSignal.addEventListener('abort', onAbort, { once: true })
 
         p.then(
@@ -434,11 +1031,17 @@ export class DelegationCoordinator {
             nextActions: ['Wait for other session to release locks, or use non-overlapping file scope'],
             evidenceStatus: 'blocked',
           }],
-          packet: buildPrimaryWorkerPacket([]),
+          packet: await buildPrimaryWorkerPacket([]),
         }
       }
       semanticLockAcquired = true
     }
+
+    // A4: arm the stall clock only once dispatch is committed (all early
+    // blocked returns above never register, so they can't leak entries).
+    this.orderControllers.set(order.id, orderController)
+    this.liveness.register(order.id, this.config.workerStallMs ?? (isWrite ? WRITE_STALL_MS : EXPLORE_STALL_MS))
+    this.ensureStallSweep()
 
     try {
       if (role === 'hands') {
@@ -457,21 +1060,27 @@ export class DelegationCoordinator {
               }
             }
             if (conflictedFiles.length > 0) {
+              // P1-1: first claim conflict — preserve actionable nextActions for the primary model
+              const degraded: WorkerResult = {
+                workOrderId: order.id,
+                status: 'blocked',
+                summary: `文件声明冲突: ${conflictedFiles.join('、')} 被另一会话持有`,
+                findings: [],
+                artifacts: [{ kind: 'risk', title: '声明冲突', content: `以下文件被另一会话锁定: ${conflictedFiles.join('、')}` }],
+                changedFiles: [],
+                risks: [`声明冲突: ${conflictedFiles.join('、')}`],
+                nextActions: ['等待其他会话释放声明后再重试', '或改用只读 profile 避免写冲突'],
+                evidenceStatus: 'blocked',
+              }
               return {
                 status: 'completed',
                 order,
-                results: [{
-                  workOrderId: order.id,
-                  status: 'blocked',
-                  summary: `File claim conflict: ${conflictedFiles.join(', ')} held by another session`,
-                  findings: [],
-                  artifacts: [{ kind: 'risk', title: 'Claim conflict', content: `Files claimed by another session: ${conflictedFiles.join(', ')}` }],
-                  changedFiles: [],
-                  risks: [`file claim conflict: ${conflictedFiles.join(', ')}`],
-                  nextActions: ['Wait for other session to release claims, or use read-only profile'],
-                  evidenceStatus: 'blocked',
-                }],
-                packet: buildPrimaryWorkerPacket([]),
+                selectedModel: selected.model,
+                modelTierShadows: [tierShadow],
+                modelTierGatedDecisions: [tierGatedDecision],
+                gatedInfluenceAudits: [gatedInfluenceAudit],
+                results: [degraded],
+                packet: await buildPrimaryWorkerPacket([degraded]),
               }
             }
           }
@@ -518,9 +1127,152 @@ export class DelegationCoordinator {
         const workerRun = await wrapAbort(this.runWorker(workerConfig))
         run = { result: workerRun.result, transcript: workerRun.transcript }
       }
+    } catch (error) {
+      // Physarum health: worker run threw (API/runtime fault, not task outcome).
+      // Caller-initiated aborts are not the provider's fault — skip those.
+      const msg = error instanceof Error ? error.message : String(error)
+      const isAbort = (error instanceof Error && error.name === 'AbortError') || msg.includes('Delegation aborted')
+      if (!isAbort) this.recordProviderOutcome(selected.model, false)
+
+      // T3: Flash→Pro escalation — retry with strong-tier model if budget allows
+      const flashTier = inferModelTierFromCard(selected)
+      const canUpgrade = !isAbort
+        && (order.budget.maxRetries > 0)
+        && this.proUpgradeCount < DelegationCoordinator.MAX_PRO_UPGRADES
+        && flashTier !== 'strong'
+      if (canUpgrade) {
+        const strongCards = this.config.modelCards.filter(c => inferModelTierFromCard(c) === 'strong')
+        const strongCard = strongCards[0]
+        if (strongCard) {
+          // Re-create worker config with Pro model
+          const upgradedConfig = this.config.runtimeFactory(order, strongCard, workerRegistry)
+          upgradedConfig.maxTurns = clampWorkerMaxTurns(upgradedConfig.maxTurns, order.budget.maxTurns)
+          upgradedConfig.reviewDepth = order.reviewDepth
+          upgradedConfig.domainKnowledgeStore = this.config.domainKnowledgeStore
+          upgradedConfig.abortSignal = mergedSignal
+          upgradedConfig.onActivity = (kind, detail) => {
+            this.liveness.tick(order.id)
+            upstreamActivity?.(kind, detail)
+          }
+          upgradedConfig.mailbox = this.mailbox
+
+          // Re-register liveness for retry
+          this.liveness.register(order.id, this.config.workerStallMs ?? (isWrite ? WRITE_STALL_MS : EXPLORE_STALL_MS))
+
+          try {
+            if (role === 'hands') {
+              // P1-1: re-acquire claims before Pro retry (original claims released in inner finally)
+              const retryClaimFiles: string[] = []
+              try {
+                if (this.config.sessionRegistry && this.config.sessionId && order.scope.files?.length) {
+                  const registry = this.config.sessionRegistry
+                  const sid = this.config.sessionId
+                  const conflictedFiles: string[] = []
+                  for (const f of order.scope.files) {
+                    if (registry.acquireClaim(sid, f, 'exclusive')) {
+                      retryClaimFiles.push(f)
+                    } else {
+                      conflictedFiles.push(f)
+                    }
+                  }
+                  if (conflictedFiles.length > 0) {
+                    for (const f of retryClaimFiles) registry.releaseClaim(sid, f)
+                    const degraded = workerFailureResult(order, new Error(`Retry blocked: ${conflictedFiles.join(', ')} claimed by another session`))
+                    return { status: 'completed' as const, order, selectedModel: strongCard.model, modelTierShadows: [tierShadow, ...escalationShadows], modelTierGatedDecisions: [tierGatedDecision], gatedInfluenceAudits: [gatedInfluenceAudit], results: [degraded], packet: await buildPrimaryWorkerPacket([degraded]) }
+                  }
+                }
+
+                // P1-1: increment quota and write escalation shadow only after claim check passes
+                escalationShadows.push(this.recordEscalation(order, strongCard, msg))
+                const cwd = this.config.cwd ?? upgradedConfig.cwd
+                const handsRun = await wrapAbort(this.runHands({
+                  order, wtCoordinator: new WorktreeCoordinator(cwd), cwd,
+                  maxTurns: upgradedConfig.maxTurns,
+                  contextWindow: upgradedConfig.contextWindow,
+                  compact: upgradedConfig.compact,
+                  activeClaims: upgradedConfig.activeClaims ?? [],
+                  domainKnowledgeStore: this.config.domainKnowledgeStore,
+                  runAgent: async (prompt, callbacks, workerCwd) => {
+                    const sessionRun = await this.runWorker({ ...upgradedConfig, order, cwd: workerCwd, activeClaims: upgradedConfig.activeClaims ?? [], domainKnowledgeStore: this.config.domainKnowledgeStore })
+                    callbacks.onTurnComplete(sessionRun.usage, 1, true)
+                    return JSON.stringify(sessionRun.result)
+                  },
+                }))
+                run = { result: handsRun.result }
+              } finally {
+                if (this.config.sessionRegistry && this.config.sessionId)
+                  for (const f of retryClaimFiles)
+                    this.config.sessionRegistry.releaseClaim(this.config.sessionId, f)
+              }
+            } else {
+              // P1-1: increment quota and write escalation shadow for read-only retry
+              escalationShadows.push(this.recordEscalation(order, strongCard, msg))
+              const workerRun = await wrapAbort(this.runWorker(upgradedConfig))
+              run = { result: workerRun.result, transcript: workerRun.transcript }
+            }
+            // Upgrade succeeded — record provider outcome; circuit recovery for tier-locked profiles
+            this.recordProviderOutcome(strongCard.model, true)
+            if (profileRegistry.get(order.profile)?.tierLock) this.circuitBreaker.recordSuccess(order.profile)
+            selected = strongCard
+            // Rebuild tierShadow for the Pro model so telemetry is coherent
+            const freshTierShadow = this.buildTierShadow(order, selected, tierRecommendation)
+            persistModelTierShadow(this.config.modelTierShadowStore, freshTierShadow)
+            // Replace the stale flash-tier tierShadow; escalation shadow records the retry event
+            escalationShadows.push(freshTierShadow)
+          } catch (_retryError) {
+            // Pro upgrade also failed — record provider outcome; circuit failure for tier-locked profiles
+            this.recordProviderOutcome(strongCard.model, false)
+            if (profileRegistry.get(order.profile)?.tierLock) this.circuitBreaker.recordFailure(order.profile)
+            const degraded = workerFailureResult(order, error)
+            return {
+              status: 'completed' as const,
+              order,
+              selectedModel: strongCard.model,
+              modelTierShadows: [tierShadow, ...escalationShadows],
+              modelTierGatedDecisions: [tierGatedDecision],
+              gatedInfluenceAudits: [gatedInfluenceAudit],
+              results: [degraded],
+              packet: await buildPrimaryWorkerPacket([degraded]),
+            }
+          }
+        }
+      }
+
+      // If retry didn't happen, return degraded — circuit records failure for tier-locked profiles
+      if (!run) {
+        if (!isAbort && profileRegistry.get(order.profile)?.tierLock) this.circuitBreaker.recordFailure(order.profile)
+        const degraded = workerFailureResult(order, error)
+        return {
+          status: 'completed' as const,
+          order,
+          selectedModel: selected.model,
+          modelTierShadows: [tierShadow],
+          modelTierGatedDecisions: [tierGatedDecision],
+          gatedInfluenceAudits: [gatedInfluenceAudit],
+          results: [degraded],
+          packet: await buildPrimaryWorkerPacket([degraded]),
+        }
+      }
     } finally {
+      // A4: stop tracking — no false stall after completion/failure.
+      this.liveness.unregister(order.id)
+      this.orderControllers.delete(order.id)
+      this.activityUpstream.delete(order.id)
+      if (this.liveness.size() === 0) this.stopStallSweep()
       if (semanticLockAcquired && this.collaboration && this.config.sessionId) {
         this.collaboration.releaseLocks(this.config.sessionId)
+      }
+    }
+
+    // Run completed — regardless of task verdict, the provider's API delivered.
+    this.recordProviderOutcome(selected.model, true)
+
+    // Circuit breaker: record outcome for tier-locked profiles (Flash army)
+    if (profileRegistry.get(order.profile)?.tierLock) {
+      if (run.result.status === 'passed') {
+        this.circuitBreaker.recordSuccess(order.profile)
+      } else {
+        this.circuitBreaker.recordFailure(order.profile)
       }
     }
 
@@ -529,14 +1281,15 @@ export class DelegationCoordinator {
     if (this.state.shouldEscalate()) {
       this.state.recordEvent({ type: 'escalated', workOrderId: order.id, timestamp: Date.now() })
       return {
-        status: 'completed',
+        status: 'completed' as const,
+        escalated: true,
         order,
         selectedModel: selected.model,
-        modelTierShadows: [tierShadow],
+        modelTierShadows: escalationShadows.length > 0 ? escalationShadows : [tierShadow],
         modelTierGatedDecisions: [tierGatedDecision],
         gatedInfluenceAudits: [gatedInfluenceAudit],
         results: [{ ...run.result, status: 'blocked' as const, summary: `Escalated: ${this.state.getSummary().failed} consecutive failures` }],
-        packet: buildPrimaryWorkerPacket([run.result]),
+        packet: await buildPrimaryWorkerPacket([run.result]),
       }
     }
 
@@ -553,15 +1306,21 @@ export class DelegationCoordinator {
       })
     }
 
+    // D1: persist worker result to ~/.rivet/subagents/ for future resume/inspection
+    const fp = fingerprintRequest(order.objective, order.scope.files, order.profile)
+    for (const r of results) {
+      persistWorkerResult(r, fp)
+    }
+
     return {
-      status: 'completed',
+      status: 'completed' as const,
       order,
       selectedModel: selected.model,
-      modelTierShadows: [tierShadow],
+      modelTierShadows: escalationShadows.length > 0 ? escalationShadows : [tierShadow],
       modelTierGatedDecisions: [tierGatedDecision],
       gatedInfluenceAudits: [gatedInfluenceAudit],
       results,
-      packet: buildPrimaryWorkerPacket(results),
+      packet: await buildPrimaryWorkerPacket(results),
     }
   }
 
@@ -575,20 +1334,39 @@ export class DelegationCoordinator {
     const savedSignal = this.config.abortSignal
     if (abortSignal) this.config.abortSignal = abortSignal
     try {
-      const runnables = requests.filter(r => shouldDelegateObjective(r.objective, r.scope))
+      // B3: depth-capped requests are rejected as blocked, not silently dropped.
+      const depthCapped: WorkerResult[] = requests
+        .filter(r => (r.delegationDepth ?? 0) >= MAX_DELEGATION_DEPTH)
+        .map(r => ({
+          workOrderId: `depth-capped-${r.parentTurnId}`,
+          status: 'blocked' as const,
+          summary: `Delegation rejected: max delegation depth (${MAX_DELEGATION_DEPTH}) reached — do the work inline instead of delegating further`,
+          findings: [],
+          artifacts: [],
+          changedFiles: [],
+          risks: ['unbounded delegation recursion prevented'],
+          nextActions: ['Perform the objective directly in this worker session'],
+          evidenceStatus: 'blocked' as const,
+        }))
+      const runnables = requests.filter(r =>
+        (r.delegationDepth ?? 0) < MAX_DELEGATION_DEPTH && shouldDelegateObjective(r.objective, r.scope))
+      if (runnables.length === 0 && depthCapped.length === 0) {
+        return { status: 'skipped', results: [], packet: await buildPrimaryWorkerPacket([]) }
+      }
       if (runnables.length === 0) {
-        return { status: 'skipped', results: [], packet: buildPrimaryWorkerPacket([]) }
+        return { status: 'completed', results: depthCapped, packet: await buildPrimaryWorkerPacket(depthCapped) }
       }
 
-    const queue = new WorkOrderQueue(this.config.maxWorkers)
+    const queue = new WorkOrderQueue(this.config.maxWorkers, {
+      explore: this.config.maxExploreWorkers,
+      write: this.config.maxWriteWorkers,
+    })
 
     // Pre-create work orders for deduplication and dependency ordering
     const orders: WorkOrder[] = []
     for (const r of runnables) {
       const isWrite = classifyProfile(r.profile) === 'hands'
-      const stableId = /\bteam:/.test(r.parentTurnId)
-        ? r.parentTurnId.split(':').slice(-2).join(':')
-        : undefined
+      const stableId = deriveStableWorkOrderId(r.parentTurnId)
       const order = isWrite
         ? createWriteWorkOrder({
             id: stableId,
@@ -598,9 +1376,12 @@ export class DelegationCoordinator {
             objective: r.objective,
             scope: r.scope,
             reviewDepth: r.reviewDepth,
+            delegationDepth: (r.delegationDepth ?? 0) + 1,
             dependencies: r.dependencies,
             authority: r.authority,
             riskTier: r.riskTier,
+            sessionTurn: r.sessionTurn,
+            budget: r.budget,
           })
         : createReadOnlyWorkOrder({
             id: stableId,
@@ -610,12 +1391,17 @@ export class DelegationCoordinator {
             objective: r.objective,
             scope: r.scope,
             reviewDepth: r.reviewDepth,
+            delegationDepth: (r.delegationDepth ?? 0) + 1,
             dependencies: r.dependencies,
             authority: r.authority,
             riskTier: r.riskTier,
+            sessionTurn: r.sessionTurn,
+            budget: r.budget,
           })
       if (queue.enqueue(order)) {
         orders.push(order)
+        // T9 P3: callbacks don't survive zod parsing — stash by order id.
+        if (r.onActivity) this.activityUpstream.set(order.id, r.onActivity)
       }
     }
 
@@ -658,18 +1444,34 @@ export class DelegationCoordinator {
     }
     await Promise.all(inflight)
 
+    // A3: drain any orders that could never be scheduled because a dependency
+    // failed (or itself ended up blocked). processNext stops dequeuing these, so
+    // without an explicit sweep they would be silently lost from the result set.
+    for (const order of queue.pending()) {
+      const unmet = order.dependencies.filter(d => !queue.isCompleted(d))
+      const failedDeps = unmet.filter(d => queue.hasFailed(d))
+      allResults.push(blockedDependencyResult(order, unmet, failedDeps))
+      queue.markFailed(order)
+    }
+
     const profileMap = new Map(orders.map(o => [o.id, o.profile] as const))
-    const aggregated = aggregateResults(allResults, policy, profileMap)
-    return {
+    const aggregated = [...aggregateResults(allResults, policy, profileMap), ...depthCapped]
+    // D1: persist worker results to ~/.rivet/subagents/
+    for (const r of aggregated) {
+      persistWorkerResult(r)
+    }
+
+    const baseRun: CoordinatorRun = {
       status: 'completed',
       results: aggregated,
-      packet: buildPrimaryWorkerPacket(aggregated),
+      packet: await buildPrimaryWorkerPacket(aggregated),
       aggregationPolicy: policy,
       ...(workerModels.length > 0 ? { workerModels } : {}),
       ...(modelTierShadows.length > 0 ? { modelTierShadows } : {}),
       ...(modelTierGatedDecisions.length > 0 ? { modelTierGatedDecisions } : {}),
       ...(gatedInfluenceAudits.length > 0 ? { gatedInfluenceAudits } : {}),
     }
+    return this.drainMailboxIntoRun(baseRun)
     // NOTE: If delegateBatch is ever changed from serial (processNext recursion)
     // to true concurrent execution, the finally-based signal restoration below
     // will race with in-flight orders — they'll lose access to the signal

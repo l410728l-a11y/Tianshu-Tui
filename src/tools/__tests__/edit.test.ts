@@ -93,20 +93,47 @@ describe('edit_file tool', () => {
     assert.equal(EDIT_FILE_TOOL.requiresApproval(makeParams({})), true)
   })
 
-  it('shows closest match when old_string differs by whitespace', async () => {
+  it('applies the edit when old_string differs only by whitespace (fuzzy fallback)', async () => {
     const file = join(TEST_DIR, 'whitespace.txt')
-    // File uses tabs, model passed spaces
+    // File uses tabs, model passed spaces — C3 whitespace-tolerant matching
+    // should land the edit instead of bouncing back a diagnostic error.
     writeFileSync(file, 'function foo() {\n\treturn 1\n}\n')
     const result = await EDIT_FILE_TOOL.execute(makeParams({
       file_path: file,
       old_string: 'function foo() {\n    return 1\n}',
       new_string: 'function foo() {\n\treturn 2\n}',
     }))
+    assert.ok(!result.isError, `Expected fuzzy success, got: ${result.content}`)
+    assert.match(result.content, /whitespace-tolerant/i)
+    const content = readFileSync(file, 'utf-8')
+    assert.ok(content.includes('return 2'), `edit should have landed, got: ${content}`)
+  })
+
+  it('still reports a not-found error when the block is genuinely absent (no false fuzzy match)', async () => {
+    const file = join(TEST_DIR, 'no-fuzzy.txt')
+    writeFileSync(file, 'function foo() {\n\treturn 1\n}\n')
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: file,
+      old_string: 'function bar() {\n  return 42\n}',
+      new_string: 'x',
+    }))
     assert.equal(result.isError, true)
-    // Should expose the actual file content as a diff so model can fix whitespace
-    assert.ok(result.content.includes('Closest match'), `Expected diff hint, got: ${result.content}`)
-    assert.ok(result.content.includes('expected'), 'should label expected vs actual')
-    assert.ok(result.content.includes('actual'), 'should show actual file lines')
+    assert.ok(result.content.includes('not found') || result.content.includes('Closest match'))
+  })
+
+  it('edits a large file above the old 100KB cap', async () => {
+    const file = join(TEST_DIR, 'big.txt')
+    // ~300KB of filler — comfortably over the retired 100KB limit, under 8MB.
+    const filler = 'x'.repeat(300 * 1024)
+    writeFileSync(file, `${filler}\nUNIQUE_ANCHOR\n${filler}`)
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: file,
+      old_string: 'UNIQUE_ANCHOR',
+      new_string: 'REPLACED_ANCHOR',
+    }))
+    assert.ok(!result.isError, `Expected large-file edit to succeed, got: ${result.content.slice(0, 200)}`)
+    const content = readFileSync(file, 'utf-8')
+    assert.ok(content.includes('REPLACED_ANCHOR'))
   })
 
   it('shows line numbers for multiple matches', async () => {
@@ -190,6 +217,54 @@ describe('edit_file tool', () => {
     const content = readFileSync(filePath, 'utf-8')
     assert.ok(content.includes('const y = 3'))
     assert.ok(content.includes('// added comment'))
+  })
+
+  it('on stale file: replace_all warns when expected_count mismatches', async () => {
+    const filePath = join(TEST_DIR, 'stale-count.ts')
+    writeFileSync(filePath, 'foo\nfoo\nfoo\nbar\n')
+
+    const { __setFileReadMtimeForTests } = await import('../read-file.js')
+    const oldMtime = statSync(filePath).mtimeMs
+    __setFileReadMtimeForTests(filePath, oldMtime)
+
+    writeFileSync(filePath, 'foo\nfoo\nbaz\nbar\n// added\n')
+    // Now only 2 'foo' occurrences instead of 3
+
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: filePath,
+      old_string: 'foo',
+      new_string: 'qux',
+      replace_all: true,
+      expected_count: 3,
+    }))
+
+    assert.ok(!result.isError, `Expected success on stale auto-apply, got: ${result.content}`)
+    assert.match(result.content, /Warning.*expected 3.*replaced 2/i,
+      `Expected expected_count warning, got: ${result.content}`)
+  })
+
+  it('on stale file: replace_all no warning when expected_count matches', async () => {
+    const filePath = join(TEST_DIR, 'stale-count-ok.ts')
+    writeFileSync(filePath, 'foo\nfoo\nbar\n')
+
+    const { __setFileReadMtimeForTests } = await import('../read-file.js')
+    const oldMtime = statSync(filePath).mtimeMs
+    __setFileReadMtimeForTests(filePath, oldMtime)
+
+    writeFileSync(filePath, 'foo\nfoo\nbar\n// added\n')
+    // Still 2 'foo' occurrences
+
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: filePath,
+      old_string: 'foo',
+      new_string: 'qux',
+      replace_all: true,
+      expected_count: 2,
+    }))
+
+    assert.ok(!result.isError, `Expected success on stale auto-apply, got: ${result.content}`)
+    assert.ok(!result.content.includes('Warning'),
+      `Expected no warning, got: ${result.content}`)
   })
 
   it('on stale file: shows current content near old_string when it no longer matches', async () => {

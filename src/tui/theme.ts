@@ -18,7 +18,7 @@ export interface RivetTheme {
   contextColor: (pct: number) => string
 }
 
-export type ThemeName = 'pastel' | 'cyberpunk' | 'observatory' | 'midnight' | 'starfield'
+export type ThemeName = 'pastel' | 'cyberpunk' | 'observatory' | 'midnight' | 'starfield' | 'tianshu' | 'claude' | 'ziwei' | 'slate' | 'antigravity' | 'cobalt' | 'gemini'
 
 interface ColorSet {
   primary: string
@@ -30,6 +30,14 @@ interface ColorSet {
   pulseQuiet: string
   pulseActive: string
   pulseAlert: string
+  /** bash/grep/glob 工具色，默认回退到 primary */
+  toolShell?: string
+  /** edit_file/write_file 工具色，默认回退到 secondary */
+  toolEdit?: string
+  /** run_tests 工具色，默认回退到 success */
+  toolTest?: string
+  /** delegate_task/delegate_batch 工具色，默认回退到 warning */
+  toolDelegate?: string
 }
 
 // Pastel theme — soft, pleasant, 二次元-inspired (default)
@@ -169,23 +177,236 @@ const STARFIELD_FALLBACK: ColorSet = {
   pulseAlert: 'red',
 }
 
+// Tianshu theme — 玄夜墨色 (Ink-Night). Design: 95% 墨灰 + 紫微紫 accent + 朱砂用户标记.
+// 功能态全部降饱和：归航青/星金/朱砂赤。工具按类别弱分色。
+const TIANSHU_TRUECOLOR: ColorSet = {
+  primary: '#d4a574',   // 星金 accent — 五行符号/流式指示。面积已限制到极少位置
+  secondary: '#9a90c2', // 墨紫灰 — edit/write headers (soft violet, design --tc-edit)
+  success: '#6f9b91',   // 归航青 — tests/done (design --qing, desaturated)
+  warning: '#b09155',   // 星金 — delegation/attention (design --jin, desaturated)
+  error: '#c1655c',     // 朱砂赤 — errors (design --chi, desaturated)
+  dim: '#545868',       // 暗墨 — separators/shortcuts (design --dim, +slight for terminal)
+  pulseQuiet: '#3a3d4a', // 墨线 — quiet pulse
+  pulseActive: '#d4a574', // 星金 — active pulse (matches primary)
+  pulseAlert: '#d4453a',  // 朱砂印 — alert pulse
+  toolShell: '#8c8f9d',   // shell grey — bash/grep/glob (design --tc-shell)
+  toolEdit: '#9a90c2',    // 墨紫灰 — edit_file/write_file (design --tc-edit)
+  toolTest: '#9c8a63',    // 金褐 — run_tests (design --tc-test)
+  toolDelegate: '#b09155', // 星金 — delegate (design --tc-delegate = warning)
+}
+
+const TIANSHU_FALLBACK: ColorSet = {
+  primary: 'yellow',    // closest named color for warm gold
+  secondary: 'magenta',
+  success: 'cyan',
+  warning: 'yellow',
+  error: 'red',
+  dim: 'white',         // brightened for readability
+  pulseQuiet: 'gray',
+  pulseActive: 'yellow',
+  pulseAlert: 'red',
+}
+
+// Ziwei theme — 紫微北斗·墨夜 (Ink-Night Purple Accent)
+// Design: 95% 墨灰 + 紫微紫 primary + 朱砂红 userColor.
+const ZIWEI_TRUECOLOR: ColorSet = {
+  primary: '#c9b8ff',     // 紫微 — 帝星紫，身份/链接/选中
+  secondary: '#8ab4ff',   // 天枢蓝白 — 北斗主序星色，正文强调
+  success: '#7ee7c7',     // 归航青 — 测试通过/完成 (木/林)
+  warning: '#ffd479',     // 星金 — 注意/委派 (土/山)
+  error: '#ff8a9b',       // 荧惑赤 — 错误/高风险 (火)
+  dim: '#5a5f7a',         // 星尘灰 — 分隔/次要
+  pulseQuiet: '#3a3d4a',  // 墨线 — quiet pulse
+  pulseActive: '#c9b8ff', // 紫微 — active pulse
+  pulseAlert: '#d4453a',  // 朱砂印 — alert pulse (user indicator color)
+  toolShell: '#8ab4ff',   // 天枢蓝白 — bash/grep/glob
+  toolEdit: '#c9b8ff',    // 紫微紫 — edit_file/write_file
+  toolTest: '#7ee7c7',    // 归航青 — run_tests
+  toolDelegate: '#ffd479' // 星金 — delegate
+}
+
+const ZIWEI_FALLBACK: ColorSet = {
+  primary: 'magenta',
+  secondary: 'blue',
+  success: 'cyan',
+  warning: 'yellow',
+  error: 'red',
+  dim: 'gray',
+  pulseQuiet: 'gray',
+  pulseActive: 'magenta',
+  pulseAlert: 'red',
+}
+
+// Claude theme — Claude Code TUI palette port. Mirrors the RGB values from
+// claude-code-haha/src/utils/theme.ts darkTheme (Claude Code's own ANSI改造 TUI),
+// so we can switch between the two terminals without retraining the eye.
+// Truecolor RGB values are kept verbatim from upstream; fallback resolves to the
+// matching dark-ansi 16-color names so 256-color terminals get the same identity.
+const CLAUDE_TRUECOLOR: ColorSet = {
+  primary: '#d77757',   // Claude Code `claude` rgb(215,119,87) — brand orange
+  secondary: '#af87ff', // `autoAccept` rgb(175,135,255) — electric violet
+  success: '#4eba65',   // `success` rgb(78,186,101) — bright green
+  warning: '#ffc107',   // `warning` rgb(255,193,7) — bright amber
+  error: '#ff6b80',     // `error` rgb(255,107,128) — bright red
+  dim: '#505050',       // `subtle` rgb(80,80,80) — dark gray
+  pulseQuiet: '#888888',    // `promptBorder` rgb(136,136,136) — medium gray
+  pulseActive: '#d77757',   // = primary (Claude brand orange pulse)
+  pulseAlert: '#ff6b80',    // = error (alert pulse)
+}
+
+const CLAUDE_FALLBACK: ColorSet = {
+  primary: 'redBright',     // dark-ansi `claude` = redBright
+  secondary: 'magentaBright', // `autoAccept` = magentaBright
+  success: 'greenBright',
+  warning: 'yellowBright',
+  error: 'redBright',
+  dim: 'white',            // dark-ansi `subtle` = white
+  pulseQuiet: 'white',     // `promptBorder` = white
+  pulseActive: 'redBright',
+  pulseAlert: 'redBright',
+}
+
+// Slate theme — 默认风格 (Professional / Calm). Design brief: 去强调紫，做专业、
+// 年轻化、不花哨、视觉不疲劳。手法：单一冷静 teal accent + 钢蓝结构色 + 全部去饱和
+// 语义色 + 柔和中性灰白正文（非纯白，降眩光）。暗色终端长时间观看不疲劳。
+const SLATE_TRUECOLOR: ColorSet = {
+  primary: '#56b6c2',   // 冷静 teal-cyan — 唯一 accent：链接/选中/相位字形/流式指示
+  secondary: '#7aa2cf', // 钢蓝 — 正文结构强调 / edit·write 头
+  success: '#7fb88a',   // 鼠尾草绿 — 测试通过/完成 (去饱和)
+  warning: '#d6a35c',   // 暗琥珀 — 注意/委派
+  error: '#e08891',     // 柔玫瑰 — 错误/高风险 (低光晕，非纯红)
+  dim: '#5b6270',       // 板岩灰 — 分隔/快捷键 (安静可见)
+  pulseQuiet: '#39414f', // 深板岩 — quiet pulse
+  pulseActive: '#56b6c2', // teal — active pulse (= primary)
+  pulseAlert: '#e08891',  // 柔玫瑰 — alert pulse (= error)
+  toolShell: '#7aa2cf',   // 钢蓝 — bash/grep/glob
+  toolEdit: '#6fb3ab',    // 雾青 — edit_file/write_file (区别于 shell 蓝与 success 绿)
+  toolTest: '#7fb88a',    // 鼠尾草绿 — run_tests
+  toolDelegate: '#d6a35c', // 暗琥珀 — delegate
+}
+
+const SLATE_FALLBACK: ColorSet = {
+  primary: 'cyan',
+  secondary: 'blue',
+  success: 'green',
+  warning: 'yellow',
+  error: 'red',
+  dim: 'gray',
+  pulseQuiet: 'gray',
+  pulseActive: 'cyan',
+  pulseAlert: 'red',
+}
+
+// Antigravity 2.0 — Codex cool azure, aligned with desktop tokens.css.
+// Single restrained accent: #5aa9ff sky-blue. Semantic colors lifted from
+// desktop --success / --warning / --error. Zero purple — no ziwei residue.
+// Dark-background tuned: chroma up ~8% vs web so truecolor glows on near-black.
+const ANTIGRAVITY_TRUECOLOR: ColorSet = {
+  primary: '#5aa9ff',   // cool azure — 唯一 accent (desktop --accent)
+  secondary: '#8ab4ff', // 浅天青 — 结构强调 / edit·write 头
+  success: '#43c463',   // 翠绿 — 测试通过/完成 (desktop --success)
+  warning: '#e0a93a',   // 琥珀 — 注意/委派 (desktop --warning)
+  error: '#f76b6b',     // 珊瑚红 — 错误 (desktop --error)
+  dim: '#6c6e7a',       // 暗灰 — 分隔/快捷键 (desktop --faint)
+  pulseQuiet: '#2a2a32', // 边框灰 — quiet pulse (desktop --border)
+  pulseActive: '#5aa9ff', // azure — active pulse (= primary)
+  pulseAlert: '#f76b6b',  // coral — alert pulse (= error)
+  toolShell: '#7aa2cf',   // 钢蓝 — bash/grep/glob
+  toolEdit: '#6fb3ab',    // 雾青 — edit_file/write_file (区别于 shell 蓝)
+  toolTest: '#43c463',    // 翠绿 — run_tests
+  toolDelegate: '#e0a93a', // 琥珀 — delegate
+}
+
+const ANTIGRAVITY_FALLBACK: ColorSet = {
+  primary: 'blue',
+  secondary: 'cyan',
+  success: 'green',
+  warning: 'yellow',
+  error: 'red',
+  dim: 'gray',
+  pulseQuiet: 'gray',
+  pulseActive: 'blue',
+  pulseAlert: 'red',
+}
+
+// Cobalt theme — 钴蓝·冷调中性 (default). 由子代理/team TUI 设计稿提炼，oklch 调和：
+// 中性灰阶统一色相 ~250°（微偏蓝冷，不发死灰），状态色全部拽进与 azure 同一和谐色环
+// （青绿 ok / 珊瑚 err / 冷琥珀 warn），不刺眼但仍可语义辨识。是 antigravity 的精炼继任者：
+// 同源冷 azure，但语义色去糖果化、明度梯度更清晰。可与桌面端 tokens.css 对照移植。
+const COBALT_TRUECOLOR: ColorSet = {
+  primary: '#61aef4',   // 钴蓝 accent — 唯一 accent：链接/选中/相位字形/流式指示 (--tui-accent)
+  secondary: '#8db5e0', // 钢青 — 正文结构强调 / edit·write 头
+  success: '#58cbb4',   // 青绿 — 测试通过/完成 (--tui-ok, teal-green 偏冷)
+  warning: '#e0c071',   // 冷琥珀 — 注意/委派 (--tui-warn)
+  error: '#ed7665',     // 珊瑚砖红 — 错误/高风险 (--tui-err, 去糖果感)
+  dim: '#8590a0',       // 冷板岩灰 — 分隔/快捷键 (提亮 ~6:1，深色背景不疲劳)
+  pulseQuiet: '#30363d', // 冷边框灰 — quiet pulse (--tui-border)
+  pulseActive: '#61aef4', // 钴蓝 — active pulse (= primary)
+  pulseAlert: '#ed7665',  // 珊瑚 — alert pulse (= error)
+  toolShell: '#78a3cf',   // 钢蓝 — bash/grep/glob
+  toolEdit: '#65b9ca',    // 冷青 — edit_file/write_file (区别于 shell 蓝与 success 青绿)
+  toolTest: '#58cbb4',    // 青绿 — run_tests (= success)
+  toolDelegate: '#e0c071', // 冷琥珀 — delegate (= warning)
+}
+
+const COBALT_FALLBACK: ColorSet = {
+  primary: 'blue',
+  secondary: 'cyan',
+  success: 'green',
+  warning: 'yellow',
+  error: 'red',
+  dim: 'gray',
+  pulseQuiet: 'gray',
+  pulseActive: 'blue',
+  pulseAlert: 'red',
+}
+
+// Gemini theme — Indigo, Purple & Mint Teal inspired by Gemini aesthetics
+const GEMINI_TRUECOLOR: ColorSet = {
+  primary: '#818cf8',      // Gemini Indigo — Cold Indigo Blue accent
+  secondary: '#c084fc',    // Nebula Violet — Radiant Violet
+  success: '#34d399',      // Aurora Mint — Cold Teal-Green
+  warning: '#fbbf24',      // Stellar Amber — Bright Golden Amber
+  error: '#f43f5e',        // Cosmic Rose — Vibrant desaturated Rose-Red
+  dim: '#5e617d',          // Nebula Gray — Elevated dividers/shortcuts
+  pulseQuiet: '#2a2b3d',   // Space Dark — Quiet pulse container
+  pulseActive: '#818cf8',  // Active Pulse
+  pulseAlert: '#f43f5e',   // Alert Pulse
+  toolShell: '#7dd3fc',    // Sky Azure — bash/grep/glob
+  toolEdit: '#c084fc',     // Nebula Violet — edit_file/write_file
+  toolTest: '#34d399',     // Aurora Mint — run_tests
+  toolDelegate: '#fbbf24', // Stellar Amber — delegate
+}
+
+const GEMINI_FALLBACK: ColorSet = {
+  primary: 'blueBright',
+  secondary: 'magentaBright',
+  success: 'cyanBright',
+  warning: 'yellowBright',
+  error: 'redBright',
+  dim: 'gray',
+  pulseQuiet: 'gray',
+  pulseActive: 'blueBright',
+  pulseAlert: 'redBright',
+}
+
 function makeToolColor(c: ColorSet) {
   return (name: string): string => {
     switch (name) {
-      case 'bash': case 'grep': case 'glob': return c.primary
-      case 'edit_file': case 'write_file': return c.secondary
-      case 'run_tests': return c.success
-      case 'delegate_task': case 'delegate_batch': return c.warning
+      case 'bash': case 'grep': case 'glob': return c.toolShell ?? c.primary
+      case 'edit_file': case 'write_file': return c.toolEdit ?? c.secondary
+      case 'run_tests': return c.toolTest ?? c.success
+      case 'delegate_task': case 'delegate_batch': return c.toolDelegate ?? c.warning
       default: return c.dim
     }
   }
 }
 
-function makeContextColor(c: Pick<ColorSet, 'primary' | 'warning' | 'error'>) {
+function makeContextColor(c: Pick<ColorSet, 'dim' | 'warning' | 'error'>) {
   return (pct: number): string => {
-    if (pct >= 0.8) return c.error
-    if (pct >= 0.6) return c.warning
-    return c.primary
+    if (pct >= 0.88) return c.error
+    if (pct >= 0.75) return c.warning
+    return c.dim
   }
 }
 
@@ -201,7 +422,7 @@ function buildTheme(colors: ColorSet, overrides?: { userColor?: string; assistan
   }
 }
 
-const THEMES: Record<ThemeName, { truecolor: RivetTheme; fallback: RivetTheme }> = {
+export const THEMES: Record<ThemeName, { truecolor: RivetTheme; fallback: RivetTheme }> = {
   pastel: {
     truecolor: buildTheme(PASTEL_TRUECOLOR),
     fallback: buildTheme(PASTEL_FALLBACK),
@@ -222,9 +443,60 @@ const THEMES: Record<ThemeName, { truecolor: RivetTheme; fallback: RivetTheme }>
     truecolor: buildTheme(STARFIELD_TRUECOLOR, { userColor: '#e8ecf8', assistantColor: '#c9a9ff', muted: '#aab4d4' }),
     fallback: buildTheme(STARFIELD_FALLBACK, { userColor: 'white', assistantColor: 'magenta' }),
   },
+  tianshu: {
+    // userColor = 朱砂印 cinnabar (the user ▌ mark, the one warm point);
+    // assistantColor = bright neutral body text (was #a7aab6, now readable);
+    // muted = brightened 元信息灰 (was #6c6f7e, too dim).
+    truecolor: buildTheme(TIANSHU_TRUECOLOR, { userColor: '#d4453a', assistantColor: '#c5c8d2', muted: '#9497a6' }),
+    fallback: buildTheme(TIANSHU_FALLBACK, { userColor: 'red', assistantColor: 'white' }),
+  },
+  claude: {
+    // userColor = Claude brand orange (matches primary — user ▌ mark reuses brand hue);
+    // assistantColor = Claude text rgb(217,217,217) neutral gray-white — the assistant
+    //   body is NOT violet in upstream; autoAccept violet is a small badge only.
+    //   Using violet for the full message body clashed with amber warning tools.
+    // muted = Claude `inactive` rgb(153,153,153) → #999999.
+    truecolor: buildTheme(CLAUDE_TRUECOLOR, { userColor: '#d77757', assistantColor: '#d9d9d9', muted: '#999999' }),
+    fallback: buildTheme(CLAUDE_FALLBACK, { userColor: 'redBright', assistantColor: 'white' }),
+  },
+  ziwei: {
+    // userColor = 朱砂印 cinnabar (the user ▌ mark, the one warm point)
+    // assistantColor = 紫微紫 primary
+    // muted = 远星灰
+    truecolor: buildTheme(ZIWEI_TRUECOLOR, { userColor: '#d4453a', assistantColor: '#c9b8ff', muted: '#9aa2b1' }),
+    fallback: buildTheme(ZIWEI_FALLBACK, { userColor: 'red', assistantColor: 'magenta', muted: 'white' }),
+  },
+  slate: {
+    // userColor = 干净中性亮白：用户 ▌ 标记不抢色（专业、不花哨）
+    // assistantColor = 柔中性灰：正文降眩光、不疲劳
+    // muted = 元信息灰
+    truecolor: buildTheme(SLATE_TRUECOLOR, { userColor: '#e2e6ec', assistantColor: '#c4c9d2', muted: '#8b93a3' }),
+    fallback: buildTheme(SLATE_FALLBACK, { userColor: 'white', assistantColor: 'white', muted: 'gray' }),
+  },
+  antigravity: {
+    // userColor = 干净中性亮白 ▌ 标记，不抢 accent 蓝
+    // assistantColor = 柔中性灰正文 (desktop --text 降档)
+    // muted = 桌面端 --muted 灰
+    truecolor: buildTheme(ANTIGRAVITY_TRUECOLOR, { userColor: '#e2e6ec', assistantColor: '#c4c9d2', muted: '#989aa6' }),
+    fallback: buildTheme(ANTIGRAVITY_FALLBACK, { userColor: 'white', assistantColor: 'white', muted: 'gray' }),
+  },
+  cobalt: {
+    // userColor = 冷调亮白 ▌ 标记 (--tui-bright)，不抢 accent 钴蓝
+    // assistantColor = 冷中性灰正文 (--tui-fg)，降眩光不疲劳
+    // muted = 元信息灰 (--tui-label)
+    truecolor: buildTheme(COBALT_TRUECOLOR, { userColor: '#e6ecf2', assistantColor: '#bdc3ca', muted: '#9ca5b3' }),
+    fallback: buildTheme(COBALT_FALLBACK, { userColor: 'white', assistantColor: 'white', muted: 'gray' }),
+  },
+  gemini: {
+    // userColor = 亮靛白 ▌ 标记
+    // assistantColor = 柔中性灰正文
+    // muted = 星云灰
+    truecolor: buildTheme(GEMINI_TRUECOLOR, { userColor: '#e0e7ff', assistantColor: '#c4c9d2', muted: '#9497a6' }),
+    fallback: buildTheme(GEMINI_FALLBACK, { userColor: 'white', assistantColor: 'white', muted: 'gray' }),
+  },
 }
 
-let activeTheme: ThemeName = 'midnight'
+let activeTheme: ThemeName = 'cobalt'
 
 export function setTheme(name: ThemeName): void {
   activeTheme = name

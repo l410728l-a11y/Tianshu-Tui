@@ -1,9 +1,10 @@
 import { execFile } from 'child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'fs'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, isAbsolute, relative } from 'path'
 import { promisify } from 'util'
+import { classifyIrreversibleEffects } from './side-effect-classifier.js'
 
 const execFileP = promisify(execFile)
 
@@ -18,6 +19,51 @@ export interface RollbackPreview {
   confirmationToken: string
 }
 
+/**
+ * Cross-session ownership guard for parallel sessions on the same branch.
+ *
+ * Multiple sessions may run concurrently on one branch. A blanket worktree
+ * restore would clobber files another session just changed. So rollback and
+ * bash side-effect capture consult this guard: any path exclusively claimed by
+ * ANOTHER live session is never attributed to, nor restored by, this session.
+ *
+ * Injected (rather than importing SessionRegistry) so checkpoint.ts stays
+ * decoupled from the DB and unit-testable with a plain stub.
+ */
+export interface OwnershipGuard {
+  /** True if relPath is exclusively claimed by a different, live session. */
+  isOwnedByOther(relPath: string): boolean
+}
+
+/** Minimal structural view of SessionRegistry needed for ownership checks. */
+export interface ClaimLookup {
+  reapStaleClaims(): string[]
+  checkClaim(filePath: string): { sessionId: string; claimType: string } | null
+}
+
+/**
+ * Build an OwnershipGuard backed by the session registry. Reaps dead sessions'
+ * claims first so a crashed peer can't permanently block rollback, then treats
+ * a path as another-session-owned only when a *different* session holds an
+ * exclusive claim. Checks both the relative and absolute path forms because
+ * claims may be stored either way.
+ */
+export function makeOwnershipGuard(registry: ClaimLookup, mySessionId: string, cwd: string): OwnershipGuard {
+  try { registry.reapStaleClaims() } catch { /* best-effort */ }
+  return {
+    isOwnedByOther(relPath: string): boolean {
+      const candidates = [relPath, join(cwd, relPath)]
+      for (const key of candidates) {
+        const claim = registry.checkClaim(key)
+        if (claim && claim.sessionId !== mySessionId && claim.claimType === 'exclusive') {
+          return true
+        }
+      }
+      return false
+    },
+  }
+}
+
 interface CheckpointData {
   version: 2
   hash: string
@@ -28,6 +74,14 @@ interface CheckpointData {
   preExistingDirtyFiles: string[]
   preExistingUntrackedFiles: string[]
   agentTouchedFiles: string[]
+  /**
+   * Human-readable caveats for irreversible side effects of bash commands that
+   * ran during this checkpoint window (API calls, DB writes, publishes, pushes,
+   * infra/service changes). File rollback (git checkout) CANNOT undo these — we
+   * record them so the rollback preview/result tells the truth instead of
+   * implying a clean undo. Deduplicated by label.
+   */
+  unrevertableEffects?: string[]
   confirmationToken?: string
 }
 
@@ -119,9 +173,69 @@ async function getDirtySnapshot(cwd: string): Promise<{ dirty: string[]; untrack
   }
 }
 
+/** Hard cap on retained checkpoint files. Session-scoped checkpoints are
+ *  named per sessionId and were never reclaimed — ephemeral/test runs (cwd in
+ *  a temp dir that's later deleted) left ~14k orphans accumulating forever. */
+const MAX_CHECKPOINTS = 500
+
+/**
+ * Reclaim stale checkpoint files: drop any whose `cwd` no longer exists
+ * (orphaned by ephemeral/test workspaces), then trim the survivors to
+ * MAX_CHECKPOINTS most-recent by mtime. Best-effort and self-contained — any
+ * fs error on a single file is swallowed so a prune never blocks a checkpoint.
+ * Returns the number of files removed.
+ */
+export function pruneOrphanCheckpoints(max = MAX_CHECKPOINTS): number {
+  let removed = 0
+  let entries: { file: string; mtime: number }[]
+  try {
+    entries = readdirSync(RIVET_DIR)
+      .filter(n => n.startsWith('checkpoint-') && n.endsWith('.json') && !n.startsWith('checkpoint-index-'))
+      .map(n => join(RIVET_DIR, n))
+      .map(file => ({ file, mtime: safeMtime(file) }))
+  } catch {
+    return 0
+  }
+
+  // 1. Drop orphans whose recorded cwd is gone.
+  const live: { file: string; mtime: number }[] = []
+  for (const e of entries) {
+    let cwd = ''
+    try {
+      cwd = (JSON.parse(readFileSync(e.file, 'utf-8')) as CheckpointData).cwd ?? ''
+    } catch { /* unreadable → treat as orphan */ }
+    if (cwd && existsSync(cwd)) {
+      live.push(e)
+    } else {
+      try { rmSync(e.file, { force: true }); removed++ } catch { /* ignore */ }
+    }
+  }
+
+  // 2. Trim survivors to the cap, oldest first.
+  if (live.length > max) {
+    live.sort((a, b) => a.mtime - b.mtime)
+    for (const e of live.slice(0, live.length - max)) {
+      try { rmSync(e.file, { force: true }); removed++ } catch { /* ignore */ }
+    }
+  }
+  return removed
+}
+
+function safeMtime(file: string): number {
+  try { return statSync(file).mtimeMs } catch { return 0 }
+}
+
+// Prune at most once per process, lazily on first checkpoint write, so the
+// scan cost (one readdir + stat/parse per file) is paid once — not per tool.
+let prunedThisProcess = false
+
 /** Create a checkpoint by recording the current HEAD hash and dirty worktree state. */
 export async function createCheckpoint(cwd: string, label?: string, sessionId?: string): Promise<Checkpoint | null> {
   try {
+    if (!prunedThisProcess) {
+      prunedThisProcess = true
+      pruneOrphanCheckpoints()
+    }
     const { stdout } = await execFileP('git', ['rev-parse', 'HEAD'], {
       cwd, timeout: 5000, encoding: 'utf-8',
     })
@@ -168,15 +282,114 @@ export async function createCheckpoint(cwd: string, label?: string, sessionId?: 
 export function recordAgentTouchedFile(cwd: string, file: string, sessionId?: string): void {
   const data = sessionId ? loadCheckpointDataForSession(sessionId) : loadCheckpointData(cwd)
   if (!data) return
-  const normalized = file.replace(/^\.\//, '')
-  if (normalized.startsWith('/') || normalized.includes('..')) return
+  let normalized = file.replace(/^\.\//, '')
+  // Tools commonly pass an absolute file_path. Re-base it relative to the repo
+  // root so it matches the checkpoint's relative bookkeeping; reject anything
+  // that resolves outside cwd. (Mirrors the claim-path normalization the R2
+  // conflict guard already does.)
+  if (isAbsolute(normalized)) {
+    const rel = relative(cwd, normalized)
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return
+    normalized = rel
+  }
+  if (normalized.includes('..')) return
   data.agentTouchedFiles = [...new Set([...data.agentTouchedFiles, normalized])].sort()
   const outFile = sessionId ? checkpointFileForSession(sessionId) : checkpointFile(cwd)
   writeFileAtomicSync(outFile, JSON.stringify(data, null, 2))
 }
 
+/**
+ * All paths currently changed in the worktree (modified / added / deleted /
+ * untracked / renamed), relative to repo root. Captures bash/tool side effects
+ * that the per-edit recorder cannot see (file creation, deletion, in-place
+ * mutation by arbitrary shell commands).
+ */
+async function getChangedPaths(cwd: string): Promise<string[]> {
+  const { stdout } = await execFileP(
+    'git',
+    ['-c', 'core.quotePath=false', 'status', '--porcelain=v1', '-uall'],
+    { cwd, timeout: 5000, encoding: 'utf-8' },
+  )
+  const paths = new Set<string>()
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue
+    const body = line.slice(3) // strip "XY " status prefix
+    const arrow = body.indexOf(' -> ')
+    if (arrow >= 0) {
+      paths.add(body.slice(0, arrow).trim())
+      paths.add(body.slice(arrow + 4).trim())
+    } else {
+      paths.add(body.trim())
+    }
+  }
+  return [...paths]
+}
+
+/**
+ * Capture bash / shell side effects into the checkpoint so a rollback can both
+ * undo file changes AND honestly report what it cannot undo.
+ *
+ * - File effects: diffed against the turn baseline and attributed to THIS
+ *   session (parallel-safe — never claims a path another live session owns).
+ * - Non-file effects: when `command` is supplied it is classified for
+ *   irreversible side effects (API/DB/publish/push/infra/service); any matches
+ *   are recorded into `unrevertableEffects`. These persist even when the
+ *   command changed zero files (a `curl -X POST` touches nothing on disk yet
+ *   mutated remote state).
+ *
+ * Returns the list of newly-recorded file paths.
+ */
+export async function recordBashSideEffects(
+  cwd: string,
+  sessionId?: string,
+  guard?: OwnershipGuard,
+  command?: string,
+): Promise<string[]> {
+  const data = sessionId ? loadCheckpointDataForSession(sessionId) : loadCheckpointData(cwd)
+  if (!data) return []
+
+  const baseline = new Set([...data.preExistingDirtyFiles, ...data.preExistingUntrackedFiles])
+  let changed: string[]
+  try {
+    changed = await getChangedPaths(cwd)
+  } catch {
+    changed = []
+  }
+
+  const owned = new Set(data.agentTouchedFiles)
+  const recorded: string[] = []
+  for (const raw of changed) {
+    const f = raw.replace(/^\.\//, '')
+    if (!f || f.startsWith('/') || f.includes('..')) continue
+    if (baseline.has(f) || owned.has(f)) continue
+    // Parallel-session safety: a path another live session owns is theirs.
+    if (guard?.isOwnedByOther(f)) continue
+    owned.add(f)
+    recorded.push(f)
+  }
+
+  // Classify irreversible non-file effects from the command itself.
+  const effects = new Set(data.unrevertableEffects ?? [])
+  const effectsBefore = effects.size
+  if (command) {
+    for (const label of classifyIrreversibleEffects(command)) effects.add(label)
+  }
+  const effectsChanged = effects.size !== effectsBefore
+
+  // Persist if either dimension changed. (A POST that touched no files still
+  // needs its unrevertable caveat written.)
+  if (recorded.length === 0 && !effectsChanged) return []
+
+  data.agentTouchedFiles = [...owned].sort()
+  if (effects.size > 0) data.unrevertableEffects = [...effects].sort()
+  const outFile = sessionId ? checkpointFileForSession(sessionId) : checkpointFile(cwd)
+  writeFileAtomicSync(outFile, JSON.stringify(data, null, 2))
+  if (sessionId && recorded.length > 0) addToCheckpointIndex(cwd, sessionId, data.agentTouchedFiles)
+  return recorded
+}
+
 /** Preview what a rollback would affect. Returns null if nothing to rollback. */
-export async function getRollbackPreview(cwd: string, sessionId?: string): Promise<RollbackPreview | null> {
+export async function getRollbackPreview(cwd: string, sessionId?: string, guard?: OwnershipGuard): Promise<RollbackPreview | null> {
   const data = sessionId
     ? (loadCheckpointDataForSession(sessionId) ?? loadCheckpointData(cwd))
     : loadCheckpointData(cwd)
@@ -189,14 +402,24 @@ export async function getRollbackPreview(cwd: string, sessionId?: string): Promi
   writeFileAtomicSync(file, JSON.stringify(data, null, 2))
 
   const protectedFiles = new Set([...data.preExistingDirtyFiles, ...data.preExistingUntrackedFiles])
-  const rollbackFiles = data.agentTouchedFiles.filter(f => !protectedFiles.has(f))
+  const candidate = data.agentTouchedFiles.filter(f => !protectedFiles.has(f))
+  const rollbackFiles = candidate.filter(f => !guard?.isOwnedByOther(f))
+  const blockedByOther = candidate.filter(f => guard?.isOwnedByOther(f))
 
-  if (rollbackFiles.length === 0) return null
+  const unrevertable = data.unrevertableEffects ?? []
+  // Nothing to restore AND no caveat to surface → truly nothing to do.
+  if (rollbackFiles.length === 0 && unrevertable.length === 0) return null
 
   const text = [
     `Checkpoint: ${data.hash.slice(0, 8)} (${new Date(data.timestamp).toLocaleString()})`,
     'Agent-owned files to restore/remove:',
-    ...rollbackFiles.map(f => `- ${f}`),
+    ...(rollbackFiles.length > 0 ? rollbackFiles.map(f => `- ${f}`) : ['- (none)']),
+    ...(blockedByOther.length > 0
+      ? ['', 'Skipped (owned by another live session):', ...blockedByOther.map(f => `- ${f}`)]
+      : []),
+    ...(unrevertable.length > 0
+      ? ['', '⚠️  CANNOT be reverted by file rollback (bash side effects):', ...unrevertable.map(e => `- ${e}`)]
+      : []),
   ].join('\n')
 
   return { text, confirmationToken: token }
@@ -207,7 +430,8 @@ export async function rollbackToCheckpoint(
   cwd: string,
   confirmationToken?: string,
   sessionId?: string,
-): Promise<{ success: boolean; hash?: string }> {
+  guard?: OwnershipGuard,
+): Promise<{ success: boolean; hash?: string; skipped?: string[]; unrevertable?: string[] }> {
   const data = sessionId
     ? (loadCheckpointDataForSession(sessionId) ?? loadCheckpointData(cwd))
     : loadCheckpointData(cwd)
@@ -215,9 +439,26 @@ export async function rollbackToCheckpoint(
     return { success: false }
   }
 
+  // Caveats about bash effects git cannot undo — surfaced on every outcome so
+  // the caller never mistakes "files restored" for "world restored".
+  const unrevertable = data.unrevertableEffects?.length ? data.unrevertableEffects : undefined
+
   const protectedFiles = new Set([...data.preExistingDirtyFiles, ...data.preExistingUntrackedFiles])
-  const files = data.agentTouchedFiles.filter(f => !protectedFiles.has(f))
-  if (files.length === 0) return { success: false }
+  const candidate = data.agentTouchedFiles.filter(f => !protectedFiles.has(f))
+
+  // Parallel-session safety: never restore a path a different live session owns.
+  // We scope the restore strictly to this session's own touched set; anything
+  // contested is skipped and surfaced rather than blanket-reverted.
+  const skipped: string[] = []
+  const files = candidate.filter(f => {
+    if (guard?.isOwnedByOther(f)) { skipped.push(f); return false }
+    return true
+  })
+  if (files.length === 0) {
+    // No revertable files. Still surface any irreversible-effect caveat so the
+    // caller doesn't mistake "nothing restored" for "nothing happened".
+    return { success: false, skipped: skipped.length ? skipped : undefined, unrevertable }
+  }
 
   try {
     for (const file of files) {
@@ -231,9 +472,9 @@ export async function rollbackToCheckpoint(
         if (existsSync(fullPath)) rmSync(fullPath, { recursive: true, force: true })
       }
     }
-    return { success: true, hash: data.hash.slice(0, 7) }
+    return { success: true, hash: data.hash.slice(0, 7), skipped: skipped.length ? skipped : undefined, unrevertable }
   } catch {
-    return { success: false }
+    return { success: false, skipped: skipped.length ? skipped : undefined, unrevertable }
   }
 }
 

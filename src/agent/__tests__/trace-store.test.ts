@@ -6,8 +6,18 @@ import {
   finishTraceEvent,
   recordTraceEvent,
   getDoomLoopLevel,
+  getClassDoomLoopLevel,
+  combineDoomLoopLevels,
+  offendingFingerprints,
+  getToolStormLevel,
   fingerprintToolCall,
+  fingerprintToolClass,
+  bashCommandClass,
   recordToolFingerprint,
+  recordToolNamedFingerprint,
+  getDoomLoopThresholds,
+  NORMAL_DOOM_THRESHOLDS,
+  GOAL_DOOM_THRESHOLDS,
   type TraceEvent,
   type TraceEventStartInput,
 } from '../trace-store.js'
@@ -74,20 +84,20 @@ describe('trace-store', () => {
     const fp = fingerprintToolCall('read_file', { file_path: 'src/a.ts' }, 'passed')
     const fpB = fingerprintToolCall('write_file', { file_path: 'src/b.ts' }, 'passed')
 
-    // 2 consecutive same → warn
-    assert.equal(getDoomLoopLevel([fp, fp]), 'warn')
-    // 3 consecutive same → still warn (need 4 for blocked)
-    assert.equal(getDoomLoopLevel([fp, fp, fp]), 'warn')
-    // 4 consecutive same → blocked
-    assert.equal(getDoomLoopLevel([fp, fp, fp, fp]), 'blocked')
+    // Normal mode thresholds: warnConsec=2, blockConsec=4, warnFreq=5, blockFreq=7
+    const nt = NORMAL_DOOM_THRESHOLDS.exact
 
-    // Oscillation: 5/8 same tool → warn (≥4)
-    assert.equal(getDoomLoopLevel([fp, fpB, fp, fpB, fp, fpB, fp, fpB]), 'warn')
-    // Oscillation: 6/8 same tool → blocked (≥6)
-    assert.equal(getDoomLoopLevel([fp, fpB, fp, fp, fpB, fp, fp, fpB]), 'warn') // 5 fp out of 8
-    assert.equal(getDoomLoopLevel([fp, fpB, fp, fp, fp, fpB, fp, fpB]), 'warn') // 5 fp out of 8
-    // Normal iteration: alternating tools with gaps → ok (3/5 < threshold)
-    assert.equal(getDoomLoopLevel([fp, fpB, fp, fpB, fp]), 'none')
+    // 2 consecutive same (1 repeat) → none (below warnConsec=2)
+    assert.equal(getDoomLoopLevel([fp, fp], nt), 'none')
+    // 3 consecutive same (2 repeats) → warn
+    assert.equal(getDoomLoopLevel([fp, fp, fp], nt), 'warn')
+    // 4 consecutive same (3 repeats) → still warn (need 5 for blocked)
+    assert.equal(getDoomLoopLevel([fp, fp, fp, fp], nt), 'warn')
+    // 5 consecutive same (4 repeats) → blocked
+    assert.equal(getDoomLoopLevel([fp, fp, fp, fp, fp], nt), 'blocked')
+
+    // Normal iteration: alternating tools → ok
+    assert.equal(getDoomLoopLevel([fp, fpB, fp, fpB, fp], nt), 'none')
   })
 
   it('marks repeated failed tool fingerprints with consecutive-only doom loop', () => {
@@ -99,8 +109,248 @@ describe('trace-store', () => {
     store = recordToolFingerprint(store, fp)
     assert.equal(getDoomLoopLevel(store.toolFingerprints), 'warn')
 
-    // 4 entries → 3 consecutive → blocked
+    // 5 entries → 4 consecutive → blocked
+    store = recordToolFingerprint(store, fp)
+    assert.equal(getDoomLoopLevel(store.toolFingerprints), 'warn')
     store = recordToolFingerprint(store, fp)
     assert.equal(getDoomLoopLevel(store.toolFingerprints), 'blocked')
+  })
+})
+
+describe('getToolStormLevel', () => {
+  it('returns none for fewer than 4 tool calls', () => {
+    assert.equal(getToolStormLevel(['grep', 'grep', 'grep']), 'none')
+  })
+
+  it('returns warn for 4 consecutive same-type calls', () => {
+    assert.equal(getToolStormLevel(['grep', 'grep', 'grep', 'grep']), 'warn')
+  })
+
+  it('returns warn for 5-7 consecutive same-type calls', () => {
+    assert.equal(getToolStormLevel(['grep', 'grep', 'grep', 'grep', 'grep']), 'warn')
+    assert.equal(getToolStormLevel(Array(7).fill('grep')), 'warn')
+  })
+
+  it('returns storm for 8+ consecutive same-type calls', () => {
+    assert.equal(getToolStormLevel(Array(8).fill('grep')), 'storm')
+  })
+
+  it('returns none when tool types alternate', () => {
+    assert.equal(getToolStormLevel(['grep', 'read_file', 'grep', 'read_file']), 'none')
+  })
+
+  it('detects storm with different fingerprints but same tool type', () => {
+    const names = Array(10).fill('grep')
+    assert.equal(getToolStormLevel(names), 'storm')
+  })
+
+  it('resets consecutive count on tool type change', () => {
+    const names = ['grep', 'grep', 'grep', 'read_file', 'grep', 'grep', 'grep']
+    assert.equal(getToolStormLevel(names), 'none')
+  })
+
+  it('only considers the last 12 entries', () => {
+    const old = Array(20).fill('read_file')
+    const spacer = ['grep', 'bash', 'read_file', 'write_file', 'grep', 'bash',
+      'read_file', 'write_file', 'grep', 'bash', 'read_file', 'write_file', 'grep']
+    assert.equal(getToolStormLevel([...old, ...spacer]), 'none')
+  })
+})
+
+describe('recordToolNamedFingerprint', () => {
+  it('records both fingerprint and tool name', () => {
+    let store = createTraceStore()
+    store = recordToolNamedFingerprint(store, 'fp1', 'grep')
+    store = recordToolNamedFingerprint(store, 'fp2', 'grep')
+    assert.deepEqual(store.toolFingerprints, ['fp1', 'fp2'])
+    assert.deepEqual(store.toolNameHistory, ['grep', 'grep'])
+  })
+
+  it('caps tool name history to 20', () => {
+    let store = createTraceStore()
+    for (let i = 0; i < 25; i++) {
+      store = recordToolNamedFingerprint(store, `fp${i}`, `tool${i}`)
+    }
+    assert.equal(store.toolNameHistory!.length, 20)
+    assert.equal(store.toolNameHistory![0], 'tool5')
+    assert.equal(store.toolNameHistory![19], 'tool24')
+  })
+})
+
+describe('bashCommandClass', () => {
+  it('merges git status pipe variants into one class', () => {
+    assert.equal(bashCommandClass('git status --porcelain'), 'git:status')
+    assert.equal(bashCommandClass('git status --porcelain | sed -n 1,50p'), 'git:status')
+    assert.equal(bashCommandClass('git status --porcelain | head -100'), 'git:status')
+    assert.equal(bashCommandClass('git status --porcelain | tee /tmp/s.txt'), 'git:status')
+    assert.equal(bashCommandClass('git status --porcelain > /tmp/out && cat /tmp/out'), 'git:status')
+  })
+
+  it('detects git embedded after other binaries (cd, env vars)', () => {
+    assert.equal(bashCommandClass('cd /repo && git log --oneline'), 'git:log')
+    assert.equal(bashCommandClass('GIT_PAGER=cat git diff --stat'), 'git:diff')
+  })
+
+  it('distinguishes git subcommands', () => {
+    assert.notEqual(bashCommandClass('git status'), bashCommandClass('git add -A'))
+    assert.notEqual(bashCommandClass('git log'), bashCommandClass('git commit -m x'))
+  })
+
+  it('includes subcommand for known multi-sub binaries', () => {
+    assert.equal(bashCommandClass('npm test'), 'npm:test')
+    assert.equal(bashCommandClass('npm run build'), 'npm:run')
+    assert.notEqual(bashCommandClass('npm test'), bashCommandClass('npm install'))
+  })
+
+  it('falls back to binary name for plain commands', () => {
+    assert.equal(bashCommandClass('ls -la src'), 'ls')
+    assert.equal(bashCommandClass('/usr/bin/python3 script.py'), 'python3')
+    assert.equal(bashCommandClass(''), 'empty')
+  })
+
+  it('skips leading env assignments', () => {
+    assert.equal(bashCommandClass('NODE_ENV=test npx tsx --test foo.ts'), 'npx:tsx')
+  })
+})
+
+describe('fingerprintToolClass', () => {
+  it('returns a class fingerprint for bash including output class', () => {
+    assert.equal(fingerprintToolClass('bash', { command: 'git status | head' }, 'success'), 'git:status·success')
+  })
+
+  it('returns null for non-bash tools', () => {
+    assert.equal(fingerprintToolClass('read_file', { path: '/a.ts' }, 'success'), null)
+    assert.equal(fingerprintToolClass('grep', { pattern: 'x' }, 'error'), null)
+  })
+})
+
+describe('recordToolFingerprint with class fingerprint', () => {
+  it('records class fingerprint alongside exact fingerprint', () => {
+    let store = createTraceStore()
+    store = recordToolFingerprint(store, 'fp1', 'git:status·success')
+    store = recordToolFingerprint(store, 'fp2', null)
+    assert.deepEqual(store.toolFingerprints, ['fp1', 'fp2'])
+    assert.deepEqual(store.bashClassFingerprints, ['git:status·success'])
+  })
+
+  it('caps class fingerprints to 20', () => {
+    let store = createTraceStore()
+    for (let i = 0; i < 25; i++) {
+      store = recordToolFingerprint(store, `fp${i}`, `class${i}`)
+    }
+    assert.equal(store.bashClassFingerprints!.length, 20)
+  })
+})
+
+describe('getClassDoomLoopLevel', () => {
+  const nt = NORMAL_DOOM_THRESHOLDS.class
+
+  it('returns none for varied command classes', () => {
+    assert.equal(getClassDoomLoopLevel(['git:status·success', 'npm:test·success', 'rg·success', 'ls·success']), 'none')
+  })
+
+  it('warns on 6th consecutive same-class call (sed/head/tee variants merged)', () => {
+    assert.equal(getClassDoomLoopLevel(Array(6).fill('git:status·success'), nt), 'warn')
+  })
+
+  it('blocks on 8th consecutive same-class call', () => {
+    assert.equal(getClassDoomLoopLevel(Array(8).fill('git:status·success'), nt), 'blocked')
+  })
+
+  it('does not flag 5 consecutive same-class calls (legit iteration headroom)', () => {
+    assert.equal(getClassDoomLoopLevel(Array(5).fill('rg·success'), nt), 'none')
+  })
+
+  it('blocks when one class dominates the window even non-consecutively', () => {
+    // 9/10 same class → blockFreq=9 met
+    const fps = ['git:status·success', 'ls·success', 'git:status·success', 'git:status·success',
+      'git:status·success', 'git:status·success', 'git:status·success', 'git:status·success',
+      'git:status·success', 'git:status·success']
+    assert.equal(getClassDoomLoopLevel(fps, nt), 'blocked')
+  })
+})
+
+describe('combineDoomLoopLevels', () => {
+  it('returns the strictest level', () => {
+    assert.equal(combineDoomLoopLevels('none', 'warn'), 'warn')
+    assert.equal(combineDoomLoopLevels('blocked', 'warn'), 'blocked')
+    assert.equal(combineDoomLoopLevels('none', 'none'), 'none')
+    assert.equal(combineDoomLoopLevels('warn', 'blocked'), 'blocked')
+  })
+})
+
+describe('offendingFingerprints', () => {
+  it('returns empty when nothing is looping', () => {
+    assert.equal(offendingFingerprints(['a', 'b', 'c', 'a', 'b']).size, 0)
+  })
+
+  it('flags a fingerprint repeated to the frequency threshold (6+ in window)', () => {
+    // 6 of 'x' in an 8-window → 'x' is the offender, 'y' is not.
+    const offenders = offendingFingerprints(['x', 'x', 'x', 'y', 'x', 'x', 'y', 'x'])
+    assert.ok(offenders.has('x'))
+    assert.ok(!offenders.has('y'))
+  })
+
+  it('flags a fingerprint repeated consecutively to threshold (4 identical)', () => {
+    const offenders = offendingFingerprints(['a', 'b', 'x', 'x', 'x', 'x'])
+    assert.ok(offenders.has('x'))
+    assert.ok(!offenders.has('a'))
+    assert.ok(!offenders.has('b'))
+  })
+
+  it('isolates the offender so a different call would not match (deadlock fix)', () => {
+    // The bug: hitting blocked blocked every tool. The fix blocks only the
+    // looping fingerprint, so a fresh tool's fingerprint is absent here and
+    // would be allowed through to refresh the window.
+    const looping = Array(6).fill('loop-fp')
+    const offenders = offendingFingerprints(looping)
+    assert.ok(offenders.has('loop-fp'))
+    assert.ok(!offenders.has('some-other-tool-fp'))
+  })
+
+  it('honors custom class-level thresholds (window 10, freq 8, consec 6)', () => {
+    // Below class thresholds → no offender.
+    assert.equal(offendingFingerprints(Array(5).fill('c'), 10, 8, 6).size, 0)
+    // 7 consecutive identical (consec run of 6 repeats) → offender.
+    assert.ok(offendingFingerprints(Array(7).fill('c'), 10, 8, 6).has('c'))
+  })
+})
+
+describe('goal-aware doom-loop thresholds', () => {
+  it('normal mode warns earlier than goal mode', () => {
+    const fp = fingerprintToolCall('bash', { command: 'grep foo' }, 'error')
+    // 3 identical → normal warns, goal does not
+    const three = [fp, fp, fp]
+    assert.equal(getDoomLoopLevel(three, NORMAL_DOOM_THRESHOLDS.exact), 'warn')
+    assert.equal(getDoomLoopLevel(three, GOAL_DOOM_THRESHOLDS.exact), 'none')
+  })
+
+  it('goal mode requires more repetitions to block', () => {
+    const fp = fingerprintToolCall('bash', { command: 'grep foo' }, 'error')
+    // 4 identical (maxConsec=3) → normal warn, goal warn (goal warnConsec=3)
+    const four = [fp, fp, fp, fp]
+    assert.equal(getDoomLoopLevel(four, NORMAL_DOOM_THRESHOLDS.exact), 'warn')
+    assert.equal(getDoomLoopLevel(four, GOAL_DOOM_THRESHOLDS.exact), 'warn')
+    // 5 identical (maxConsec=4) → normal blocked, goal warn (goal blockConsec=6)
+    const five = [fp, fp, fp, fp, fp]
+    assert.equal(getDoomLoopLevel(five, NORMAL_DOOM_THRESHOLDS.exact), 'blocked')
+    assert.equal(getDoomLoopLevel(five, GOAL_DOOM_THRESHOLDS.exact), 'warn')
+    // 7 identical (maxConsec=6) → goal blocked
+    const seven = Array(7).fill(fp)
+    assert.equal(getDoomLoopLevel(seven, GOAL_DOOM_THRESHOLDS.exact), 'blocked')
+  })
+
+  it('goal mode class thresholds are more lenient', () => {
+    const cf = 'git:status·success'
+    // 6 same class → normal warn, goal none
+    assert.equal(getClassDoomLoopLevel(Array(6).fill(cf), NORMAL_DOOM_THRESHOLDS.class), 'warn')
+    assert.equal(getClassDoomLoopLevel(Array(6).fill(cf), GOAL_DOOM_THRESHOLDS.class), 'none')
+    // 11 same class → goal blocked
+    assert.equal(getClassDoomLoopLevel(Array(11).fill(cf), GOAL_DOOM_THRESHOLDS.class), 'blocked')
+  })
+
+  it('getDoomLoopThresholds switches by goalActive flag', () => {
+    assert.equal(getDoomLoopThresholds(false), NORMAL_DOOM_THRESHOLDS)
+    assert.equal(getDoomLoopThresholds(true), GOAL_DOOM_THRESHOLDS)
   })
 })

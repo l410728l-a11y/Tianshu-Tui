@@ -89,14 +89,65 @@ describe('buildStarPhaseContext', () => {
 })
 
 describe('buildHealthTelemetry', () => {
-  it('reports rigidity and elmDue', () => {
+  it('flat-low triggers rigidity, elmDue stays false (below elm threshold)', () => {
     const health = buildHealthTelemetry(createVigorState({
-      vigor: 0.86,
-      history: [0.81, 0.82, 0.83, 0.84, 0.86, 0.86, 0.86, 0.86, 0.86, 0.86],
-    }))
+      vigor: 0.4,
+      history: Array(10).fill(0.4),
+    }), 1)
 
     assert.equal(health.rigidity, true)
+    assert.equal(health.elmDue, false)
+  })
+
+  it('flat-high does NOT trigger rigidity (sustained success is healthy)', () => {
+    const health = buildHealthTelemetry(createVigorState({
+      vigor: 0.9,
+      history: Array(10).fill(0.9),
+    }), 1)
+
+    assert.equal(health.rigidity, false)
     assert.equal(health.elmDue, true)
+  })
+
+  it('elmDue cools down within cooldown window (caller-held lastElmReleaseTurn)', () => {
+    const highState = createVigorState({
+      vigor: 0.86,
+      history: [0.81, 0.83, 0.84, 0.82, 0.86],
+    })
+
+    // 首次：无冷却记录（lastElmReleaseTurn 默认 -Infinity）→ 触发
+    const first = buildHealthTelemetry(highState, 1)
+    assert.equal(first.elmDue, true)
+
+    // 调用方记录 lastElmReleaseTurn=1 后，冷却期内（<5 轮）不再触发
+    const second = buildHealthTelemetry(highState, 2, 1)
+    assert.equal(second.elmDue, false)
+
+    const third = buildHealthTelemetry(highState, 4, 1)
+    assert.equal(third.elmDue, false)
+  })
+
+  it('elmDue re-triggers after cooldown expires', () => {
+    const highState = createVigorState({
+      vigor: 0.86,
+      history: [0.81, 0.83, 0.84, 0.82, 0.86],
+    })
+
+    // 上次触发在第 10 轮；第 15 轮已过 5 轮冷却 → 再次触发
+    const afterCooldown = buildHealthTelemetry(highState, 15, 10)
+    assert.equal(afterCooldown.elmDue, true)
+  })
+
+  it('纯函数无模块级状态：重复调用（不传 lastElmReleaseTurn）互不污染', () => {
+    const highState = createVigorState({
+      vigor: 0.86,
+      history: [0.81, 0.83, 0.84, 0.82, 0.86],
+    })
+
+    // 旧实现用模块级 lastElmReleaseTurn，第二次会被静默；
+    // 改 per-session 纯函数后，不传冷却态 = 每次独立判定，均触发。
+    assert.equal(buildHealthTelemetry(highState, 1).elmDue, true)
+    assert.equal(buildHealthTelemetry(highState, 2).elmDue, true)
   })
 })
 

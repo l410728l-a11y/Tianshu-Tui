@@ -54,6 +54,10 @@ export interface OwnershipLedger {
   /** Filter a file list to only owned files */
   scopeToOwned(files: string[]): string[]
   getOwnershipReport(): OwnershipReport
+  /** VSW: real baseline commit SHA (BaselineSnapshot.head) — the commit-ish a
+   *  snapshot worktree detaches onto. Distinct from baseline.getBaselineHash()
+   *  which is a structural-identity hash for integrity checks. */
+  getBaselineHead(): string
 }
 
 export function createOwnershipLedger(opts: {
@@ -150,12 +154,22 @@ export function createOwnershipLedger(opts: {
   function adoptFiles(files: string[]): string[] {
     const adopted: string[] = []
     for (const f of files) {
-      if (!ownedSet.has(f) && !coOwnedSet.has(f) && !adoptedSet.has(f)) {
-        adoptedSet.add(f)
-        adopted.push(f)
+      // 幂等：已 adopted 的文件跳过
+      if (adoptedSet.has(f)) continue
+      // 已 owned 的文件跳过（无需重复认领）
+      if (ownedSet.has(f)) continue
+      // co-owned → adopted：从共享所有权迁移为独占所有权
+      if (coOwnedSet.has(f)) {
+        coOwnedSet.delete(f)
       }
+      adoptedSet.add(f)
+      adopted.push(f)
     }
     return adopted.sort()
+  }
+
+  function getBaselineHead(): string {
+    return baseline.getHead()
   }
 
   function getOwnershipReport(): OwnershipReport {
@@ -186,5 +200,6 @@ export function createOwnershipLedger(opts: {
     getExternalFiles,
     scopeToOwned,
     getOwnershipReport,
+    getBaselineHead,
   }
 }

@@ -1,14 +1,18 @@
 import type { AgentConfig, AgentCallbacks } from './loop-types.js'
 import type { TurnBudget } from './turn-budget.js'
 import type { ContentBlock } from '../api/types.js'
-import type { ToolCallParams } from '../tools/types.js'
+import type { ToolCallParams, VerificationMetadata } from '../tools/types.js'
 import type { TurnHarness } from './turn-harness.js'
 import type { EvidenceTrackerPublic } from './evidence.js'
 import type { TraceStore } from './trace-store.js'
 import type { RepairHintTracker } from './repair-hint.js'
 import type { ImportGraph } from './import-graph.js'
-import { createCheckpoint, recordAgentTouchedFile } from './checkpoint.js'
-import { validatePath } from '../tools/path-validate.js'
+import { mkdir, appendFile } from 'node:fs/promises'
+import { createCheckpoint, recordAgentTouchedFile, recordBashSideEffects, makeOwnershipGuard, type OwnershipGuard, type ClaimLookup } from './checkpoint.js'
+import { validatePath, validatePathSafe } from '../tools/path-validate.js'
+import { grantPath } from '../tools/path-grants.js'
+import { dirname, join, resolve as resolvePath } from 'node:path'
+import { getSessionDir } from './session-persist.js'
 import { classifyFailure, classifyTestRun } from './failure-classifier.js'
 import { extractClaimsFromToolResult } from '../context/claim-extractor.js'
 import { appendProjectMemory, compactProjectMemory } from '../context/project-memory-writer.js'
@@ -16,22 +20,24 @@ import { detectConflicts } from '../context/conflict-detect.js'
 import { createAntibodyProposal } from '../context/antibody.js'
 import { buildImportGraph, invalidateFile } from './import-graph.js'
 import { generateImpactHint } from './impact-hint.js'
-import { shouldRunDiagnostics, runTypeCheck } from '../lsp/client.js'
+import { shouldRunDiagnostics } from '../lsp/client.js'
 import type { LspManager } from '../lsp/manager.js'
-import { startTraceEvent, finishTraceEvent, fingerprintToolCall, recordToolFingerprint, recordTraceEvent } from './trace-store.js'
+import { startTraceEvent, finishTraceEvent, fingerprintToolCall, fingerprintToolClass, recordToolFingerprint, recordTraceEvent, offendingFingerprints, getDoomLoopThresholds } from './trace-store.js'
 import { summarizeRepairTelemetry } from './repair-pipeline.js'
 import type { InterventionLevel } from './prediction-error.js'
 import { assessToolRisk, CONFIDENCE_THRESHOLDS, isDestructiveGitAction, requiresBashWriteApproval } from './approval-risk.js'
 import type { Sensorium } from './sensorium.js'
 import { isToolAllowed, isBashCommandAllowlisted, learnBashPrefix } from './permissions.js'
+import { isSandboxActive } from '../tools/sandbox-profile.js'
 import { applyApprovalEdit, type ApprovalResult } from './approval-edit.js'
-import { debugLog } from '../utils/debug.js'
+import { debugEnabled, debugLog } from '../utils/debug.js'
 import { suggestStrategyShift, type TrajectorySummary } from './strategy-shift.js'
 import { PrewarmCache } from './prewarm.js'
 import { batchPrewarm } from './prewarm-file.js'
 
 import { compactThresholds, pruneThresholds } from '../compact/constants.js'
 import { getToolArtifactThreshold } from '../tools/artifact-threshold.js'
+import { extractTrailingArtifactId } from './tool-result-tiering.js'
 import { truncateToolResult } from './tool-result-truncate.js'
 import { getStarSignature } from './star-signature.js'
 import type { ImmuneHook } from './immune-hook.js'
@@ -44,6 +50,7 @@ import type { P3Integration } from './p3-integration.js'
 import { buildCommitNudge } from './commit-nudge.js'
 import { checkPlanMode } from './plan-mode.js'
 import { buildSensitivePreflightMessage, shouldRequireSensitivePreflight } from './sensitive-preflight.js'
+import { detectExplorationStall } from './exploration-stall.js'
 
 /** Extract artifact ID from content if it starts with [artifact:ID] */
 function extractArtifactId(content: string): string | undefined {
@@ -60,11 +67,102 @@ const BLOCKED_CLASSES: ReadonlySet<string> = new Set([
 
 const DEFAULT_TOOL_TIMEOUT_MS = 120_000 // 2 minutes
 
+/** Tools that may mutate the workspace and therefore open the rollback window. */
+const MUTATING_TOOLS: ReadonlySet<string> = new Set([
+  'write_file', 'edit_file', 'apply_patch', 'bash',
+])
+function isMutatingTool(name: string): boolean {
+  return MUTATING_TOOLS.has(name)
+}
+
+function sortedInputKeys(input: Record<string, unknown>): string[] {
+  return Object.keys(input).sort()
+}
+
+function toolInputTraceDebugEnabled(): boolean {
+  return process.env.RIVET_DEBUG_TOOL_INPUT === '1'
+}
+
+function shouldEmitToolInputTrace(
+  toolName: string,
+  beforeHookKeys: string[] | undefined,
+  afterHookKeys: string[] | undefined,
+  afterRepairKeys: string[] | undefined,
+): boolean {
+  if (toolInputTraceDebugEnabled()) return true
+  if (toolName !== 'grep') return false
+  return !beforeHookKeys?.includes('pattern') ||
+    !afterHookKeys?.includes('pattern') ||
+    !afterRepairKeys?.includes('pattern')
+}
+
+async function emitToolInputTrace(input: { cwd: string; sessionId?: string; message: string }): Promise<void> {
+  if (debugEnabled()) {
+    debugLog(input.message)
+    return
+  }
+  try {
+    const sessionDir = input.sessionId
+      ? join(getSessionDir(input.cwd), input.sessionId)
+      : join(getSessionDir(input.cwd), 'unknown')
+    await mkdir(sessionDir, { recursive: true })
+    await appendFile(join(sessionDir, 'tool-input-trace.jsonl'), `${input.message}\n`, 'utf8')
+  } catch {
+    // Diagnostics must never affect tool execution or pollute model-visible output.
+  }
+}
+
+/**
+ * File tools whose path operand may target a path outside the workspace, with
+ * the access mode they need. Used to gate out-of-workspace file ops behind an
+ * approval-driven path grant (rather than a hard "Path outside workspace" error).
+ * `read_section` is artifact-id based and `apply_patch` embeds paths in a patch
+ * body — neither has a single extractable path, so they rely on request_path_access.
+ */
+const FILE_TOOL_MODES: Record<string, 'read' | 'write'> = {
+  read_file: 'read',
+  write_file: 'write',
+  edit_file: 'write',
+  hash_edit: 'write',
+}
+
+/**
+ * Resolve the absolute paths a file tool would touch that currently fall OUTSIDE
+ * the workspace and are not yet covered by a grant. Empty when in-workspace or
+ * already granted (validatePathSafe consults the grant store).
+ */
+function outOfWorkspaceFilePaths(cwd: string, toolName: string, input: Record<string, unknown>): { mode: 'read' | 'write'; paths: string[] } | null {
+  const mode = FILE_TOOL_MODES[toolName]
+  if (!mode) return null
+  const candidates: string[] = []
+  if (typeof input.file_path === 'string') candidates.push(input.file_path)
+  if (Array.isArray(input.file_paths)) {
+    for (const p of input.file_paths) if (typeof p === 'string') candidates.push(p)
+  }
+  const paths: string[] = []
+  for (const c of candidates) {
+    if (!validatePathSafe(cwd, c, mode).ok) paths.push(resolvePath(cwd, c))
+  }
+  return paths.length > 0 ? { mode, paths } : null
+}
+
+/** Build a cross-session ownership guard from the live session registry, if any. */
+function buildOwnershipGuard(deps: {
+  cwd: string
+  config: { sessionRegistry?: ClaimLookup; sessionId?: string }
+}): OwnershipGuard | undefined {
+  const registry = deps.config.sessionRegistry
+  const sessionId = deps.config.sessionId
+  if (!registry || !sessionId) return undefined
+  return makeOwnershipGuard(registry, sessionId, deps.cwd)
+}
+
 function withToolTimeout<T>(
   promise: Promise<T>,
   toolName: string,
   timeoutMs: number,
   signal?: AbortSignal,
+  timeoutController?: AbortController,
 ): Promise<T> {
   // Guard against NaN/Infinity/negative timeout (e.g. parameter misplacement bugs)
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -73,7 +171,12 @@ function withToolTimeout<T>(
   if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
 
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Tool ${toolName} timed out after ${timeoutMs / 1000}s`)), timeoutMs)
+    const timer = setTimeout(() => {
+      // Cascade abort to the underlying op (child proc / fetch) BEFORE rejecting,
+      // so the tool stops consuming resources instead of orphaning.
+      try { timeoutController?.abort() } catch { /* noop */ }
+      reject(new Error(`Tool ${toolName} timed out after ${timeoutMs / 1000}s`))
+    }, timeoutMs)
     const onAbort = () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')) }
     signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -97,10 +200,18 @@ export interface ToolPipelineDeps {
   lastConflictCheckCount: number
   trajectory: { getEntries(): { tool: string; target: string; status: string; errorClass?: string }[] }
   getDoomLoopLevel(): import('./trace-store.js').DoomLoopLevel
+  /** Whether goal mode is active — relaxes doom-loop thresholds when true. */
+  isGoalActive?: boolean
   latestRisk: import('./approval-risk.js').RiskAssessment
   sessionTurnCount: number
   sessionId: string | undefined
   abortSignal?: AbortSignal
+  /** Capture an agent's departure mark (leave_mark tool) for 主控 to record at close. */
+  onLeaveMark?: (mark: import('../tools/types.js').LeaveMarkInput) => void
+  /** U6/C1: capture goal decomposition from plan_steps into the loop's PlanExecutionTrace. */
+  onPlanSteps?: (descriptions: string[]) => void
+  /** Write a constellation milestone when plan_close succeeds with apply=true. */
+  onPlanClosed?: (input: import('../tools/types.js').PlanClosedInput) => void
   recordToolHistory(name: string, input: Record<string, unknown>, isError: boolean, content: string): void
   getInterventionLevel?(): InterventionLevel
   recordPrediction?(correct: boolean): void
@@ -122,6 +233,9 @@ export interface ToolPipelineDeps {
   taskLedger?: TaskLedger
   /** Optional OwnershipLedger for real-time file ownership registration */
   ownershipLedger?: import('./ownership-ledger.js').OwnershipLedger
+  /** VSW: session-scoped snapshot manager. Consulted before run_tests to decide
+   *  isolated (Phase A) + integration (Phase B) verification vs in-place. */
+  verificationSnapshotManager?: import('./verification-snapshot-manager.js').VerificationSnapshotManager
   /** Optional SessionRegistry for cross-session file claim coordination */
   sessionRegistry?: import('./session-registry.js').SessionRegistry
   /** P3 integration facade for speculative execution + mistake hints */
@@ -132,6 +246,9 @@ export interface ToolPipelineDeps {
   artifactIdsAccessed?: string[]
   /** Optional LSP manager — notified on file changes for goto-def / find-refs accuracy */
   lspManager?: LspManager
+  /** T4: late-bound LSP manager getter. Checked first, falls back to `lspManager`.
+   *  Enables T9 path where LSP initializes asynchronously after AgentLoop construction. */
+  getLspManager?: () => LspManager | null
 }
 
 export interface ToolExecResult {
@@ -161,23 +278,31 @@ function truncateSuccessfulToolResult(content: string, config: AgentConfig): str
 const ARTIFACT_INTERCEPT_THRESHOLD = 2500 // chars — success results (raised from 800; review workflows need more inline content)
 const ARTIFACT_ERROR_THRESHOLD = 1600 // chars — error results need more inline context for debugging
 
-/** Tools whose output is the agent's "eyes" — intercept only at very high thresholds. */
-const READ_TOOLS: ReadonlySet<string> = new Set([
-  'read_file', 'grep', 'glob', 'find_files', 'search', 'repo_map', 'inspect_project',
-  // read_section is the model's escape hatch from artifact references. Its output
-  // is content the model explicitly asked for (artifactId + section), already
-  // capped by computeModelReadCap inside the tool. Wrapping it again here turned
-  // every recovery attempt into [artifact:NEW_ID] -> read_section(NEW_ID) -> ...
-  // an infinite nesting loop the model could only escape by requesting tiny
-  // L1-L10 slices. (Diagnosed by tianshu v4 pro post-mortem 2026-05-25.)
-  'read_section',
-])
+/**
+ * Tools whose output MUST reach the model complete and inline — never replaced by
+ * a lossy artifact summary, nor head/tail truncated, nor collapsed to a budget
+ * preview. The `skill` tool loads a skill's full instructions that the model
+ * explicitly asked for and will follow verbatim; a summary or a truncated middle
+ * would make it act on partial/wrong instructions and force a whole-session redo
+ * (fidelity is the #1 priority over context cleanliness). Unlike read tools,
+ * `skill` has no offset/section param, so any truncation is unrecoverable. Heavy
+ * reference material is split into sub-files (Tier-3) read on demand via
+ * read_file (which DOES page), so the SKILL.md body stays bounded by author
+ * convention and is safe to deliver in full.
+ */
+const FIDELITY_EXEMPT_TOOLS: ReadonlySet<string> = new Set(['skill'])
 
-/** Heuristic: is this bash command read-only (cat, grep, find, git log/diff/status, ls, etc.)? */
-function isBashReadOnly(input: Record<string, unknown>): boolean {
-  const cmd = typeof input.command === 'string' ? input.command.trimStart() : ''
-  return /^(cat|head|tail|grep|rg|find|ls|tree|wc|git\s+(log|diff|status|show|blame|rev-parse|branch)|echo|printf|type|which|file)\b/.test(cmd)
-}
+/** Tools that perform their own L0 artifact wrapping (inside the tool impl) and
+ *  emit a trailing [artifact:id] marker. L1 must NOT re-wrap their output:
+ *  - read_file / read_section: content the model explicitly requested; re-wrap
+ *    turns every recovery into [artifact:NEW_ID] -> read_section(NEW_ID) -> ...
+ *    an infinite nesting loop (tianshu v4 pro post-mortem 2026-05-25).
+ *  - grep / bash: L0 wraps at its own threshold with a trailing marker; the old
+ *    startsWith('[artifact:') check missed the trailing marker and re-saved the
+ *    already-truncated string (L0->L1 double-save bug). */
+const L0_WRAPPED_TOOLS: ReadonlySet<string> = new Set([
+  'read_file', 'read_section', 'grep', 'bash',
+])
 
 function isDietNoInfoReadResult(content: string): boolean {
   return content.includes('[diet:redundant]') || content.includes('[diet:useless]')
@@ -232,9 +357,13 @@ async function artifactIntercept(
   contextWindow?: number,
 ): Promise<string> {
   if (!artifactStore) return content
-  // Read-class tools bypass artifact intercept entirely — rely on per-message budget + hard truncation.
-  const isReadTool = READ_TOOLS.has(toolName) || (toolName === 'bash' && isBashReadOnly(toolInput))
-  if (isReadTool) return content
+
+  // Tools with their own L0 wrapping must not be re-intercepted here.
+  if (L0_WRAPPED_TOOLS.has(toolName)) return content
+  // Belt-and-suspenders: never re-wrap content that already ends in an artifact
+  // ref (covers any future L0-wrapping tool not yet listed above). Uses the
+  // shared trailing-marker convention, not startsWith — the marker is at the END.
+  if (extractTrailingArtifactId(content)) return content
 
   let threshold = thresholdOverride ?? (isError ? ARTIFACT_ERROR_THRESHOLD : ARTIFACT_INTERCEPT_THRESHOLD)
 
@@ -266,8 +395,6 @@ async function artifactIntercept(
     debugLog(`[artifact-intercept-skip] tool=${toolName} len=${content.length} threshold=${threshold} isError=${isError}`)
     return content
  }
-  if (content.startsWith('[artifact:')) return content // already an artifact ref
-
   // Determine target label for the artifact
   const target = typeof toolInput.file_path === 'string'
     ? toolInput.file_path
@@ -390,13 +517,23 @@ export async function executeToolUse(
     onOutput: (chunk) => {
       callbacks.onToolResult(tu.id, tu.name, chunk)
    },
+    // T4: structured per-worker delegation updates → subagent panel. Optional;
+    // forwarded to the session layer alongside the text progress stream.
+    onWorkerActivity: callbacks.onDelegationActivity
+      ? (activity) => callbacks.onDelegationActivity!(activity)
+      : undefined,
+    onLeaveMark: deps.onLeaveMark,
+    onPlanSteps: deps.onPlanSteps,
+    onPlanClosed: deps.onPlanClosed,
     sessionModifiedFiles: [...deps.evidence.getState().filesModified],
     ownedFiles: deps.ownershipLedger?.getOwnedFiles(),
+    baselineHead: deps.ownershipLedger?.getBaselineHead(),
     artifactStore: deps.artifactStore,
     contextWindow: deps.config.contextWindow,
     providerProfile: deps.config.providerProfile,
     sessionTurnCount: deps.sessionTurnCount,
     reviewDepth: deps.config.reviewDepth,
+    delegationDepth: deps.config.delegationDepth,
     abortSignal: deps.abortSignal,
  }
 
@@ -415,6 +552,9 @@ export async function executeToolUse(
      }
    }
 
+    const shouldSampleToolInput = toolInputTraceDebugEnabled() || tu.name === 'grep'
+    const beforeHookKeys = shouldSampleToolInput ? sortedInputKeys(tu.input) : undefined
+
     // PreToolUse hook
     const preHookResult = deps.config.hooks?.firePreToolUse({ toolName: tu.name, input: tu.input as Record<string, unknown> }) ?? {}
     if (preHookResult.block) {
@@ -426,6 +566,7 @@ export async function executeToolUse(
       tu.input = preHookResult.input
       params.input = preHookResult.input
    }
+    const afterHookKeys = shouldSampleToolInput ? sortedInputKeys(tu.input) : undefined
 
     // Multi-pass tool input repair
     const toolDef = deps.config.toolRegistry.get(tu.name)
@@ -454,6 +595,7 @@ export async function executeToolUse(
        }
      }
    }
+    const afterRepairKeys = shouldSampleToolInput ? sortedInputKeys(tu.input) : undefined
 
     // Reliability mode gate — Phase 2 degraded/minimal executor.
     const reliabilityDecision = deps.getReliabilityDecision?.() ?? null
@@ -472,21 +614,49 @@ export async function executeToolUse(
    }))
     const doomLevel = deps.getDoomLoopLevel()
     const hint = suggestStrategyShift(trajectorySummary, doomLevel)
-    deps.config.promptEngine.setStrategyShift(hint)
     if (doomLevel === 'blocked') {
-      // 计算连续失败次数和 fingerprint 信息，让 agent 知道发生了什么
-      const fps = traceStore.toolFingerprints
-      const lastFp = fps.at(-1)
-      const maxCount = lastFp ? fps.filter(f => f === lastFp).length : 0
-      const baseMsg = hint ?? 'Repeated identical failures detected.'
-      const msg = [
-        baseMsg,
-        `Tool: ${tu.name} | Consecutive same-pattern failures: ${maxCount} | Fingerprint: ${lastFp?.slice(0, 8) ?? 'unknown'}`,
-        'Recovery: try a different tool (e.g. read_file, todo), change the input, or modify the target path.',
-      ].join('\n')
+      // Block ONLY repeats of the call(s) that are actually looping — not every
+      // tool. The looping fingerprints are recorded with outputClass 'error'
+      // (a passing call breaks the loop and wouldn't be blocked), so compare the
+      // current call's error-variant fingerprint against the offenders. Letting
+      // different tools/inputs through is what refreshes the window out of
+      // 'blocked'; blocking everything deadlocks the turn (blocked calls are
+      // never recorded, so the window never changes — see offendingFingerprints).
+      const goalActive = deps.isGoalActive ?? false
+      const thresholds = getDoomLoopThresholds(goalActive)
+      const exactOffenders = offendingFingerprints(traceStore.toolFingerprints, thresholds.exact.window, thresholds.exact.blockFreq, thresholds.exact.blockConsec)
+      const classOffenders = offendingFingerprints(traceStore.bashClassFingerprints ?? [], thresholds.class.window, thresholds.class.blockFreq, thresholds.class.blockConsec)
+      const curExactFp = fingerprintToolCall(tu.name, tu.input, 'error')
+      const curClassFp = fingerprintToolClass(tu.name, tu.input, 'error')
+      const isOffendingCall = exactOffenders.has(curExactFp) || (curClassFp != null && classOffenders.has(curClassFp))
+
+      if (isOffendingCall) {
+        const fps = traceStore.toolFingerprints
+        const lastFp = fps.at(-1)
+        const maxCount = lastFp ? fps.filter(f => f === lastFp).length : 0
+        const baseMsg = hint ?? 'Repeated identical failures detected.'
+        const msg = [
+          baseMsg,
+          `Tool: ${tu.name} | Consecutive same-pattern failures: ${maxCount} | Fingerprint: ${curExactFp.slice(0, 8)}`,
+          'Recovery: try a different tool (e.g. read_file, todo), change the input, or modify the target path.',
+        ].join('\n')
+        callbacks.onToolResult(tu.id, tu.name, msg, true)
+        return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? msg + starSig : msg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+      }
+      // Different tool/input under 'blocked' — let it run. It will be recorded
+      // and slide the offending fingerprints out of the detection window.
+   }
+
+    // Exploration stall gate — after N consecutive read-only tools without any
+    // write/test/action, block further exploration and force the agent to act.
+    // Prevents GLM/thinking-mode "explore forever, never code" loops that waste
+    // minutes of reasoning only to be killed by SSE timeout.
+    const stall = detectExplorationStall(trajectorySummary, tu.name)
+    if (stall.blocked) {
+      const msg = stall.message!
       callbacks.onToolResult(tu.id, tu.name, msg, true)
       return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? msg + starSig : msg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
-   }
+    }
 
     // Plan-mode gate — block write tools during planning phase
     const planModeResult = checkPlanMode(deps.config.planModeState ?? 'off', tu.name)
@@ -526,27 +696,48 @@ export async function executeToolUse(
     const bashAllowlisted = tu.name === 'bash' && typeof tu.input.command === 'string'
       ? isBashCommandAllowlisted(tu.input.command, deps.config.permissions?.bash?.allowlist)
       : false
-    const bashWriteRequiresApproval = requiresBashWriteApproval(tu.name, tu.input) && !allowlisted && !bashAllowlisted
+    // Autonomy-first: when a real kernel sandbox boundary is in effect, an
+    // in-workspace bash write is safe-by-construction (writes can't escape the
+    // workspace, and B2 rollback makes them reversible), so it must NOT
+    // interrupt an unattended run for approval. When no sandbox is available we
+    // stay fail-closed and keep requiring approval for write commands.
+    const bashWriteRequiresApproval =
+      requiresBashWriteApproval(tu.name, tu.input)
+      && !allowlisted && !bashAllowlisted
+      && !isSandboxActive()
 
     // Protection mode: during doom-loop, destructive git actions always require
     // approval. warn is the live window (blocked is short-circuited earlier).
     const protectionMode = deps.getDoomLoopLevel() !== 'none' && isDestructiveGitAction(tu.name, tu.input)
 
+    // Out-of-workspace file op: the path is outside the workspace and not yet
+    // granted. Instead of hard-blocking in execute(), route through the approval
+    // flow — on approval we record a directory-subtree grant so the op proceeds.
+    let pathGrantNeed = outOfWorkspaceFilePaths(deps.cwd, tu.name, tu.input)
+    // In dangerously-skip-permissions the user opted out of all prompts: record
+    // the grant directly so the op isn't blocked by the path guard.
+    if (skipAllApproval && pathGrantNeed) {
+      for (const p of pathGrantNeed.paths) grantPath(dirname(p), pathGrantNeed.mode)
+      pathGrantNeed = null
+    }
+
     const shouldAsk = skipAllApproval
       ? false
-      : protectionMode
+      : pathGrantNeed
         ? true
-        : bashWriteRequiresApproval
+        : protectionMode
           ? true
-          : allowlisted
-            ? false
-            : canAutoApprove
+          : bashWriteRequiresApproval
+            ? true
+            : allowlisted
               ? false
-              : approvalMode === 'manual'
-                ? needsApproval
-                : approvalMode === 'auto-safe'
-                  ? isHighRisk
-                  : false
+              : canAutoApprove
+                ? false
+                : approvalMode === 'manual'
+                  ? needsApproval
+                  : approvalMode === 'auto-safe'
+                    ? isHighRisk
+                    : false
 
     if (shouldAsk) {
       const approvalResult = await callbacks.onApprovalRequired(tu.id, tu.name, tu.input)
@@ -567,10 +758,51 @@ export async function executeToolUse(
       if (tu.name === 'bash' && typeof tu.input.command === 'string') {
         learnBashPrefix(tu.input.command, deps.config.permissions)
      }
+      // Out-of-workspace file op approved: record a directory-subtree grant so
+      // both gates (validatePathSafe + sandbox) accept it. Recompute from the
+      // (possibly edited) final input so an edited path is granted, not the stale one.
+      const approvedGrant = outOfWorkspaceFilePaths(deps.cwd, tu.name, tu.input)
+      if (approvedGrant) {
+        for (const p of approvedGrant.paths) grantPath(dirname(p), approvedGrant.mode)
+      }
    }
 
-    // Checkpoint before first write
-    if ((tu.name === 'write_file' || tu.name === 'edit_file') && !checkpointCreated) {
+    // R2 — concurrent write conflict block (desktop multi-session). When a live
+    // SessionRegistry is wired and another active session holds an exclusive
+    // claim on the target file, fail-closed: refuse the write instead of
+    // clobbering a peer session's in-flight edit. acquireClaim is idempotent for
+    // the same session, so an uncontended write also stakes our claim here.
+    // Only active when a registry is present — CLI / single-session / no-registry
+    // paths are completely unaffected.
+    if (
+      deps.sessionRegistry &&
+      deps.sessionId &&
+      (tu.name === 'write_file' || tu.name === 'edit_file') &&
+      typeof tu.input.file_path === 'string'
+    ) {
+      // Normalize to the same key form the post-write claim path uses (relative
+      // to cwd when inside the workspace) so claims compare consistently.
+      let claimPath = tu.input.file_path
+      if (claimPath.startsWith(deps.cwd + '/') || claimPath.startsWith(deps.cwd + '\\')) {
+        claimPath = claimPath.slice(deps.cwd.length + 1)
+      }
+      const acquired = deps.sessionRegistry.acquireClaim(deps.sessionId, claimPath, 'exclusive')
+      if (!acquired) {
+        const owner = deps.sessionRegistry.checkClaim(claimPath)
+        const ownerTag = owner?.sessionId ? `（会话 ${owner.sessionId.slice(0, 8)}）` : ''
+        const blockMsg =
+          `文件「${claimPath}」正被另一个会话${ownerTag}独占编辑，已阻断本次写入以避免并发冲突。` +
+          `请等待对方完成，或改写其它文件。`
+        callbacks.onToolResult(tu.id, tu.name, blockMsg, true)
+        return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: blockMsg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+      }
+    }
+
+    // Checkpoint before the first MUTATING tool of the turn. Beyond file edits
+    // this now covers bash (and apply_patch): any shell side effect must fall
+    // inside the rollback window, so the snapshot baseline has to be taken
+    // before bash runs — not only before write_file/edit_file.
+    if (isMutatingTool(tu.name) && !checkpointCreated) {
       const cp = await createCheckpoint(deps.cwd, 'auto', deps.config.sessionId)
       checkpointCreated = true
       if (cp) callbacks.onCheckpoint?.(cp.hash)
@@ -604,6 +836,20 @@ export async function executeToolUse(
       predictedSuccess: true,
    })
     let rawToolResult: import('../tools/types.js').ToolResult | undefined
+
+    // VSW: for run_tests, ask the snapshot manager whether to isolate. §6 policy
+    // decides; in the common single-clean-session case it returns null → params
+    // stays unset → in-place single-phase verification (unchanged default). Any
+    // failure here degrades to in-place — VSW must never break verification.
+    if (tu.name === 'run_tests' && deps.verificationSnapshotManager) {
+      try {
+        const plan = deps.verificationSnapshotManager.prepare(deps.ownershipLedger?.getOwnedFiles() ?? [])
+        if (plan) params.verificationSnapshot = { path: plan.path, snapshotRef: plan.snapshotRef }
+      } catch {
+        // degrade to in-place
+      }
+    }
+
     const harnessResult = await deps.harness.executeTool({
       id: tu.id,
       name: tu.name,
@@ -621,11 +867,19 @@ export async function executeToolUse(
         // (smaller) cap; serving cached content here would re-introduce the
         // truncation regression. fs.readFile + OS page cache is fast enough.
         const toolTimeout = toolDef?.timeoutMs?.(params) ?? DEFAULT_TOOL_TIMEOUT_MS
+        // P0/H1: compose a per-tool timeout AbortController with the loop signal,
+        // so a tool-level timeout cascades an abort into the underlying op
+        // (child proc / fetch) instead of merely rejecting the wrapper Promise.
+        const toolAbort = new AbortController()
+        const composedSignal = deps.abortSignal
+          ? AbortSignal.any([deps.abortSignal, toolAbort.signal])
+          : toolAbort.signal
         const r = await withToolTimeout(
-          deps.config.toolRegistry.execute(tu.name, params),
+          deps.config.toolRegistry.execute(tu.name, { ...params, abortSignal: composedSignal }),
           tu.name,
           toolTimeout,
           deps.abortSignal,
+          toolAbort,
         )
         rawToolResult = r
         return { content: r.content, isError: r.isError }
@@ -633,6 +887,17 @@ export async function executeToolUse(
       classify: (content) => classifyFailure(content).class,
       isConcurrencySafe: toolDef?.isConcurrencySafe() ?? false,
    })
+
+    if (shouldSampleToolInput && shouldEmitToolInputTrace(tu.name, beforeHookKeys, afterHookKeys, afterRepairKeys)) {
+      await emitToolInputTrace({
+        cwd: deps.cwd,
+        sessionId: deps.sessionId,
+        message: `[tool-input-trace] id=${tu.id} name=${tu.name} isError=${harnessResult.isError}` +
+        ` beforeHook=${JSON.stringify(beforeHookKeys ?? [])}` +
+        ` afterHook=${JSON.stringify(afterHookKeys ?? [])}` +
+        ` afterRepair=${JSON.stringify(afterRepairKeys ?? [])}`,
+      })
+    }
 
     // PostToolUse hook
     const postHookResult = deps.config.hooks?.firePostToolUse({
@@ -648,42 +913,71 @@ export async function executeToolUse(
     finalContent = finalContent.trimEnd()
 
     // LSP: notify the language server that a file changed on disk.
-    // Must happen BEFORE tsc diagnostics so the server's view is current.
+    // Must happen BEFORE diagnostics so the server's view is current.
     if (!harnessResult.isError && (tu.name === 'edit_file' || tu.name === 'write_file' || tu.name === 'apply_patch')) {
-      deps.lspManager?.changeFile(tu.input.file_path as string)
+      (deps.getLspManager?.() ?? deps.lspManager)?.changeFile(tu.input.file_path as string)
    }
 
-    // LSP diagnostics
-    if (deps.config.lspEnabled && !harnessResult.isError && shouldRunDiagnostics(tu.name, tu.input.file_path as string | undefined)) {
-      const check = runTypeCheck(deps.cwd, tu.input.file_path as string)
-      if (check.formatted) {
-        finalContent = finalContent + `
-
-[LSP Diagnostics]
-${check.formatted}`
-     }
+    // T4: LSP diagnostics via lspManager (async file-level, ~2s timeout)
+    const mgr = deps.getLspManager?.() ?? deps.lspManager
+    if (!harnessResult.isError && mgr?.isReady() && shouldRunDiagnostics(tu.name, tu.input.file_path as string | undefined)) {
+      try {
+        const diagnostics = await mgr.getFileDiagnostics(tu.input.file_path as string)
+        if (diagnostics.length > 0) {
+          const formatted = diagnostics
+            .filter(d => d.severity <= 2) // errors and warnings only
+            .slice(0, 10) // cap at 10 diagnostics
+            .map(d => `${d.severity === 1 ? 'ERROR' : 'WARNING'} L${d.range.start.line + 1}: ${d.message}`)
+            .join('\n')
+          if (formatted) {
+            finalContent = finalContent + `\n\n[LSP Diagnostics]\n${formatted}`
+          }
+        }
+      } catch {
+        // Silent: LSP diagnostics are best-effort, never fail the turn
+      }
    }
+
+    // Capture bash/shell side effects into the rollback window. The per-edit
+    // recorder above only sees write_file/edit_file; bash can create, delete or
+    // rewrite arbitrary files. We diff the worktree against the turn's snapshot
+    // baseline and attribute the changes to THIS session — never to paths a
+    // different live session exclusively owns (parallel-branch safety).
+    if (!harnessResult.isError && tu.name === 'bash' && checkpointCreated) {
+      try {
+        const guard = buildOwnershipGuard(deps)
+        const bashCommand = typeof tu.input?.command === 'string' ? tu.input.command : undefined
+        await recordBashSideEffects(deps.cwd, deps.config.sessionId, guard, bashCommand)
+      } catch { /* best-effort: capture failure must not fail the turn */ }
+    }
 
     if (!harnessResult.isError) {
-      // Artifact intercept: persist long output to disk, replace with compact ref.
-      // This must run BEFORE truncation — if we store an artifact, truncation is unnecessary.
-      const successThreshold = deps.cacheAdvisor?.getArtifactThreshold(deps.phaseHint ?? 'execute', false)
-      const budgetFraction = deps.turnBudget.maxTokensPerTurn > 0
-        ? 1 - (deps.turnBudget.usedTokens / deps.turnBudget.maxTokensPerTurn)
-        : 1
-      finalContent = await artifactIntercept(finalContent, tu.name, tu.input, deps.artifactStore, false, successThreshold, budgetFraction, deps.config.contextWindow)
-      // Track eviction for GhostRegistry
-      const evictedId = extractArtifactId(finalContent)
-      if (evictedId) deps.artifactIdsEvicted?.push(evictedId)
-      finalContent = truncateSuccessfulToolResult(finalContent, deps.config)
-      const contentChars = finalContent.length
-      const tokenEstimate = Math.ceil(contentChars / 4)
-      deps.turnBudget.consume(tokenEstimate)
-      if (deps.turnBudget.isExhausted()) {
-        const preview = finalContent.slice(0, 500)
-        const refPath = rawToolResult?.rawPath ?? 'unknown'
-        finalContent = `<stored ref="${refPath}" chars=${contentChars} tool="${tu.name}">\n${preview}\n...(turn budget exceeded — use read_file with offset/limit for full content)</stored>`
-     }
+      if (FIDELITY_EXEMPT_TOOLS.has(tu.name)) {
+        // Fidelity-first: deliver the skill instructions verbatim. We still
+        // account for the budget so later tools see the cost, but we never
+        // rewrite the content (no artifact summary, no truncation, no preview).
+        deps.turnBudget.consume(Math.ceil(finalContent.length / 4))
+      } else {
+        // Artifact intercept: persist long output to disk, replace with compact ref.
+        // This must run BEFORE truncation — if we store an artifact, truncation is unnecessary.
+        const successThreshold = deps.cacheAdvisor?.getArtifactThreshold(deps.phaseHint ?? 'execute', false)
+        const budgetFraction = deps.turnBudget.maxTokensPerTurn > 0
+          ? 1 - (deps.turnBudget.usedTokens / deps.turnBudget.maxTokensPerTurn)
+          : 1
+        finalContent = await artifactIntercept(finalContent, tu.name, tu.input, deps.artifactStore, false, successThreshold, budgetFraction, deps.config.contextWindow)
+        // Track eviction for GhostRegistry
+        const evictedId = extractArtifactId(finalContent)
+        if (evictedId) deps.artifactIdsEvicted?.push(evictedId)
+        finalContent = truncateSuccessfulToolResult(finalContent, deps.config)
+        const contentChars = finalContent.length
+        const tokenEstimate = Math.ceil(contentChars / 4)
+        deps.turnBudget.consume(tokenEstimate)
+        if (deps.turnBudget.isExhausted()) {
+          const preview = finalContent.slice(0, 500)
+          const refPath = rawToolResult?.rawPath ?? 'unknown'
+          finalContent = `<stored ref="${refPath}" chars=${contentChars} tool="${tu.name}">\n${preview}\n...(turn budget exceeded — use read_file with offset/limit for full content)</stored>`
+        }
+      }
    } else {
       // Error results can also be very long (e.g. failed test output).
       // Artifact-intercept them too to keep message history append-only.
@@ -723,8 +1017,11 @@ ${check.formatted}`
     if (!isTddRed) {
       deps.recordPrediction?.(!harnessResult.isError)
    }
-    const fp = fingerprintToolCall(tu.name, tu.input, harnessResult.isError ? 'error' : 'success')
-    traceStore = recordToolFingerprint(traceStore, fp)
+    const outputClass = harnessResult.isError ? 'error' : 'success'
+    const fp = fingerprintToolCall(tu.name, tu.input, outputClass)
+    // bash 类指纹：sed/head/python/tee 变体归并为同一命令类，堵 doom-loop 漏检
+    const classFp = fingerprintToolClass(tu.name, tu.input, outputClass)
+    traceStore = recordToolFingerprint(traceStore, fp, classFp)
 
     // P3-A: write path — when a tool resolves a prior failure of itself,
     // record the mistake into MistakeNotebook so getMistakeHints can find
@@ -806,19 +1103,38 @@ ${check.formatted}`
         const filter = typeof tu.input.filter === 'string' ? tu.input.filter : undefined
         const command = filter ? `run_tests ${filter}` : 'run_tests'
         const verification = rawToolResult?.verification
-        const meta: Record<string, unknown> = { scope: verification?.scope ?? (filter ? 'targeted' : 'full') }
-        if (verification) {
-          meta.exitCode = verification.exitCode
-          meta.passed = verification.passed
-          meta.failed = verification.failed
-          meta.skipped = verification.skipped
-          meta.durationMs = verification.durationMs
-          meta.resolvedCommand = verification.command
-          meta.recommendedCommand = verification.command
-          if (verification.failureKind) meta.failureKind = verification.failureKind
-          if (verification.targetFiles) meta.targetFiles = verification.targetFiles
-       }
-        deps.taskLedger.record({ type: 'verification', command, status: harnessResult.isError ? 'failed' : 'passed', meta })
+        const buildMeta = (v?: VerificationMetadata): Record<string, unknown> => {
+          const m: Record<string, unknown> = { scope: v?.scope ?? (filter ? 'targeted' : 'full') }
+          if (v) {
+            m.exitCode = v.exitCode
+            m.passed = v.passed
+            m.failed = v.failed
+            m.skipped = v.skipped
+            m.durationMs = v.durationMs
+            m.resolvedCommand = v.command
+            m.recommendedCommand = v.command
+            if (v.failureKind) m.failureKind = v.failureKind
+            if (v.targetFiles) m.targetFiles = v.targetFiles
+            // VSW: carry snapshot identity + phase so the gate can apply
+            // staleness supersession and integration_conflict attribution.
+            if (v.snapshotRef) m.snapshotRef = v.snapshotRef
+            if (v.verificationPhase) m.verificationPhase = v.verificationPhase
+          }
+          return m
+        }
+        deps.taskLedger.record({ type: 'verification', command, status: harnessResult.isError ? 'failed' : 'passed', meta: buildMeta(verification) })
+        // VSW two-phase: record the integration (Phase B) verification too so a
+        // Phase B failure surfaces as a non-blocking integration_conflict.
+        for (const extra of rawToolResult?.extraVerifications ?? []) {
+          deps.taskLedger.record({ type: 'verification', command, status: extra.status, meta: buildMeta(extra) })
+        }
+     } else if (tu.name === 'deliver_task' && tu.input.commit === true && !harnessResult.isError) {
+        // Successful scoped commit changed git state — invalidate the frozen
+        // git-status snapshot so the next appendix rebuild shows the post-commit
+        // reality. Without this the model sees stale "modified" files and
+        // re-attempts the commit (cache-log 6c9b3bd6 root cause).
+        deps.config.promptEngine.markGitDirty()
+        deps.taskLedger.record({ type: 'git_action', tool: tu.name, meta: { command: 'deliver_task commit' } })
      } else {
         deps.taskLedger.record({ type: 'tool_exec', tool: tu.name, path: filePath })
      }
@@ -871,7 +1187,6 @@ ${check.formatted}`
     // Repair hint + antibody
     if (!harnessResult.isError) {
       deps.repairHintTracker.recordSuccess(tu.name)
-      deps.config.promptEngine.setStrategyShift(null)
    } else {
       const failureClass = classifyFailure(harnessResult.content)
       deps.repairHintTracker.recordFailure(tu.name, failureClass.class)
@@ -950,7 +1265,6 @@ ${check.formatted}`
         const hint = generateImpactHint(importGraph, tu.input.file_path as string, deps.cwd)
         if (hint) {
           deps.evidence.trackImpact(hint.impactedFiles, hint.relatedTests)
-          deps.config.promptEngine.setImpactHint(hint.summary)
        }
      }
    } else if (tu.name === 'run_tests' && rawToolResult) {
@@ -989,8 +1303,15 @@ ${check.formatted}`
     // AbortError: user cancelled — not a tool failure.
     // Skip failure recording so immune/doom-loop signals aren't polluted.
     if ((err as Error).name === 'AbortError') {
-      callbacks.onToolResult(tu.id, tu.name, '', false)
-      return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: '', is_error: false }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+      // NEVER return empty content: a silent '' success made the model fly
+      // blind on its most critical deliveries (session 803d897d: two
+      // deliver_task results came back empty after user steering aborted the
+      // batch, while the detached execute kept running and landed commits).
+      // The model must know (a) the call was interrupted and (b) the work may
+      // still have completed in the background.
+      const abortedNote = `[interrupted] ${tu.name} was cancelled before its result could be returned. The underlying operation may still have completed in the background — verify actual state (e.g. git log, file contents, test output) before assuming it failed or retrying.`
+      callbacks.onToolResult(tu.id, tu.name, abortedNote, false)
+      return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: abortedNote, is_error: false }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
    }
     const msg = err instanceof Error ? err.message : String(err)
     deps.repairHintTracker.recordFailure(tu.name, classifyFailure(msg).class)

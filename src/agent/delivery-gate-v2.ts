@@ -16,12 +16,69 @@
  * @task B1-7
  */
 
+import { spawnSync } from 'node:child_process'
 import type { TaskLedger } from './task-ledger.js'
 import type { OwnershipLedger } from './ownership-ledger.js'
 import type { VerificationAttribution } from './verification-attribution.js'
 import { getEffectiveVerifications } from './verification-attribution.js'
 import { summarizeOwnershipHealth } from './ownership-health.js'
 import type { VerificationMetadata } from '../tools/types.js'
+
+// ─── External-file noise filtering (C-fix, session 803d897d) ───────────────
+// 67 untracked .test-tmp files drowned the GREEN/YELLOW signal in every
+// delivery report. External files from junk directories are noise, not
+// blockers — filter them from display and summarize the count.
+
+const JUNK_PATH_PREFIXES = [
+  '.test-tmp/',
+  '.rivet/',
+  'node_modules/',
+  '.git/',
+  'dist/',
+  'build/',
+  'coverage/',
+  'tmp/',
+]
+
+export function isJunkExternalPath(file: string): boolean {
+  return JUNK_PATH_PREFIXES.some(prefix => file.startsWith(prefix))
+}
+
+/** Files matched by .gitignore (batched `git check-ignore`). Fails open to []. */
+function gitIgnoredSubset(files: string[], cwd: string): Set<string> {
+  if (files.length === 0) return new Set()
+  try {
+    const r = spawnSync('git', ['check-ignore', '--stdin'], {
+      cwd,
+      input: files.join('\n'),
+      encoding: 'utf-8',
+      timeout: 5000,
+    })
+    // exit 0: some ignored; exit 1: none ignored; other: error → fail open
+    if (r.status !== 0 && r.status !== 1) return new Set()
+    return new Set(r.stdout.split('\n').filter(Boolean))
+  } catch {
+    return new Set()
+  }
+}
+
+export interface ExternalNoiseSplit {
+  /** Signal-bearing external files, in original order. */
+  files: string[]
+  /** Count of filtered junk/gitignored paths. */
+  noiseCount: number
+}
+
+/**
+ * Split external files into signal vs noise (junk dirs + gitignored paths).
+ * cwd is used for the gitignore check; omit to use prefix rules only.
+ */
+export function filterExternalNoise(files: string[], cwd?: string): ExternalNoiseSplit {
+  const prefixKept = files.filter(f => !isJunkExternalPath(f))
+  const ignored = cwd ? gitIgnoredSubset(prefixKept, cwd) : new Set<string>()
+  const kept = prefixKept.filter(f => !ignored.has(f))
+  return { files: kept, noiseCount: files.length - kept.length }
+}
 
 export type GateState = 'GREEN' | 'YELLOW' | 'RED'
 
@@ -36,6 +93,7 @@ export interface DeliveryGateResult {
   verificationCount: number
   /** Count of earlier failures superseded by later successes */
   supersededFailures: number
+  latestVerificationTotals?: { passed: number; failed: number; skipped: number; command: string }
   staleFailureCandidates: number
   toolInvocationFailureCandidates: string[]
   currentBlockingFailure?: string
@@ -57,6 +115,9 @@ export interface DeliveryReport {
   verificationCount: number
   /** Count of earlier failures superseded by later successes */
   supersededFailures: number
+  /** Latest verification pass/fail/skipped totals — for "声明即实测" echo in deliver_task output.
+   *  Agents copy these numbers into delivery reports instead of guessing from memory. */
+  latestVerificationTotals?: { passed: number; failed: number; skipped: number; command: string }
   staleFailureCandidates: number
   toolInvocationFailureCandidates: string[]
   currentBlockingFailure?: string
@@ -67,10 +128,36 @@ export interface DeliveryReport {
 }
 
 export interface DeliveryGateV2 {
-  /** Assess delivery readiness, optionally with external verification metadata and current dirty files */
-  assess(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[]): DeliveryGateResult
+  /** Assess delivery readiness, optionally with external verification metadata,
+   *  current dirty files, and the current VSW snapshotRef (drops stale snapshot
+   *  verifications when provided). */
+  assess(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[], currentSnapshotRef?: string): DeliveryGateResult
   /** Full structured report suitable for cycle_close deposit */
-  getReport(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[]): DeliveryReport
+  getReport(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[], currentSnapshotRef?: string): DeliveryReport
+}
+
+/**
+ * Track 3 门禁合一：收敛检测 L2+ 时基于权威门禁状态生成结束/修复指引。
+ * GREEN → 指示输出最终摘要结束回合；RED → 指示阻断项与最短下一步；
+ * YELLOW → 可带条件交付。返回的字符串作为 system-reminder 注入。
+ */
+export function buildGateConvergenceHint(
+  gate: Pick<DeliveryGateResult, 'state' | 'reason' | 'blockingReason' | 'shortestNextStep'>,
+  depthLayer?: import('../context/task-contract.js').TaskDepthLayer,
+): string {
+  const depthSuffix = depthLayer && depthLayer !== 'unit'
+    ? `\n[depth=${depthLayer}] 验证必须覆盖跨模块边界，不仅仅是单函数行为。`
+    : ''
+  if (gate.state === 'GREEN') {
+    return '交付门禁 GREEN：所有 owned 文件已验证。请输出最终摘要并结束回合，不再调用工具。' + depthSuffix
+  }
+  if (gate.state === 'RED') {
+    const lines = [`交付门禁 RED：${gate.blockingReason ?? gate.reason ?? 'owned 文件存在未验证或失败项。'}`]
+    if (gate.shortestNextStep) lines.push(`最短下一步：${gate.shortestNextStep}`)
+    lines.push('请先解决阻断项再继续；若无法解决，明确报告阻断原因后结束回合。')
+    return lines.join('\n') + depthSuffix
+  }
+  return `交付门禁 YELLOW：${gate.reason ?? '存在外部阻塞，owned 文件已验证。'}\n可带条件交付：输出最终摘要并明确标注 caveat，然后结束回合。${depthSuffix}`
 }
 
 export function createDeliveryGateV2(opts: {
@@ -128,7 +215,7 @@ export function createDeliveryGateV2(opts: {
     return { ownedFilesForGate, coOwnedFiles, historicalOwnedFiles, externalFiles }
   }
 
-  function assess(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[]): DeliveryGateResult {
+  function assess(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[], currentSnapshotRef?: string): DeliveryGateResult {
     const { ownedFilesForGate: ownedFiles, coOwnedFiles, externalFiles } = getGateFiles(currentDirtyFiles)
 
     // Check ownership health for unclassified dirty files
@@ -155,9 +242,9 @@ export function createDeliveryGateV2(opts: {
       }
     }
 
-    // Use effective verifications (deduplicated by supersession)
+    // Use effective verifications (deduplicated by supersession + VSW staleness)
     const rawVerifications = taskLedger.getVerifications()
-    const { effective: ownedVerifications, supersededFailures } = getEffectiveVerifications(rawVerifications)
+    const { effective: ownedVerifications, supersededFailures } = getEffectiveVerifications(rawVerifications, currentSnapshotRef)
 
     // Combine owned + external verifications for full picture
     const allVerifications = [
@@ -165,6 +252,12 @@ export function createDeliveryGateV2(opts: {
       ...externalVerifications,
     ]
     const diagnostics = verificationDiagnostics(allVerifications, supersededFailures)
+
+    // 层 1a: latest verification totals for "声明即实测" echo
+    const _lv = allVerifications.length > 0 ? allVerifications[allVerifications.length - 1] : undefined
+    const latestVerificationTotals = _lv
+      ? { passed: _lv.passed, failed: _lv.failed, skipped: _lv.skipped, command: _lv.command }
+      : undefined
 
     // Nothing to deliver
     if (ownedFiles.length === 0) {
@@ -181,6 +274,7 @@ export function createDeliveryGateV2(opts: {
         verificationCount: allVerifications.length,
         supersededFailures,
         ...diagnostics,
+      latestVerificationTotals,
       }
     }
 
@@ -199,6 +293,7 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
         }
 
       case 'external_blocked':
@@ -212,6 +307,7 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
         }
 
       case 'owned_failure':
@@ -226,6 +322,7 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
           currentBlockingFailure: aggregate.reason,
         }
 
@@ -240,6 +337,7 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
         }
 
       case 'unattributed_failure':
@@ -253,6 +351,24 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
+        }
+
+      case 'integration_conflict':
+        // Phase B failed on current HEAD but the owned diff passed in isolation
+        // (Phase A). Concurrent-change conflict — advisory, not this session's
+        // fault. Deliverable with a rebase/coordinate caveat.
+        return {
+          state: 'YELLOW',
+          canDeliver: true,
+          isBlocked: false,
+          reason: `${ownedFiles.length} owned file(s) verified in isolation, but integration on current HEAD conflicts: ${aggregate.reason}`,
+          ownedFileCount: ownedFiles.length,
+          externalFileCount: externalFiles.length,
+          verificationCount: allVerifications.length,
+          supersededFailures,
+          ...diagnostics,
+      latestVerificationTotals,
         }
 
       case 'unverified':
@@ -267,6 +383,7 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
           currentBlockingFailure: `${ownedFiles.length} owned file(s) modified but unverified.`,
         }
 
@@ -281,13 +398,14 @@ export function createDeliveryGateV2(opts: {
           verificationCount: allVerifications.length,
           supersededFailures,
           ...diagnostics,
+      latestVerificationTotals,
           currentBlockingFailure: 'Unknown verification state.',
         }
     }
   }
 
-  function getReport(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[]): DeliveryReport {
-    const result = assess(externalVerifications, currentDirtyFiles)
+  function getReport(externalVerifications: VerificationMetadata[], currentDirtyFiles?: string[], currentSnapshotRef?: string): DeliveryReport {
+    const result = assess(externalVerifications, currentDirtyFiles, currentSnapshotRef)
     const { ownedFilesForGate, coOwnedFiles, historicalOwnedFiles, externalFiles } = getGateFiles(currentDirtyFiles)
     return {
       taskId: taskLedger.getTaskId(),
@@ -303,6 +421,7 @@ export function createDeliveryGateV2(opts: {
       externalFileCount: result.externalFileCount,
       verificationCount: result.verificationCount,
       supersededFailures: result.supersededFailures,
+      latestVerificationTotals: result.latestVerificationTotals,
       staleFailureCandidates: result.staleFailureCandidates,
       toolInvocationFailureCandidates: result.toolInvocationFailureCandidates,
       currentBlockingFailure: result.currentBlockingFailure,

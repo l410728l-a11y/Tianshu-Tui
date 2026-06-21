@@ -3,9 +3,12 @@ import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
 import { aggregationPolicySchema, workOrderKindSchema, type AggregationPolicy } from '../agent/work-order.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
 import type { ClaimProposal } from '../context/claims.js'
-import { profileRegistry } from '../agent/profile-registry.js'
+import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
+import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
+import { createActivityStreamer, activityProgressLine } from './worker-activity-stream.js'
+import type { WorkerActivityEvent } from '../agent/coordinator.js'
 
 export interface DelegateBatchCoordinator {
   delegateBatch(
@@ -22,10 +25,17 @@ const profileStringSchema = z.string().refine(
   (val) => ({ message: `Unknown profile "${val}". Available: ${profileRegistry.getProfileNames().join(', ')}` }),
 )
 
+/** Dynamic star-domain (authority) validation — see delegate-task.ts. */
+const authorityStringSchema = z.string().refine(
+  (val) => starDomainRegistry.getDomainIds().includes(val),
+  (val) => ({ message: `Unknown authority "${val}". Available: ${starDomainRegistry.getDomainIds().join(', ')}` }),
+)
+
 const taskSchema = z.object({
   objective: z.string().min(1),
   kind: workOrderKindSchema.optional(),
   profile: profileStringSchema.optional(),
+  authority: authorityStringSchema.optional(),
   files: z.array(z.string()).optional(),
   symbols: z.array(z.string()).optional(),
 })
@@ -69,19 +79,12 @@ function extractClaimsFromRun(run: CoordinatorRun, toolUseId: string, claimStore
   }
 }
 
-/** Progressive timeout: early turns get short budget so the first user
- *  response isn't blocked for 2 minutes.  As the session matures, workers
- *  get more time for deeper analysis.
- *    turn 0-1 (cold open)  → 45 s  — quick scout only
- *    turn 2-4 (warming)    → 90 s  — 2-3 focused tasks
- *    turn 5+  (mature)     → 180 s — full parallel depth
+/** Progressive timeout: batches start fast and grow with session maturity.
+ *  Now unified with delegate-task via timeout-ladder.ts (60→120→180, Δ60s).
+ *    turn 0-1 (cold open)  → 60 s
+ *    turn 2-4 (warming)    → 120 s
+ *    turn 5+  (mature)     → 180 s
  */
-function progressiveBatchTimeout(sessionTurnCount?: number): number {
-  const turn = sessionTurnCount ?? 10 // default to mature when unknown
-  if (turn <= 1) return 45_000
-  if (turn <= 4) return 90_000
-  return 180_000
-}
 
 /** Progressive task cap: don't fan out 5 workers on a cold session.
  *    turn 0-1 (cold open)  → 1 task  — single focused scout
@@ -115,6 +118,7 @@ export function createDelegateBatchTool(
                 objective: { type: 'string' },
                 kind: { type: 'string', enum: [...workOrderKindSchema.options] },
                 profile: { type: 'string', enum: profileRegistry.getProfileNames() },
+                authority: { type: 'string', description: 'Optional star-domain persona (e.g. tianquan, tianji, yuheng).' },
                 files: { type: 'array', items: { type: 'string' } },
                 symbols: { type: 'array', items: { type: 'string' } },
               },
@@ -155,14 +159,39 @@ export function createDelegateBatchTool(
         }
       }
 
-      const requests: DelegationRequest[] = parsed.data.tasks.map((t, i) => ({
+      // T9 P3: one shared streamer — events from all workers interleave with labels.
+      // T4: also fan out structured per-worker updates for the subagent panel.
+      const textStreamer = params.onOutput ? createActivityStreamer(params.onOutput) : undefined
+      // Build authority lookup: workOrderId prefix → authority, for terminal callbacks.
+      const taskAuthorityMap = new Map<number, string | undefined>()
+      const streamActivity = (textStreamer || params.onWorkerActivity)
+        ? (ev: WorkerActivityEvent) => {
+            textStreamer?.(ev)
+            params.onWorkerActivity?.({
+              workOrderId: ev.workOrderId,
+              parentToolId: params.toolUseId,
+              profile: ev.profile,
+              authority: ev.authority,
+              status: 'running',
+              progressLine: activityProgressLine(ev),
+            })
+          }
+        : undefined
+      const requests: DelegationRequest[] = parsed.data.tasks.map((t, i) => {
+        taskAuthorityMap.set(i, t.authority)
+        return {
         parentTurnId: `${params.toolUseId}:${i}`,
         objective: t.objective,
         kind: t.kind ?? 'code_search',
-        profile: (t.profile ?? 'code_scout') as import('../agent/work-order.js').WorkerProfile,
+        profile: (t.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
+        authority: t.authority,
         scope: { files: t.files, symbols: t.symbols },
         reviewDepth: params.reviewDepth,
-      }))
+        delegationDepth: params.delegationDepth ?? 0,
+        sessionTurn: params.sessionTurnCount,
+        onActivity: streamActivity,
+        }
+      })
 
       // Progressive task cap: trim to the allowed slice on early turns
       const cap = progressiveTaskCap(params.sessionTurnCount)
@@ -215,6 +244,18 @@ export function createDelegateBatchTool(
         }
       }
 
+      // T4: terminal per-worker status for the subagent panel.
+      if (params.onWorkerActivity) {
+        for (const r of run.results) {
+          params.onWorkerActivity({
+            workOrderId: r.workOrderId,
+            parentToolId: params.toolUseId,
+            status: r.status,
+            progressLine: r.summary.slice(0, 80),
+          })
+        }
+      }
+
       const passed = run.results.filter(r => r.status === 'passed').length
       return {
         content: run.packet + trimmedNote,
@@ -225,6 +266,17 @@ export function createDelegateBatchTool(
     requiresApproval: () => false,
     isConcurrencySafe: () => true,
     isEnabled: () => true,
-    timeoutMs: (params) => progressiveBatchTimeout(params?.sessionTurnCount),
+    // P0: outer tool timeout dominates max(profile budgets) of all batch tasks
+    // AND scales by the number of sequential waves the worker pool must run, so a
+    // full 5-task batch is not killed by a single-wave budget before its later
+    // wave can finish (and salvage partial output) — see delegationToolTimeoutMs.
+    timeoutMs: (params) => {
+      const tasks = (params?.input?.tasks as Array<{ profile?: string }> | undefined) ?? []
+      return delegationToolTimeoutMs(
+        params?.sessionTurnCount,
+        tasks.map(t => t.profile),
+        { taskCount: tasks.length },
+      )
+    },
   }
 }

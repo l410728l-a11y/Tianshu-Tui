@@ -17,10 +17,10 @@ export interface CognitiveLedgerInput {
   strategy?: StrategyProfile | null
   vigor?: VigorState | null
   season?: CognitiveSeason | null
+  /** Season intensity (0-1), from classifySeason().intensity */
+  seasonIntensity?: number
   /** CVM trap: latest tool risk level for uncertainty framing */
   riskLevel?: RiskLevel
-  /** Meta-regulation: current regulation pressure (0-1) */
-  regulationPressure?: number
 }
 
 export interface CognitiveLedger {
@@ -32,8 +32,8 @@ export interface CognitiveLedger {
   strategy?: StrategyProfile | null
   vigor?: VigorState | null
   season?: CognitiveSeason | null
+  seasonIntensity?: number
   riskLevel?: RiskLevel
-  regulationPressure?: number
 }
 
 export interface CognitivePhaseSnapshot {
@@ -55,8 +55,8 @@ export function createCognitiveLedger(input: CognitiveLedgerInput): CognitiveLed
     strategy: input.strategy ?? null,
     vigor: input.vigor ?? null,
     season: input.season ?? null,
+    seasonIntensity: input.seasonIntensity,
     riskLevel: input.riskLevel,
-    regulationPressure: input.regulationPressure,
   }
 }
 
@@ -78,16 +78,18 @@ export function buildVerificationGapProjection(ledger: CognitiveLedger): string 
  * before generating each turn. This is paravirtualization — the model
  * knows it's in the CVM and can actively adjust behavior.
  *
- * Six sensorium dimensions + strategy + vigor:
- *   verification_coverage — how many modified files have been verified? (not general confidence)
- *   complexity — how diverse is the recent tool pattern?
- *   momentum   — are we accelerating or coasting?
- *   stability  — is the session healthy or approaching doom loop?
- *   freshness  — how familiar is the current file context?
- *   pressure   — is the context window filling up?
+ * Visible dimensions (model reads these to adjust behavior):
+ *   verification_coverage — how many modified files have been verified?
  *   files_modified — raw count so model can interpret vacuous coverage
+ *   complexity — how diverse is the recent tool pattern?
+ *   stability  — is the session healthy or approaching doom loop?
  *   strategy   — current reasoning effort + exploration breadth
  *   vigor      — phasic (acute arousal) + tonic (sustained) activation
+ *
+ * Routing-only dimensions (consumed by hooks from sensorium, NOT shown to model):
+ *   freshness  — affordance scoring, EFE, star-event routing, CCR P2
+ *   momentum   — shouldKick, prediction-error, retrospect
+ *   pressure   — signal-consumer, model-policy-selection, reward-loop
  *
  * The mirror is CONCISE — it must not consume the cognitive oxygen
  * it's meant to protect (see Task 12: CVM overhead).
@@ -98,18 +100,12 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
 
   const parts: string[] = [`verification_coverage="${formatDim(s.confidence)}"`]
 
-  // Show how many files have been modified so the model can interpret
-  // verification_coverage correctly. When files_modified=0,
-  // verification_coverage=1.00 is vacuously true (0/0 = all verified).
   parts.push(`files_modified="${ledger.evidence.filesModified.size}"`)
 
   if (s.complexity !== undefined) parts.push(`complexity="${formatDim(s.complexity)}"`)
-  if (s.momentum !== undefined) parts.push(`momentum="${formatDim(s.momentum)}"`)
+  // momentum, freshness, pressure — routing-only: consumed by hooks from sensorium directly
   if (s.stability !== undefined) parts.push(`stability="${formatDim(s.stability)}"`)
-  if (s.freshness !== undefined) parts.push(`freshness="${formatDim(s.freshness)}"`)
-  if (s.pressure !== undefined) parts.push(`pressure="${formatDim(s.pressure)}"`)
 
-  // Strategy profile: most actionable dimension
   if (ledger.strategy) {
     const st = ledger.strategy
     if (st.reasoningEffort && st.reasoningEffort !== 'medium') parts.push(`reasoning="${st.reasoningEffort}"`)
@@ -118,21 +114,18 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
     if (st.shouldEscalate) parts.push(`escalation="true"`)
   }
 
-  // Vigor: phasic arousal level — when high, model should act with urgency
   if (ledger.vigor) {
     const v = ledger.vigor
-    const tonic = v.tonic ?? v.phasic ?? 0.5
-    parts.push(`vigor="${formatDim(tonic)}"`)
+    parts.push(`vigor="${formatDim(v.vigor)}"`)
+    if (v.curiosity > 0.3) parts.push(`curiosity="${formatDim(v.curiosity)}"`)
   }
 
-  // Season: 道德经四章螺旋 — session lifecycle phase
   if (ledger.season) {
-    parts.push(`season="${ledger.season}"`)
-  }
-
-  // Regulation cost: let model see its own regulation overhead
-  if (ledger.regulationPressure !== undefined && ledger.regulationPressure > 0) {
-    parts.push(`regulation-cost="${formatDim(ledger.regulationPressure)}"`)
+    const intensity = ledger.seasonIntensity
+    const seasonVal = intensity !== undefined && intensity < 1.0
+      ? `${ledger.season}:${formatDim(intensity)}`
+      : ledger.season
+    parts.push(`season="${seasonVal}"`)
   }
 
   return `<cognitive-mirror ${parts.join(' ')} />`
@@ -148,6 +141,7 @@ export function buildCognitivePromptProjection(
   opts?: {
     sycophancyHint?: string | null
     immuneHint?: string | null
+    yaoguangHint?: string | null
   },
 ): string {
   return [
@@ -156,6 +150,7 @@ export function buildCognitivePromptProjection(
     buildCognitiveMirror(ledger),
     buildUncertaintyProjection(ledger),
     opts?.sycophancyHint ?? '',
+    opts?.yaoguangHint ?? '',
     opts?.immuneHint ?? '',
   ].filter(Boolean).join('\n')
 }

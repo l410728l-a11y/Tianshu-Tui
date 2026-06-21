@@ -128,7 +128,7 @@ it('getLatestTurnHitRate returns null with no turn cache snapshots', () => {
   assert.equal(ctx.getLatestTurnHitRate(), null)
 })
 
-it('getLatestTurnHitRate returns null when latest turn has no cache counters', () => {
+it('getLatestTurnHitRate returns 0 when latest turn has no cache hit (but has input)', () => {
   const ctx = new SessionContext()
   ctx.recordTurnCache(1, {
     input_tokens: 100,
@@ -137,7 +137,8 @@ it('getLatestTurnHitRate returns null when latest turn has no cache counters', (
     cache_creation_input_tokens: 0,
   })
 
-  assert.equal(ctx.getLatestTurnHitRate(), null)
+  // inputTokens > 0 → 0% hit rate, not "no data"
+  assert.equal(ctx.getLatestTurnHitRate(), 0)
 })
 
 it('getLatestTurnHitRate returns latest turn cache read ratio', () => {
@@ -155,6 +156,7 @@ it('getLatestTurnHitRate returns latest turn cache read ratio', () => {
     cache_creation_input_tokens: 25,
   })
 
+  // New formula: cacheRead / inputTokens = 75 / 100 = 0.75
   assert.equal(ctx.getLatestTurnHitRate(), 0.75)
 })
 
@@ -172,6 +174,7 @@ describe('getRecentTurnHitRate', () => {
       cache_read_input_tokens: 80,
       cache_creation_input_tokens: 20,
     })
+    // New formula: cacheRead / inputTokens = 80 / 100 = 0.8
     assert.equal(ctx.getRecentTurnHitRate(3), 0.8)
   })
 
@@ -195,11 +198,11 @@ describe('getRecentTurnHitRate', () => {
       cache_read_input_tokens: 60,
       cache_creation_input_tokens: 40,
     })
-    // Last 2 turns aggregated: (30+60) / ((30+70)+(60+40)) = 90/200 = 0.45
+    // Last 2 turns aggregated: (30+60) / (100+100) = 90/200 = 0.45
     assert.equal(ctx.getRecentTurnHitRate(2), 0.45)
   })
 
-  it('returns null when all turns have zero cache counters', () => {
+  it('returns 0 when all turns have zero cache hit but have input tokens', () => {
     const ctx = new SessionContext()
     ctx.recordTurnCache(1, {
       input_tokens: 100,
@@ -207,7 +210,8 @@ describe('getRecentTurnHitRate', () => {
       cache_read_input_tokens: 0,
       cache_creation_input_tokens: 0,
     })
-    assert.equal(ctx.getRecentTurnHitRate(3), null)
+    // inputTokens > 0 → 0% hit rate, not null
+    assert.equal(ctx.getRecentTurnHitRate(3), 0)
   })
 })
 
@@ -473,5 +477,107 @@ describe('SessionContext removeLastMessage', () => {
     assert.equal(mutationFired, false, 'no mutation when guard throws')
     assert.equal(ctx.getMessages().length, 2, 'state fully restored')
     assert.equal(ctx.getEstimatedTokens() > 0, true, 'tokens not corrupted')
+  })
+})
+
+describe('SessionContext lastRealPromptTokens', () => {
+  it('initializes lastRealPromptTokens to 0', () => {
+    const ctx = new SessionContext()
+    assert.equal(ctx.getLastRealPromptTokens(), 0)
+  })
+
+  it('addUsage captures input_tokens as lastRealPromptTokens', () => {
+    const ctx = new SessionContext()
+    ctx.addUsage({ input_tokens: 50_000 })
+    assert.equal(ctx.getLastRealPromptTokens(), 50_000)
+  })
+
+  it('addUsage overwrites lastRealPromptTokens on each call', () => {
+    const ctx = new SessionContext()
+    ctx.addUsage({ input_tokens: 50_000 })
+    ctx.addUsage({ input_tokens: 80_000 })
+    assert.equal(ctx.getLastRealPromptTokens(), 80_000)
+  })
+
+  it('addUsage without input_tokens does not overwrite lastRealPromptTokens', () => {
+    const ctx = new SessionContext()
+    ctx.addUsage({ input_tokens: 50_000 })
+    ctx.addUsage({ output_tokens: 1_000 })
+    assert.equal(ctx.getLastRealPromptTokens(), 50_000)
+  })
+})
+
+describe('SessionContext contextCalibrationRatio', () => {
+  it('calibrates getEstimatedTokens after addUsage', () => {
+    const ctx = new SessionContext()
+    ctx.setPrefixOverhead(10_000)
+    ctx.addUserMessage('hello world')
+    const before = ctx.getEstimatedTokens()
+    assert.ok(before > 0, 'local estimate should be positive')
+
+    // API reports 2.5x local — within clamp, first EMA 0.7*2.5 + 0.3*1 = 2.05
+    ctx.addUsage({ input_tokens: Math.round(before * 2.5) })
+    const ratio = ctx.getEstimatedTokens() / before
+    assert.ok(Math.abs(ratio - 2.05) < 0.01, `first EMA ratio should be ~2.05, got ${ratio}`)
+  })
+
+  it('applies EMA smoothing across calibrations', () => {
+    const ctx = new SessionContext()
+    ctx.setPrefixOverhead(10_000)
+    ctx.addUserMessage('hello world')
+    const before = ctx.getEstimatedTokens()
+
+    ctx.addUsage({ input_tokens: before * 4 })
+    let ratio = ctx.getEstimatedTokens() / before
+    assert.ok(Math.abs(ratio - 3.1) < 0.01, `after 4x: ratio should be ~3.1, got ${ratio}`)
+
+    ctx.addUsage({ input_tokens: before * 2 })
+    ratio = ctx.getEstimatedTokens() / before
+    assert.ok(Math.abs(ratio - 2.33) < 0.01, `after 2x: EMA 0.7*2 + 0.3*3.1 = 2.33, got ${ratio}`)
+  })
+
+  it('does not calibrate when local estimate is zero', () => {
+    const ctx = new SessionContext()
+    ctx.addUsage({ input_tokens: 10_000 })
+    assert.equal(ctx.getEstimatedTokens(), 0)
+  })
+
+  // P1: defer calibration when local estimate can't explain even 10% of the
+  // API report. This happens when prefixOverhead hasn't been set yet (first
+  // turn before ensurePrefixOverhead runs in maybeCompact). Without this
+  // guard, the ratio gets poisoned by a tiny denominator and GlanceBar explodes.
+  it('defers calibration when local estimate is far below API report', () => {
+    const ctx = new SessionContext()
+    ctx.setPrefixOverhead(0)
+    ctx.addUserMessage('hi')
+    const before = ctx.getEstimatedTokens()
+    // API reports 30K — local estimate is ~1, defer should kick in
+    ctx.addUsage({ input_tokens: 30_000 })
+    assert.equal(ctx.getEstimatedTokens(), before, 'calibration must defer when local estimate is unreliable')
+  })
+
+  // P2: clamp the raw ratio so a single outlier response can't poison EMA.
+  // Tokenization differences across providers are typically within 2x; 0.5x–5x
+  // is a generous envelope that still rejects pathological inputs.
+  it('clamps raw calibration ratio to [0.5, 5] before EMA', () => {
+    const ctx = new SessionContext()
+    ctx.setPrefixOverhead(10_000)
+    ctx.addUserMessage('hello world')
+    const before = ctx.getEstimatedTokens()
+
+    // Step 1: 2x within clamp — EMA 0.7*2 + 0.3*1 = 1.7
+    ctx.addUsage({ input_tokens: before * 2 })
+    let ratio = ctx.getEstimatedTokens() / before
+    assert.ok(Math.abs(ratio - 1.7) < 0.01, `step1 2x should pass through to 1.7, got ${ratio}`)
+
+    // Step 2: 10x clamped to 5 — EMA 0.7*5 + 0.3*1.7 = 4.01
+    ctx.addUsage({ input_tokens: before * 10 })
+    ratio = ctx.getEstimatedTokens() / before
+    assert.ok(Math.abs(ratio - 4.01) < 0.01, `step2 10x should clamp to 5, then EMA to 4.01, got ${ratio}`)
+
+    // Step 3: 0.1x clamped to 0.5 — EMA 0.7*0.5 + 0.3*4.01 = 1.553
+    ctx.addUsage({ input_tokens: Math.round(before * 0.1) })
+    ratio = ctx.getEstimatedTokens() / before
+    assert.ok(Math.abs(ratio - 1.553) < 0.01, `step3 0.1x should clamp to 0.5, then EMA to 1.553, got ${ratio}`)
   })
 })

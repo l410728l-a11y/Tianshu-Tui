@@ -1,6 +1,11 @@
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
 import { validateTrend } from './retrospect-fingerprint.js'
+
+export function projectHash(cwd: string): string {
+  return createHash('sha256').update(cwd).digest('hex').slice(0, 12)
+}
 
 export interface SessionEntry {
   id: string
@@ -99,9 +104,11 @@ CREATE TABLE IF NOT EXISTS retrospect_fingerprints (
   max_pressure REAL NOT NULL,
   tool_failure_rate REAL NOT NULL,
   bullet_ids TEXT NOT NULL DEFAULT '[]',
+  project_hash TEXT,
   UNIQUE(session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_fingerprints_created ON retrospect_fingerprints(created_at);
+CREATE INDEX IF NOT EXISTS idx_fingerprints_project ON retrospect_fingerprints(project_hash);
 `
 
 export class SessionRegistry {
@@ -111,14 +118,18 @@ export class SessionRegistry {
     if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true })
     let db: any
     try {
-      const nodeModule = await import('node:module')
-      const Database = nodeModule.createRequire(import.meta.url)('better-sqlite3')
+      const { resolveBetterSqlite3 } = await import('../repo/native-resolver.js')
+      const Database = resolveBetterSqlite3(import.meta.url)
       if (!Database) throw new Error('better-sqlite3 not installed')
       const dbPath = join(stateDir, 'registry.db')
       db = new Database(dbPath)
       db.pragma('journal_mode = WAL')
       db.pragma('busy_timeout = 3000')
       db.pragma('foreign_keys = ON')
+      // Migration: add project_hash column BEFORE exec(SCHEMA), because SCHEMA's
+      // CREATE INDEX on project_hash fails if the column doesn't exist yet in
+      // databases created before the project_hash column was added.
+      try { db.exec('ALTER TABLE retrospect_fingerprints ADD COLUMN project_hash TEXT') } catch { /* already exists */ }
       db.exec(SCHEMA)
     } catch (err) {
       // Distinguish "library missing" from "schema execution failed"
@@ -407,12 +418,13 @@ export class SessionRegistry {
     maxPressure: number
     toolFailureRate: number
     bulletIds: string[]
+    projectHash?: string
   }): void {
     this.safeRun(`
       INSERT INTO retrospect_fingerprints
         (session_id, created_at, root_cause_keywords, recommendation_keywords,
-         stability_trend, confidence_trend, max_pressure, tool_failure_rate, bullet_ids)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         stability_trend, confidence_trend, max_pressure, tool_failure_rate, bullet_ids, project_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_id) DO UPDATE SET
         created_at = excluded.created_at,
         root_cause_keywords = excluded.root_cause_keywords,
@@ -421,7 +433,8 @@ export class SessionRegistry {
         confidence_trend = excluded.confidence_trend,
         max_pressure = excluded.max_pressure,
         tool_failure_rate = excluded.tool_failure_rate,
-        bullet_ids = excluded.bullet_ids
+        bullet_ids = excluded.bullet_ids,
+        project_hash = excluded.project_hash
     `,
       fp.sessionId,
       fp.createdAt,
@@ -432,6 +445,7 @@ export class SessionRegistry {
       fp.maxPressure,
       fp.toolFailureRate,
       JSON.stringify(fp.bulletIds),
+      fp.projectHash ?? null,
     )
   }
 
@@ -440,7 +454,7 @@ export class SessionRegistry {
    * @param limit 最多返回的指纹数量（默认 10）
    * @param excludeSessionId 排除的 session ID（通常是当前 session）
    */
-  loadFingerprints(limit = 10, excludeSessionId?: string): Array<{
+  loadFingerprints(limit = 10, excludeSessionId?: string, projectHash?: string): Array<{
     sessionId: string
     createdAt: number
     rootCauseKeywords: string[]
@@ -451,22 +465,20 @@ export class SessionRegistry {
     toolFailureRate: number
     bulletIds: string[]
   }> {
-    const query = excludeSessionId
-      ? `SELECT session_id, created_at, root_cause_keywords, recommendation_keywords,
+    const conditions: string[] = []
+    const params: unknown[] = []
+    if (excludeSessionId) { conditions.push('session_id != ?'); params.push(excludeSessionId) }
+    if (projectHash) { conditions.push('project_hash = ?'); params.push(projectHash) }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(limit)
+    const query = `SELECT session_id, created_at, root_cause_keywords, recommendation_keywords,
                 stability_trend, confidence_trend, max_pressure, tool_failure_rate, bullet_ids
          FROM retrospect_fingerprints
-         WHERE session_id != ?
-         ORDER BY created_at DESC
-         LIMIT ?`
-      : `SELECT session_id, created_at, root_cause_keywords, recommendation_keywords,
-                stability_trend, confidence_trend, max_pressure, tool_failure_rate, bullet_ids
-         FROM retrospect_fingerprints
+         ${where}
          ORDER BY created_at DESC
          LIMIT ?`
 
-    const rows = excludeSessionId
-      ? this.safeAll<Record<string, unknown>>(query, excludeSessionId, limit)
-      : this.safeAll<Record<string, unknown>>(query, limit)
+    const rows = this.safeAll<Record<string, unknown>>(query, ...params)
 
     return rows.map(row => ({
       sessionId: row.session_id as string,
@@ -497,7 +509,11 @@ export class SessionRegistry {
  * All method calls succeed silently — session features degrade gracefully.
  */
 function createNullDb(): any {
-  const noopStmt = { run: () => {}, all: () => [] as any[], get: () => undefined }
+  const noopStmt = {
+    run: () => ({ changes: 0, lastInsertRowid: 0 }),
+    all: () => [] as any[],
+    get: () => undefined,
+  }
   return new Proxy(Object.create(null), {
     get: (_target, prop: string) => {
       if (prop === 'prepare') return () => noopStmt

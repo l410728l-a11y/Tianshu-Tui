@@ -37,6 +37,9 @@ export interface ConvergenceInput {
    *  Used to detect cross-turn text repetition — the model produces similar
    *  analysis text over multiple turns without making progress. */
   textFingerprints?: ReadonlyArray<string>
+  /** Provider name for provider-specific thresholds (e.g. 'glm' gets tighter cutoffs).
+   *  When absent, uses default DeepSeek-tuned values. */
+  providerName?: string
 }
 
 export interface ConvergenceResult {
@@ -367,6 +370,9 @@ function computeConvergenceScore(
   weights: PhaseWeights,
   phaseClass: PhaseClass,
   noToolTurnCount: number,
+  turn: number,
+  recentToolHistory: ConvergenceInput['recentToolHistory'],
+  providerName?: string,
 ): number {
   const raw =
     weights.editRatio * signals.editRatio +
@@ -387,16 +393,66 @@ function computeConvergenceScore(
     penalty = 0.5
   }
 
+  // Read-only stagnation penalty: when ALL recent tools are read-class with
+  // zero productive output (no edits/tests/commits), the model is in a
+  // "keep exploring without converging" loop. This is the most common
+  // infinite-loop pattern — the model reads file after file, each target
+  // novel, entropy high, but never takes action.
+  //
+  // Uses productiveRatio (productive tools / total tools in window) instead of
+  // a boolean hasProductive check. This catches alternating patterns like
+  // read→think→read→think where each turn has a tool call but productive
+  // ratio remains 0.
+  //
+  // GLM: Preserved Thinking accumulates server-side reasoning state across
+  // turns. Once GLM enters a read-only loop the server retains that trajectory,
+  // making it harder to break out — hence the tighter ramp (4→0.65 vs 8→0.7).
+  // Default ramp is tuned for DeepSeek's stateless reasoning model.
+  const productiveTools = new Set([
+    'edit_file', 'write_file', 'hash_edit', 'apply_patch',
+    'run_tests', 'bash', 'deliver_task', 'plan_submit', 'plan_close',
+  ])
+  const window = recentToolHistory.slice(-Math.min(turn, 15))
+  const productiveCount = window.filter(h => productiveTools.has(h.tool)).length
+  const productiveRatio = window.length > 0 ? productiveCount / window.length : 1.0
+  const isGlm = providerName === 'glm'
+  if (window.length >= (isGlm ? 2 : 4) && productiveRatio === 0) {
+    if (isGlm) {
+      // GLM ramp: turn 4→0.65, turn 7→0.35, turn 11→0.15, turn 15+→0.05
+      if (turn >= 15) penalty = Math.min(penalty, 0.05)
+      else if (turn >= 11) penalty = Math.min(penalty, 0.15)
+      else if (turn >= 7) penalty = Math.min(penalty, 0.35)
+      else if (turn >= 4) penalty = Math.min(penalty, 0.65)
+    } else {
+      // Default ramp: turn 8→0.7, turn 12→0.45, turn 16→0.25, turn 20+→0.1
+      if (turn >= 20) penalty = Math.min(penalty, 0.1)
+      else if (turn >= 16) penalty = Math.min(penalty, 0.25)
+      else if (turn >= 12) penalty = Math.min(penalty, 0.45)
+      else if (turn >= 8) penalty = Math.min(penalty, 0.7)
+    }
+  }
+
   // No-tool-turn penalty: consecutive turns without tool calls signal
   // hesitation or text-only looping — model is "thinking" but not acting.
   // Tool-based signals can't detect this because recentToolHistory doesn't
-  // grow on no-tool turns. Aggressively penalize after 2 consecutive empty turns.
-  if (noToolTurnCount >= 3) {
-    penalty = Math.min(penalty, 0.15) // severe: 3+ turns of doing nothing
-  } else if (noToolTurnCount >= 2) {
-    penalty = Math.min(penalty, 0.35) // moderate: 2 turns of hesitation
-  } else if (noToolTurnCount >= 1) {
-    penalty = Math.min(penalty, 0.7)  // mild: 1 turn — may be recovering
+  // grow on no-tool turns.
+  //
+  // GLM: text-only loops escalate faster because Preserved Thinking
+  // locks in the "I need more information" trajectory server-side.
+  if (isGlm) {
+    if (noToolTurnCount >= 2) {
+      penalty = Math.min(penalty, 0.1)  // severe: 2+ turns with no tools
+    } else if (noToolTurnCount >= 1) {
+      penalty = Math.min(penalty, 0.4)  // moderate: 1 turn may be recovering
+    }
+  } else {
+    if (noToolTurnCount >= 3) {
+      penalty = Math.min(penalty, 0.15) // severe: 3+ turns of doing nothing
+    } else if (noToolTurnCount >= 2) {
+      penalty = Math.min(penalty, 0.35) // moderate: 2 turns of hesitation
+    } else if (noToolTurnCount >= 1) {
+      penalty = Math.min(penalty, 0.7)  // mild: 1 turn — may be recovering
+    }
   }
 
   return Math.min(1.0, Math.max(0.0, raw * penalty))
@@ -412,26 +468,41 @@ function buildInjectedMessage(
   tier: WindowTier,
   deliveryStatus?: string,
   noToolTurnCount?: number,
+  productiveStagnation?: boolean,
 ): string {
   const lines: string[] = []
+
+  // Productive-ratio stagnation variant: model keeps calling read/grep tools
+  // (so noToolTurnCount stays 0), but never edits/tests/commits. This catches
+  // the alternating read→analyze→read→analyze loop.
+  if (productiveStagnation) {
+    lines.push('**天枢-感知：最近多轮全部是读取/搜索操作，没有任何编辑、测试或提交。**')
+    lines.push('')
+    lines.push('信息已足够，请采取行动：')
+    lines.push('- 如果已有方案，直接编辑或测试')
+    lines.push('- 如果不确定方向，向用户说出你的判断')
+    lines.push('- 如果任务已完成，输出摘要并结束')
+    return lines.join('\n')
+  }
 
   // No-tool stagnation variant: consecutive turns without tool calls signal
   // hesitation or stuck state — the model is producing text/thinking but not
   // taking any action. This is a different failure mode from tool oscillation.
   if (noToolTurnCount && noToolTurnCount >= 2) {
-    lines.push(`**系统感知：连续 ${noToolTurnCount} 轮未执行任何工具调用。**`)
+    lines.push(`**天璇-感知：连续 ${noToolTurnCount} 轮未执行任何工具调用。你可能陷入了隧道视野。**`)
     lines.push('')
-    lines.push('模型可能陷入犹豫或重复输出文本但未采取实际行动。')
+    lines.push('停下来，换个角度看当前状态：')
     lines.push('- 如果你发现了问题但不确定，请直接向用户指出')
     lines.push('- 如果需要更多信息，请调用 read_file / grep 等工具')
     lines.push('- 如果任务已完成，请输出摘要并结束回合')
+    lines.push('- 天璇胶囊（docs/seed-capsule-tianxuan.md）有换视角方法论可供 recall')
     return lines.join('\n')
   }
 
   // Delivery-completion variant: when task is verified and convergence fires,
   // signal completion instead of asking the model to try harder.
   if (deliveryStatus === 'verified' && level === 2) {
-    lines.push('**系统感知：所有代码变更已验证通过，任务可能已完成。**')
+    lines.push('**天枢-感知：所有代码变更已验证通过，任务可能已完成。**')
     lines.push('')
     lines.push('如果所有子任务已完成且验证通过，请结束当前回合。')
     lines.push('- 检查是否有遗漏的 deliver_task 调用')
@@ -440,9 +511,9 @@ function buildInjectedMessage(
   }
 
   if (level === 2) {
-    lines.push('**系统感知：当前任务可能进入低效循环。**')
+    lines.push('**天璇-感知：当前任务可能进入低效循环。换个角度看问题。**')
   } else {
-    lines.push('**系统感知：任务未能在预期轮次内收敛，建议中断当前探索。**')
+    lines.push('**天枢-感知：任务未能在预期轮次内收敛，建议中断当前探索。**')
   }
 
   if (signals.editRatio < 0.1 && phaseClass === 'execute') {
@@ -463,6 +534,9 @@ function buildInjectedMessage(
   if (signals.tokenEfficiency < 0.2 && phaseClass !== 'explore') {
     lines.push('- 纯读取无产出，建议立即采取编辑或测试行动验证当前假设')
   }
+  if (signals.tokenEfficiency === 0.0 && phaseClass === 'explore') {
+    lines.push('- 已连续读取多个文件但未做任何编辑/测试/提交 — 信息已足够，请输出结论或采取行动')
+  }
   if (signals.textRepetitionPenalty < 0.3) {
     lines.push('- 连续多轮输出高度相似的文本内容，模型可能陷入"重复输出"循环')
   }
@@ -477,6 +551,7 @@ function buildInjectedMessage(
     lines.push('- 对当前最可能的方案进行编辑或测试')
     lines.push('- 重新阅读用户原始请求，确认方向')
     lines.push('- 缩小范围：只解决一个子问题')
+    lines.push('- 天璇胶囊（docs/seed-capsule-tianxuan.md）有换视角方法论可供 recall')
   }
 
   return lines.join('\n')
@@ -499,7 +574,7 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     textRepetitionPenalty: computeTextRepetitionPenalty(input.textFingerprints ?? []),
   }
 
-  const score = computeConvergenceScore(signals, weights, input.phaseClass, input.noToolTurnCount ?? 0)
+  const score = computeConvergenceScore(signals, weights, input.phaseClass, input.noToolTurnCount ?? 0, input.turn, input.recentToolHistory, input.providerName)
 
   // Determine escalation level
   let level: 0 | 1 | 2 | 3 = 0
@@ -509,11 +584,31 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
   // No-tool stagnation: fire earlier than normal thresholds. When the model
   // produces multiple turns with no tool calls, it's clearly stuck — don't
   // wait for nLow/nMid/nHigh turn counts to accumulate.
-  // Hard cap: 5+ consecutive no-tool turns → forced abort (prevents 10+ wasted LLM calls).
-  const NO_TOOL_ABORT_THRESHOLD = 5
-  const noToolStagnation = noToolCount >= 2
+  // Hard cap: 5+ (default) / 3+ (GLM) consecutive no-tool turns → forced abort.
+  const isGlm = input.providerName === 'glm'
+  const NO_TOOL_ABORT_THRESHOLD = isGlm ? 3 : 5
+  const noToolStagnation = noToolCount >= (isGlm ? 1 : 2) // GLM: fire on first no-tool turn
+
+  // Productive-ratio stagnation: when recent tool calls are all non-productive
+  // (read/grep/glob only, zero edits/tests/commits), the agent is in an
+  // alternating read-analyze loop. This bypasses the turn gate because the
+  // pattern is meaningful from early turns — each turn burns full input cost
+  // (especially on GLM with no prefix cache).
+  const productiveToolsSet = new Set([
+    'edit_file', 'write_file', 'hash_edit', 'apply_patch',
+    'run_tests', 'bash', 'deliver_task', 'plan_submit', 'plan_close',
+  ])
+  const stagnationWindow = input.recentToolHistory.slice(-windowSize)
+  const productiveInWindow = stagnationWindow.filter(h => productiveToolsSet.has(h.tool)).length
+  const productiveRatio = stagnationWindow.length > 0
+    ? productiveInWindow / stagnationWindow.length
+    : 1.0
+  const productiveStagnation = stagnationWindow.length >= Math.min(windowSize, 4) && productiveRatio === 0
+
   if (noToolCount >= NO_TOOL_ABORT_THRESHOLD) {
     level = 3 // force abort — model is clearly stuck in a text-only loop
+  } else if (noToolCount >= 2 && isGlm) {
+    level = 3 // GLM: 2 consecutive no-tool turns → hard abort (faster than kick)
   } else if (noToolCount >= 3) {
     level = 2 // kick on 3+ consecutive no-tool turns
   } else if (noToolCount >= 2 && turn >= 4) {
@@ -527,10 +622,17 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
   }
 
   // Level 0 early-exit ONLY for score-based detection (needs statistical
-  // significance from enough turns).  No-tool stagnation is meaningful from
-  // the very first turn — never override it with the early-exit gate.
-  if (turn < tier.nLow && !noToolStagnation) {
+  // significance from enough turns).  No-tool stagnation and productive-ratio
+  // stagnation are meaningful from the very first turn — never override them
+  // with the early-exit gate.
+  if (turn < tier.nLow && !noToolStagnation && !productiveStagnation) {
     level = 0
+  }
+
+  // Productive-ratio stagnation: if early-exit was bypassed but no other
+  // condition set a level, ensure at least level 1 nudge fires.
+  if (productiveStagnation && level === 0 && turn >= (isGlm ? 3 : 4)) {
+    level = 1
   }
 
   const noToolForceAbort = noToolCount >= NO_TOOL_ABORT_THRESHOLD
@@ -540,7 +642,7 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
   const shouldForceSplit = level >= 3 && !noToolForceAbort
   const shouldKick = level >= 2
   const injectedMessage = (level >= 2)
-    ? buildInjectedMessage(level as 2 | 3, score, signals, input.phaseClass, tier, input.evidenceState.deliveryStatus, noToolCount)
+    ? buildInjectedMessage(level as 2 | 3, score, signals, input.phaseClass, tier, input.evidenceState.deliveryStatus, noToolCount, productiveStagnation)
     : null
 
   return {

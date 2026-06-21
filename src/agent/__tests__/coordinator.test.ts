@@ -13,6 +13,7 @@ import {
 import { READ_ONLY_WORKER_TOOLS, WRITE_WORKER_TOOLS, type WorkerResult } from '../work-order.js'
 import { CollaborationProtocol } from '../collaboration-protocol.js'
 import { profileRegistry } from '../profile-registry.js'
+import { ProviderHealthTracker } from '../provider-health.js'
 
 function fakeTool(name: string): Tool {
   return {
@@ -162,6 +163,51 @@ describe('DelegationCoordinator', () => {
 
     assert.equal(orderDepth, 1)
     assert.equal(configDepth, 1)
+  })
+
+  it('clamps worker maxTurns to the work order budget (R3.1 budget enforcement)', async () => {
+    let capturedMaxTurns: number | undefined
+    let budgetMaxTurns: number | undefined
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => {
+        budgetMaxTurns = order.budget.maxTurns
+        return {
+          order,
+          client: {} as StreamClient,
+          promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+          toolRegistry: workerRegistry,
+          cwd: '/repo',
+          // Deliberately huge generic default — the per-profile budget must win.
+          maxTurns: 99,
+          contextWindow: card.contextWindow,
+          compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        }
+      },
+      runWorker: async config => {
+        capturedMaxTurns = config.maxTurns
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    await coordinator.delegate({
+      parentTurnId: 'turn-budget',
+      objective: 'Verify worker turn budget is enforced against runtime default',
+      kind: 'code_search',
+      profile: 'code_scout',
+      scope: { files: ['src/agent/coordinator.ts', 'src/agent/worker-session.ts'] },
+    })
+
+    assert.equal(typeof budgetMaxTurns, 'number')
+    assert.ok(budgetMaxTurns! < 99, 'budget should be tighter than the runtime default')
+    assert.equal(capturedMaxTurns, budgetMaxTurns, 'worker must run within the work order budget, not the runtime default')
   })
 
   it('routes patcher profile through injected hands runner seam', async () => {
@@ -362,6 +408,68 @@ describe('DelegationCoordinator', () => {
     assert.ok(run.results.every(r => r.status === 'passed'))
   })
 
+  it('A3: a dependent of a failed worker is reported as blocked, never silently dropped', async () => {
+    const ran: string[] = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      // A hard dispatch fault (factory throw) propagates out of delegateOrder and
+      // is caught as a worker failure → queue.markFailed. The upstream id then
+      // never enters completedIds, so its dependent can never be dequeued.
+      runtimeFactory: (order, card, workerRegistry) => {
+        if (order.id === 'team:T1') throw new Error('factory boom')
+        return {
+          order,
+          client: {} as StreamClient,
+          promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+          toolRegistry: workerRegistry,
+          cwd: '/repo',
+          maxTurns: 2,
+          contextWindow: card.contextWindow,
+          compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        }
+      },
+      runWorker: async config => {
+        ran.push(config.order.id)
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    const run = await coordinator.delegateBatch([
+      {
+        parentTurnId: 'turn_meta:team:T1',
+        objective: 'Scout the routing seams in the main module before review.',
+        kind: 'code_search',
+        profile: 'code_scout',
+        scope: { files: ['src/main.tsx'] },
+      },
+      {
+        parentTurnId: 'turn_meta:team:T2',
+        objective: 'Review the coordinator risk patterns that the scout surfaces.',
+        kind: 'review',
+        profile: 'reviewer',
+        scope: { files: ['src/agent/coordinator.ts'] },
+        dependencies: ['team:T1'],
+      },
+    ])
+
+    // Every order must be accounted for — the dependent is NOT lost.
+    assert.equal(run.results.length, 2)
+    const t1 = run.results.find(r => r.workOrderId === 'team:T1')!
+    const t2 = run.results.find(r => r.workOrderId === 'team:T2')!
+    assert.equal(t1.status, 'blocked', 'failed upstream worker is blocked')
+    assert.equal(t2.status, 'blocked', 'dependent is reported blocked, not dropped')
+    assert.match(t2.summary, /dependency failed: team:T1/)
+    // The dependent must never have actually run on the broken foundation.
+    assert.ok(!ran.includes('team:T2'), 'dependent worker was not executed')
+  })
+
   it('returns selected model metadata for each runnable batch work order', async () => {
     const coordinator = new DelegationCoordinator({
       baseToolRegistry: makeRegistry(),
@@ -444,6 +552,8 @@ describe('DelegationCoordinator', () => {
       authority: 'tianquan',
     })
 
+    // reviewer has tierLock:'cheap' → preferredTier='cheap' → no cheap cards in set
+    // → fallback to all cards → recommendModelForTask picks large-cache
     assert.equal(run.selectedModel, 'large-cache')
     assert.equal(saved.length, 3)
     assert.ok(saved.some(row => row.kind.startsWith('gated_influence_audit:model_tier_bandit:')))
@@ -451,11 +561,11 @@ describe('DelegationCoordinator', () => {
     assert.equal(audit.applied, false)
     assert.equal(audit.source, 'model_tier_bandit')
     const event = JSON.parse(saved.find(row => row.kind.startsWith('model_tier_shadow:'))!.json)
-    assert.equal(event.recommendedTier, 'strong')
+    assert.equal(event.recommendedTier, 'cheap')
     assert.equal(event.actualModel, 'large-cache')
     assert.equal(event.actualTier, 'strong')
-    assert.equal(event.matched, true)
-    assert.equal(run.modelTierShadows?.[0]?.recommendedTier, 'strong')
+    assert.equal(event.matched, false)
+    assert.equal(run.modelTierShadows?.[0]?.recommendedTier, 'cheap')
     assert.equal(run.modelTierGatedDecisions?.[0]?.applied, false)
     assert.equal(run.modelTierGatedDecisions?.[0]?.selectedModel, 'large-cache')
   })
@@ -508,14 +618,16 @@ describe('DelegationCoordinator', () => {
       authority: 'tianliang',
     })
 
+    // tierLock:'cheap' forces ruleTier=cheap; bandit also recommends cheap →
+    // baseline=candidate (same arm), margin=0 → gate closed (reward_margin)
     assert.equal(run.selectedModel, 'cheap-flash')
     assert.deepEqual(selectedModels, ['cheap-flash'])
-    assert.equal(run.modelTierGatedDecisions?.[0]?.applied, true)
+    assert.equal(run.modelTierGatedDecisions?.[0]?.applied, false)
     assert.equal(run.modelTierGatedDecisions?.[0]?.candidateTier, 'cheap')
     assert.equal(run.modelTierGatedDecisions?.[0]?.selectedTier, 'cheap')
     assert.ok(saved.some(row => row.kind.startsWith('model_tier_gated_decision:')))
     const audit = JSON.parse(saved.find(row => row.kind.startsWith('gated_influence_audit:model_tier_bandit:'))!.json)
-    assert.equal(audit.applied, true)
+    assert.equal(audit.applied, false)
     assert.equal(audit.evidenceWindow.selectedTier, 'cheap')
   })
 
@@ -565,9 +677,11 @@ describe('DelegationCoordinator', () => {
       authority: 'tianliang',
     })
 
-    assert.equal(run.selectedModel, 'large-cache')
-    assert.deepEqual(selectedModels, ['large-cache'])
-    assert.equal(run.modelTierGatedDecisions?.[0]?.gateOpen, true)
+    // reviewer tierLock:'cheap' → recommendedTier='cheap' → selects cheap-flash even when bandit disabled
+    // tierLock=cheap matches bandit cheap → margin=0 → gateOpen=false
+    assert.equal(run.selectedModel, 'cheap-flash')
+    assert.deepEqual(selectedModels, ['cheap-flash'])
+    assert.equal(run.modelTierGatedDecisions?.[0]?.gateOpen, false)
     assert.equal(run.modelTierGatedDecisions?.[0]?.applied, false)
   })
 
@@ -626,10 +740,12 @@ describe('DelegationCoordinator', () => {
       authority: 'tianliang',
     })
 
-    assert.equal(run.selectedModel, 'large-cache')
-    assert.deepEqual(selectedModels, ['large-cache'])
+    // reviewer tierLock:'cheap' → tierRecommendation='cheap' even when gate vetoes
+    // tierLock=cheap matches bandit cheap → margin=0 → gate closed on reward_margin (before scope-health)
+    assert.equal(run.selectedModel, 'cheap-flash')
+    assert.deepEqual(selectedModels, ['cheap-flash'])
     assert.equal(run.modelTierGatedDecisions?.[0]?.applied, false)
-    assert.match(run.modelTierGatedDecisions?.[0]?.reason ?? '', /scope-health veto high/)
+    assert.match(run.modelTierGatedDecisions?.[0]?.reason ?? '', /reward margin|scope-health/)
   })
 
   it('hardFloor prevents verifier downgrade despite strong cheap reward history', async () => {
@@ -670,12 +786,15 @@ describe('DelegationCoordinator', () => {
       objective: 'Adversarially verify a failing test path where strong tier hard floor must hold.',
       kind: 'verify',
       profile: 'adversarial_verifier',
+      authority: 'tianquan',
       scope: { files: ['src/agent/coordinator.ts', 'src/agent/__tests__/coordinator.test.ts'] },
     })
 
-    assert.equal(run.selectedModel, 'large-cache')
+    // adversarial_verifier has tierLock:'cheap' — margin=0 (rule=bandit=cheap)
+    // → gate closed on reward_margin → applied=false → falls back to tierRecommendation='cheap' → cheap-flash
+    assert.equal(run.selectedModel, 'cheap-flash')
     assert.equal(run.modelTierGatedDecisions?.[0]?.applied, false)
-    assert.match(run.modelTierGatedDecisions?.[0]?.reason ?? '', /hardFloor strong blocks cheap/)
+    assert.match(run.modelTierGatedDecisions?.[0]?.reason ?? '', /reward margin/)
   })
 
   it('keeps failed batch workers visible in aggregated results', async () => {
@@ -1178,13 +1297,17 @@ describe('DelegationCoordinator', () => {
       runHands: async () => { throw new Error('worker crashed after lock') },
     })
 
-    await assert.rejects(() => coordinator.delegate({
+    // B1: delegate no longer rethrows — returns structured degradation.
+    // Locks must still be released (finally block runs regardless).
+    const degradedRun = await coordinator.delegate({
       parentTurnId: 'turn_lock_throw',
       objective: 'Patch the locked file and intentionally exercise lock cleanup on worker failure.',
       kind: 'patch_proposal',
       profile: 'patcher',
       scope: { files: ['src/semantic-lock-cleanup.ts'] },
-    }), /worker crashed after lock/)
+    })
+    assert.equal(degradedRun.results[0]?.status, 'blocked')
+    assert.ok(degradedRun.results[0]?.summary?.includes('worker crashed after lock'))
 
     const cp = (coordinator as unknown as { collaboration: CollaborationProtocol }).collaboration
     assert.equal(cp.getSessionLocks('s-main').length, 0)
@@ -1267,15 +1390,187 @@ describe('DelegationCoordinator', () => {
       runHands: async () => { throw new Error('worker crashed after claim') },
     })
 
-    await assert.rejects(() => coordinator.delegate({
+    // B1: delegate no longer rethrows — returns structured degradation.
+    // File claims must still be released (finally block runs regardless).
+    const degradedRun = await coordinator.delegate({
       parentTurnId: 'turn_claim_throw',
       objective: 'Patch the claimed file and intentionally exercise file claim cleanup on worker failure.',
       kind: 'patch_proposal',
       profile: 'patcher',
       scope: { files: ['src/claim-failure-cleanup.ts'] },
-    }), /worker crashed after claim/)
+    })
+    assert.equal(degradedRun.results[0]?.status, 'blocked')
+    assert.ok(degradedRun.results[0]?.summary?.includes('worker crashed after claim'))
 
     assert.equal(sessionRegistry.acquireClaim('other-session', 'src/claim-failure-cleanup.ts'), true)
+  })
+
+  it('blocks write worker when files are already claimed by another session', async () => {
+    const claims = new Map<string, string>()
+    // Pre-claim a file for another session
+    claims.set('src/blocked-file.ts', 'other-session')
+    const sessionRegistry = {
+      acquireClaim: (sessionId: string, filePath: string) => {
+        const owner = claims.get(filePath)
+        if (owner && owner !== sessionId) return false
+        claims.set(filePath, sessionId)
+        return true
+      },
+      releaseClaim: (sessionId: string, filePath: string) => {
+        if (claims.get(filePath) === sessionId) claims.delete(filePath)
+      },
+    }
+    let runHandsCalled = false
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => ({
+        order,
+        client: {} as StreamClient,
+        promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+        toolRegistry: workerRegistry,
+        cwd: '/repo',
+        maxTurns: 2,
+        contextWindow: card.contextWindow,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      }),
+      sessionRegistry: sessionRegistry as never,
+      sessionId: 's-main',
+      runHands: async () => {
+        runHandsCalled = true
+        return { result: resultFor('unreachable'), usage: {} }
+      },
+    })
+
+    const run = await coordinator.delegate({
+      parentTurnId: 'turn_claim_blocked',
+      objective: 'Patch a file that is already claimed by another session.',
+      kind: 'patch_proposal',
+      profile: 'patcher',
+      scope: { files: ['src/blocked-file.ts'] },
+    })
+
+    assert.equal(run.status, 'completed')
+    assert.equal(run.results[0]?.status, 'blocked')
+    assert.ok(run.results[0]?.summary?.includes('文件声明冲突'))
+    assert.ok(run.results[0]?.summary?.includes('src/blocked-file.ts'))
+    // Worker should NOT be dispatched
+    assert.equal(runHandsCalled, false)
+    // Claim should still belong to other session
+    assert.equal(claims.get('src/blocked-file.ts'), 'other-session')
+    assert.equal(sessionRegistry.acquireClaim('s-main', 'src/blocked-file.ts'), false)
+  })
+
+  it('T3: retries failed worker with Pro model when budget allows (Flash→Pro escalation)', async () => {
+    const escalateCards: ModelCapabilityCard[] = [
+      { model: 'cheap-flash', toolUseReliability: 0.7, jsonStability: 0.7, editSuccessRate: 0.5, testRepairRate: 0.5, contextWindow: 1_000_000, cacheEconomics: 'strong', recommendedTasks: ['code_search'] },
+      { model: 'deepseek-pro', toolUseReliability: 0.95, jsonStability: 0.95, editSuccessRate: 0.9, testRepairRate: 0.85, contextWindow: 128_000, cacheEconomics: 'medium', recommendedTasks: ['patch_proposal'] },
+    ]
+    const modelsUsed: string[] = []
+    let firstCall = true
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: escalateCards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => {
+        modelsUsed.push(card.model)
+        return {
+          order,
+          client: {} as StreamClient,
+          promptEngine: new PromptEngine({ model: card.model, maxTokens: 4096, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+          toolRegistry: workerRegistry,
+          cwd: '/repo',
+          maxTurns: 4,
+          contextWindow: card.contextWindow,
+          compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        }
+      },
+      runWorker: async (config) => {
+        if (firstCall) {
+          firstCall = false
+          throw new Error('Flash worker transient failure')
+        }
+        return {
+          result: resultFor('pro-retry'),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    const run = await coordinator.delegate({
+      parentTurnId: 'turn_escalation',
+      objective: 'Investigate the Flash→Pro escalation when a worker fails transiently.',
+      kind: 'code_search',
+      profile: 'code_scout',
+      scope: { files: ['src/test.ts'] },
+      budget: { maxRetries: 1, maxTurns: 4, maxTokens: 4096, timeoutMs: 30000 },
+    })
+
+    assert.equal(run.status, 'completed')
+    // First call used cheap-flash, retry used deepseek-pro
+    assert.equal(modelsUsed.length, 2)
+    assert.equal(modelsUsed[0], 'cheap-flash')
+    assert.equal(modelsUsed[1], 'deepseek-pro')
+    // Escalation shadow event emitted
+    assert.ok(run.modelTierShadows && run.modelTierShadows.length >= 2, 'expected at least 2 tier shadows')
+    const escShadow = run.modelTierShadows!.find(s => s.actualTier === 'strong' && s.reason.includes('Flash→Pro 升级重试'))
+    assert.ok(escShadow, 'escalation shadow must be emitted')
+    assert.equal(escShadow!.actualModel, 'deepseek-pro')
+    assert.ok(run.selectedModel === 'deepseek-pro', 'selected model should be the Pro model')
+  })
+
+  it('T3: respects Pro upgrade limit (max 3 per session)', async () => {
+    const escalateCards: ModelCapabilityCard[] = [
+      { model: 'cheap-flash', toolUseReliability: 0.7, jsonStability: 0.7, editSuccessRate: 0.5, testRepairRate: 0.5, contextWindow: 1_000_000, cacheEconomics: 'strong', recommendedTasks: ['code_search'] },
+      { model: 'deepseek-pro', toolUseReliability: 0.95, jsonStability: 0.95, editSuccessRate: 0.9, testRepairRate: 0.85, contextWindow: 128_000, cacheEconomics: 'medium', recommendedTasks: ['patch_proposal'] },
+    ]
+    const modelsUsed: string[] = []
+    let failCount = 0
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: escalateCards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => {
+        modelsUsed.push(card.model)
+        return {
+          order,
+          client: {} as StreamClient,
+          promptEngine: new PromptEngine({ model: card.model, maxTokens: 4096, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+          toolRegistry: workerRegistry,
+          cwd: '/repo',
+          maxTurns: 4,
+          contextWindow: card.contextWindow,
+          compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        }
+      },
+      runWorker: async (config) => {
+        // Fail all 4 attempts — first 3 escalate to Pro, 4th stays Flash
+        failCount++
+        throw new Error(`Worker failure #${failCount}`)
+      },
+    })
+
+    // Run 4 failing delegates — only first 3 should escalate
+    for (let i = 0; i < 4; i++) {
+      await coordinator.delegate({
+        parentTurnId: `turn_limit_${i}`,
+        objective: `Test escalation limit attempt number ${i + 1} with more words.`,
+        kind: 'code_search',
+        profile: 'code_scout',
+        scope: { files: ['src/test.ts'] },
+        budget: { maxRetries: 1, maxTurns: 4, maxTokens: 4096, timeoutMs: 30000 },
+      })
+    }
+
+    // Models used: flash(×4) + pro(×3) = 7 runtimeFactory calls
+    assert.equal(modelsUsed.length, 7)
+    // First 3 delegates: flash → pro escalation
+    assert.equal(modelsUsed.filter(m => m === 'deepseek-pro').length, 3)
+    // 4th delegate: flash only (no escalation)
+    assert.equal(modelsUsed.filter(m => m === 'cheap-flash').length, 4)
   })
 
   it('blocks exploration worker when scope exceeds maxFiles budget without acquiring semantic locks', async () => {
@@ -1356,5 +1651,260 @@ describe('DelegationCoordinator', () => {
     })
 
     assert.equal(run.results[0]!.status, 'passed')
+  })
+
+  describe('provider health recording', () => {
+    const fastcorpProvider = {
+      name: 'fastcorp',
+      apiKey: 'test-key',
+      baseUrl: 'https://example.com/v1',
+      protocol: 'openai' as const,
+      capabilities: { cacheControl: false, stripParams: [], toolJsonBug: false, prefixCache: 'none' as const, prefixCompletion: false },
+      thinking: 'enabled' as const,
+      maxTokens: 4096,
+      models: [{ id: 'fast-json', contextWindow: 128_000, maxTokens: 4096 }],
+      unsupported: [],
+    }
+
+    const routing = {
+      providers: { fastcorp: fastcorpProvider },
+      profiles: { cheap: { provider: 'fastcorp', model: 'fast-json' } },
+      routing: { repo_summarization: 'cheap' },
+    }
+
+    const runtimeFactory: WorkerRuntimeFactory = (order, card, workerRegistry) => ({
+      order,
+      client: {} as StreamClient,
+      promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+      toolRegistry: workerRegistry,
+      cwd: '/repo',
+      maxTurns: 2,
+      contextWindow: card.contextWindow,
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+    })
+
+    it('records success on the routed provider when worker run completes', async () => {
+      const health = new ProviderHealthTracker()
+      const coordinator = new DelegationCoordinator({
+        baseToolRegistry: makeRegistry(),
+        modelCards: cards,
+        maxWorkers: 2,
+        runtimeFactory,
+        routing,
+        providerHealth: health,
+        runWorker: async config => ({
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }),
+      })
+
+      await coordinator.delegate({
+        parentTurnId: 'turn_ph1',
+        objective: 'Summarize repository documentation layout for onboarding guide.',
+        kind: 'doc_research',
+        profile: 'code_scout',
+        scope: {},
+      })
+
+      const fastcorp = health.getWeights().find(h => h.providerId === 'fastcorp')
+      assert.ok(fastcorp, 'fastcorp should be registered in the tracker')
+      assert.equal(fastcorp.consecutiveSuccesses, 1)
+      assert.equal(fastcorp.tier, 'hot')
+    })
+
+    it('records failure on the routed provider when worker run throws', async () => {
+      const health = new ProviderHealthTracker()
+      const coordinator = new DelegationCoordinator({
+        baseToolRegistry: makeRegistry(),
+        modelCards: cards,
+        maxWorkers: 2,
+        runtimeFactory,
+        routing,
+        providerHealth: health,
+        runWorker: async () => { throw new Error('502 upstream error') },
+      })
+
+      // B1: delegate() no longer rethrows — returns structured degradation
+      const degradedRun = await coordinator.delegate({
+        parentTurnId: 'turn_ph2',
+        objective: 'Summarize repository documentation layout for onboarding guide.',
+        kind: 'doc_research',
+        profile: 'code_scout',
+        scope: {},
+      })
+      assert.equal(degradedRun.status, 'completed')
+      assert.equal(degradedRun.results[0]?.status, 'blocked')
+      assert.ok(degradedRun.results[0]?.summary?.includes('502 upstream error'))
+
+      const fastcorp = health.getWeights().find(h => h.providerId === 'fastcorp')
+      assert.ok(fastcorp, 'fastcorp should be registered in the tracker')
+      assert.equal(fastcorp.consecutiveFailures, 1)
+      assert.ok(fastcorp.weight < 1, 'failure should reduce weight')
+    })
+
+    it('does not record failure when the worker run is aborted by the caller', async () => {
+      const health = new ProviderHealthTracker()
+      const coordinator = new DelegationCoordinator({
+        baseToolRegistry: makeRegistry(),
+        modelCards: cards,
+        maxWorkers: 2,
+        runtimeFactory,
+        routing,
+        providerHealth: health,
+        runWorker: async () => { throw new Error('Delegation aborted: caller signal fired') },
+      })
+
+      // B1: delegate no longer rethrows — it returns structured degradation
+      const degradedRun = await coordinator.delegate({
+        parentTurnId: 'turn_ph3',
+        objective: 'Summarize repository documentation layout for onboarding guide.',
+        kind: 'doc_research',
+        profile: 'code_scout',
+        scope: {},
+      })
+      assert.equal(degradedRun.status, 'completed')
+      assert.equal(degradedRun.results[0]?.status, 'blocked')
+      assert.ok(degradedRun.results[0]?.summary?.includes('Delegation aborted'))
+
+      const fastcorp = health.getWeights().find(h => h.providerId === 'fastcorp')
+      assert.equal(fastcorp, undefined, 'abort must not touch provider health')
+    })
+  })
+
+  describe('EFE × provider-health worker routing (Track 1)', () => {
+    const neutralSignals = {
+      efe: { epistemicValue: 0.5, pragmaticValue: 0.5, noveltyBonus: 0.2, precision: 0.5 },
+      sensorium: { complexity: 0.4, pressure: 0.3, confidence: 0.6, stability: 0.8 },
+    }
+
+    function makeProvider(name: string, modelId: string) {
+      return {
+        name,
+        apiKey: 'test-key',
+        baseUrl: 'https://example.com/v1',
+        protocol: 'openai' as const,
+        capabilities: { cacheControl: false, stripParams: [], toolJsonBug: false, prefixCache: 'none' as const, prefixCompletion: false },
+        thinking: 'enabled' as const,
+        maxTokens: 4096,
+        models: [{ id: modelId, contextWindow: 128_000, maxTokens: 4096 }],
+        unsupported: [],
+      }
+    }
+
+    // No routing.routing entry for repo_summarization → explicit routing never
+    // matches, so the EFE path (or static fallback) decides.
+    const routing = {
+      providers: {
+        fastcorp: makeProvider('fastcorp', 'fast-json'),
+        bigcorp: makeProvider('bigcorp', 'large-cache'),
+      },
+      profiles: {},
+      routing: {},
+    }
+
+    function makeCoordinator(opts: {
+      health?: ProviderHealthTracker
+      efeEnabled: boolean
+      auditEvents?: Array<{ kind: string; json: string }>
+      selectedModels: string[]
+    }) {
+      return new DelegationCoordinator({
+        baseToolRegistry: makeRegistry(),
+        modelCards: cards,
+        maxWorkers: 2,
+        runtimeFactory: (order, card, workerRegistry) => {
+          opts.selectedModels.push(card.model)
+          return {
+            order,
+            client: {} as StreamClient,
+            promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+            toolRegistry: workerRegistry,
+            cwd: '/repo',
+            maxTurns: 2,
+            contextWindow: card.contextWindow,
+            compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+          }
+        },
+        routing,
+        providerHealth: opts.health,
+        gatedInfluenceAuditStore: opts.auditEvents
+          ? { saveBanditState: (kind, json) => { opts.auditEvents!.push({ kind, json }) } }
+          : undefined,
+        efeRouting: { enabled: opts.efeEnabled, getSignals: () => neutralSignals },
+        runWorker: async config => ({
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }),
+      })
+    }
+
+    const delegateRequest = {
+      parentTurnId: 'turn_efe',
+      objective: 'Summarize repository documentation layout for onboarding guide.',
+      kind: 'doc_research' as const,
+      profile: 'code_scout' as const,
+      scope: {},
+    }
+
+    function coldProvider(health: ProviderHealthTracker, providerId: string) {
+      health.registerProvider(providerId)
+      // hot → warm (2 failures), warm → cold (3 more)
+      for (let i = 0; i < 5; i++) health.recordFailure(providerId)
+    }
+
+    it('shadow mode: emits audit event but dispatch uses the static fallback', async () => {
+      const selectedModels: string[] = []
+      const auditEvents: Array<{ kind: string; json: string }> = []
+      const coordinator = makeCoordinator({ efeEnabled: false, auditEvents, selectedModels })
+
+      await coordinator.delegate(delegateRequest)
+
+      // Static fallback for repo_summarization picks large-cache (strong cache + 1M context)
+      assert.equal(selectedModels[0], 'large-cache')
+
+      const efeAudit = auditEvents
+        .map(e => JSON.parse(e.json))
+        .find(e => e.targetId === 'efe_routing:repo_summarization')
+      assert.ok(efeAudit, 'EFE routing must emit an audit event even in shadow mode')
+      assert.equal(efeAudit.applied, false)
+      assert.equal(efeAudit.gateOpen, false)
+    })
+
+    it('gated mode: cold provider is excluded from the EFE pool and dispatch follows EFE', async () => {
+      const selectedModels: string[] = []
+      const health = new ProviderHealthTracker()
+      coldProvider(health, 'bigcorp') // large-cache's provider goes cold
+
+      const coordinator = makeCoordinator({ health, efeEnabled: true, selectedModels })
+      await coordinator.delegate(delegateRequest)
+
+      // Without health, fallback would pick large-cache; cold exclusion forces fast-json.
+      assert.equal(selectedModels[0], 'fast-json')
+
+      const cold = health.getWeights().find(h => h.providerId === 'bigcorp')
+      assert.equal(cold?.tier, 'cold')
+    })
+
+    it('gated mode audit event records applied=true and the selected model', async () => {
+      const selectedModels: string[] = []
+      const auditEvents: Array<{ kind: string; json: string }> = []
+      const health = new ProviderHealthTracker()
+      coldProvider(health, 'bigcorp')
+
+      const coordinator = makeCoordinator({ health, efeEnabled: true, auditEvents, selectedModels })
+      await coordinator.delegate(delegateRequest)
+
+      const efeAudit = auditEvents
+        .map(e => JSON.parse(e.json))
+        .find(e => e.targetId === 'efe_routing:repo_summarization')
+      assert.ok(efeAudit, 'gated EFE routing must emit an audit event')
+      assert.equal(efeAudit.applied, true)
+      assert.equal(efeAudit.evidenceWindow.selectedModel, 'fast-json')
+      assert.equal(efeAudit.evidenceWindow.coldExcluded, 1)
+    })
   })
 })

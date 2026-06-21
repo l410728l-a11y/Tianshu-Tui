@@ -1,6 +1,10 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createReadOnlyWorkOrder, createWriteWorkOrder, WRITE_WORKER_TOOLS } from '../work-order.js'
+import { ArtifactStore } from '../../artifact/store.js'
 import {
   buildPrimaryWorkerPacket,
   buildWorkerPrompt,
@@ -137,8 +141,8 @@ describe('worker prompts', () => {
     assert.ok(!prompt.includes('2026-06-01-project-memory-architecture-conflict.md'))
   })
 
-  it('builds a compact primary packet from worker results', () => {
-    const packet = buildPrimaryWorkerPacket([
+  it('builds a compact primary packet from worker results', async () => {
+    const packet = await buildPrimaryWorkerPacket([
       {
         workOrderId: 'wo_1',
         status: 'passed',
@@ -160,8 +164,8 @@ describe('worker prompts', () => {
     assert.ok(!packet.includes('\n  '))
   })
 
-  it('strips empty arrays from packet to reduce size', () => {
-    const packet = buildPrimaryWorkerPacket([
+  it('strips empty arrays from packet to reduce size', async () => {
+    const packet = await buildPrimaryWorkerPacket([
       {
         workOrderId: 'wo_2',
         status: 'passed',
@@ -183,9 +187,9 @@ describe('worker prompts', () => {
     assert.ok(packet.includes('"summary"'))
   })
 
-  it('truncates non-diff artifact content to 2000 chars', () => {
+  it('truncates non-diff artifact content to 2000 chars', async () => {
     const longContent = 'x'.repeat(3000)
-    const packet = buildPrimaryWorkerPacket([
+    const packet = await buildPrimaryWorkerPacket([
       {
         workOrderId: 'wo_3',
         status: 'passed',
@@ -205,9 +209,9 @@ describe('worker prompts', () => {
     assert.ok(!packet.includes('x'.repeat(3000)))
   })
 
-  it('does not truncate diff artifacts', () => {
+  it('does not truncate diff artifacts', async () => {
     const diffContent = `diff --git a/src/a.ts b/src/a.ts\n${'+'.repeat(3000)}`
-    const packet = buildPrimaryWorkerPacket([
+    const packet = await buildPrimaryWorkerPacket([
       {
         workOrderId: 'wo_diff',
         status: 'passed',
@@ -225,14 +229,14 @@ describe('worker prompts', () => {
     assert.ok(!packet.includes('…'))
   })
 
-  it('caps total packet size at 32K chars by dropping low-value fields', () => {
+  it('caps total packet size at 32K chars by dropping low-value fields', async () => {
     // Create a result with many fields that would exceed 8K
     const manyFindings = Array.from({ length: 50 }, (_, i) => ({
       claim: `Finding ${i}: ${'detail '.repeat(20)}`,
       evidence: `src/file-${i}.ts`,
       confidence: 'high' as const,
     }))
-    const packet = buildPrimaryWorkerPacket([
+    const packet = await buildPrimaryWorkerPacket([
       {
         workOrderId: 'wo_big',
         status: 'passed',
@@ -252,5 +256,45 @@ describe('worker prompts', () => {
     // Core fields should survive
     assert.ok(packet.includes('wo_big'))
     assert.ok(packet.includes('Big result.'))
+  })
+
+  it('emits a resolvable artifact reference when over-budget packet is offloaded to the store', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-artifact-'))
+    const store = new ArtifactStore(dir, 'sess-test')
+
+    // Build an over-budget result so the artifact-handoff path is taken.
+    const manyFindings = Array.from({ length: 400 }, (_, i) => ({
+      claim: `Finding ${i}: ${'detail '.repeat(40)}`,
+      evidence: `src/file-${i}.ts`,
+      confidence: 'high' as const,
+    }))
+    const packet = await buildPrimaryWorkerPacket(
+      [
+        {
+          workOrderId: 'wo_offload',
+          status: 'passed',
+          summary: 'Offloaded result.',
+          findings: manyFindings,
+          artifacts: [],
+          changedFiles: [],
+          risks: [],
+          nextActions: [],
+          evidenceStatus: 'verified',
+        },
+      ],
+      store,
+    )
+
+    // Reference must be present...
+    const match = packet.match(/\[artifact:([^\]]+)\]/)
+    assert.ok(match, `packet should embed an artifact reference: ${packet.slice(0, 200)}`)
+    const referencedId = match[1]
+    assert.ok(referencedId, 'artifact reference must contain an id')
+
+    // ...and it must resolve in the store (the bug: a fabricated
+    // `worker-packet-…` id that save() never produced → read_section null).
+    const raw = await store.readRaw(referencedId)
+    assert.ok(raw, `referenced artifact id "${referencedId}" must resolve in the store`)
+    assert.ok(raw.includes('wo_offload'))
   })
 })

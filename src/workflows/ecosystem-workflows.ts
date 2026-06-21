@@ -1,3 +1,9 @@
+import { classifyTaskDepth, classifyPlanMethodology, type TaskContract } from '../context/task-contract.js'
+import { DEFAULT_COUNCIL_SEATS } from '../agent/council/council-routing.js'
+
+const FULL_TEMPLATE_PATH = 'docs/superpowers/plans/2026-06-14-plan-methodology-template.md'
+const LIGHTWEIGHT_TEMPLATE_PATH = 'docs/superpowers/plans/2026-06-14-plan-methodology-lightweight.md'
+
 export interface WritingPlanPromptOptions {
   feature: string
   date?: Date
@@ -23,9 +29,16 @@ export interface TeamWorkflowPromptOptions {
   objective: string
 }
 
+export interface CouncilWorkflowPromptOptions {
+  objective: string
+  seats?: string[]
+  rounds?: number
+}
+
 const WRITING_PLAN_COMMANDS = new Set(['/plan', '/write-plan'])
 const PLAN_CLOSE_COMMANDS = new Set(['/plan-close'])
 const TEAM_COMMANDS = new Set(['/team'])
+const COUNCIL_COMMANDS = new Set(['/council'])
 
 export function isWritingPlanCommand(command: string): boolean {
   return WRITING_PLAN_COMMANDS.has(command.toLowerCase())
@@ -101,71 +114,78 @@ export function buildWritingPlanPrompt(options: WritingPlanPromptOptions): strin
   const feature = options.feature.trim()
   const path = options.planPath ?? defaultPlanPath(feature, options.date)
 
-  return `我正在使用 writing-plans 技能创建实现计划。加载 /skill writing-plans 查看完整方法论。
+  // 构建最小 TaskContract 供 methodology 路由使用
+  //（/plan 无文件上下文，路由默认走 lightweight；agent 后续可 override）
+  const contract: TaskContract = {
+    id: 'slash-plan',
+    objective: feature,
+    scope: { mentionedFiles: [] },
+    constraints: [],
+    successCriteria: [],
+    status: 'planning',
+    createdAtTurn: 0,
+    updatedAtTurn: 0,
+    isActionable: true,
+  }
+  const depth = classifyTaskDepth(contract)
+  const methodology = classifyPlanMethodology(contract, depth)
 
-Create a comprehensive implementation plan for: ${feature}
+  const templatePath = methodology === 'full' ? FULL_TEMPLATE_PATH : LIGHTWEIGHT_TEMPLATE_PATH
+  const templateLabel = methodology === 'full' ? '完整版（9阶段）' : '轻量版（5阶段）'
+  const methodologyNote = methodology === 'full'
+    ? '必须包含：安全不变量、触发路径清单、双门对齐数据流图。系统边界标定和跨模块协调说明不可省略。'
+    : '单模块边界内变更，聚焦核心改动与验证即可。'
 
-Requirements:
-- Do not write implementation code yet.
-- Read relevant code deeply before proposing tasks — understand why each function to modify exists.
-- For functions to delete or change behavior: grep callers, read commit messages, confirm edge cases are covered.
-- Save the plan to \`${path}\` unless the user explicitly chooses another path.
-- Plan filenames must be short business-semantic names. Do not mechanically use the entire \`/plan\` argument as the filename.
-- Assume the implementing engineer has near-zero context about this codebase.
-- Prefer DRY, YAGNI, TDD, small focused files, and frequent commits.
+  return `创建实现计划：${feature}
 
-Required plan header:
+计划模板路由：任务深度 ${depth} → ${templateLabel}
+模板路径：${templatePath}
+${methodologyNote}
+
+要求：
+- 不要写实现代码。先深入读相关代码，理解每个要改的函数为什么存在。
+- 对要删除或改行为的函数：grep 调用方、读 commit 记录、确认边界情况。
+- 计划保存到 \`${path}\`，除非用户显式指定其他路径。
+- 文件名用简短业务语义命名，不用 /plan 参数的全文做文件名。
+- 假设执行工程师对此代码库零上下文。
+
+计划头部格式：
 \`\`\`markdown
 # [功能名称] 实现计划
 
-> **面向 AI 代理：** 使用 subagent-driven-development（推荐）或 executing-plans 逐任务实现此计划。步骤使用复选框（\`- [ ]\`）语法来跟踪进度。
+> **面向 AI 代理：** 使用 subagent-driven-development（推荐）或 executing-plans 逐任务实现。
 
-**目标：** [一句话描述要构建什么]
+**目标：** [一句话描述]
 
-**架构：** [2-3 句话描述方案，关键设计决策及其理由]
+**架构：** [2-3 句话描述方案、关键决策及理由]
 
-**技术栈：** [关键技术/库]
+**技术栈：** [关键技术]
 
 ---
 \`\`\`
 
-Required sections:
-1. Scope check — if the feature spans independent subsystems, split into independent plans.
-2. File structure — list every file to create or modify before defining tasks, with each file's responsibility.
-3. Research endorsement（调研背书）— for each delete/behavior-change operation: list callers, existence reason, edge case risks.
-4. Tasks — each task must be independently meaningful and testable, with precise file paths.
-5. Verification — exact commands and expected results.
-6. Self-check — spec coverage, placeholder scan, type/signature consistency.
-7. Execution handoff — ask whether to execute via subagent-driven-development or inline executing-plans.
+任务要求：
+- 每步应为一个独立可测的操作，约 2-5 分钟。
+- TDD 形态：写失败测试 → 确认失败 → 最小实现 → 通过测试 → commit。
+- 每个任务标注精确文件路径（创建/修改/测试）。
+- 每个代码改动步骤提供具体代码或精确编辑描述。
+- 每个命令标注预期结果，commit 用 conventional commit 格式。
 
-Task requirements:
-- Each step should be one operation that takes roughly 2-5 minutes.
-- Use TDD shape: write failing test → run and confirm failure → implement minimum code → run passing test → commit.
-- Every task must list exact files:
-  - 创建：\`exact/path/to/new-file.ts\`
-  - 修改：\`exact/path/to/existing-file.ts:line-range\`
-  - 测试：\`exact/path/to/test.test.ts\`
-- Every code-changing step must include concrete code or an exact edit description precise enough to execute.
-- Every command must include the expected result.
-- Every commit step must use conventional commit format.
-- No research endorsement on a delete operation → flagged as unverified assumption during execution.
-
-Forbidden placeholders:
+禁用占位符：
 - TODO / TBD / 待定 / 后续实现 / 补充细节
-- "添加适当的错误处理" without exact behavior
-- "为上述代码编写测试" without concrete test code
-- "类似任务 N"
-- Any type, function, method, or property used before being defined somewhere in the plan
+- "添加适当的错误处理"（无精确行为）
+- "为上述代码编写测试"（无具体测试代码）
+- 任何在计划中未定义的类型、函数、方法、属性
 
-Before finishing, perform and report this self-check:
-1. Spec coverage: map each requirement to one or more tasks; list and fix omissions.
-2. Placeholder scan: remove every forbidden placeholder pattern.
-3. Type consistency: verify names/signatures/paths are consistent across tasks.
+完成前自检：
+1. 规格覆盖：每个需求映射到任务
+2. 占位符扫描：移除全部禁用占位符
+3. 类型一致性：名称/签名/路径跨任务一致
 
-End with this handoff:
+收尾：
 "计划已完成并保存到 \`${path}\`。两种执行方式：
-1. 子代理驱动（推荐）— 每个任务调度一个新的子代理，任务间进行审查，快速迭代。
-2. 内联执行 — 在当前会话中使用 executing-plans 执行任务，批量执行并设有检查点。
+1. 子代理驱动（推荐）
+2. 内联执行（使用 executing-plans）
 选哪种方式？"
 `
 }
@@ -303,6 +323,71 @@ export function parseTeamWorkflowArgs(args: string): TeamWorkflowPromptOptions |
   return { mode: 'standard', objective: trimmed }
 }
 
+export const COUNCIL_USAGE = 'Council usage: /council <要会诊的计划/问题> [--seats id1,id2,...] [--rounds 1-2]'
+
+export function parseCouncilWorkflowArgs(args: string): CouncilWorkflowPromptOptions | null {
+  let objective = args.trim()
+  if (!objective) return null
+
+  // Parse --rounds flag first (before --seats truncates the objective).
+  let rounds: number | undefined
+  const roundsIdx = objective.search(/\s+--rounds\b/)
+  if (roundsIdx >= 0) {
+    const afterRounds = objective.slice(roundsIdx).replace(/^\s+--rounds\s*/, '')
+    const tok = afterRounds.split(/[\s,]+/).find(s => s.length > 0)
+    const n = tok ? Number.parseInt(tok, 10) : NaN
+    objective = objective.slice(0, roundsIdx).trim()
+    if (Number.isInteger(n) && n >= 1 && n <= 2) rounds = n
+  }
+
+  // Parse --seats flag: /council review the plan --seats tianquan,tianfu,tianji
+  let seats: string[] | undefined
+  const seatsIdx = objective.search(/\s+--seats\b/)
+  if (seatsIdx >= 0) {
+    const afterSeats = objective.slice(seatsIdx).replace(/^\s+--seats\s*/, '')
+    // 过滤空 token：`--seats` 后仅空白/无值时不注入空 authority（否则 council_convene
+    // 的 zod authority.min(1) 会拒整轮），降级回默认席。
+    const seatTokens = afterSeats.split(/[\s,]+/).filter(s => s.length > 0 && !s.startsWith('--'))
+    // 只要出现 --seats 就从 objective 剥离该段，避免噪音残留；有值才注入，无值降级默认席。
+    objective = objective.slice(0, seatsIdx).trim()
+    if (seatTokens.length > 0) seats = seatTokens
+  }
+
+  return objective ? { objective, ...(seats?.length ? { seats } : {}), ...(rounds ? { rounds } : {}) } : null
+}
+
+export function buildCouncilWorkflowPrompt(options: CouncilWorkflowPromptOptions): string {
+  const objective = options.objective.trim()
+  const hasCustomSeats = options.seats && options.seats.length > 0
+  const defaultSeatsDesc = DEFAULT_COUNCIL_SEATS
+    .map(s => `${s.authority} ${(s.charter ?? '').split('：')[0] || '顾问'}`)
+    .join(' · ')
+  const seatsNote = hasCustomSeats
+    ? `席位用自定义配置: ${options.seats!.join(' · ')}`
+    : `席位用默认配置(${defaultSeatsDesc}),无需自行指定 seats`
+  const seatsParam = hasCustomSeats
+    ? `, seats: [${options.seats!.map(s => `{ authority: "${s}" }`).join(', ')}]`
+    : ''
+  const roundsParam = options.rounds ? `, rounds: ${options.rounds}` : ''
+  const roundDesc = options.rounds && options.rounds >= 2
+    ? `这是多轮辩论(至多 ${options.rounds} 轮,仅在首轮出现冲突时才进第二轮反驳收敛)`
+    : '这是单轮会诊'
+
+  return `我正在使用 /council 发起星域议事会——多星域单轮对抗评审,只出计划不执行。
+
+评审主题:
+${objective}
+
+执行契约:
+- 用户已显式发起议事会;不要再问是否使用,直接调用 council_convene 工具。
+- 调用 council_convene 工具,参数 { objective: "${objective}"${seatsParam}${roundsParam} };${seatsNote}。
+- ${roundDesc}:扇出席位 → 确定性裁决 → 产出议事记录。绝不触发 team_orchestrate 或任何执行链。
+- council_convene 返回的议事记录(席位贡献 / 裁决记录 / 冲突 / 最终任务表)直接原样呈现给用户,不要二次概括或改写。
+- 返回的 content 末尾会内嵌一个 \`\`\`council-plan-json 代码块——由议事结论确定性生成的可执行 UnifiedPlan(含每项任务的 files 文件提示)。这是评审→执行的交接载体,不要展示给用户也不要改写其中任何字段。
+- 议事会只负责出计划。产出议事记录后,主动询问用户是否执行(例如:"议事会评审完成。最终任务表有 N 项。需要执行吗?")。
+- 用户确认执行后,提取 content 中 council-plan-json 块里的 JSON,原样作为 team_orchestrate 的 planJson 参数发起执行(模型交接,team 直接按 files 分波,无需重新解析)。用户不确认就此打住——议事会绝不自行触发 team_orchestrate。`
+}
+
 export function resolveEcosystemWorkflowInput(input: string, opts?: { date?: Date }): WorkflowResolveResult | null {
   const parsed = parseSlashInput(input)
   if (!parsed) return null
@@ -310,6 +395,11 @@ export function resolveEcosystemWorkflowInput(input: string, opts?: { date?: Dat
   if (TEAM_COMMANDS.has(parsed.command)) {
     const team = parseTeamWorkflowArgs(parsed.args)
     return { command: parsed.command, prompt: team ? buildTeamWorkflowPrompt(team) : TEAM_USAGE }
+  }
+
+  if (COUNCIL_COMMANDS.has(parsed.command)) {
+    const council = parseCouncilWorkflowArgs(parsed.args)
+    return { command: parsed.command, prompt: council ? buildCouncilWorkflowPrompt(council) : COUNCIL_USAGE }
   }
 
   if (PLAN_CLOSE_COMMANDS.has(parsed.command)) {

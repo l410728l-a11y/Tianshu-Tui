@@ -4,9 +4,10 @@ import type { Tool, ToolCallParams } from './types.js'
 import { track } from './process-tracker.js'
 import { killProcessTree } from './process-kill.js'
 import { getShellCommand } from '../platform.js'
+import { wrapSandboxCommand as sandboxWrap } from './sandbox-profile.js'
 import { persistRawOutput, buildModelOutput, buildUiOutput } from './output-store.js'
+import { applyCommandFilter } from './command-filters.js'
 import { summarizeBashOutput } from '../artifact/summarize.js'
-import { pruneThresholds } from '../compact/constants.js'
 import { getToolArtifactThreshold } from './artifact-threshold.js'
 import { debugLog } from '../utils/debug.js'
 
@@ -51,6 +52,17 @@ export function isExecFailure(exitCode: number): boolean {
 }
 
 /**
+ * Wrap a command in a workspace-scoped sandbox. Default-ON (opt out with
+ * RIVET_NO_SANDBOX=1). The actual backend/profile logic lives in
+ * sandbox-profile.ts (pure + unit-testable per platform); this thin wrapper
+ * threads the workspace cwd through so writes are confined to it.
+ */
+export function wrapSandboxCommand(command: string, cwd?: string): { command: string; sandboxed: boolean; note?: string } {
+  const decision = sandboxWrap(command, { cwd: cwd ?? process.cwd() })
+  return { command: decision.command, sandboxed: decision.sandboxed, note: decision.note }
+}
+
+/**
  * Per-call cache to avoid calling rtkRewrite twice for the same command
  * within a single tool invocation (requiresApproval → execute).
  *
@@ -78,6 +90,36 @@ function rtkRewrite(command: string, toolUseId?: string): string {
   return result
 }
 
+// ── bash-level file read tracking ──
+// Detects when the model repeatedly reads the same file via cat/grep/head/tail/wc,
+// which burns context tokens without adding information. Mirrors read_file's dedup.
+const bashFileReads = new Map<string, { command: string; toolUseId: string; at: number }>()
+const BASH_READ_PATTERNS = [
+  /(?:^|[;&|]\s*)cat\s+['"]?([^'"\s;|&]+)['"]?/g,
+  /(?:^|[;&|]\s*)grep\s+.*\s+['"]?([^'"\s;|&]+)['"]?\s*$/gm,
+  /(?:^|[;&|]\s*)head\s+.*\s+['"]?([^'"\s;|&]+)['"]?/g,
+  /(?:^|[;&|]\s*)tail\s+.*\s+['"]?([^'"\s;|&]+)['"]?/g,
+]
+function checkBashReread(command: string, toolUseId: string): string | null {
+  for (const pattern of BASH_READ_PATTERNS) {
+    pattern.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(command)) !== null) {
+      const filePath = match[1]!
+      if (filePath.startsWith('/tmp/') || filePath.startsWith('/dev/') || filePath === '-') continue
+      const key = filePath
+      const prior = bashFileReads.get(key)
+      if (prior && prior.toolUseId !== toolUseId) {
+        bashFileReads.set(key, { command: command.slice(0, 80), toolUseId, at: Date.now() })
+        return `── bash-reread ──\n⚠ 该文件已被 bash 读取过: ${prior.command}。重复读取浪费上下文。如需多次查询，先 cat > /tmp 一次，后续操作在 /tmp 上进行。\n── bash-reread ──`
+      }
+      bashFileReads.set(key, { command: command.slice(0, 80), toolUseId, at: Date.now() })
+    }
+  }
+  return null
+}
+setInterval(() => { for (const [k, v] of bashFileReads) { if (Date.now() - v.at > 600_000) bashFileReads.delete(k) } }, 300_000).unref()
+
 export const BASH_TOOL: Tool = {
   definition: {
     name: 'bash',
@@ -99,7 +141,9 @@ Timeout defaults to 120s; pass timeout parameter for longer commands.`,
 
   async execute(params: ToolCallParams) {
     const rawCommand = params.input.command as string
-    const command = rtkRewrite(rawCommand, params.toolUseId)
+    const rewritten = rtkRewrite(rawCommand, params.toolUseId)
+    const sandbox = wrapSandboxCommand(rewritten, params.cwd)
+    const command = sandbox.command
     const timeout = (params.input.timeout as number) ?? 120_000
     const startTime = Date.now()
 
@@ -115,34 +159,54 @@ Timeout defaults to 120s; pass timeout parameter for longer commands.`,
       let stdout = ''
       let stderr = ''
       let timedOut = false
+      let stdoutTruncated = false
+      let stderrTruncated = false
+      let stdoutRawBytes = 0
+      let stderrRawBytes = 0
 
       child.stdout!.on('data', (data: Buffer) => {
         const text = data.toString()
+        stdoutRawBytes += data.length
         stdout += text
         params.onOutput?.(text)
         if (stdout.length > 32_000) {
+          if (!stdoutTruncated) {
+            stdoutTruncated = true
+          }
           stdout = stdout.slice(-24_000)
         }
       })
 
       child.stderr!.on('data', (data: Buffer) => {
         const text = data.toString()
+        stderrRawBytes += data.length
         stderr += text
         params.onOutput?.(text)
         if (stderr.length > 32_000) {
+          stderrTruncated = true
           stderr = stderr.slice(-24_000)
         }
       })
 
       const buildResult = async (code: number, isTimeout = false) => {
-        const raw = stdout + (stderr ? '\n' + stderr : '')
+        const truncNote = stdoutTruncated
+          ? `[stdout truncated: output exceeded 32KB (${stdoutRawBytes} bytes total), showing last 24KB — full output at rawPath below]\n`
+          : ''
+        const stderrNote = stderrTruncated
+          ? `[stderr truncated: output exceeded 32KB, showing last 24KB]\n`
+          : ''
+        const raw = truncNote + stderrNote + stdout + (stderr ? '\n' + stderr : '')
+        const totalRawBytes = stdoutRawBytes + stderrRawBytes
+        const totalRawLines = raw.split('\n').length - (truncNote ? truncNote.split('\n').length - 1 : 0) - (stderrNote ? stderrNote.split('\n').length - 1 : 0)
+        // P1: Command-Aware filtering — apply before content construction so the
+        // model sees a condensed, semantically-relevant version. Raw output is
+        // still persisted for artifact recovery.
+        const filtered = applyCommandFilter(rawCommand, raw, code) ?? raw
         const durationMs = Date.now() - startTime
         const exitCode = isTimeout ? -1 : code
         const meta = { command: rawCommand, exitCode, durationMs }
-        // 非零退出码 ≠ 失败：grep/diff/test 等用退出码表达"有差异/无匹配/有失败用例"，
-        // build/lint 工具也常以非零码报告非致命问题。只把"无法执行/被信号杀死"判为真 error，
-        // 避免环境性非零码被无条件打成 error 并被下游放大成 error 风暴（天枢退化的根因）。
         const isError = isExecFailure(exitCode)
+        const rereadWarn = checkBashReread(rawCommand, params.toolUseId)
 
         // Use ArtifactStore if available (preferred); otherwise fall back to output-store.
         // Skip persistRawOutput in artifact mode — ArtifactStore owns raw persistence,
@@ -155,21 +219,27 @@ Timeout defaults to 120s; pass timeout parameter for longer commands.`,
           // post-mortem: every bash result became "[artifact:X] ... use read_section"
           // → the model started writing /tmp files just to escape the artifact loop.
           const artifactThreshold = getToolArtifactThreshold('bash', params.contextWindow)
-          const wrapInArtifact = raw.length >= artifactThreshold
+          const wrapInArtifact = filtered.length >= artifactThreshold
 
           if (!wrapInArtifact) {
             debugLog(`[artifact-skip] tool=bash cmd=${rawCommand.slice(0, 60)} raw=${raw.length} threshold=${artifactThreshold}`)
             const rawPath = await persistRawOutput(params.toolUseId, raw)
+            const baseContent = buildModelOutput(filtered || (isTimeout ? 'Command timed out' : `Exit code: ${code}`), { ...meta, rawPath })
             return {
-              content: buildModelOutput(raw || (isTimeout ? 'Command timed out' : `Exit code: ${code}`), meta),
-              uiContent: buildUiOutput(raw, meta),
+              content: rereadWarn ? rereadWarn + '\n' + baseContent : baseContent,
+              uiContent: buildUiOutput(filtered, meta),
               rawPath,
               isError,
+              lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' : 'lossless',
+              rawBytes: totalRawBytes,
+              rawLines: totalRawLines,
+              exitCode,
+              command: rawCommand,
             }
           }
 
           debugLog(`[artifact-wrap] tool=bash cmd=${rawCommand.slice(0, 60)} raw=${raw.length} threshold=${artifactThreshold}`)
-          const { summary, sections } = summarizeBashOutput(raw, rawCommand, exitCode)
+          const { summary, sections } = summarizeBashOutput(filtered, rawCommand, exitCode)
           const artifactId = await params.artifactStore.save({
             tool: 'bash',
             target: rawCommand,
@@ -181,25 +251,37 @@ Timeout defaults to 120s; pass timeout parameter for longer commands.`,
           // Even when wrapping, prepend the model-formatted output so the model
           // sees the head/tail directly — the [artifact:X] marker is a back-up
           // recovery path, not the only way to access content.
-          const lineCount = raw.split('\n').length
+          const lineCount = filtered.split('\n').length
           const successFold = exitCode === 0 && lineCount > SUCCESS_INLINE_LINES
           const modelOutput = successFold
             ? `[${rawCommand}] exit=0 (${lineCount} lines) — success output folded, full output recoverable below`
-            : buildModelOutput(raw || (isTimeout ? 'Command timed out' : `Exit code: ${code}`), meta)
+            : buildModelOutput(filtered || (isTimeout ? 'Command timed out' : `Exit code: ${code}`), meta)
+          const baseContent = `${modelOutput}\n\nUse read_section(artifactId="${artifactId}", section="L1-L500") to load full output if the head/tail above is not enough.\n[artifact:${artifactId}]`
           return {
-            content: `${modelOutput}\n\nUse read_section(artifactId="${artifactId}", section="L1-L500") to load full output if the head/tail above is not enough.\n[artifact:${artifactId}]`,
-            uiContent: buildUiOutput(raw, meta),
+            content: rereadWarn ? rereadWarn + '\n' + baseContent : baseContent,
+            uiContent: buildUiOutput(filtered, meta),
             rawPath: artifact?.rawPath,
             isError,
+            lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' : 'lossless',
+            rawBytes: totalRawBytes,
+            rawLines: totalRawLines,
+            exitCode,
+            command: rawCommand,
           }
         }
 
         const rawPath = await persistRawOutput(params.toolUseId, raw)
+        const baseContent = buildModelOutput(filtered || (isTimeout ? 'Command timed out' : `Exit code: ${code}`), { ...meta, rawPath })
         return {
-          content: buildModelOutput(raw || (isTimeout ? 'Command timed out' : `Exit code: ${code}`), meta),
-          uiContent: buildUiOutput(raw, meta),
+          content: rereadWarn ? rereadWarn + '\n' + baseContent : baseContent,
+          uiContent: buildUiOutput(filtered, meta),
           rawPath,
           isError,
+          lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' : 'lossless',
+          rawBytes: totalRawBytes,
+          rawLines: totalRawLines,
+          exitCode,
+          command: rawCommand,
         }
       }
 
@@ -207,12 +289,42 @@ Timeout defaults to 120s; pass timeout parameter for longer commands.`,
       let timer: ReturnType<typeof setTimeout> | null = null
       let forceKillTimer: ReturnType<typeof setTimeout> | null = null
 
+      const signal = params.abortSignal
+      const cleanupAbort = () => {
+        if (signal) signal.removeEventListener('abort', onAbort)
+      }
+
       const finish = async (code: number, isTimeout = false, clearForceKill = true) => {
         if (settled) return
         settled = true
         if (timer) clearTimeout(timer)
         if (clearForceKill && forceKillTimer) clearTimeout(forceKillTimer)
+        cleanupAbort()
         resolve(await buildResult(code, isTimeout))
+      }
+
+      // 用户中止（Esc/Ctrl+C → AgentLoop.abort → pipeline abortSignal）：
+      // 协作式取消——杀掉 detached 进程树（SIGTERM，3s 后 SIGKILL 兜底），立即 settle。
+      // 没有这一步，bash 子进程会在 abort 后继续在后台运行（detached），是会话"假死"
+      // 期间资源泄漏与副作用的来源。结果值本身可能被 withToolTimeout 的竞速丢弃，
+      // 真正的目的是确保进程被杀。
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        cleanupAbort()
+        killProcessTree(child, 'SIGTERM')
+        forceKillTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 3000)
+        const raw = stdout + (stderr ? '\n' + stderr : '')
+        resolve({
+          content: raw ? `[aborted] 命令被用户中止，部分输出:\n${raw.slice(-2000)}` : 'Command aborted by user.',
+          uiContent: '⏹ aborted',
+          isError: false,
+        })
+      }
+      if (signal) {
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, { once: true })
       }
 
       timer = setTimeout(() => {
@@ -231,6 +343,7 @@ Timeout defaults to 120s; pass timeout parameter for longer commands.`,
         settled = true
         if (timer) clearTimeout(timer)
         if (forceKillTimer) clearTimeout(forceKillTimer)
+        cleanupAbort()
         resolve({ content: err.message, isError: true })
       })
     })

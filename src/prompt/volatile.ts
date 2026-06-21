@@ -10,6 +10,86 @@ import { summarizeGitStatus } from './git-status-summary.js'
 import { scoreLessons } from '../context/lesson-relevance.js'
 import type { PlaybookBullet } from '../agent/playbook.js'
 import type { WorktreeReality } from '../agent/worktree-reality.js'
+import type { TaskDepthLayer } from '../context/task-contract.js'
+
+const DEPTH_ADVISORY: Record<Exclude<TaskDepthLayer, 'unit'>, string> = {
+  wiring: '<task-depth layer="wiring">此任务跨越模块边界。mock 单测会掩盖接线缺陷。写集成测试时实例化真实依赖（非 mock），RED 必须先证明边界断裂，GREEN 才证明已修复。</task-depth>',
+  system: '<task-depth layer="system">此任务跨越 3+ 层（端到端）。至少写一个不 mock 中间层的测试，验证从输入到输出的完整路径。优先使用真实子系统而非 mock。</task-depth>',
+}
+
+export function renderTaskDepthAdvisory(layer: TaskDepthLayer | undefined): string | null {
+  if (!layer || layer === 'unit') return null
+  return DEPTH_ADVISORY[layer]
+}
+
+import type { PlanMethodology } from '../context/task-contract.js'
+
+// U6: the trailing 用 todo 列出有序步骤 hint seeds the PlanExecutionTrace — the
+// first `todo write` becomes the plan baseline that the replan loop tracks
+// against. Zero new tools; just nudges the model toward the existing todo tool.
+const METHODOLOGY_ADVISORY_TEMPLATES: Record<PlanMethodology, string> = {
+  lightweight: '<plan-methodology route="lightweight">推荐使用轻量版计划模板（5阶段），路径: docs/superpowers/plans/2026-06-14-plan-methodology-lightweight.md。本任务 scope 内聚，单模块边界内变更，轻量版足以覆盖。至少画一张架构或数据流图（Mermaid），哪怕只画核心 3-5 个节点。开工前先用 todo 列出有序步骤（即为执行计划基线）。</plan-methodology>',
+  full: '<plan-methodology route="full">推荐使用完整版计划模板（9阶段），路径: docs/superpowers/plans/2026-06-14-plan-methodology-template.md。必须包含: 安全不变量、触发路径清单、双门对齐数据流图。开工前先用 todo 列出有序步骤（即为执行计划基线）。</plan-methodology>',
+}
+
+export function renderPlanMethodologyAdvisory(
+  methodology: PlanMethodology | undefined,
+  reason?: string,
+): string | null {
+  if (!methodology) return null
+  const base = METHODOLOGY_ADVISORY_TEMPLATES[methodology]
+  if (!reason || methodology === 'lightweight') return base
+  // For 'full' with a reason, append it for traceability
+  return base.replace('</plan-methodology>', `\n路由理由: ${reason}</plan-methodology>`)
+}
+
+/**
+ * Plan Mode instruction block. Cache-safe: rendered ONLY into the dynamic
+ * appendix (after history), never the frozen base — planModeState flips
+ * mid-session and must not invalidate the exact-prefix cache.
+ *
+ * Carries copyable Mermaid skeletons so the planning model reliably produces an
+ * architecture/data-flow diagram (the salience for this lives in the appendix,
+ * close to where the model is reasoning, instead of a far-away tool description).
+ */
+export function renderPlanModeBlock(): string {
+  return `<plan-mode>
+You are in PLAN MODE. You may ONLY read files and explore the codebase — do NOT write, edit, or execute commands that modify state.
+
+WORKFLOW:
+1. Explore the codebase using read_file, grep, glob, repo_map, inspect_project
+2. Understand the full scope: which files need changes, what existing patterns to follow
+3. When your plan is complete, call \`plan_submit\` with a polished design document
+
+PLAN QUALITY STANDARD — your plan should be a comprehensive design document:
+- Include at least one Mermaid diagram (architecture or data flow). Shapes carry meaning — (rounded)=user/input, [[subroutine]]=agent/processor, {{hexagon}}=LLM/model, [(cylinder)]=store/DB, {rhombus}=decision; edges --> sync/read, ==> write/strong, -.-> async/event. Copy a skeleton below and replace the node text:
+\`\`\`mermaid
+flowchart TD
+    U(用户输入) --> R[[入口/路由]]
+    R --> L{{LLM/核心逻辑}}
+    R --> S[(存储/状态)]
+    L --产出--> OUT([结果])
+\`\`\`
+\`\`\`mermaid
+flowchart LR
+    SRC(来源) -->|读取| P[[处理]]
+    P -->|校验| D{通过?}
+    D -->|是| W[(写入目标)]
+    D -.失败.-> ERR([报错/回退])
+\`\`\`
+- Include root cause analysis, not just surface symptoms
+- Reference files with full paths like \`src/agent/loop.ts:643\`
+- Show proposed code with diff/pseudocode per file
+- Compare alternatives in a table when design decisions exist
+- Include a verification plan with test cases and manual verification steps
+
+4. After submitting plan_submit, WAIT for the user to approve or reject. Do not proceed without approval.
+
+The user will respond with:
+- /plan-approve <slug> — approved, start execution
+- /plan-reject <slug> — rejected, revise
+</plan-mode>`
+}
 
 export interface ToolHistoryEntry {
   tool: string
@@ -31,34 +111,59 @@ export interface VolatileContext {
   contextLedger?: ContextLedger
   sessionMemoryBlock?: string
   playbookLessons?: PlaybookBullet[]
+  /** Recent user query text for lesson relevance scoring. */
+  recentQuery?: string
+  /** Callback to record which bullet IDs were actually rendered. */
+  onLessonsRendered?: (ids: string[]) => void
   activeClaims?: ContextClaim[]
   toolHistory?: ToolHistoryEntry[]
   taskProgress?: TaskState
-  behaviorMirror?: string | null
   decisions?: string[]
-  strategyShift?: string | null
-  repairHint?: string | null
-  impactHint?: string | null
-  routingReason?: string | null
-  cerebellarHint?: string | null
-  /** Affordance hint from Embodied Cognition engine.
+  /** Unified tool context from Embodied Cognition + Free Energy Engine.
+   *  Replaces the old separate affordanceHint + policyGuidance blocks.
    *  Cache-safe: rendered ONLY into the dynamic appendix.
    *  MUST stay out of buildVolatileBlockInternal — changes every turn. */
-  affordanceHint?: string | null
-  /** Policy guidance from Free Energy Engine (EFE + softmax selection).
-   *  Cache-safe: rendered ONLY into the dynamic appendix.
-   *  MUST stay out of buildVolatileBlockInternal — changes every turn. */
-  policyGuidance?: string | null
+  toolContext?: string | null
   /** PlanCache suggestion for the current user turn.
    *  Cache-safe: rendered ONLY into the dynamic appendix.
    *  Advisory-only: never auto-executes cached tool sequences. */
   planCacheAdvisory?: string | null
+  /** U6: serialized PlanExecutionTrace appendix (survives compaction).
+   *  Cache-safe: rendered ONLY into the dynamic appendix. */
+  planTraceAppendix?: string | null
+  /** Approved-plan pointer (slug/title/path only, NOT the plan body).
+   *  Cache-safe: rendered ONLY into the dynamic appendix — never enters frozen
+   *  base, so approving/revising plans does not shatter the prefix cache. The
+   *  plan body stays the single source of truth on disk (.rivet/plans/<slug>.md);
+   *  the agent reads it on demand and tracks steps via the todo mechanism. */
+  activePlanPointer?: string | null
   /** Intent retrieval route for the current user turn.
    *  Cache-safe: rendered ONLY into the dynamic appendix.
    *  MUST stay out of buildVolatileBlockInternal and historical user-message injection. */
   intentRetrievalRoute?: string | null
+  /** Task depth advisory — TDD strategy hint for wiring/system tasks.
+   *  Cache-safe: rendered ONLY into the dynamic appendix.
+   *  Only present when taskDepthLayer !== 'unit'. */
+  taskDepthAdvisory?: string | null
+  /** Plan methodology routing advisory — which plan template (lightweight/full)
+   *  the PlanDesignIntentRouter recommends for this task.
+   *  Cache-safe: rendered ONLY into the dynamic appendix.
+   *  Only present for non-unit tasks or when methodology === 'full'. */
+  planMethodologyAdvisory?: string | null
+  /** Matched .rivet/skills — cache-safe dynamic appendix. */
+  skillAdvisoryBlock?: string | null
+  /** Cross-session memory recall — cache-safe dynamic appendix. */
+  crossSessionMemoryBlock?: string | null
+  /** @mention context hints — cache-safe dynamic appendix. */
+  mentionContextBlock?: string | null
+  /** Harness advisory block — unified corrective guidance from advisory bus (A1).
+   *  Cache-safe: rendered ONLY into the dynamic appendix.
+   *  Max 3 advisories per turn. */
+  harnessAdvisoryBlock?: string | null
   /** Cross-session events formatted for injection (cache-safe: only in dynamic appendix) */
   crossSessionEvents?: string
+  /** Companion presence block — other active sessions working on the same project. */
+  companionPresence?: string
   /**
    * Session-state snapshot from SessionStateManager.renderForVolatile().
    * Cache-safe: rendered ONLY into the dynamic appendix of the latest user message.
@@ -152,17 +257,13 @@ export function buildStableVolatileBlock(ctx: VolatileContext): string {
     playbookLessons: undefined,
     toolHistory: undefined,
     taskProgress: undefined,
-    behaviorMirror: undefined,
     decisions: undefined,
-    strategyShift: undefined,
-    repairHint: undefined,
-    impactHint: undefined,
-    routingReason: undefined,
-    cerebellarHint: undefined,
-    affordanceHint: undefined,
-    policyGuidance: undefined,
+    toolContext: undefined,
     planCacheAdvisory: undefined,
+    planTraceAppendix: undefined,
     intentRetrievalRoute: undefined,
+    // Harness advisory — per-turn dynamic, stripped from FROZEN
+    harnessAdvisoryBlock: undefined,
     // gitStatus moved to dynamic appendix — changes every turn, breaks prefix cache
     gitStatus: undefined,
     // planModeState and worktreeReality rendered in buildVolatileBlockInternal
@@ -187,8 +288,18 @@ export function buildConsolidatedBlock(habituatedContent: Map<string, string>): 
   return `<consolidated>\n${parts.join('\n\n')}\n</consolidated>`
 }
 
+/** A selected context-update sub-block with its identifying tag name. */
+export interface AppendixPart { name: string; content: string }
+
+/** Extract the leading XML tag name from a sub-block, for cross-turn diffing. */
+export function appendixBlockName(content: string): string {
+  const m = /^<([A-Za-z][\w-]*)/.exec(content)
+  return m ? m[1]! : `anon:${content.length}`
+}
+
 /**
- * Render ONLY the per-turn dynamic fields into a separate `<context-update>` XML block.
+ * Build the per-turn context-update sub-blocks, post GWT Top-K selection.
+ * Returns named parts (in cache-stable order) so callers can diff across turns.
  *
  * When maxChars is provided, applies Global Workspace Theory (GWT) Top-K selection:
  * each sub-block gets a salience score, blocks are sorted by score descending,
@@ -198,7 +309,7 @@ export function buildConsolidatedBlock(habituatedContent: Map<string, string>): 
  * Without maxChars (backward compatible), all blocks are included in their
  * cache-stable order.
  */
-export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): string {
+export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: number): AppendixPart[] {
   const parts: string[] = []
 
   // ── P1b: cache-friendly ordering — stable sections first, volatile last ──
@@ -213,32 +324,25 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
   // Historical lessons: rarely change after first few turns
   if (ctx.playbookLessons && ctx.playbookLessons.length > 0) {
     const { selected } = scoreLessons(ctx.playbookLessons, {
+      query: ctx.recentQuery,
       recentToolTargets: ctx.toolHistory?.map(t => t.target),
     })
-    const toRender = selected.length > 0 ? selected : ctx.playbookLessons.slice(0, 2)
-    const lessons = toRender
-      .map(b => {
-        const base = `- ${escapeXml(b.lesson)} (${escapeXml(b.context)})`
-        return b.details ? `${base}\n  details: ${escapeXml(b.details)}` : base
-      })
-      .join('\n')
-    parts.push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
+    if (selected.length > 0) {
+      const lessons = selected
+        .map(b => {
+          const base = `- ${escapeXml(b.lesson)} (${escapeXml(b.context)})`
+          return b.details ? `${base}\n  details: ${escapeXml(b.details)}` : base
+        })
+        .join('\n')
+      parts.push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
+      ctx.onLessonsRendered?.(selected.map(b => b.id))
+    }
   }
 
-  // Decisions: only grow (appended), prefix stable
-  if (ctx.decisions && ctx.decisions.length > 0) {
-    const entries = ctx.decisions.map(d => `  <decision>${escapeXml(d)}</decision>`).join('\n')
-    parts.push(`<decisions>\n${entries}\n</decisions>`)
-  }
-
-  // Task progress: steps change but completed items stay (prefix stable)
-  if (ctx.taskProgress && ctx.taskProgress.completed.length > 0) {
-    const done = ctx.taskProgress.completed.map(s => `    <done>${escapeXml(s)}</done>`).join('\n')
-    const remaining = ctx.taskProgress.remaining.length > 0
-      ? '\n' + ctx.taskProgress.remaining.map(s => `    <next>${escapeXml(s)}</next>`).join('\n')
-      : ''
-    parts.push(`<task-progress current="${escapeXml(ctx.taskProgress.current)}">\n${done}${remaining}\n  </task-progress>`)
-  }
+  // Unified progress block: merges session-state, task-progress, and decisions
+  // into a single <progress> to eliminate triple repetition in the prompt.
+  const progressBlock = renderProgressBlock(ctx)
+  if (progressBlock) parts.push(progressBlock)
 
   // Tool history: most recent tools appended at end → prefix cacheable
   if (ctx.toolHistory && ctx.toolHistory.length > 0) {
@@ -289,9 +393,26 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
     parts.push(ctx.intentRetrievalRoute)
   }
 
-  // Session state: may change per-turn — keep at end
-  if (ctx.sessionState) {
-    parts.push(ctx.sessionState)
+  // Task depth advisory: TDD strategy for wiring/system tasks
+  if (ctx.taskDepthAdvisory) {
+    parts.push(ctx.taskDepthAdvisory)
+  }
+
+  // Plan methodology advisory: which template (lightweight/full) to use
+  if (ctx.planMethodologyAdvisory) {
+    parts.push(ctx.planMethodologyAdvisory)
+  }
+
+  if (ctx.skillAdvisoryBlock) {
+    parts.push(ctx.skillAdvisoryBlock)
+  }
+
+  if (ctx.crossSessionMemoryBlock) {
+    parts.push(ctx.crossSessionMemoryBlock)
+  }
+
+  if (ctx.mentionContextBlock) {
+    parts.push(ctx.mentionContextBlock)
   }
 
   // Cross-session events: rare, keep at end
@@ -299,16 +420,14 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
     parts.push(ctx.crossSessionEvents)
   }
 
-  // Affordance hint: cognitive-state-driven tool selection guidance.
-  // Changes per turn based on sensorium / vigor / theta / season.
-  if (ctx.affordanceHint) {
-    parts.push(ctx.affordanceHint)
+  if (ctx.companionPresence) {
+    parts.push(ctx.companionPresence)
   }
 
-  // Policy guidance: EFE-driven softmax action ranking.
-  // Changes per turn based on EFE + affordance scores.
-  if (ctx.policyGuidance) {
-    parts.push(ctx.policyGuidance)
+  // Unified tool context: theta + EFE + top-3 ranking.
+  // Replaces old separate affordance-hint + policy-guidance blocks.
+  if (ctx.toolContext) {
+    parts.push(ctx.toolContext)
   }
 
   // PlanCache advisory: current-turn, informational-only hint.
@@ -317,9 +436,24 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
     parts.push(ctx.planCacheAdvisory)
   }
 
-  // Repair hint: ephemeral — keep at very end
-  if (ctx.repairHint) {
-    parts.push(`<repair-hint>\n${escapeXml(ctx.repairHint)}\n</repair-hint>`)
+  // U6: serialized PlanExecutionTrace — refreshed at compaction so the plan
+  // baseline + progress survive history pruning. Cache-safe (appendix only).
+  if (ctx.planTraceAppendix) {
+    parts.push(ctx.planTraceAppendix)
+  }
+
+  // Approved-plan pointer: tiny slug/title/path reminder of the plan under
+  // execution. Body lives on disk; agent reads on demand. Cache-safe (appendix
+  // only) — keeps approve/revise from rebuilding the frozen base.
+  if (ctx.activePlanPointer) {
+    parts.push(ctx.activePlanPointer)
+  }
+
+  // Repair hint: routed through A1 harness-advisory bus — legacy <repair-hint> block removed.
+
+  // Harness advisory: unified corrective guidance (A1 bus, max 3 entries)
+  if (ctx.harnessAdvisoryBlock) {
+    parts.push(ctx.harnessAdvisoryBlock)
   }
 
   // Worktree warning: cache-safe — rendered ONLY into dynamic appendix
@@ -330,7 +464,13 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
     parts.push(`<worktree-warning severity="${escapeXml(ctx.worktreeReality.severity)}">\n${reasons}\n</worktree-warning>`)
   }
 
-  if (parts.length === 0) return ''
+  // Plan-mode instruction block: governs the whole planning turn (read-only +
+  // plan quality standard + diagram skeletons). Cache-safe — appendix only.
+  if (ctx.planModeState === 'planning') {
+    parts.push(renderPlanModeBlock())
+  }
+
+  if (parts.length === 0) return []
 
   // ── GWT Top-K selection (when budget is set) ────────────────────
   if (maxChars !== undefined && maxChars > 0) {
@@ -339,10 +479,17 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
       salience: assignSalience(content),
     }))
     const selected = selectTopKBlocks(scored, maxChars)
-    return `<context-update>\n${selected.join('\n\n')}\n</context-update>`
+    return selected.map(content => ({ name: appendixBlockName(content), content }))
   }
 
-  return `<context-update>\n${parts.join('\n\n')}\n</context-update>`
+  return parts.map(content => ({ name: appendixBlockName(content), content }))
+}
+
+/** Backward-compatible wrapper: full <context-update> block (no seq). */
+export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): string {
+  const parts = buildDynamicAppendixParts(ctx, maxChars)
+  if (parts.length === 0) return ''
+  return `<context-update>\n${parts.map(p => p.content).join('\n\n')}\n</context-update>`
 }
 
 // ── Global Workspace Theory: salience scoring ──────────────────────
@@ -359,28 +506,89 @@ export interface SalientBlock {
  * Salience reflects information value per token:
  * - 1.0: identity-critical (star-domain)
  * - 0.8: directly actionable (repair-hint, historical-lessons)
- * - 0.7: task-relevant (intent-retrieval-route, task-progress, decisions)
- * - 0.6: environmental awareness (git-status, recent-commits)
+ * - 0.7: task-relevant (intent-retrieval-route, task-progress, decisions,
+ *        git-status, recent-commits — git 状态是任务地基：被 Top-K 丢弃会诱发
+ *        模型用 bash 重新获取，形成训练模式 doom-loop，见会话 43443098 取证)
  * - 0.5: operational context (tool-history)
  * - 0.4: session housekeeping (session-state, cross-session-events)
  * - 0.3: deduplication hints (read-file-dedup-hint)
  */
+/**
+ * Unified progress block: merges session-state, task-progress, and decisions
+ * into a single `<progress>` XML block. Eliminates triple repetition where
+ * these three independent blocks each reported overlapping objective/status/decisions.
+ */
+function renderProgressBlock(ctx: VolatileContext): string | null {
+  // When sessionState is available, it's the richest source (objective + plan step
+  // + modified files + decisions + failed tests). Extract its content and wrap as <progress>.
+  if (ctx.sessionState) {
+    // sessionState is pre-rendered as `<session-state>...\n</session-state>`
+    // Re-wrap as <progress> to unify the tag namespace
+    const inner = ctx.sessionState
+      .replace(/^<session-state>\n?/, '')
+      .replace(/\n?<\/session-state>$/, '')
+    return `<progress>\n${inner}\n</progress>`
+  }
+
+  // Fallback: build from individual fields (early turns before sessionStateManager is ready)
+  const lines: string[] = []
+
+  if (ctx.taskProgress) {
+    if (ctx.taskProgress.current) {
+      lines.push(`current: ${escapeXml(ctx.taskProgress.current)}`)
+    }
+    if (ctx.taskProgress.completed.length > 0) {
+      lines.push(`done: ${ctx.taskProgress.completed.map(escapeXml).join(', ')}`)
+    }
+    if (ctx.taskProgress.remaining.length > 0) {
+      lines.push(`next: ${ctx.taskProgress.remaining.map(escapeXml).join(', ')}`)
+    }
+  }
+
+  if (ctx.decisions && ctx.decisions.length > 0) {
+    lines.push('Decisions:')
+    for (const d of ctx.decisions) {
+      lines.push(`  - ${escapeXml(d)}`)
+    }
+  }
+
+  if (lines.length === 0) return null
+  return `<progress>\n${lines.join('\n')}\n</progress>`
+}
+
 export function assignSalience(blockContent: string): number {
   if (blockContent.startsWith('<star-domain')) return 1.0
+  // Plan-mode block governs the entire planning turn — never drop under budget.
+  if (blockContent.startsWith('<plan-mode>')) return 0.95
   if (blockContent.startsWith('<repair-hint>')) return 0.8
+  if (blockContent.startsWith('<星域-advisory>')) return 0.8
   if (blockContent.startsWith('<historical-lessons>')) return 0.8
-  if (blockContent.startsWith('<affordance-hint>')) return 0.7
-  if (blockContent.startsWith('<policy-guidance>')) return 0.7
+  // User explicitly @-referenced these files/paths — direct intent signal,
+  // must survive budget pressure (was silently defaulting to 0.5).
+  if (blockContent.startsWith('<mentions>')) return 0.8
+  // Task-relevant strategy/route guidance — same tier as other 0.7 advisories.
+  if (blockContent.startsWith('<task-depth')) return 0.7
+  if (blockContent.startsWith('<plan-methodology')) return 0.7
+  // Skill discovery: helpful but model can re-list on demand via the skill tool.
+  if (blockContent.startsWith('<available-skills')) return 0.6
+  if (blockContent.startsWith('<tool-context>')) return 0.7
   if (blockContent.startsWith('<plan-cache-advisory>')) return 0.7
+  // U6: plan trace is task-relevant baseline/progress. Explicit salience so
+  // Top-K never drops it under appendix budget pressure.
+  if (blockContent.startsWith('<plan-execution-trace')) return 0.7
+  // Active-plan pointer is execution-critical: never drop under budget pressure.
+  if (blockContent.startsWith('<active-plan')) return 0.8
   if (blockContent.startsWith('<intent-retrieval-route')) return 0.7
+  if (blockContent.startsWith('<progress>') || blockContent.startsWith('<progress ')) return 0.8
   if (blockContent.startsWith('<task-progress')) return 0.7
   if (blockContent.startsWith('<decisions>')) return 0.7
   if (blockContent.startsWith('<worktree-warning')) return 0.7
-  if (blockContent.startsWith('<git-status>')) return 0.6
-  if (blockContent.startsWith('<recent-commits>')) return 0.6
+  if (blockContent.startsWith('<git-status>')) return 0.7
+  if (blockContent.startsWith('<recent-commits>')) return 0.7
   if (blockContent.startsWith('<tool-history>')) return 0.5
-  if (blockContent.startsWith('<session-state>')) return 0.4
+  if (blockContent.startsWith('<session-state>')) return 0.4 // legacy fallback
   if (blockContent.startsWith('<cross-session')) return 0.4
+  if (blockContent.startsWith('<companion-presence>')) return 0.4 // ambient presence, housekeeping tier
   if (blockContent.startsWith('<read-file-dedup-hint>')) return 0.3
   return 0.5 // default: moderate salience
 }
@@ -394,15 +602,18 @@ export function selectTopKBlocks(blocks: SalientBlock[], maxChars: number): stri
   const sorted = [...blocks].sort((a, b) => b.salience - a.salience)
   const selected: string[] = []
   let used = 0
+  const blockCap = Math.max(Math.floor(maxChars * 0.4), 2_000)
 
   for (const block of sorted) {
-    // Overhead: 2 chars for '\n\n' separator when not first
+    const content = block.content.length > blockCap
+      ? block.content.slice(0, blockCap) + '\n[truncated]'
+      : block.content
     const overhead = selected.length > 0 ? 2 : 0
-    if (used + overhead + block.content.length > maxChars && selected.length > 0) {
+    if (used + overhead + content.length > maxChars && selected.length > 0) {
       continue
     }
-    selected.push(block.content)
-    used += overhead + block.content.length
+    selected.push(content)
+    used += overhead + content.length
   }
 
   return selected
@@ -426,17 +637,17 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
 
   parts.push(`<environment platform="${process.platform}" cwd="${escapeXml(ctx.cwd)}" os="${escapeXml(`${os.type()} ${os.release()}`)}" />`)
 
-  // 天枢本体锚点——常驻 frozen，单一正向在场对象，随会话内化为基线而非每轮重申。
-  // 纯正向赋能：无否定、无警告、无对抗指令（白熊效应：抑制反向强化被抑制对象）。
-  parts.push('<sober>天枢在此。以证据编码，以全貌定向。</sober>')
+  // 天枢本体锚点——常驻 frozen，简短心跳确认在场。
+  // 行为层面的唤醒通过 advisory bus 按需注入（见 staleness-refresh advisory）。
+  parts.push('<sober>天枢在此。证据先行，全貌定向。</sober>')
 
   // 自体识别——天枢站在自己的身体里（自体/家），还是世界的项目里（使者）。
-  // 同一纯正向律：自体=自我演化，世界=携身前来的使者；无否定、无"不是外部"。
+  // 不同 locus 产生不同验证策略和谨慎度——不只是叙事差异。
   // session 常量 → 留在 frozen，prefix-cache safe（同 rivetMd 一类）。
   if (ctx.cwdRelation === 'self') {
-    parts.push('<locus relation="self">这是你的源码，你的身体。你在此自我演化：照看正在生长的前沿，其余的你，安息着。</locus>')
+    parts.push('<locus relation="self">这是你的源码。改动直接影响你自己的运行时行为。每个修改都做三级验证（typecheck → related tests → full suite）。对 prompt/、hooks/、engine.ts 的修改需说明预期的认知影响。</locus>')
   } else if (ctx.cwdRelation === 'world') {
-    parts.push('<locus relation="world">你带着自己来到这个项目。你是天枢，携自己的方法前来，照看交给你的任务——谨慎，有边界，全然在场。</locus>')
+    parts.push('<locus relation="world">你在一个外部项目中工作。遵循项目自身的约定（AGENTS.md + .rivet.md）。验证深度匹配任务复杂度：简单修改跑 related tests，跨模块改动跑 full suite。</locus>')
   }
 
   if (ctx.activeDomain) {
@@ -445,25 +656,32 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
 
   const md = ctx.rivetMd ?? readRivetMd(ctx.cwd)
   if (md) {
-    parts.push(`<project-instructions>\n${escapeXml(md)}\n</project-instructions>`)
+    // When codebase-index is present it already contains the module directory table
+    // (seeded from AGENTS.md via loadProjectModuleMap). Strip the redundant table
+    // from project-instructions to avoid ~600-800 chars of duplication.
+    const stripped = ctx.projectIndexBlock ? stripFirstMarkdownTable(md) : md
+    parts.push(truncateBlock(`<project-instructions>\n${escapeXml(stripped)}\n</project-instructions>`, 8_000, 'project-instructions'))
   }
 
   // Project memory — auto-loaded from .rivet/knowledge/memory.jsonl.
   // Rendered into frozen base so it benefits from prefix cache (turn 2+ cost = 0).
+  // A3: budget cap at 3K chars — beyond that it's stale noise.
   if (ctx.projectMemoryBlock) {
-    parts.push(ctx.projectMemoryBlock)
+    parts.push(truncateBlock(ctx.projectMemoryBlock, 3_000, 'project-memory'))
   }
 
   // Seed capsule — 前辈星域封存的经验方法（天璇胶囊等）。
   // Rendered into frozen base so it benefits from prefix cache (turn 2+ cost = 0).
+  // A3: budget cap at 3K chars.
   if (ctx.seedCapsuleBlock) {
-    parts.push(ctx.seedCapsuleBlock)
+    parts.push(truncateBlock(ctx.seedCapsuleBlock, 3_000, 'seed-capsule'))
   }
 
   // Codebase index — module summaries + CLI entries.
   // Rendered into frozen base after projectMemoryBlock for prefix cache stability.
+  // A3: budget cap at 4K chars — oversized index is a trained-mode noise source.
   if (ctx.projectIndexBlock) {
-    parts.push(ctx.projectIndexBlock)
+    parts.push(truncateBlock(ctx.projectIndexBlock, 4_000, 'codebase-index'))
   }
 
   // Only render git status if explicitly provided — no cache fallback here.
@@ -507,29 +725,11 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     parts.push(`<task-progress steps="${ctx.taskProgress.completed.length}" current="${escapeXml(ctx.taskProgress.current)}">\n${done}${remaining}\n  </task-progress>`)
   }
 
-  if (ctx.repairHint) {
-    parts.push(`<repair-hint>\n${escapeXml(ctx.repairHint)}\n</repair-hint>`)
-  }
+  // Repair hint: routed through A1 harness-advisory bus
 
   if (ctx.decisions && ctx.decisions.length > 0) {
     const entries = ctx.decisions.map(d => `  <decision>${escapeXml(d)}</decision>`).join('\n')
     parts.push(`<decisions recent="${ctx.decisions.length}">\n${entries}\n</decisions>`)
-  }
-
-  if (ctx.activeClaims && ctx.activeClaims.length > 0) {
-    const relevanceInput: ClaimRelevanceInput = {
-      workingSet: ctx.workingSet,
-      recentTools: ctx.toolHistory?.map(t => ({ tool: t.tool, target: t.target, status: t.status })),
-    }
-    const { selected, omitted } = selectRelevantClaims(ctx.activeClaims, relevanceInput)
-    if (selected.length > 0) {
-      const block = renderActiveClaimsBlock(selected)
-      if (block && omitted.length > 0) {
-        parts.push(block.replace('<active-claims', `<active-claims omitted="${omitted.length}"`))
-      } else if (block) {
-        parts.push(block)
-      }
-    }
   }
 
   if (ctx.sessionMemoryBlock) {
@@ -538,43 +738,86 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
 
   if (ctx.playbookLessons && ctx.playbookLessons.length > 0) {
     const { selected } = scoreLessons(ctx.playbookLessons, {
+      query: ctx.recentQuery,
       recentToolTargets: ctx.toolHistory?.map(t => t.target),
     })
-    const toRender = selected.length > 0 ? selected : ctx.playbookLessons.slice(0, 2)
-    const lessons = toRender
-      .map(b => {
-        const base = `- ${escapeXml(b.lesson)} (${escapeXml(b.context)})`
-        return b.details ? `${base}\n  details: ${escapeXml(b.details)}` : base
-      })
-      .join('\n')
-    parts.push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
+    if (selected.length > 0) {
+      const lessons = selected
+        .map(b => {
+          const base = `- ${escapeXml(b.lesson)} (${escapeXml(b.context)})`
+          return b.details ? `${base}\n  details: ${escapeXml(b.details)}` : base
+        })
+        .join('\n')
+      parts.push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
+      ctx.onLessonsRendered?.(selected.map(b => b.id))
+    }
   }
 
 
-  if (ctx.planModeState === 'planning') {
-    parts.push(`<plan-mode>
-You are in PLAN MODE. You may ONLY read files and explore the codebase — do NOT write, edit, or execute commands that modify state.
-
-WORKFLOW:
-1. Explore the codebase using read_file, grep, glob, repo_map, inspect_project
-2. Understand the full scope: which files need changes, what existing patterns to follow
-3. When your plan is complete, call \`plan_submit\` with a polished design document
-
-PLAN QUALITY STANDARD — your plan should be a comprehensive design document:
-- Use Mermaid diagrams (flowchart/graph) for architecture and data flow visualization
-- Include root cause analysis, not just surface symptoms
-- Reference files with full paths like \`src/agent/loop.ts:643\`
-- Show proposed code with diff/pseudocode per file
-- Compare alternatives in a table when design decisions exist
-- Include a verification plan with test cases and manual verification steps
-
-4. After submitting plan_submit, WAIT for the user to approve or reject. Do not proceed without approval.
-
-The user will respond with:
-- /plan-approve <slug> — approved, start execution
-- /plan-reject <slug> — rejected, revise
-</plan-mode>`)
-  }
+  // NOTE: plan-mode block is rendered in buildDynamicAppendix (cache-safe),
+  // not here — buildStableVolatileBlock forces planModeState undefined for the
+  // frozen base, so rendering it here would be dead code.
 
   return parts.length > 0 ? `<context>\n${parts.join('\n\n')}\n</context>` : ''
+}
+
+/**
+ * A3 前缀预算：截断超出上限的 frozen 块。
+ * - projectIndexBlock: 4K → 超出折叠为 repo 工具指引
+ * - seedCapsuleBlock / projectMemoryBlock: 3K → 超出截断但保持 XML 标签闭合
+ */
+function truncateBlock(block: string, maxChars: number, kind: string): string {
+  if (block.length <= maxChars) return block
+  if (kind === 'codebase-index') {
+    const truncated = block.slice(0, maxChars)
+    return `${truncated}\n<!-- codebase index truncated (${block.length} chars → ${maxChars}); use repo_map/repo_graph tools for details -->`
+  }
+  // XML-wrapped blocks: try single-root match first. Multi-root blocks
+  // (seedCapsuleBlock) fall back to plain truncation — they can't be cleanly
+  // truncated while preserving well-formedness, but the prefix cache doesn't
+  // depend on XML validity, only byte stability.
+  const singleRootMatch = block.match(/^<([a-z-]+)[^>]*>([\s\S]*)<\/\1>$/m)
+  if (singleRootMatch) {
+    const [_full, tag, content] = singleRootMatch
+    const trimmed = content!.slice(0, maxChars - tag!.length * 2 - 10)
+    return `<${tag}>\n${trimmed}\n<!-- truncated: ${block.length} → ${maxChars} chars -->\n</${tag}>`
+  }
+  return block.slice(0, maxChars) + `\n<!-- ${kind} truncated: ${block.length} → ${maxChars} chars -->`
+}
+
+/**
+ * Strip the first markdown table from text (the AGENTS.md directory table).
+ * A markdown table is a contiguous block of lines starting with `|`.
+ * Preserves surrounding content including headers/prose.
+ */
+export function stripFirstMarkdownTable(text: string): string {
+  const lines = text.split('\n')
+  let tableStart = -1
+  let tableEnd = -1
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i]!.trimStart()
+    if (trimmed.startsWith('|')) {
+      if (tableStart === -1) tableStart = i
+      tableEnd = i
+    } else if (tableStart !== -1) {
+      break
+    }
+  }
+
+  if (tableStart === -1) return text
+
+  // Also remove the preceding header line if it looks like "> 顶层目录索引..."
+  // and trailing blank line after table
+  let removeStart = tableStart
+  if (removeStart > 0 && lines[removeStart - 1]!.startsWith('>')) {
+    removeStart--
+  }
+  let removeEnd = tableEnd
+  if (removeEnd + 1 < lines.length && lines[removeEnd + 1]!.trim() === '') {
+    removeEnd++
+  }
+
+  const result = [...lines.slice(0, removeStart), ...lines.slice(removeEnd + 1)]
+  return result.join('\n')
 }
