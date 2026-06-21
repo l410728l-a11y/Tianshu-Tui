@@ -1,6 +1,8 @@
 import { join } from 'node:path'
 import { existsSync, mkdirSync } from 'node:fs'
-import { createRequire } from 'node:module'
+
+
+import { resolveBetterSqlite3 } from './native-resolver.js'
 import type { ParseResult, MeridianSymbol, MeridianEdge, EdgeConfidence } from './meridian-types.js'
 import type { ModuleSummaryEntry, CliEntry } from './meridian-types.js'
 import type { PhysarumEdgeState, PhysarumPredictionObservation } from './physarum-types.js'
@@ -154,8 +156,7 @@ export class MeridianDb {
     if (!this.conn) {
       if (!existsSync(this.stateDir)) mkdirSync(this.stateDir, { recursive: true })
       try {
-        const require = createRequire(import.meta.url)
-        const Database = require('better-sqlite3')
+        const Database = resolveBetterSqlite3(import.meta.url)
         if (!Database) throw new Error('better-sqlite3 not installed')
         const dbPath = join(this.stateDir, 'meridian.db')
         this.conn = new Database(dbPath)
@@ -662,7 +663,7 @@ export class MeridianDb {
 
 /** No-op database proxy when better-sqlite3 is unavailable */
 function createNullDb(): any {
-  const noopStmt = { run: () => {}, all: () => [] as any[], get: () => undefined }
+  const noopStmt = { run: () => ({ changes: 0, lastInsertRowid: 0 }), all: () => [] as any[], get: () => undefined }
   return new Proxy(Object.create(null), {
     get: (_target: any, prop: string) => {
       if (prop === 'prepare') return () => noopStmt

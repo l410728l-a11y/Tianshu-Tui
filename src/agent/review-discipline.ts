@@ -47,6 +47,64 @@ export function formatPathBoundaryReviewStance(): string {
   return PATH_BOUNDARY_REVIEW_STANCE.map((directive, index) => `${index + 1}. ${directive}`).join('\n')
 }
 
+/**
+ * 天权（称量者）审查之道里不与对抗验证重复的那一维：审查不只验真伪、找反例，
+ * 还要"称量"——权衡这个改动在当前上下文里偏轻还是偏重、退化了什么换来了什么。
+ * 对抗验证回答"对不对"，称量回答"值不值、是否伤了全局"。仅保留此独有维度，
+ * 同伴归零/沉默是失职等已由 REVIEW_DISCIPLINES / OBJECTIVE_REVIEW_STANCE 覆盖。
+ */
+export const WEIGHING_REVIEW_STANCE: readonly string[] = [
+  '审查不止于找错，更要称量：这个改动在当前上下文里偏轻还是偏重？封装/抽象/边界退化了多少，换来了什么？秤的两端都要放上东西，只报缺陷不报代价是半截称量。',
+  '记账全局影响：局部优化是否以牺牲整体稳定/封装性为代价（如批量移除 private、复制常量、跨模块耦合）。真实退化即使"测试仍绿"也要记录并指明偿还阶段，不可静默通过。',
+]
+
+export function formatWeighingReviewStance(): string {
+  return WEIGHING_REVIEW_STANCE.map((directive, index) => `${index + 1}. ${directive}`).join('\n')
+}
+
+/**
+ * 接线生效审查姿态（2026-06-12 噪音治理/委派质量复审教训）：
+ * 「功能建好」≠「接好」≠「生效」。专抓建好但断线、半做、或实际效果与声称
+ * 目标相反的改动。对抗验证回答"对不对"，称量回答"值不值"，本姿态回答
+ * "通没通、灵不灵"——一次复审抓出双渲染增噪、门控静默全关、死参数无人传
+ * 三类问题，全部带着绿测试通过了交付。
+ */
+export const WIRING_EFFECTIVENESS_REVIEW_STANCE: readonly string[] = [
+  '闭环必须从生产入口正向追：先识别目标项目的真实运行入口（package.json 的 bin/main/start 脚本、服务启动文件、CLI 入口、框架约定入口如 next/vite/django 的 app 根），再从入口经组合根（bootstrap/composition root/DI 容器/路由注册）逐跳追到改动点，确认它在该路径上被构造/传参/调用。"在某处找到了挂点"不是闭环证据——只出现在废弃/平行入口、示例代码、脚本或测试里的挂点不算；多入口项目（CLI+server、新旧 UI 并存）必须确认挂点位于本次改动实际影响的那条入口链上。找不到从活入口到改动点的正向链路时按 HIGH 上报断线。',
+  '逐条对照计划/提交声明的验收标准审"做没做完"，不以"提交存在、代码在场、测试绿"为完成；专找半做：字段加了但无消费端执行、能力建了但生产路径不调用、预算换了来源但仍然无人检查。',
+  '新能力沿 生产者→传输→消费者→渲染/执行 全链路走通才算接好：新增可选参数必须 grep 全部调用方，零调用方传值即死参数；新增 setter/store/bus 必须确认存在 flush/失效/读取路径，否则是死 setter；新增 config 字段必须确认运行时真的读取。',
+  '目标反效检查：改动声称减少 X（噪音/重复/成本/延迟），就构造场景验证 X 实际下降。旧通道未删、新通道又渲染同一内容的"双渲染"是典型反效——减噪提交反而增噪，按 HIGH 上报。',
+  '门控/过滤条件用运行时真实数据形态核对，不信类型签名：相对 vs 绝对路径、可选字段缺失、空集合、模型自由输入。估算真实通过率——过滤掉 ~100% 的门控等于静默关闭功能，与放行 100% 同等严重。',
+  '对结构化内容（XML/JSON/markdown 块）的截断或 slice，验证不变式保持：闭合标签、转义、配对符号不被切断；并确认截断结果是确定性的，不引入前缀缓存抖动。',
+]
+
+export function formatWiringEffectivenessReviewStance(): string {
+  return WIRING_EFFECTIVENESS_REVIEW_STANCE.map((directive, index) => `${index + 1}. ${directive}`).join('\n')
+}
+
+/**
+ * 方法论文档验证姿态（2026-06-14 PlanDesignIntentRouter 对抗审查反推）：
+ * 方法论文档（知识文件、计划模板、规则、自检清单）包含可执行指令——
+ * grep 命令、正则表达式、心智操作步骤。这些与代码函数实现具有相同的性质：
+ * 可执行、可验证、可能出错。"写完一条 grep 示例而不跑它" = "写完一个函数
+ * 而不跑它的测试"。本姿态专抓方法论文档中的隐蔽缺陷——它们不会报测试红，
+ * 但会在执行者遵循时静默失效。
+ *
+ * 三条核心教训：
+ *  1. 方法论文档是代码——grep/regex/命令必须经实证验证
+ *  2. "数门"和"数调用者"是两件事——沿操作往下数门，而非沿函数往上数调用者
+ *  3. 递归自验证——方法论能在自己的规则里发现错误并修正 = 活系统
+ */
+export const METHODOLOGY_VERIFICATION_STANCE: readonly string[] = [
+  '方法论文档中的每一条可执行指令（grep、regex、shell 命令、心智操作步骤）必须在真实代码库中跑一遍并确认输出覆盖预期目标，然后才能提交。不跑不交付。理由：补丁里写的那条 grep "validatePathSafe" 在写作模式下"看起来对"，但实证验证发现它漏掉了 sandbox-profile.ts——因为两个门的关系不是 caller/callee，而是并行执行点共享状态模块。',
+  '核实"门"之间的关系是 caller/callee 还是并行执行点：不要假设两个 enforcement point 共享 guard 函数。grep 共享状态的导入方（rg -l "state-module" src/），或枚举"这个操作的所有拒绝点"——沿着操作往下数门，而非沿着函数往上数调用者。原则 A 的原始措辞用"guard 函数"隐喻把并行执行点压缩成了调用链，遮蔽了真实架构。',
+  '修复方法论文档的补丁，用方法论自己的原则递归审查它自己：补丁是否引入了与原始缺陷同族的错误？补丁中的可执行指令是否经实证验证？方法论能抓住自己的错误 = 活的系统；补丁写了就冻结从不回头验证 = 死的文档。',
+]
+
+export function formatMethodologyVerificationStance(): string {
+  return METHODOLOGY_VERIFICATION_STANCE.map((directive, index) => `${index + 1}. ${directive}`).join('\n')
+}
+
 const FIX_PATTERNS = [
   /\bfix(?:\(|:|\b)/i,
   /\bbugfix\b/i,
@@ -66,24 +124,85 @@ export interface ChangeSet {
   files: readonly string[]
   crossModule: boolean
   isFix: boolean
+  /** Explicitly override the auto-classified review scale. L2 = single verifier, L3 = squadron. */
+  forceLevel?: ReviewScale
+  /** User-provided focus hint (from /review [max] <focus>). Passed to
+   *  inspector/verifier objectives so workers know what to prioritize. */
+  focusHint?: string
+  /** When true, review is suppressed to L1 (nudge-only) regardless of change
+   *  structure. Set by deliver_task when a goal tracker is actively driving
+   *  auto-continuation — child review workers would stall the goal loop. */
+  goalActive?: boolean
 }
 
-const TRIVIAL_FILE_PATTERN = /(?:^|\/)(?:README|CHANGELOG)(?:\.[^/]*)?$|\.(?:md|mdx|txt|json)$/i
+const TRIVIAL_FILE_PATTERN = /(?:^|\/)README|CHANGELOG(?:\.[^/]*)?$|\.(?:md|mdx|txt|json)$/i
 const DEPENDENCY_OR_COMPILER_CONFIG_PATTERN = /(?:^|\/)(?:package(?:-lock)?\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|deno\.lock|tsconfig(?:\.[^/]*)?\.json|[^/]+\.lock)$/i
+const TEST_ONLY_PATTERN = /(?:^|\/)__tests__\//i
+
+/** Files touching these paths cross into security/safety boundaries → forced L3. */
+const SECURITY_BOUNDARY_PATTERNS = [
+  'approval-risk',
+  'path-validate',
+  'sandbox-exec',
+  'permissions',
+  'sycophancy-trap',
+  'immune-hook',
+  'sensitive-preflight',
+]
+
+function isTestOnlyFile(file: string): boolean {
+  return TEST_ONLY_PATTERN.test(file)
+}
+
+/** Docs/test-only change — auto review adds no value here, nudge suffices. */
+export function isTrivialChange(files: readonly string[]): boolean {
+  return files.length > 0 && files.every(file =>
+    TRIVIAL_FILE_PATTERN.test(file) || isTestOnlyFile(file)
+  )
+}
+
+function touchesSecurityBoundary(files: readonly string[]): boolean {
+  return files.some(f => SECURITY_BOUNDARY_PATTERNS.some(p => f.includes(p)))
+}
 
 /**
  * Classify a change set into the review workflow scale:
- * - L3: new/cross-module/large changes → Review Squadron
- * - L2: fix, code, dependency, or compiler config changes → single adversarial verifier
- * - L1: tiny non-fix docs/trivial data changes → nudge only
+ * - L3: cross-module, large (≥5 files), or touches security boundary → Review Squadron
+ * - L2: dependency/config files → single adversarial verifier (opt-in by file nature)
+ * - L1: everything else → nudge only (DEFAULT — no child workers spawned)
+ *
+ * isFix from the commit message is NOT used as a gating signal —
+ * structural properties of the change determine review depth, not message prefix.
  */
 export function classifyChangeScale(change: ChangeSet): ReviewScale {
-  if (change.crossModule || change.files.length >= 4) return 'L3'
+  if (change.forceLevel) return change.forceLevel
+  // Goal-active mode: suppress auto-review to L1 so child review workers
+  // don't stall the goal auto-continuation loop. L3 is reserved for the
+  // final goal-achieved commit (triggered manually or via deactivation hook).
+  if (change.goalActive) return 'L1'
+  if (change.crossModule || change.files.length >= 5 || touchesSecurityBoundary(change.files)) return 'L3'
   if (change.files.some(file => DEPENDENCY_OR_COMPILER_CONFIG_PATTERN.test(file))) return 'L2'
-  if (!change.isFix && change.files.length > 0 && change.files.every(file => TRIVIAL_FILE_PATTERN.test(file))) {
+  if (change.files.length > 0 && change.files.every(file =>
+    TRIVIAL_FILE_PATTERN.test(file) || isTestOnlyFile(file)
+  )) {
     return 'L1'
   }
-  return 'L2'
+  // DEFAULT: L1 — nudge only. L2/L3 require explicit structural signals
+  // (cross-module, large batch, security boundary, dep/config files).
+  // This prevents review workflow child workers from stalling deliver_task.
+  return 'L1'
+}
+
+/**
+ * Upgrade review scale based on task dependency depth.
+ * wiring tasks need at least L2 (adversarial verifier),
+ * system tasks need L3 (review squadron).
+ */
+export function upgradeScaleByDepth(base: ReviewScale, depthLayer?: import('../context/task-contract.js').TaskDepthLayer): ReviewScale {
+  if (!depthLayer || depthLayer === 'unit') return base
+  if (depthLayer === 'system') return 'L3'
+  if (depthLayer === 'wiring' && base === 'L1') return 'L2'
+  return base
 }
 
 /** Route any non-empty delivery through ReviewRouter; L1 remains a non-blocking nudge. */

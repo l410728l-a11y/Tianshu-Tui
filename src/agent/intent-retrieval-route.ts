@@ -1,4 +1,4 @@
-import type { TaskContract } from '../context/task-contract.js'
+import { isSocialOrTrivial, type TaskContract } from '../context/task-contract.js'
 import type { TaskListItem } from './session-state.js'
 import {
   resolveContextualIdentifier,
@@ -21,6 +21,7 @@ export type IntentTaskKind =
   | 'review_audit'
   | 'verification'
   | 'security_safety'
+  | 'social_idle'
 
 export interface RetrievalDirection {
   source: RetrievalSource
@@ -44,6 +45,8 @@ export interface RetrievalRouteInput {
   /** 跨轮持久化的任务列表，用于多轮回溯解析编号引用 */
   taskList?: readonly TaskListItem[]
   taskContract?: TaskContract
+  /** followUp mode: inherit previous turn's taskKinds when current message yields only default classification */
+  inheritedTaskKinds?: IntentTaskKind[]
 }
 
 const SOURCES: readonly RetrievalSource[] = ['codebase', 'git', 'memory', 'docs', 'external', 'tests']
@@ -59,6 +62,7 @@ const TASK_KINDS: readonly IntentTaskKind[] = [
   'review_audit',
   'verification',
   'security_safety',
+  'social_idle',
 ]
 const KIND_SET = new Set<string>(TASK_KINDS)
 const SOURCE_SET = new Set<string>(SOURCES)
@@ -81,6 +85,7 @@ const KIND_RANK: Record<IntentTaskKind, number> = {
   verification: 7,
   usage_question: 8,
   code_explanation: 9,
+  social_idle: 10,
 }
 
 export const TASK_KIND_BASELINES: Record<IntentTaskKind, RetrievalDirection[]> = {
@@ -140,10 +145,19 @@ export const TASK_KIND_BASELINES: Record<IntentTaskKind, RetrievalDirection[]> =
     { source: 'tests', priority: 'must', query: '查安全边界测试和回归验证。', reason: '安全修复需要防回归。' },
     { source: 'memory', priority: 'should', query: '召回历史安全发现和项目规则。', reason: '历史发现能提示易错边界。' },
   ],
+  social_idle: [],
 }
 
 export function buildHeuristicRetrievalRoute(input: RetrievalRouteInput): RetrievalRoute {
-  const taskKinds = inferTaskKinds(input.userMessage, input.lastAssistantMessage, input.taskList)
+  let taskKinds = inferTaskKinds(input.userMessage, input.lastAssistantMessage, input.taskList)
+  // followUp inheritance: when the current message yields only a non-specific classification
+  // (default new_feature or social_idle), prefer the previous turn's task context.
+  if (input.inheritedTaskKinds && input.inheritedTaskKinds.length > 0) {
+    const isNonSpecific = taskKinds.length === 1 && (taskKinds[0] === 'new_feature' || taskKinds[0] === 'social_idle')
+    if (isNonSpecific) {
+      taskKinds = input.inheritedTaskKinds.slice(0, MAX_TASK_KINDS)
+    }
+  }
   const objectiveSummary = summarizeObjective(input)
   const directions = mergeDirections(taskKinds.flatMap(kind => baselineForKind(kind, input.taskContract)))
   return {
@@ -174,7 +188,7 @@ export function normalizeRetrievalRoute(raw: unknown, fallbackInput?: RetrievalR
   const baselineDirections = taskKinds.flatMap(kind => baselineForKind(kind, fallbackInput?.taskContract))
   const directions = mergeDirections([...baselineDirections, ...directionsFromRaw]).slice(0, MAX_DIRECTIONS)
 
-  if (directions.length === 0) {
+  if (directions.length === 0 && !taskKinds.includes('social_idle')) {
     return fallbackInput ? buildHeuristicRetrievalRoute(fallbackInput) : buildHeuristicRetrievalRoute({ userMessage: '' })
   }
 
@@ -213,6 +227,12 @@ export function renderIntentRetrievalRoute(route: RetrievalRoute): string {
   return lines.join('\n')
 }
 
+/** Detect trivial / social inputs that should not trigger tool-driven retrieval.
+ *  Delegates to the unified isSocialOrTrivial from task-contract.ts. */
+function isTrivialInput(sanitized: string): boolean {
+  return isSocialOrTrivial(sanitized)
+}
+
 function inferTaskKinds(userMessage: string, lastAssistantMessage?: string, taskList?: readonly TaskListItem[]): IntentTaskKind[] {
   // Step 1: 解析上一轮回复中的关联任务计划（如 P1/P2/T1 等），含持久化 taskList 回溯
   const resolvedContexts = resolveContextualIdentifier(userMessage, lastAssistantMessage, taskList)
@@ -239,6 +259,7 @@ function inferTaskKinds(userMessage: string, lastAssistantMessage?: string, task
   if (/(怎么用|如何用|配置|命令|api|usage|how\s+to|configure|command)/i.test(sanitized)) add('usage_question')
   if (/(解释|看一下|分析|说明|explain|describe|walk through|read)/i.test(sanitized)) add('code_explanation')
 
+  if (kinds.length === 0 && isTrivialInput(sanitized)) add('social_idle')
   if (kinds.length === 0) add('new_feature')
   
   // Step 4: 动词消歧 — 当多种匹配时，动词语义优先
@@ -318,6 +339,7 @@ function summarizeObjective(input: RetrievalRouteInput): string | undefined {
 
 function confidenceFor(kinds: IntentTaskKind[]): number {
   if (kinds.length === 0) return 0.4
+  if (kinds.includes('social_idle')) return 0.3
   if (kinds.length === 1 && kinds[0] === 'new_feature') return 0.55
   return kinds.length > 1 ? 0.65 : 0.75
 }

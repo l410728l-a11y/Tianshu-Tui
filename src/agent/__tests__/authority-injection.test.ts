@@ -39,6 +39,24 @@ describe('V3 Component A — authority injection', () => {
     const order = readOnlyOrder()
     const prompt = buildWorkerPrompt(order)
     assert.doesNotMatch(prompt, /权域指令/)
+    assert.doesNotMatch(prompt, /## 你是谁/)
+  })
+
+  test('buildWorkerPrompt injects volatileBlock persona ("你是谁") before methodology', () => {
+    const order = readOnlyOrder({ authority: 'tianquan' })
+    const prompt = buildWorkerPrompt(order)
+    assert.match(prompt, /## 你是谁/)
+    const def = starDomainRegistry.get('tianquan')!
+    // The persona text (a slice of volatileBlock) is present
+    assert.ok(prompt.includes(def.volatileBlock.slice(0, 20)))
+    // Persona ("你是谁") comes before methodology ("权域指令")
+    assert.ok(prompt.indexOf('你是谁') < prompt.indexOf('权域指令'))
+  })
+
+  test('buildWorkerPrompt explicit authoritySuffix suppresses persona block', () => {
+    const order = readOnlyOrder({ authority: 'tianquan' })
+    const prompt = buildWorkerPrompt(order, 'CUSTOM SUFFIX OVERRIDE')
+    assert.doesNotMatch(prompt, /## 你是谁/)
   })
 
   test('buildWorkerPrompt explicit authoritySuffix overrides order.authority', () => {
@@ -65,12 +83,11 @@ describe('V3 Component A — authority injection', () => {
     assert.equal(order.authority, undefined)
   })
 
-  test('toolWhitelist intersection: tianfu read-only has no write tools', () => {
+  test('toolWhitelist intersection: tianfu read-only keeps read tools', () => {
     const order = readOnlyOrder({ authority: 'tianfu' })
-    // tianfu's toolWhitelist is read-only: no write_file, edit_file, bash
-    assert.ok(!order.allowedTools.includes('write_file'))
-    assert.ok(!order.allowedTools.includes('edit_file'))
-    assert.ok(!order.allowedTools.includes('bash'))
+    assert.ok(order.allowedTools.includes('read_file'))
+    assert.ok(order.allowedTools.includes('grep'))
+    assert.ok(order.allowedTools.includes('glob'))
   })
 
   test('toolWhitelist intersection: pojun read-only keeps exploration tools', () => {
@@ -89,12 +106,11 @@ describe('V3 Component A — authority injection', () => {
     assert.ok(order.allowedTools.includes('bash'))
   })
 
-  test('toolWhitelist intersection: tianfu write gets empty tools (strict)', () => {
+  test('toolWhitelist intersection: tianfu write keeps write tools (full access)', () => {
     const order = writeOrder({ authority: 'tianfu' })
-    // tianfu's whitelist has no write tools → intersection is empty
-    // This is correct: tianfu shouldn't be doing writes
-    assert.ok(!order.allowedTools.includes('write_file'))
-    assert.ok(!order.allowedTools.includes('bash'))
+    assert.ok(order.allowedTools.includes('write_file'))
+    assert.ok(order.allowedTools.includes('edit_file'))
+    assert.ok(order.allowedTools.includes('bash'))
   })
 
   test('unknown authority fails closed: no injection and no allowed tools', () => {

@@ -2,9 +2,12 @@ import { z } from 'zod'
 import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
 import type { ClaimProposal } from '../context/claims.js'
-import { profileRegistry } from '../agent/profile-registry.js'
+import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
+import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
+import { createActivityStreamer, activityProgressLine } from './worker-activity-stream.js'
+import type { WorkerActivityEvent } from '../agent/coordinator.js'
 
 export interface DelegateTaskCoordinator {
   delegate(request: DelegationRequest, abortSignal?: AbortSignal): Promise<CoordinatorRun>
@@ -16,10 +19,19 @@ const profileStringSchema = z.string().refine(
   (val) => ({ message: `Unknown profile "${val}". Available: ${profileRegistry.getProfileNames().join(', ')}` }),
 )
 
+/** Dynamic star-domain (authority) validation — accepts built-in + user-loaded domains.
+ *  Injects the domain's persona (volatileBlock) + methodology (systemPromptSuffix)
+ *  into the worker, and intersects the worker's tools with the domain whitelist. */
+const authorityStringSchema = z.string().refine(
+  (val) => starDomainRegistry.getDomainIds().includes(val),
+  (val) => ({ message: `Unknown authority "${val}". Available: ${starDomainRegistry.getDomainIds().join(', ')}` }),
+)
+
 const delegateTaskInputSchema = z.object({
   objective: z.string().min(1),
   kind: z.enum(['code_search', 'doc_research', 'plan', 'review', 'verify', 'patch_proposal']).optional(),
   profile: profileStringSchema.optional(),
+  authority: authorityStringSchema.optional(),
   files: z.array(z.string()).optional(),
   symbols: z.array(z.string()).optional(),
 })
@@ -28,19 +40,9 @@ function formatUiContent(run: CoordinatorRun): string {
   if (run.status === 'skipped') return 'delegate_task skipped: objective did not pass budget gate'
   const passed = run.results.filter(r => r.status === 'passed').length
   const blocked = run.results.filter(r => r.status === 'blocked').length
-  return `delegate_task completed: ${passed} passed, ${blocked} blocked, model=${run.selectedModel ?? 'unknown'}`
-}
-
-/** Progressive timeout: single-task workers start fast and grow with session maturity.
- *    turn 0-1 (cold open)  → 30 s
- *    turn 2-4 (warming)    → 75 s
- *    turn 5+  (mature)     → 180 s
- */
-function progressiveTaskTimeout(sessionTurnCount?: number): number {
-  const turn = sessionTurnCount ?? 10
-  if (turn <= 1) return 30_000
-  if (turn <= 4) return 75_000
-  return 180_000
+  const base = `delegate_task completed: ${passed} passed, ${blocked} blocked, model=${run.selectedModel ?? 'unknown'}`
+  if (run.escalated) return `⚠️ ${base}\n[escalated] 子代理连续失败，建议改为内联执行`
+  return base
 }
 
 export function createDelegateTaskTool(
@@ -58,6 +60,7 @@ export function createDelegateTaskTool(
           objective: { type: 'string', description: 'Specific objective for the worker.' },
           kind: { type: 'string', enum: ['code_search', 'doc_research', 'plan', 'review', 'verify', 'patch_proposal'], description: 'Worker task type. Default: code_search.' },
           profile: { type: 'string', enum: profileRegistry.getProfileNames(), description: 'Worker profile. Default: code_scout.' },
+          authority: { type: 'string', description: 'Optional star-domain persona (e.g. tianquan, tianji, yuheng). Injects that expert\'s perspective + methodology and restricts tools to its whitelist.' },
           files: { type: 'array', items: { type: 'string' }, description: 'Optional file paths to focus on.' },
           symbols: { type: 'array', items: { type: 'string' }, description: 'Optional symbols to focus on.' },
         },
@@ -93,17 +96,50 @@ export function createDelegateTaskTool(
         }
       }
 
+      // T9 P3 text stream + T4 structured per-worker updates (subagent panel).
+      const textStreamer = params.onOutput ? createActivityStreamer(params.onOutput) : undefined
+      const onActivity = (textStreamer || params.onWorkerActivity)
+        ? (ev: WorkerActivityEvent) => {
+            textStreamer?.(ev)
+            params.onWorkerActivity?.({
+              workOrderId: ev.workOrderId,
+              parentToolId: params.toolUseId,
+              profile: ev.profile,
+              authority: ev.authority,
+              status: 'running',
+              progressLine: activityProgressLine(ev),
+            })
+          }
+        : undefined
+
       const run = await coordinator.delegate({
         parentTurnId: params.toolUseId,
         objective: parsed.data.objective,
         kind: parsed.data.kind ?? 'code_search',
-        profile: (parsed.data.profile ?? 'code_scout') as import('../agent/work-order.js').WorkerProfile,
+        profile: (parsed.data.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
+        authority: parsed.data.authority,
         scope: {
           files: parsed.data.files,
           symbols: parsed.data.symbols,
         },
         reviewDepth: params.reviewDepth,
+        delegationDepth: params.delegationDepth ?? 0,
+        sessionTurn: params.sessionTurnCount,
+        onActivity,
       }, params.abortSignal)
+
+      // T4: terminal per-worker status for the subagent panel.
+      if (params.onWorkerActivity) {
+        for (const r of run.results) {
+          params.onWorkerActivity({
+            workOrderId: r.workOrderId,
+            parentToolId: params.toolUseId,
+            authority: parsed.data.authority,
+            status: r.status,
+            progressLine: r.summary.slice(0, 80),
+          })
+        }
+      }
 
       // Extract worker findings into claim store
       if (run.status === 'completed') {
@@ -152,6 +188,12 @@ export function createDelegateTaskTool(
     requiresApproval: () => false,
     isConcurrencySafe: () => true,
     isEnabled: () => true,
-    timeoutMs: (params) => progressiveTaskTimeout(params?.sessionTurnCount),
+    // P0: outer tool timeout must dominate the worker's internal budget
+    // (profile defaultTimeoutMs or ladder) so the worker's graceful
+    // blocked+partial-output path always wins the race.
+    timeoutMs: (params) => delegationToolTimeoutMs(
+      params?.sessionTurnCount,
+      [params?.input?.profile as string | undefined],
+    ),
   }
 }

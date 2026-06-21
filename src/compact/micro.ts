@@ -1,16 +1,44 @@
 import type { OaiMessage } from '../api/oai-types.js'
 import { KEEP_RECENT_MESSAGES, CACHE_ANCHOR_MESSAGES, compactThresholds } from './constants.js'
 import { groupIntoRoundsOai } from '../context/rounds.js'
+import { collapseToolResult } from './context-collapse.js'
 
 const CHARS_PER_TOKEN = 4
 
-function compactToolMessage(msg: OaiMessage, contextWindow: number): { msg: OaiMessage; changed: boolean } {
+/**
+ * Compact a tool message: first try semantic Context Collapse (for old messages),
+ * then fall back to truncation.
+ *
+ * BUG FIX: The original previewChars formula `toolResultMaxTokens * CHARS_PER_TOKEN`
+ * produced 240K chars for a 200K window (60K tokens × 4), making truncation
+ * never trigger. Fixed to use `toolResultMaxTokens` directly as the char limit.
+ */
+function compactToolMessage(
+  msg: OaiMessage,
+  contextWindow: number,
+  turnAge?: number,
+): { msg: OaiMessage; changed: boolean } {
   if (msg.role !== 'tool') return { msg, changed: false }
-  const previewChars = Math.max(1_200, compactThresholds(contextWindow).toolResultMaxTokens * CHARS_PER_TOKEN)
+
+  const toolName = msg.tool_call_id ? extractToolNameFromId(msg.tool_call_id) : undefined
+
+  if (turnAge != null && turnAge >= 4 && toolName) {
+    const collapsed = collapseToolResult(toolName, msg.content, turnAge, contextWindow)
+    if (collapsed) {
+      return { msg: { ...msg, content: collapsed.summary }, changed: true }
+    }
+  }
+
+  const previewChars = Math.max(1_200, compactThresholds(contextWindow).toolResultMaxTokens)
   if (msg.content.length <= previewChars) return { msg, changed: false }
   const stub = `<microcompacted tool_result original_chars="${msg.content.length}">\n${msg.content.slice(0, previewChars)}\n</microcompacted tool_result>`
   if (stub.length >= msg.content.length) return { msg, changed: false }
   return { msg: { ...msg, content: stub }, changed: true }
+}
+
+function extractToolNameFromId(toolCallId: string): string | undefined {
+  const m = toolCallId.match(/^([\w-]+)_/)
+  return m?.[1]
 }
 
 function compactOaiReasoning(_msg: OaiMessage): { msg: OaiMessage; changed: boolean } {
@@ -22,14 +50,28 @@ function compactOaiReasoning(_msg: OaiMessage): { msg: OaiMessage; changed: bool
 
 export function estimateOaiMessageTokens(msg: OaiMessage): number {
   let content: string
-  if (msg.role === 'assistant' && msg.tool_calls) {
-    content = (msg.content ?? '') + JSON.stringify(msg.tool_calls)
-  } else if (msg.role === 'assistant' && msg.reasoning_content) {
-    content = (msg.content ?? '') + msg.reasoning_content
-  } else if (msg.role === 'assistant') {
-    content = msg.content ?? ''
+  if (msg.role === 'assistant') {
+    // Count content + tool_calls + reasoning together. The old exclusive
+    // branches skipped reasoning_content whenever tool_calls were present —
+    // but tool-call turns are exactly the ones that retain reasoning for
+    // DeepSeek echo, so estimates undercounted the dominant token sink and
+    // compaction fired systematically late in tool-dense sessions.
+    content = (msg.content ?? '')
+      + (msg.tool_calls ? JSON.stringify(msg.tool_calls) : '')
+      + (msg.reasoning_content ?? '')
+  } else if (msg.role === 'user' && Array.isArray(msg.content)) {
+    // Multimodal user message (vision): count text parts + fixed cost per image.
+    let textLen = 0
+    let imageCount = 0
+    for (const part of msg.content) {
+      if (part.type === 'text') textLen += part.text.length
+      else imageCount++
+    }
+    // OpenAI uses ~765 tokens per image (low detail); base64 payload itself
+    // is not counted as text tokens — the provider encodes it separately.
+    return Math.ceil(textLen / 4) + imageCount * 765
   } else {
-    content = msg.content
+    content = msg.content as string
   }
 
   let asciiChars = 0
@@ -49,7 +91,7 @@ export function estimateOaiMessageTokens(msg: OaiMessage): number {
       asciiChars++
     }
   }
-  return Math.ceil(asciiChars / 4) + Math.ceil(cjkChars / 1.5)
+  return Math.ceil(asciiChars / 4) + Math.ceil(cjkChars / 1.2)
 }
 
 export function estimateOaiTokens(messages: OaiMessage[]): number {
@@ -67,11 +109,14 @@ export function microCompactOai(
 ): { messages: OaiMessage[]; truncated: number } {
   const recentStart = Math.max(0, messages.length - KEEP_RECENT_MESSAGES)
 
+  const turnAgeMap = computeTurnAges(messages)
+
   let compactedCount = 0
   const shortened = messages.map((msg, msgIdx) => {
     const isRecent = msgIdx >= recentStart
+    const turnAge = turnAgeMap.get(msgIdx) ?? 0
 
-    const toolResult = compactToolMessage(msg, contextWindow)
+    const toolResult = compactToolMessage(msg, contextWindow, turnAge)
     if (toolResult.changed) { compactedCount++; return toolResult.msg }
 
     if (!isRecent && msgIdx >= CACHE_ANCHOR_MESSAGES) {
@@ -112,4 +157,29 @@ export function microCompactOai(
   }
 
   return { messages: shortened, truncated: compactedCount }
+}
+
+/**
+ * Compute the "turn age" of each message — how many user turns ago
+ * it was created. Current turn = 0, previous turn = 1, etc.
+ */
+function computeTurnAges(messages: OaiMessage[]): Map<number, number> {
+  const ages = new Map<number, number>()
+  let currentTurn = 0
+  const turnBoundaries: number[] = []
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === 'user') {
+      turnBoundaries.push(i)
+      currentTurn++
+    }
+  }
+
+  let turn = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === 'user') turn++
+    ages.set(i, turn)
+  }
+
+  return ages
 }

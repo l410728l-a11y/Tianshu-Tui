@@ -2,6 +2,7 @@ import { READ_ONLY_WORKER_TOOLS, type WorkOrder, type WorkerResult, type WorkerP
 import { buildMemoryKnowledgePacket, needsMemoryKnowledgePacket } from './worker-knowledge-packet.js'
 import { profileRegistry } from './profile-registry.js'
 import { starDomainRegistry } from './star-domain-registry.js'
+import type { ArtifactStore } from '../artifact/store.js'
 
 // ─── Profile-specific expertise prompts ────────────────────────────
 // Each profile gets targeted guidance on HOW to do its job,
@@ -186,9 +187,12 @@ function buildWriteResultShape(): string {
 }
 
 export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string): string {
-  // V3 Component A: if order has authority, derive suffix from domain registry
-  const effectiveSuffix = authoritySuffix
-    ?? (order.authority ? starDomainRegistry.get(order.authority)?.systemPromptSuffix : undefined)
+  // V3 Component A: if order has authority, derive persona + suffix from domain registry.
+  // volatileBlock = "你是谁" (frames identity, goes first); systemPromptSuffix = "你怎么做"
+  // (methodology, goes last for highest attention weight).
+  const domainDef = order.authority ? starDomainRegistry.get(order.authority) : undefined
+  const effectiveSuffix = authoritySuffix ?? domainDef?.systemPromptSuffix
+  const personaBlock = authoritySuffix ? undefined : domainDef?.volatileBlock
   const hasWriteTools = order.allowedTools.some(t => !(READ_ONLY_WORKER_TOOLS as readonly string[]).includes(t))
   const capability = hasWriteTools ? 'write-capable' : 'read-only'
   const resultShape = hasWriteTools ? buildWriteResultShape() : buildReadOnlyResultShape()
@@ -199,6 +203,12 @@ export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string): s
     `Kind: ${order.kind}`,
     `Profile: ${order.profile}`,
   ]
+
+  // V3 Component A (persona): inject the star-domain identity up front so the
+  // worker reasons in-character before reading its methodology / task.
+  if (personaBlock) {
+    parts.push('', '## 你是谁', '', personaBlock)
+  }
 
   // Inject profile-specific expertise (prefer registry, fallback to hardcoded PROFILE_PROMPTS)
   const profileDef = profileRegistry.get(order.profile)
@@ -307,7 +317,10 @@ function truncateArtifactContent(artifacts: Array<Record<string, unknown>>): Arr
   })
 }
 
-export function buildPrimaryWorkerPacket(results: WorkerResult[]): string {
+/** Build the `<worker_results>` packet for the primary session.
+ *  Async because large packets await artifact store persistence before returning
+ *  the reference — never emits a dangling artifact reference. */
+export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifactStore?: ArtifactStore): Promise<string> {
   const compact = results.map(result => {
     const raw = {
       workOrderId: result.workOrderId,
@@ -327,8 +340,46 @@ export function buildPrimaryWorkerPacket(results: WorkerResult[]): string {
 
   let json = JSON.stringify(compact)
 
-  // Hard cap: if packet exceeds budget, progressively drop low-value fields
+  // Hard cap: if packet exceeds budget, try artifact handoff first
   if (json.length > MAX_WORKER_PACKET_CHARS) {
+    if (artifactStore) {
+      const fullJson = JSON.stringify(results)
+      // Use the ID returned by save() — the store generates its own ID
+      // (`delegate_task:<hex>`), so a fabricated `worker-packet-…` reference
+      // would never resolve via read_section even on a successful save.
+      let artifactId: string | null = null
+      try {
+        artifactId = await artifactStore.save({
+          tool: 'delegate_task',
+          target: 'worker-packet',
+          rawContent: fullJson,
+          summary: `${results.length} worker results (${fullJson.length} chars) — full content in artifact store`,
+          sections: [],
+        })
+      } catch {
+        // Save failed — fall through to progressive field drop below
+      }
+
+      if (artifactId) {
+        // Build a compact packet with artifact reference
+        for (const result of compact) {
+          delete result.examinedFiles
+          delete result.risks
+          delete result.nextActions
+          delete result.verification
+          delete result.artifacts
+        }
+        json = JSON.stringify(compact)
+        // Append artifact reference so primary agent can read_section if needed
+        if (json.length > MAX_WORKER_PACKET_CHARS) {
+          json = json.slice(0, MAX_WORKER_PACKET_CHARS - 100) + '…"'
+        }
+        return `<worker_results>${json}\n[artifact:${artifactId}] — full worker results saved to artifact store, use read_section to retrieve</worker_results>`
+      }
+      // artifact save failed → fall through to progressive field drop
+    }
+
+    // No artifact store or save failed: progressive field drop (fallback)
     for (const result of compact) {
       delete result.examinedFiles
       delete result.risks

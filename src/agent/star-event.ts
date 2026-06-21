@@ -8,14 +8,14 @@ import type { Sensorium } from './sensorium.js'
  * personality system) and has a distinct TUI glyph.
  */
 export type StarPhase =
-  | 'tianshu-planning'   // ⭐ 请星/观局 — 天枢规划
-  | 'tianxuan-locating'  // 🔍 寻迹 — 天璇定位
-  | 'tianji-decomposing' // 📐 排阵 — 天玑拆解
-  | 'tianquan-contracting' // 📜 立约 — 天权立约
-  | 'yuheng-implementing'  // 🔨 铸形 — 玉衡实现
-  | 'kaiyang-testing'      // ⚔️ 试锋 — 开阳测试
-  | 'yaoguang-delivering'  // 🏠 归航 — 摇光交付
-  | 'tianshu-encore'       // ⭐⭐ 二次请星 — 天枢再临
+  | 'tianshu-planning'   // ◐ 观局 — 天枢规划
+  | 'tianxuan-locating'  // ⚙ 寻迹 — 天璇定位
+  | 'tianji-decomposing' // ⚙ 拆解 — 天玑拆解
+  | 'tianquan-contracting' // ◐ 立约 — 天权立约
+  | 'yuheng-implementing'  // ✦ 铸形 — 玉衡实现
+  | 'kaiyang-testing'      // ❧ 试锋 — 开阳测试
+  | 'yaoguang-delivering'  // ❧ 归航 — 摇光交付
+  | 'tianshu-encore'       // ◐ 再临 — 天枢再临
 
 /** Human-readable labels for each phase. */
 export const PHASE_LABELS: Record<StarPhase, string> = {
@@ -31,22 +31,22 @@ export const PHASE_LABELS: Record<StarPhase, string> = {
 
 /** Glyphs for TUI rendering. */
 export const PHASE_GLYPHS: Record<StarPhase, string> = {
-  'tianshu-planning': '⭐',
-  'tianxuan-locating': '🔍',
-  'tianji-decomposing': '📐',
-  'tianquan-contracting': '📜',
-  'yuheng-implementing': '🔨',
-  'kaiyang-testing': '⚔️',
-  'yaoguang-delivering': '🏠',
-  'tianshu-encore': '⭐⭐',
+  'tianshu-planning': '◐',   // 天枢观局
+  'tianxuan-locating': '⚙',  // 天璇寻迹
+  'tianji-decomposing': '⚙', // 天玑拆解
+  'tianquan-contracting': '◐', // 天权立约
+  'yuheng-implementing': '✦',  // 玉衡铸形
+  'kaiyang-testing': '❧',      // 开阳试锋
+  'yaoguang-delivering': '❧',  // 摇光交付
+  'tianshu-encore': '◐',       // 天枢再临
 }
 
-/** Short Chinese labels for strip display (≤4 chars). */
+/** Short Chinese labels for strip display (≤5 chars). */
 export const PHASE_SHORT_LABELS: Record<StarPhase, string> = {
   'tianshu-planning': '观局',
   'tianxuan-locating': '寻迹',
   'tianji-decomposing': '拆解',
-  'tianquan-contracting': '定标',
+  'tianquan-contracting': '立约',
   'yuheng-implementing': '铸形',
   'kaiyang-testing': '试锋',
   'yaoguang-delivering': '归航',

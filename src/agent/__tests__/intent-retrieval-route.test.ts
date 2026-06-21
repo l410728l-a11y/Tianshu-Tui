@@ -90,6 +90,60 @@ describe('intent retrieval route heuristic', () => {
     assert.ok(sources(route).includes('tests'))
     assert.ok(sources(route).includes('git'))
   })
+
+  it('classifies short social greetings as social_idle with zero directions', () => {
+    const cn = routeFor('你好')
+    assert.ok(cn.taskKinds.includes('social_idle'))
+    assert.equal(cn.directions.length, 0)
+    assert.ok(cn.confidence <= 0.4)
+
+    const en = routeFor('hi')
+    assert.ok(en.taskKinds.includes('social_idle'))
+    assert.equal(en.directions.length, 0)
+
+    const hey = routeFor('hey there')
+    assert.ok(hey.taskKinds.includes('social_idle'))
+  })
+
+  it('does NOT classify technical short inputs as social_idle', () => {
+    const route = routeFor('修 bug')
+    assert.ok(!route.taskKinds.includes('social_idle'))
+    assert.ok(route.taskKinds.includes('bug_fix'))
+  })
+})
+
+describe('followUp mode inheritance', () => {
+  it('inherits previous taskKinds when current message yields only default new_feature', () => {
+    const route = buildHeuristicRetrievalRoute({
+      userMessage: '继续',
+      inheritedTaskKinds: ['bug_fix'],
+    })
+    assert.ok(route.taskKinds.includes('bug_fix'), `expected bug_fix from inheritance, got ${route.taskKinds}`)
+    assert.ok(!route.taskKinds.includes('new_feature'), 'should not contain default new_feature')
+  })
+
+  it('does not inherit when current message has a specific classification', () => {
+    const route = buildHeuristicRetrievalRoute({
+      userMessage: '审查这个模块的安全风险',
+      inheritedTaskKinds: ['bug_fix'],
+    })
+    assert.ok(route.taskKinds.includes('review_audit'), `expected review_audit, got ${route.taskKinds}`)
+  })
+
+  it('does not inherit when no inheritedTaskKinds provided', () => {
+    const route = buildHeuristicRetrievalRoute({
+      userMessage: '继续',
+    })
+    assert.ok(route.taskKinds.includes('social_idle'), 'without inheritance, short continuation should be social_idle')
+  })
+
+  it('uses inherited refactor kind for short follow-up', () => {
+    const route = buildHeuristicRetrievalRoute({
+      userMessage: '好的 做吧',
+      inheritedTaskKinds: ['refactor'],
+    })
+    assert.ok(route.taskKinds.includes('refactor'), `expected refactor from inheritance, got ${route.taskKinds}`)
+  })
 })
 
 describe('intent retrieval route normalization and rendering', () => {

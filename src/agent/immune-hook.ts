@@ -38,6 +38,8 @@ export interface ImmuneHookContext {
   targetFile?: string
   tokenUsage?: number
   trajectoryHealth?: HealthSignal
+  /** When true, tool result was an error — innate layer skips fingerprint for tool_repeat. */
+  isError?: boolean
 }
 
 export interface ImmuneHookResult {
@@ -77,6 +79,7 @@ export class ImmuneHook {
         fingerprint: ctx.fingerprint,
         turn: ctx.turn,
         tokenUsage: ctx.tokenUsage,
+        isError: ctx.isError,
       })
 
       // 2. Trajectory health as danger signal
@@ -135,18 +138,22 @@ export class ImmuneHook {
         memory.hitCount++
         memory.lastHit = ctx.turn
       } else {
-        // Primary response: deposit warning + learn
-        response = {
-          type: 'deposit_warning',
-          targetFile: ctx.targetFile,
+        // Primary response: map APC three-tier decision
+        const tier = activation.responseType ?? 'deposit_warning'
+        if (tier === 'quarantine') {
+          response = { type: 'quarantine', targetFile: ctx.targetFile, duration: 20 }
+        } else {
+          // prune_toxic lacks toxicEdges data source — fallback to deposit_warning
+          // until Physarum exposes edge-level anomaly queries
+          response = { type: 'deposit_warning', targetFile: ctx.targetFile }
         }
       }
 
       // 7. Apply response to Physarum
       this.applyResponse(response)
 
-      // 8. Deposit pheromone warning if stigmergy available
-      if (this.deps.stigmergy && ctx.targetFile) {
+      // 8. Deposit pheromone warning if stigmergy available (skip for quarantine — already frozen)
+      if (this.deps.stigmergy && ctx.targetFile && response.type !== 'quarantine') {
         // Fire-and-forget: pheromone persistence failures (e.g. unwritable cwd
         // in tests) must not break immune response. Without .catch this becomes
         // an unhandled rejection that surfaces unpredictably depending on

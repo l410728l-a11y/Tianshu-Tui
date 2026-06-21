@@ -40,6 +40,16 @@ export function resolveApiKey(provider: ProviderConfig): string {
  * All providers use OpenAI Chat Completions format.
  * Codex OAuth is the sole exception (uses the Responses API).
  */
+
+/** SLOW_THINKING providers 的 thinking-stall 默认值（ms）。
+ *  仅对已知易在纯 thinking 阶段卡死的 provider 启用；
+ *  其余 provider 默认 undefined（沿用既有行为：取 readMs，等于禁用）。
+ *  取值依据：基于「chunk 空闲窗」而非「总时长」的语义——120s 远小于 300s read 兜底、
+ *  远大于合法 reasoning delta 间隙，仅命中 reasoning 完全停流的真卡死。 */
+const SLOW_THINKING_STALL_DEFAULT_MS: Record<string, number> = {
+  glm: 210_000,
+}
+
 export function createProviderClient(
   provider: ProviderConfig,
   capabilities: ProviderCapabilities,
@@ -86,6 +96,7 @@ export function createProviderClient(
     maxTokens: params.maxTokens,
     auth: params.auth,
     thinking: provider.thinking as 'enabled' | 'disabled' | undefined,
+    thinkingStallTimeoutMs: provider.thinkingStallTimeoutMs ?? SLOW_THINKING_STALL_DEFAULT_MS[provider.name],
     thinkingFormat: capabilities.thinkingFormat,
     effortFormat: capabilities.effortFormat,
     reasoningEffort: params.reasoningEffort,
@@ -96,11 +107,19 @@ export function createProviderClient(
       ? provider.unsupported
       : capabilities.stripParams,
     prefixCompletion: provider.capabilities.prefixCompletion,
-    useMaxCompletionTokens: provider.name === 'mimo' || provider.name === 'minimax',
+    useMaxCompletionTokens: provider.name === 'mimo' || provider.name === 'mimo-api' || provider.name === 'minimax',
     userAgent: provider.name === 'kimi' ? 'KimiCLI/1.0' : undefined,
+    usageCalibrationFactor: provider.usageCalibrationFactor,
   })
 }
 
-function modelContextWindow(provider: ProviderConfig, modelId: string): number | undefined {
-  return provider.models.find(model => model.id === modelId || model.alias === modelId)?.contextWindow
+function modelContextWindow(provider: ProviderConfig, modelId: string): number {
+  // Fall back to the provider's first configured model rather than a fixed
+  // small constant: schema requires contextWindow on every model, so the
+  // 128K terminal fallback only applies to a provider with zero models.
+  return (
+    provider.models.find(model => model.id === modelId || model.alias === modelId)?.contextWindow
+    ?? provider.models[0]?.contextWindow
+    ?? 128_000
+  )
 }

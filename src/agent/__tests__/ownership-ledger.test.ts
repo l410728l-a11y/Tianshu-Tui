@@ -26,6 +26,16 @@ describe('ownership-ledger — file ownership tracking', () => {
     assert.equal(ownership.isOwned('src/other.ts'), false)
   })
 
+  it('exposes baseline.head as getBaselineHead (VSW commit-ish, not the structural hash)', () => {
+    const baseline = createWorktreeBaseline(baselineSnap)
+    const ledger = createTaskLedger({ taskId: 't1' })
+    const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+    assert.equal(ownership.getBaselineHead(), 'abc123')
+    // The VSW commit-ish must be the raw head, never the structural identity hash.
+    assert.notEqual(ownership.getBaselineHead(), baseline.getBaselineHash())
+  })
+
   it('pre-existing dirty files are NOT owned', () => {
     const baseline = createWorktreeBaseline(baselineSnap)
     const ledger = createTaskLedger({ taskId: 't1' })
@@ -358,6 +368,109 @@ describe('ownership-ledger — file ownership tracking', () => {
       const adopted = ownership.adoptFiles([])
 
       assert.deepEqual(adopted, [])
+    })
+
+    // ── co-owned → adopted migration ──
+    // co-owned files (pre-existing baseline files modified by current task)
+    // should be adoptable when the other session is done/crashed.
+
+    it('migrates co-owned files to adopted set', () => {
+      const baseline = createWorktreeBaseline(baselineSnap)
+      const ledger = createTaskLedger({ taskId: 'takeover' })
+      const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+      // Register an external file → becomes co-owned
+      ownership.registerOwned('src/external-dirty.ts')
+      // Verify it's co-owned, not owned
+      assert.equal(ownership.isCoOwned('src/external-dirty.ts'), true)
+      assert.equal(ownership.isOwned('src/external-dirty.ts'), false)
+
+      // Adopt the co-owned file
+      const adopted = ownership.adoptFiles(['src/external-dirty.ts'])
+      assert.deepEqual(adopted, ['src/external-dirty.ts'],
+        'co-owned file should be adoptable')
+
+      // After adoption: it should be owned, not co-owned
+      assert.equal(ownership.isOwned('src/external-dirty.ts'), true,
+        'adopted co-owned file must be owned')
+      assert.equal(ownership.isCoOwned('src/external-dirty.ts'), false,
+        'adopted co-owned file must leave co-owned set')
+
+      // Should appear in getOwnedFiles
+      const owned = ownership.getOwnedFiles()
+      assert.ok(owned.includes('src/external-dirty.ts'),
+        'adopted file must appear in owned files list')
+    })
+
+    it('co-owned → adopted is idempotent on second call', () => {
+      const baseline = createWorktreeBaseline(baselineSnap)
+      const ledger = createTaskLedger({ taskId: 'takeover' })
+      const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+      ownership.registerOwned('src/external-dirty.ts')
+
+      // First adoption
+      const first = ownership.adoptFiles(['src/external-dirty.ts'])
+      assert.deepEqual(first, ['src/external-dirty.ts'])
+
+      // Second adoption — should be no-op (already in adoptedSet)
+      const second = ownership.adoptFiles(['src/external-dirty.ts'])
+      assert.deepEqual(second, [],
+        'second adoption of same file should be empty')
+
+      // Still owned
+      assert.equal(ownership.isOwned('src/external-dirty.ts'), true)
+      // Still not co-owned
+      assert.equal(ownership.isCoOwned('src/external-dirty.ts'), false)
+    })
+
+    it('adoptFiles does not duplicate files already in owned set', () => {
+      const baseline = createWorktreeBaseline({
+        branch: 'main',
+        head: 'abc',
+        preExistingDirty: [],
+        preExistingUntracked: [],
+        capturedAt: Date.now(),
+      })
+      const ledger = createTaskLedger({ taskId: 'takeover' })
+      const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+      // Register an owned file (not external → straight to ownedSet)
+      ownership.registerOwned('src/my-file.ts')
+      assert.equal(ownership.isOwned('src/my-file.ts'), true)
+
+      // Adopt it — should be skipped
+      const adopted = ownership.adoptFiles(['src/my-file.ts'])
+      assert.deepEqual(adopted, [], 'already-owned file should not be re-adopted')
+      assert.equal(ownership.isOwned('src/my-file.ts'), true)
+    })
+
+    it('migrates multiple co-owned files in one call', () => {
+      const baseline = createWorktreeBaseline({
+        branch: 'main',
+        head: 'abc',
+        preExistingDirty: ['ext-a.ts', 'ext-b.ts', 'ext-c.ts'],
+        preExistingUntracked: [],
+        capturedAt: Date.now(),
+      })
+      const ledger = createTaskLedger({ taskId: 'takeover' })
+      const ownership = createOwnershipLedger({ baseline, taskLedger: ledger })
+
+      ownership.registerOwned('ext-a.ts')
+      ownership.registerOwned('ext-b.ts')
+      // ext-c.ts is pure external (not co-owned)
+
+      const adopted = ownership.adoptFiles(['ext-a.ts', 'ext-b.ts', 'ext-c.ts'])
+      assert.deepEqual(adopted.sort(), ['ext-a.ts', 'ext-b.ts', 'ext-c.ts'].sort())
+
+      // All three should now be owned
+      assert.equal(ownership.isOwned('ext-a.ts'), true)
+      assert.equal(ownership.isOwned('ext-b.ts'), true)
+      assert.equal(ownership.isOwned('ext-c.ts'), true)
+
+      // Co-owned should be empty
+      assert.equal(ownership.isCoOwned('ext-a.ts'), false)
+      assert.equal(ownership.isCoOwned('ext-b.ts'), false)
     })
   })
 })

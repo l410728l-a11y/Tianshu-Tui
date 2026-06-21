@@ -81,6 +81,8 @@ export interface AffordanceState {
   workingSetSize: number
   /** 最近使用的工具名称列表 */
   recentToolNames: string[]
+  /** 当前 TaskContract 状态（planning 阶段时 LSP 工具升权） */
+  contractStatus?: string
 }
 
 // ─── Modulators ────────────────────────────────────────────────────
@@ -186,6 +188,11 @@ export function computeAffordanceScores(
   const epMod = epistemicModulator(state)
   const insMod = instrumentalModulator(state)
 
+  // U3: planning 阶段 LSP 工具 epistemic 升权
+  const isPlanning = state.contractStatus === 'planning'
+  const LSP_TOOLS = new Set(['lsp_find_references', 'lsp_goto_definition'])
+  const LSP_PLANNING_BOOST = 0.15
+
   // 收集所有需要评分的工具名
   const names = new Set([
     ...Object.keys(toolAffordanceRegistry),
@@ -196,8 +203,9 @@ export function computeAffordanceScores(
   for (const name of names) {
     // Session-local adaptation overrides global registry, if present
     const base = adaptations?.[name] ?? toolAffordanceRegistry[name] ?? DEFAULT_AFFORDANCE
+    const epBoost = (isPlanning && LSP_TOOLS.has(name)) ? LSP_PLANNING_BOOST : 0
     result[name] = {
-      epistemic: clamp(base.epistemic * epMod),
+      epistemic: clamp(base.epistemic * epMod + epBoost),
       instrumental: clamp(base.instrumental * insMod),
       contextual: contextualModulator(name, state),
     }
@@ -283,7 +291,6 @@ function escapeXml(text: string): string {
 function computeHint(state: AffordanceState): AffordanceHint {
   const scores = computeAffordanceScores(state)
 
-  // 计算全局 epistemic/instrumental 平均强度
   const entries = Object.entries(scores)
   let totalEpi = 0
   let totalIns = 0
@@ -294,7 +301,6 @@ function computeHint(state: AffordanceState): AffordanceHint {
   const epiStrength = entries.length > 0 ? totalEpi / entries.length : 0.5
   const insStrength = entries.length > 0 ? totalIns / entries.length : 0.5
 
-  // Top-K 工具（仅 registry 中已注册的）
   const registered = entries.filter(([name]) => toolAffordanceRegistry[name] !== undefined)
   const topEpistemic = registered
     .sort(([, a], [, b]) => b.epistemic - a.epistemic)
@@ -315,34 +321,19 @@ function computeHint(state: AffordanceState): AffordanceHint {
 }
 
 /**
- * 渲染 affordance 上下文提示 XML 块。
- *
- * 向模型提供当前认知状态下的工具选择建议，不强制覆盖 LLM 决策。
- * 纯提示——模型仍自主选择工具。
- *
- * 返回空字符串当 state 信息不足时（无 sensorium 且无 vigor）。
+ * @deprecated Use renderToolContext instead. Kept for test backward compatibility.
  */
 export function renderAffordanceHint(state: AffordanceState): string {
-  // 信息不足时不渲染——避免给出无意义的提示
   if (!state.sensorium && !state.vigor) return ''
 
   const hint = computeHint(state)
   const s = state.sensorium
-  const v = state.vigor
 
   const lines: string[] = []
 
-  // Cognitive state summary
   const theta = state.thetaPhase ?? 'unknown'
-  const vigorVal = v ? v.vigor.toFixed(1) : '?'
-  const season = state.season ?? '?'
-  const conf = s ? (s.confidence * 100).toFixed(0) : '?'
+  lines.push(`Theta phase: ${theta}`)
 
-  lines.push(
-    `Cognitive state: theta=${theta}, vigor=${vigorVal}, season=${season}, confidence=${conf}%`,
-  )
-
-  // Prefer epistemic OR instrumental guidance
   if (hint.preferEpistemic) {
     const confStr = s && s.confidence < 0.4 ? 'uncertainty is high' : 'gathering context'
     lines.push(`Prefer epistemic tools (${hint.topEpistemic.slice(0, 3).join(', ')}) — ${confStr}.`)
@@ -358,4 +349,44 @@ export function renderAffordanceHint(state: AffordanceState): string {
   }
 
   return `<affordance-hint>\n${lines.map(l => escapeXml(l)).join('\n')}\n</affordance-hint>`
+}
+
+// ─── Unified Tool Context ─────────────────────────────────────────
+
+import type { EFEComponents } from './prediction-error.js'
+import type { PolicyOption } from './policy-selection.js'
+
+/**
+ * Render a single unified `<tool-context>` block that replaces the old
+ * separate `<affordance-hint>` + `<policy-guidance>` blocks.
+ *
+ * Theta phase + one-line EFE summary + top-3 tool ranking.
+ * Returns empty string when state information is insufficient.
+ */
+export function renderToolContext(
+  state: AffordanceState,
+  policies: PolicyOption[],
+  efe: EFEComponents,
+): string {
+  if (!state.sensorium && !state.vigor) return ''
+  if (policies.length === 0) return ''
+
+  const hint = computeHint(state)
+  const lines: string[] = []
+
+  const theta = state.thetaPhase ?? 'unknown'
+  const direction = hint.preferEpistemic ? 'explore' : 'execute'
+  lines.push(`theta=${theta} direction=${direction}`)
+
+  lines.push(
+    `EFE: epistemic=${efe.epistemicValue.toFixed(2)} pragmatic=${efe.pragmaticValue.toFixed(2)} precision=${efe.precision.toFixed(2)}`,
+  )
+
+  const top3 = policies.slice(0, 3)
+  const ranking = top3
+    .map((p, i) => `${i + 1}. ${escapeXml(p.toolName)} (${(p.probability * 100).toFixed(0)}%)`)
+    .join('  ')
+  lines.push(ranking)
+
+  return `<tool-context>\n${lines.join('\n')}\n</tool-context>`
 }

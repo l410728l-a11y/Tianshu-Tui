@@ -1,6 +1,6 @@
 import type { StreamClient } from '../api/stream-client.js'
 import type { OaiMessage } from '../api/oai-types.js'
-import { CACHE_ANCHOR_MESSAGES } from '../compact/constants.js'
+import { CACHE_ANCHOR_MESSAGES, summaryOutputBudgetChars } from '../compact/constants.js'
 import { microCompactOai, estimateOaiTokens } from '../compact/micro.js'
 
 import { debugLog } from '../utils/debug.js'
@@ -12,9 +12,75 @@ import type { PromptEngine } from '../prompt/engine.js'
 import type { PressureMonitor } from '../context/pressure-monitor.js'
 import type { SessionContext } from './context.js'
 import { extractTaskState } from './task-state.js'
+import { renderTaskAnchor, type TaskContract } from '../context/task-contract.js'
 import type { TrajectoryEntry } from './trajectory.js'
 import type { CacheAdvisor } from '../cache/advisor.js'
 import { extractSessionMemories, type ExtractedMemory } from './session-memory-extract.js'
+
+/**
+ * Extract the user intent chain: all user messages in order,
+ * truncated to a reasonable preview for the compaction prompt.
+ * This ensures the LLM summary preserves the user's full intent
+ * evolution, including corrections and clarifications.
+ */
+function extractUserIntentChain(messages: OaiMessage[]): string[] {
+  const MAX_PER_MESSAGE = 300
+  const MAX_MESSAGES = 20
+
+  return messages
+    .filter(m => m.role === 'user')
+    .slice(-MAX_MESSAGES)
+    .map(m => {
+      const text = (typeof m.content === 'string' ? m.content : '').trim().replace(/\n+/g, ' ')
+      return text.length > MAX_PER_MESSAGE
+        ? text.slice(0, MAX_PER_MESSAGE) + '...'
+        : text
+    })
+}
+
+/**
+ * Find a safe split point that doesn't cut through a tool_calls ↔ tool group.
+ *
+ * The OpenAI-compatible API requires every assistant message with tool_calls
+ * to be immediately followed by matching tool messages. If tryPartialCompact
+ * splits between an assistant(tool_calls) and its tool results, the resulting
+ * message list becomes invalid and the API returns an error.
+ *
+ * This function walks backward from the desired split point to ensure we
+ * split only at group boundaries: a tool call group (assistant + its tool
+ * results) stays together in either oldZone or recentZone, not split across.
+ */
+export function findSafeSplitPoint(
+  messages: OaiMessage[],
+  desiredSplit: number,
+  minSplit: number,
+): number {
+  let sp = desiredSplit
+
+  // Walk backward while the message at sp is a tool — its owning assistant
+  // must be before sp, so we move sp before that assistant to keep the group intact.
+  let iterations = 0
+  while (sp > minSplit && sp < messages.length && messages[sp]?.role === 'tool') {
+    if (++iterations > 100) break // safety valve
+    const toolCallId = (messages[sp] as Record<string, unknown>).tool_call_id as string | undefined
+    if (!toolCallId) break
+    let found = false
+    for (let i = sp - 1; i >= 0; i--) {
+      const msg = messages[i]
+      if (msg?.role === 'assistant') {
+        const toolCalls = (msg as Record<string, unknown>).tool_calls as Array<{ id: string }> | undefined
+        if (toolCalls?.some(tc => tc.id === toolCallId)) {
+          sp = i // move split before the assistant that owns this tool
+          found = true
+          break
+        }
+      }
+    }
+    if (!found) break // orphaned tool with no matching assistant — shouldn't happen
+  }
+
+  return sp
+}
 
 export type HandoffToolStatus = TrajectoryEntry['status'] | 'running'
 
@@ -188,6 +254,15 @@ export interface CompactionControllerDeps {
   contextWindow: number
   providerProfile?: ProviderProfile
   primaryClient?: StreamClient
+  /**
+   * When false, discretionary compaction (ratio tiers, 1M partial/full LLM
+   * compact) is skipped entirely. Emergency paths — session split and the
+   * 95% context ceiling — stay active regardless, because exceeding the
+   * window is a hard API failure, not a tuning preference.
+   * Worker sessions pass `compact.enabled: false` and previously relied on
+   * this being silently ignored.
+   */
+  compactEnabled?: boolean
   pressureMonitor: PressureMonitor
   getTrajectoryEntries: () => TrajectoryEntry[]
   getStreamedText: () => string
@@ -198,6 +273,12 @@ export interface CompactionControllerDeps {
   persistMemories?: (memories: Array<{ text: string; source: ExtractedMemory['source']; kind: ExtractedMemory['kind'] }>) => void | Promise<void>
   /** Current abort signal from the agent loop, so LLM compact can be cancelled. */
   getAbortSignal?: () => AbortSignal | undefined
+  /**
+   * C4: the live authoritative task contract. Re-injected into the appendix
+   * region after every compaction so the goal / constraints / forbidden items
+   * survive verbatim even when the LLM summary above drifts or drops them.
+   */
+  getActiveContract?: () => TaskContract | undefined
 }
 
 export interface MaybeCompactInput {
@@ -222,8 +303,8 @@ export class CompactionController {
    * systematically 5K-8K tokens too low, causing compaction decisions to
    * trigger too late.
    */
-  private _ensurePrefixOverhead(): void {
-    if (this._prefixOverheadSet) return
+  ensurePrefixOverhead(force = false): void {
+    if (!force && this._prefixOverheadSet) return
     this._prefixOverheadSet = true
 
     // System prompt tokens
@@ -244,13 +325,22 @@ export class CompactionController {
   }
 
   async maybeCompact(input: MaybeCompactInput): Promise<MaybeCompactResult> {
+    // Ensure prefix overhead is always set before any early return.
+    // Without this, getEstimatedTokens() omits the system prompt + tool
+    // definition cost, making GlanceBar show ctx 0% and ◧ 0/1.0M.
+    this.ensurePrefixOverhead()
+
+    if (this.deps.compactEnabled === false) {
+      return { failures: input.failures, compacted: false }
+    }
+
     const messages = this.deps.session.getMessages()
 
     // Prune removed (C4): pruneStaleToolResults was called here solely for debugLog
     // stats — it never mutated storage. The actual request-time pruning happens in
     // PromptEngine.buildOaiRequest via semanticPruneLayer1 + detectStaleness.
 
-    this._ensurePrefixOverhead()
+    this.ensurePrefixOverhead()
     const estimatedTokens = this.deps.session.getEstimatedTokens()
     const contextWindow = this.deps.contextWindow
     const ratio = contextWindow > 0 ? estimatedTokens / contextWindow : 0
@@ -266,15 +356,35 @@ export class CompactionController {
     // opens and skips LLM compact for the next 3 turns, preventing repeated
     // 750K-860K token requests from being wasted on a failing pipeline.
     if (this.deps.contextWindow >= 1_000_000) {
-      if (ratio >= 0.75 && this.deps.primaryClient) {
-        // Check circuit breaker before attempting expensive LLM compact
-        const breakerOpen = input.failures.disabledUntilTurn !== undefined
-          && this.deps.session.getTurnCount() < input.failures.disabledUntilTurn
-        if (breakerOpen) {
-          debugLog(`[llm-compact] circuit breaker open until turn ${input.failures.disabledUntilTurn} — skipping`)
-          return { failures: input.failures, compacted: false }
+      // Check circuit breaker before attempting any expensive compact
+      const breakerOpen = input.failures.disabledUntilTurn !== undefined
+        && this.deps.session.getTurnCount() < input.failures.disabledUntilTurn
+      if (breakerOpen) {
+        debugLog(`[llm-compact] circuit breaker open until turn ${input.failures.disabledUntilTurn} — skipping`)
+        return { failures: input.failures, compacted: false }
+      }
+
+      // T8: Partial Compact at 60% — earlier, lighter, preserves recent context.
+      if (ratio >= 0.60 && ratio < 0.75 && this.deps.primaryClient) {
+        debugLog(`[partial-compact] 1M window at ${(ratio * 100).toFixed(0)}% — trying partial compact`)
+        const partialResult = await this.tryPartialCompact(60)
+        if (partialResult) {
+          return { failures: recordCompactSuccess(input.failures), compacted: true }
         }
-        debugLog(`[llm-compact] 1M window at ${(ratio * 100).toFixed(0)}% — triggering LLM compact`)
+        debugLog('[partial-compact] partial compact failed — will wait for 75% full compact')
+        return { failures: input.failures, compacted: false }
+      }
+
+      // Full LLM compact at 75% — fallback when partial was insufficient
+      if (ratio >= 0.75 && this.deps.primaryClient) {
+        // Try partial compact first (lighter)
+        debugLog(`[llm-compact] 1M window at ${(ratio * 100).toFixed(0)}% — trying partial compact before full`)
+        const partialResult = await this.tryPartialCompact(60)
+        if (partialResult) {
+          return { failures: recordCompactSuccess(input.failures), compacted: true }
+        }
+
+        debugLog(`[llm-compact] partial compact insufficient — triggering full LLM compact`)
         const summary = await this.llmCompact(undefined, this.deps.getAbortSignal?.())
         if (this.isAbortRequested()) {
           debugLog('[llm-compact] turn aborted after compact returned — skipping checkpoint replacement')
@@ -290,7 +400,6 @@ export class CompactionController {
           })
           return { failures: recordCompactSuccess(input.failures), compacted: true }
         }
-        // LLM compact returned null — track failure for circuit breaker
         debugLog(`[llm-compact] LLM compact failed (null summary)`)
         return {
           failures: recordCompactFailure(input.failures, this.deps.session.getTurnCount()),
@@ -315,7 +424,9 @@ export class CompactionController {
       return { failures: input.failures, compacted: false }
     }
 
-    if (this.deps.cacheAdvisor?.shouldDelayCompact(compactDecision.tier)) {
+    // Track 4: 显式 cache-miss 成本 vs 压缩收益权衡 — 传入压力上下文，
+    // 热缓存只在低压力时挡住压缩，高压力时放行（1M 余量 > 前缀重建成本）。
+    if (this.deps.cacheAdvisor?.shouldDelayCompact(compactDecision.tier, { estimatedTokens, contextWindow })) {
       return { failures: input.failures, compacted: false }
     }
 
@@ -361,9 +472,17 @@ export class CompactionController {
           toolHistory: [],
         })
         compacted.push({ role: 'user', content: summaryText })
+
+        // C4: re-inject the authoritative task anchor after the summary so the
+        // objective / constraints / forbidden items survive verbatim.
+        const anchorAppendix = this.buildTaskAnchorAppendix()
+        if (anchorAppendix) {
+          compacted.push({ role: 'user', content: anchorAppendix })
+        }
       }
 
       this.deps.session.replaceMessages(compacted)
+      this.deps.promptEngine.resetAppendixBaseline()
       this.deps.session.markCompacted(input.loopTurn)
       this.deps.pressureMonitor.recordCompaction(this.deps.session.getTurnCount())
       const afterTokens = this.deps.session.getEstimatedTokens()
@@ -549,10 +668,17 @@ export class CompactionController {
   }
 
   refreshCacheDiagnostic(loopTurn: number): string | null {
+    const history = this.deps.session.getCacheHistory()
+    // No provider cache data this turn (both counters 0) → no-data, not a 0%
+    // hit. getLatestTurnHitRate reports 0 here (inputTokens denominator), which
+    // would otherwise surface a spurious "First turn" diagnostic. Nothing to
+    // diagnose when the provider reported no cache numbers at all.
+    const latest = history[history.length - 1]
+    if (latest && latest.cacheRead === 0 && latest.cacheCreation === 0) return null
     const hitRate = this.deps.session.getLatestTurnHitRate()
     if (hitRate !== null && hitRate < 0.8) {
       const diagnostic = diagnoseCacheMiss(
-        this.deps.session.getCacheHistory(),
+        history,
         this.deps.session.getTurnCount(),
         this.deps.promptEngine.checkDrift(),
         this.deps.session.wasCompactedAt(loopTurn),
@@ -593,6 +719,26 @@ export class CompactionController {
   }
 
   /**
+   * C4: render the authoritative task anchor for appendix re-injection.
+   * Fuses the verbatim contract (objective / constraints / success) with live
+   * progress (completed / remaining) from the trajectory-derived task state.
+   * Returns null when there is no actionable contract.
+   */
+  private buildTaskAnchorAppendix(): string | null {
+    const contract = this.deps.getActiveContract?.()
+    if (!contract) return null
+    const taskState = extractTaskState(
+      this.deps.getTrajectoryEntries(),
+      this.deps.getStreamedText(),
+    )
+    const anchor = renderTaskAnchor(contract, {
+      completed: taskState.completed,
+      remaining: taskState.remaining,
+    })
+    return anchor.length > 0 ? anchor : null
+  }
+
+  /**
    * Replace message history with cache anchors + checkpoint summary.
    * Called by both trySessionSplit (86% threshold, richer handoff) and
    * enforceContextCeiling (95% threshold, emergency fallback).
@@ -612,8 +758,17 @@ export class CompactionController {
       candidate = [...anchorMessages, { role: 'user', content: params.fallbackText }]
     }
 
+    // C4: append the authoritative task anchor at the tail (appendix region —
+    // never the frozen prefix, so prefix-cache stays intact). The anchor is the
+    // ground truth the model defers to if the summary above drifted.
+    const anchorAppendix = this.buildTaskAnchorAppendix()
+    if (anchorAppendix) {
+      candidate.push({ role: 'user', content: anchorAppendix })
+    }
+
     const beforeTokens = estimateOaiTokens(messages)
     this.deps.session.replaceMessages(candidate)
+    this.deps.promptEngine.resetAppendixBaseline()
     this.deps.session.recordCompactEvent({
       turn: this.deps.session.getTurnCount(),
       tier: params.tier,
@@ -623,6 +778,111 @@ export class CompactionController {
       createdAt: Date.now(),
     })
     this.deps.refreshLedger()
+  }
+
+  /**
+   * T8: Partial Compact — summarize only old messages, preserve recent ones.
+   * Splits messages into: anchor (first 2) + old zone + recent zone (last N).
+   * Only the old zone is summarized via LLM; recent messages are kept intact.
+   * Returns true if successful, false if LLM summary failed.
+   */
+  async tryPartialCompact(recentToPreserve = 60): Promise<boolean> {
+    if (!this.deps.primaryClient) return false
+    if (this._llmCompactInFlight) return false
+
+    const messages = this.deps.session.getMessages()
+    const anchorCount = CACHE_ANCHOR_MESSAGES
+    if (messages.length <= anchorCount + recentToPreserve + 4) {
+      debugLog(`[partial-compact] not enough messages to split (${messages.length} total, need > ${anchorCount + recentToPreserve + 4})`)
+      return false
+    }
+
+    const anchor = messages.slice(0, anchorCount)
+    const rawSplitPoint = messages.length - recentToPreserve
+    const splitPoint = findSafeSplitPoint(messages, rawSplitPoint, anchorCount)
+    // If the safe split point leaves too few oldZone messages, skip compaction
+    if (splitPoint <= anchorCount + 4) {
+      debugLog(`[partial-compact] safe split point ${splitPoint} too close to anchor ${anchorCount} — skipping`)
+      return false
+    }
+    const oldZone = messages.slice(anchorCount, splitPoint)
+    const recentZone = messages.slice(splitPoint)
+
+    debugLog(`[partial-compact] anchor=${anchor.length} old=${oldZone.length} recent=${recentZone.length}`)
+
+    const userIntentChain = extractUserIntentChain(oldZone)
+    const partialBudget = summaryOutputBudgetChars(this.deps.contextWindow).partial
+    const summaryPrompt: OaiMessage = {
+      role: 'user',
+      content: [
+        '请总结以下对话片段的关键信息（这是对话的较早部分，最近的消息会被完整保留）。',
+        '',
+        '## 用户意图链（按时间序）',
+        ...userIntentChain.map((m, i) => `${i + 1}. ${m}`),
+        '',
+        '## 保留',
+        '1. 每条用户消息的核心意图',
+        '2. 关键技术决策和原因',
+        '3. 涉及的文件路径和变更摘要',
+        '4. 错误和修复方法',
+        '',
+        '## 丢弃',
+        '- 工具输出详情（只保留结论）',
+        '- 探索性搜索的中间过程',
+        '',
+        `控制在 ${partialBudget} 字以内。只输出总结，不要调用工具。`,
+      ].join('\n'),
+    }
+
+    this._llmCompactInFlight = true
+    try {
+      const compactMessages: OaiMessage[] = [...anchor, ...oldZone, summaryPrompt]
+      const request = this.deps.promptEngine.buildOaiRequest(
+        compactMessages,
+        undefined,
+        this.deps.contextWindow,
+      )
+      request.tools = undefined
+
+      const chunks: string[] = []
+      let errored = false
+      const signal = this.deps.getAbortSignal?.()
+      const timeoutSignal = AbortSignal.timeout(60_000)
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal
+
+      try {
+        await this.deps.primaryClient.stream(request, {
+          onTextDelta: (text) => { chunks.push(text) },
+          onThinkingDelta: () => {},
+          onContentBlock: () => {},
+          onStopReason: () => {},
+          onError: () => { errored = true },
+        }, combinedSignal)
+      } catch {
+        return false
+      }
+
+      if (errored || chunks.length === 0) return false
+      const summary = chunks.join('').trim()
+      if (summary.length === 0) return false
+
+      const summaryMessage: OaiMessage = {
+        role: 'assistant',
+        content: `<partial-compact-summary turn="${this.deps.session.getTurnCount()}">\n${summary}\n</partial-compact-summary>`,
+      }
+
+      const newMessages = [...anchor, summaryMessage, ...recentZone]
+      this.deps.session.replaceMessages(newMessages)
+      this.deps.promptEngine.resetAppendixBaseline()
+      this.deps.refreshLedger()
+
+      debugLog(`[partial-compact] success: ${messages.length} → ${newMessages.length} messages (removed ${oldZone.length} old, kept ${recentZone.length} recent)`)
+      return true
+    } finally {
+      this._llmCompactInFlight = false
+    }
   }
 
   /**
@@ -642,21 +902,32 @@ export class CompactionController {
       const messages = this.deps.session.getMessages()
       if (messages.length < CACHE_ANCHOR_MESSAGES + 2) return null
 
+      const userIntentChain = extractUserIntentChain(messages)
       const compactMessages: OaiMessage[] = [
         ...messages,
         {
           role: 'user' as const,
           content: [
             '请总结上述对话的关键信息，用于上下文压缩。',
-            '保留以下内容：',
-            '1. 用户的核心需求和意图',
+            '',
+            '## 必须完整保留的用户意图链',
+            '以下是用户所有消息（按时间序），**必须逐条保留核心意图，不得合并或遗漏**：',
+            ...userIntentChain.map((m, i) => `${i + 1}. ${m}`),
+            '',
+            '## 保留以下内容',
+            '1. 用户的核心需求和意图演变（如果用户纠正了 agent 的理解，以用户的纠正为准）',
             '2. 所有关键技术决策及其原因',
             '3. 涉及的文件路径及变更摘要',
             '4. 遇到的错误及修复方法',
             '5. 当前工作状态和进度',
             '6. 明确的待办事项和下一步',
             '',
-            '只输出总结内容，不要调用工具。格式用 markdown，控制在 3000 字以内。',
+            '## 丢弃以下内容',
+            '- 工具输出的详细内容（只保留结论）',
+            '- 探索性搜索的中间过程',
+            '- 重复的状态汇报',
+            '',
+            `只输出总结内容，不要调用工具。格式用 markdown，控制在 ${summaryOutputBudgetChars(this.deps.contextWindow).full} 字以内。`,
           ].join('\n'),
         },
       ]
@@ -695,5 +966,65 @@ export class CompactionController {
     } finally {
       this._llmCompactInFlight = false
     }
+  }
+
+  /**
+   * Build a structured handoff text from current session state.
+   * Called by AgentLoop.runPostSession to persist for the next session.
+   */
+  buildSessionHandoff(): string {
+    const messages = this.deps.session.getMessages()
+    const trajectory = this.deps.getTrajectoryEntries()
+    const streamedText = this.deps.getStreamedText()
+    const taskState = extractTaskState(trajectory, streamedText)
+    const turnCount = this.deps.session.getTurnCount()
+
+    // Extract files seen from user + assistant messages
+    const filesSeen = new Set<string>()
+    for (const m of messages) {
+      if (m.role === 'user' && typeof m.content === 'string') {
+        const matches = m.content.matchAll(/(?:^|\s)([a-zA-Z0-9_./-]+\.(?:ts|tsx|js|jsx|py|md|json|yaml|yml))/g)
+        for (const match of matches) {
+          if (match[1]) filesSeen.add(match[1])
+        }
+      }
+    }
+
+    // Extract errors from trajectory
+    const errors: StructuredHandoffInput['errors'] = trajectory
+      .filter(t => t.status === 'failed' || t.status === 'retried-failed')
+      .map(t => ({
+        turn: t.turn,
+        tool: t.tool,
+        target: t.target,
+        errorClass: t.errorClass ?? 'unknown',
+        summary: t.resultSummary.slice(0, 120),
+      }))
+
+    // Build tool history
+    const toolHistory: StructuredHandoffInput['toolHistory'] = trajectory.map(t => ({
+      tool: t.tool,
+      target: t.target,
+      status: t.status,
+    }))
+
+    const reasoningParts: string[] = []
+    for (const m of messages) {
+      if (m.role === 'assistant' && typeof m.content === 'string' && m.content.trim()) {
+        reasoningParts.push(m.content)
+      }
+    }
+    const reasoningSnippet = reasoningParts.slice(-3).join('\n')
+
+    return buildStructuredHandoff({
+      taskState,
+      turnCount,
+      filesSeen: [...filesSeen].sort(),
+      reasoningSnippet,
+      errorCount: errors.length,
+      errors,
+      toolHistory,
+      stanceSummary: this.deps.getStanceSummary?.() ?? null,
+    })
   }
 }

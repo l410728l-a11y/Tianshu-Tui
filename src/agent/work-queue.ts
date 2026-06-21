@@ -1,4 +1,6 @@
 import type { WorkOrder } from './work-order.js'
+import { classifyProfile } from './coordination-policy.js'
+import type { AgentRole } from './coordination-policy.js'
 
 export interface QueueEntry {
   order: WorkOrder
@@ -16,11 +18,18 @@ export class WorkOrderQueue {
   private inFlightKeys = new Set<string>()
   private inFlightOrders = new Map<string, WorkOrder>()
   private completedIds = new Set<string>()
+  private failedIds = new Set<string>()
   private maxConcurrency: number
+  /** Separate concurrency cap for explore (read-only) workers. Default: same as maxConcurrency. */
+  private maxExploreConcurrency: number
+  /** Separate concurrency cap for hands (write) workers. Default: same as maxConcurrency. */
+  private maxWriteConcurrency: number
   private listeners: Array<(event: QueueEvent) => void> = []
 
-  constructor(maxConcurrency = Infinity) {
+  constructor(maxConcurrency = Infinity, roleConcurrency?: { explore?: number; write?: number }) {
     this.maxConcurrency = maxConcurrency
+    this.maxExploreConcurrency = roleConcurrency?.explore ?? maxConcurrency
+    this.maxWriteConcurrency = roleConcurrency?.write ?? maxConcurrency
   }
 
   on(listener: (event: QueueEvent) => void): () => void {
@@ -42,13 +51,30 @@ export class WorkOrderQueue {
   }
 
   dequeue(): WorkOrder | undefined {
-    if (this.inFlightKeys.size >= this.maxConcurrency) return undefined
+    // Per-role concurrency check: count in-flight workers by role
+    let exploreInFlight = 0
+    let writeInFlight = 0
+    for (const [id, order] of this.inFlightOrders) {
+      const role = classifyProfile(order.profile)
+      if (role === 'hands') writeInFlight++
+      else exploreInFlight++
+    }
 
     const index = this.entries.findIndex(e => {
       // 依赖检查
       if (!e.order.dependencies.every(dep => this.completedIds.has(dep))) return false
       // 文件冲突检查
       if (this.hasFileConflict(e.order)) return false
+      // Global concurrency cap: never exceed maxConcurrency regardless of role pools
+      if (this.inFlightKeys.size >= this.maxConcurrency) return false
+      // Per-role concurrency: explore workers limited by maxExploreConcurrency,
+      // write workers limited by maxWriteConcurrency
+      const role = classifyProfile(e.order.profile)
+      if (role === 'hands') {
+        if (writeInFlight >= this.maxWriteConcurrency) return false
+      } else {
+        if (exploreInFlight >= this.maxExploreConcurrency) return false
+      }
       return true
     })
 
@@ -85,7 +111,22 @@ export class WorkOrderQueue {
   markFailed(order: WorkOrder): void {
     this.inFlightKeys.delete(order.dedupeKey)
     this.inFlightOrders.delete(order.id)
+    // Record the failure so dependents can be distinguished as "dependency failed"
+    // (vs. "dependency never scheduled") during the post-drain blocked sweep.
+    // A failed id is NOT added to completedIds: dependents must NOT run on a
+    // broken foundation — they are settled as `blocked`, never silently dropped.
+    this.failedIds.add(order.id)
     this.emit({ type: 'failed', orderId: order.id })
+  }
+
+  /** True once an order has completed successfully (its dependents may run). */
+  isCompleted(id: string): boolean {
+    return this.completedIds.has(id)
+  }
+
+  /** True once an order has failed (its dependents must be blocked, not run). */
+  hasFailed(id: string): boolean {
+    return this.failedIds.has(id)
   }
 
   size(): number {

@@ -4,7 +4,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { applyCommandFilter } from './command-filters.js'
 
-const RAW_DIR = join(tmpdir(), 'rivet-raw')
+// Lazily compute RAW_DIR so tests (or agents inside a Seatbelt boundary) can
+// redirect TMPDIR at runtime. Module-level `const RAW_DIR = join(tmpdir(), ...)`
+// captures the path at import time — before any before() hook runs.
+function rawDir(): string {
+  return join(tmpdir(), 'rivet-raw')
+}
 const STALE_TTL_MS = 3_600_000 // 1 hour
 const CLEAN_INTERVAL = 10 // clean every N calls
 
@@ -14,6 +19,10 @@ export interface ToolOutputMeta {
   command: string
   exitCode: number
   durationMs: number
+  /** Path to the persisted full raw output. When present, truncation footers
+   *  include a recovery hint so the model reads the file instead of re-running
+   *  the command with sed/head/tee variants (doom-loop root cause, 会话 43443098). */
+  rawPath?: string
 }
 
 function safeRawFileName(id: string): string {
@@ -22,8 +31,8 @@ function safeRawFileName(id: string): string {
 }
 
 export async function persistRawOutput(id: string, raw: string): Promise<string> {
-  await mkdir(RAW_DIR, { recursive: true })
-  const filePath = join(RAW_DIR, safeRawFileName(id))
+  await mkdir(rawDir(), { recursive: true })
+  const filePath = join(rawDir(), safeRawFileName(id))
   await writeFile(filePath, raw, 'utf-8')
 
   persistCount++
@@ -37,13 +46,13 @@ export async function persistRawOutput(id: string, raw: string): Promise<string>
 async function cleanStaleRawOutputs(): Promise<void> {
   let names: string[]
   try {
-    names = await readdir(RAW_DIR)
+    names = await readdir(rawDir())
   } catch {
     return
   }
   const cutoff = Date.now() - STALE_TTL_MS
   for (const name of names) {
-    const filePath = join(RAW_DIR, name)
+    const filePath = join(rawDir(), name)
     try {
       const s = await stat(filePath)
       if (s.mtimeMs < cutoff) {
@@ -76,21 +85,33 @@ export function buildModelOutput(raw: string, meta: ToolOutputMeta): string {
   const lineCount = countLines(effectiveRaw)
   const header = `[${meta.command}] exit=${meta.exitCode} time=${(meta.durationMs / 1000).toFixed(1)}s lines=${lineCount}`
 
+  // Recovery hint: without it the model retries the same command with
+  // sed/head/python/tee variants to "see the rest" — the doom-loop trigger.
+  const recovery = meta.rawPath ? ` · full output: read_file ${meta.rawPath} — 不要重跑命令` : ''
+
+  // Empty output: explicitly confirm it's genuinely empty (not collapsed)
+  if (lineCount === 0 && effectiveRaw.length === 0) {
+    return `${header}\n[output complete: 0 lines — confirmed empty]`
+  }
+
+  // Success output that's folded (too many lines for inline display)
   if (meta.exitCode === 0 && lineCount > SUCCESS_INLINE_LINES) {
     const tail = lines.slice(-SUCCESS_TAIL_LINES)
     const omitted = lineCount - SUCCESS_TAIL_LINES
-    return `${header}\n... ${omitted} lines omitted ...\n${tail.join('\n')}\n[truncated: ${lineCount} lines → ${SUCCESS_TAIL_LINES} shown]`
+    return `${header}\n... ${omitted} lines omitted ...\n${tail.join('\n')}\n[output truncated: last ${SUCCESS_TAIL_LINES} of ${lineCount} lines shown — ${omitted} lines omitted${recovery}]`
   }
 
+  // Output fits within model max lines — complete
   if (lines.length <= MODEL_MAX_LINES) {
-    return `${header}\n${effectiveRaw}`
+    return `${header} — output complete\n${effectiveRaw}`
   }
 
+  // Output exceeds model max lines — head + tail truncation
   const head = lines.slice(0, MODEL_HEAD_LINES)
   const tail = lines.slice(-MODEL_TAIL_LINES)
   const omitted = lines.length - MODEL_HEAD_LINES - MODEL_TAIL_LINES
   const kept = MODEL_HEAD_LINES + MODEL_TAIL_LINES
-  return `${header}\n${head.join('\n')}\n... (${omitted} lines omitted) ...\n${tail.join('\n')}\n[truncated: ${lines.length} lines → ${kept} shown]`
+  return `${header}\n${head.join('\n')}\n... (${omitted} lines omitted) ...\n${tail.join('\n')}\n[output truncated: head ${MODEL_HEAD_LINES} + tail ${MODEL_TAIL_LINES} of ${lines.length} lines shown — ${omitted} lines omitted${recovery}]`
 }
 
 export function buildUiOutput(raw: string, meta: ToolOutputMeta, maxLines = 20): string {

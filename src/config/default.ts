@@ -25,7 +25,7 @@ export const DEFAULT_CONFIG: Config = {
           {
             id: 'kimi-for-coding',
             alias: 'kimi',
-            contextWindow: 200_000,
+            contextWindow: 256_000,
             maxTokens: 64000,
             reasoningEffort: 'high',
           },
@@ -36,7 +36,8 @@ export const DEFAULT_CONFIG: Config = {
       claude: {
         name: 'claude',
         apiKeyEnv: 'CLAUDE_API_KEY',
-        baseUrl: 'http://85.137.242.133:8080/v1',
+        // Anthropic 无原生 OpenAI 兼容端点；需自行部署代理（如 litellm/openrouter）并替换此 URL。
+        baseUrl: 'https://api.anthropic.com/v1',
         protocol: 'openai' as const,
         capabilities: {
           cacheControl: false,
@@ -50,7 +51,8 @@ export const DEFAULT_CONFIG: Config = {
         models: [
           {
             id: 'claude-opus-4-8',
-            alias: 'opus-4-8',
+            // alias 用实际后端名，消除迷惑。id 不可改（代理按 id 路由）。
+            alias: 'qwen37-max',
             contextWindow: 1_000_000,
             maxTokens: 128000,
             reasoningEffort: 'max',
@@ -80,6 +82,7 @@ export const DEFAULT_CONFIG: Config = {
         unsupported: [],
       },
       mimo: cloneProviderPreset('mimo'),
+      'mimo-api': cloneProviderPreset('mimo-api'),
       minimax: cloneProviderPreset('minimax'),
       codex: cloneProviderPreset('codex'),
     },
@@ -88,8 +91,10 @@ export const DEFAULT_CONFIG: Config = {
     approval: 'suggest',
     maxTurns: 50,
     mode: 'code',
-    autoReasoning: false,
+    autoReasoning: true,
     songlineEnabled: false,
+    desktopTools: false,
+    crossSessionEnabled: true,
     hearthObserveEnabled: false,
     antiAnchoring: {
       enabled: false,
@@ -99,10 +104,18 @@ export const DEFAULT_CONFIG: Config = {
       planningTurn: 1,
       projectionThreshold: 0.4,
       seedMaxTokens: 512,
+      anchorBreakScout: {
+        enabled: false,
+        complexityThreshold: 0.5,
+        minTurn: 3,
+        scoutBudgetMs: 60_000,
+        scoutMaxTokens: 2048,
+      },
     },
+    autoDelegateEnabled: false,
     intentRetrievalRouter: {
       enabled: true,
-      classifier: 'llm',
+      classifier: 'heuristic',
       timeoutMs: 4_000,
       maxTokens: 600,
       temperature: 0,
@@ -110,6 +123,13 @@ export const DEFAULT_CONFIG: Config = {
     teamSchedulerBanditEnabled: false,
     modelTierBanditEnabled: false,
     modelRoutingGatedEnabled: false,
+    banditPromotion: {
+      modelTier: 'shadow',
+      teamScheduler: 'shadow',
+      modelRouting: 'shadow',
+      effort: 'shadow',
+      killSwitch: false,
+    },
     permissions: {
       allow: [],
       bash: { allowlist: [] },
@@ -137,6 +157,7 @@ export const DEFAULT_CONFIG: Config = {
       capable: { provider: 'deepseek', model: 'deepseek-v4-pro' },
       mimo: { provider: 'mimo', model: 'mimo-v2.5' },
       'mimo-pro': { provider: 'mimo', model: 'mimo-v2.5-pro' },
+      'mimo-ultra': { provider: 'mimo-api', model: 'mimo-v2.5-pro-ultraspeed' },
     },
     routing: {
       repo_summarization: 'cheap-flash',
@@ -144,5 +165,8 @@ export const DEFAULT_CONFIG: Config = {
       test_failure_diagnosis: 'cheap-flash',
       risky_refactor: 'cheap-flash',
     },
+  },
+  skills: {
+    importFromClaude: [],
   },
 }

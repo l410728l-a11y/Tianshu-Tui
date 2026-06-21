@@ -1,6 +1,6 @@
 import type { ContentBlock } from '../api/types.js'
 import type { TurnBudget } from './turn-budget.js'
-import { enforcePerMessageBudget, enforceTurnReadBudget, enforceContextPressureTruncation } from './per-message-budget.js'
+import { enforcePerMessageBudget, enforceTurnReadBudget, enforceContextPressureTruncation, enforceToolTypeBudgets } from './per-message-budget.js'
 import { perMessageToolResultBudget } from '../compact/constants.js'
 import type { AgentConfig, AgentCallbacks } from './loop-types.js'
 import type { TurnHarness } from './turn-harness.js'
@@ -24,6 +24,10 @@ import type { P3Integration } from './p3-integration.js'
 import type { ImmuneHook } from './immune-hook.js'
 import type { LspManager } from '../lsp/manager.js'
 import { classifyFailure } from './failure-classifier.js'
+import { ToolAccumulator } from './tool-accumulator.js'
+import { guardLossyToolResult } from './negative-fact-detector.js'
+import { getToolStormLevel, type ToolStormLevel } from './trace-store.js'
+import { extractTrailingArtifactId, tierToolResult } from './tool-result-tiering.js'
 import {
   getInterventionLevel,
   recordPrediction,
@@ -77,10 +81,23 @@ export interface ToolExecutionDeps {
    *  prediction recording — e.g., TDD RED in verify phase is NOT a prediction error. */
   getPhaseHint?: () => string | undefined
   /** Optional LSP manager — notified on file changes for goto-def / find-refs accuracy. */
-  /** Optional LSP manager — notified on file changes for goto-def / find-refs accuracy. */
   lspManager?: LspManager
+  /** T4: late-bound LSP manager getter. */
+  getLspManager?: () => LspManager | null
   /** Session-level estimated token count — enables context-pressure-aware truncation. */
   getEstimatedTokens?: () => number
+  /** Tool name history — for tool storm detection. */
+  getToolNameHistory?: () => string[]
+  /** Record a named fingerprint (tool name + fingerprint) */
+  recordToolNamedFingerprint?: (fingerprint: string, toolName: string) => void
+  /** Capture an agent's departure mark (leave_mark tool) for 主控 to record at close. */
+  onLeaveMark?: (mark: import('../tools/types.js').LeaveMarkInput) => void
+  /** U6/C1: capture goal decomposition (plan_steps) for the loop's PlanExecutionTrace. */
+  onPlanSteps?: (descriptions: string[]) => void
+  /** Write a constellation milestone when plan_close succeeds with apply=true. */
+  onPlanClosed?: (input: import('../tools/types.js').PlanClosedInput) => void
+  /** Whether goal mode is active — relaxes doom-loop thresholds when true. */
+  isGoalActive?: () => boolean
 }
 
 export interface ToolExecBatchInput {
@@ -112,6 +129,7 @@ export interface ToolExecBatchResult {
 }
 
 export class ToolExecutionController {
+  private accumulator = new ToolAccumulator()
   constructor(private deps: ToolExecutionDeps) {}
 
   /**
@@ -175,11 +193,15 @@ export class ToolExecutionController {
           lastConflictCheckCount,
           trajectory: this.deps.trajectory,
           getDoomLoopLevel: () => this.deps.getDoomLoopLevel(),
+          isGoalActive: this.deps.isGoalActive?.() ?? false,
           latestRisk,
           sessionTurnCount: this.deps.getSessionTurnCount(),
           sessionId: this.deps.getSessionId(),
           recordToolHistory: (name, input_, isError, content) =>
             this.deps.recordToolHistory(name, input_, isError, content),
+          onLeaveMark: this.deps.onLeaveMark,
+          onPlanSteps: this.deps.onPlanSteps,
+          onPlanClosed: this.deps.onPlanClosed,
           getInterventionLevel: () => getInterventionLevel(this.deps.getPredictionAccumulator()),
           recordPrediction: (correct) => {
             this.deps.setPredictionAccumulator(
@@ -193,6 +215,7 @@ export class ToolExecutionController {
           cacheAdvisor: this.deps.cacheAdvisor,
           taskLedger: this.deps.config.taskLedger,
           ownershipLedger: this.deps.config.ownershipLedger,
+          verificationSnapshotManager: this.deps.config.verificationSnapshotManager,
           sessionRegistry: this.deps.config.sessionRegistry,
           p3: this.deps.p3,
           immuneHook: this.deps.immuneHook,
@@ -200,6 +223,7 @@ export class ToolExecutionController {
           artifactIdsEvicted,
           artifactIdsAccessed,
           lspManager: this.deps.lspManager,
+          getLspManager: this.deps.getLspManager,
           // Thread the batch-level abort signal into per-tool deps. Without this,
           // deps.abortSignal stays undefined, delegate_task passes undefined to
           // coordinator.delegate, and the entire coordinator abort path becomes
@@ -237,11 +261,15 @@ export class ToolExecutionController {
           lastConflictCheckCount,
           trajectory: this.deps.trajectory,
           getDoomLoopLevel: () => this.deps.getDoomLoopLevel(),
+          isGoalActive: this.deps.isGoalActive?.() ?? false,
           latestRisk,
           sessionTurnCount: this.deps.getSessionTurnCount(),
           sessionId: this.deps.getSessionId(),
           recordToolHistory: (name, input_, isError, content) =>
             this.deps.recordToolHistory(name, input_, isError, content),
+          onLeaveMark: this.deps.onLeaveMark,
+          onPlanSteps: this.deps.onPlanSteps,
+          onPlanClosed: this.deps.onPlanClosed,
           getInterventionLevel: () => getInterventionLevel(this.deps.getPredictionAccumulator()),
           recordPrediction: (correct) => {
             this.deps.setPredictionAccumulator(
@@ -255,6 +283,7 @@ export class ToolExecutionController {
           cacheAdvisor: this.deps.cacheAdvisor,
           taskLedger: this.deps.config.taskLedger,
           ownershipLedger: this.deps.config.ownershipLedger,
+          verificationSnapshotManager: this.deps.config.verificationSnapshotManager,
           sessionRegistry: this.deps.config.sessionRegistry,
           p3: this.deps.p3,
           immuneHook: this.deps.immuneHook,
@@ -262,6 +291,7 @@ export class ToolExecutionController {
           artifactIdsEvicted,
           artifactIdsAccessed,
           lspManager: this.deps.lspManager,
+          getLspManager: this.deps.getLspManager,
           // See makeDeps above — same abort-signal threading for the sequential
           // (non-safe) tool path. (root-cause analysis 2026-06-05)
           abortSignal: input.abortSignal,
@@ -277,27 +307,25 @@ export class ToolExecutionController {
      }
    }
 
-    // Drain steer guidance ONLY when there is a tool_result to attach it to.
-    // onSteerDrain() empties the buffer, so calling it without a valid injection
-    // target (e.g. abort broke the loop before any result, or last block is not
-    // a tool_result) would discard the guidance. Peek the target first; if absent,
-    // leave the buffer intact so the next tool-using turn injects it.
-    const lastResult = toolResults.length > 0 ? toolResults[toolResults.length - 1]! : null
-    if (lastResult && lastResult.type === 'tool_result') {
-      const steerText = input.callbacks.onSteerDrain?.()
-      if (steerText) {
-        const existing = typeof lastResult.content === 'string' ? lastResult.content : ''
-        toolResults[toolResults.length - 1] = { ...lastResult, content: existing + '\n\n' + steerText }
-      }
-    }
-
-    // Enforce per-message aggregate budget before adding to conversation.
+    // Enforce per-tool-type cumulative budget before aggregate budget.
     const budgetEntries = toolResults
       .map((r, i) => r.type === 'tool_result'
         ? { toolUseId: r.tool_use_id, content: typeof r.content === 'string' ? r.content : '', toolName: input.toolUses[i]?.name ?? '' }
         : null)
       .filter((e): e is NonNullable<typeof e> => e !== null)
-    const enforced = enforcePerMessageBudget(budgetEntries, perMessageToolResultBudget(this.deps.config.contextWindow))
+    const toolTypeBudgeted = enforceToolTypeBudgets(budgetEntries, this.deps.config.contextWindow)
+    for (const entry of toolTypeBudgeted) {
+      const idx = toolResults.findIndex(r => r.type === 'tool_result' && r.tool_use_id === entry.toolUseId)
+      if (idx >= 0) {
+        const orig = toolResults[idx]!
+        if (orig.type === 'tool_result' && entry.content !== (typeof orig.content === 'string' ? orig.content : '')) {
+          toolResults[idx] = { ...orig, content: entry.content }
+        }
+      }
+    }
+
+    // Enforce per-message aggregate budget before adding to conversation.
+    const enforced = enforcePerMessageBudget(toolTypeBudgeted, perMessageToolResultBudget(this.deps.config.contextWindow))
     for (const entry of enforced) {
       const idx = toolResults.findIndex(r => r.type === 'tool_result' && r.tool_use_id === entry.toolUseId)
       if (idx >= 0) {
@@ -338,6 +366,113 @@ export class ToolExecutionController {
      }
      }
    }
+
+    // ── Tool Storm Guard: track & collapse consecutive same-type calls ──
+    for (let i = 0; i < input.toolUses.length; i++) {
+      const tu = input.toolUses[i]!
+      const tr = toolResults[i]
+      if (tr && tr.type === 'tool_result') {
+        const content = typeof tr.content === 'string' ? tr.content : ''
+        this.accumulator.record({ toolName: tu.name, toolUseId: tu.id, content, turn: input.turn })
+        this.deps.recordToolNamedFingerprint?.(tu.id, tu.name)
+      }
+    }
+    if (input.toolUses.length > 0) {
+      const lastToolName = input.toolUses[input.toolUses.length - 1]!.name
+      const collapse = this.accumulator.tryCollapse(lastToolName)
+      if (collapse) {
+        for (const collapsedId of collapse.collapsedIds) {
+          const idx = toolResults.findIndex(r => r.type === 'tool_result' && r.tool_use_id === collapsedId)
+          if (idx >= 0) {
+            const orig = toolResults[idx]!
+            if (orig.type === 'tool_result') {
+              toolResults[idx] = { type: 'tool_result', tool_use_id: orig.tool_use_id, content: collapse.summary }
+            }
+          }
+        }
+      }
+    }
+
+    // Check tool storm level for strategy shift hint
+    const toolNames = this.deps.getToolNameHistory?.() ?? []
+    const stormLevel = getToolStormLevel(toolNames)
+    if (stormLevel === 'storm') {
+      const lastTr = toolResults[toolResults.length - 1]
+      if (lastTr && lastTr.type === 'tool_result') {
+        const existing = typeof lastTr.content === 'string' ? lastTr.content : ''
+        toolResults[toolResults.length - 1] = {
+          ...lastTr,
+          content: existing + '\n\n⚠️ [tool-storm-detected] 同类工具连续调用过多（8+次），请考虑更换策略或汇总已有结果。',
+        }
+      }
+    }
+
+    // ── T10: Tool Result Tiering for 1M+ windows ──
+    // Read-path tools are exempt: read_file/read_section have their own cap
+    // chain (model-read-cap → artifact wrapping → per-call/turn read budgets →
+    // context-pressure truncation) and deliberately keep full source inline so
+    // the model can construct exact edit_file old_string matches. Tier-1's
+    // head/tail summary on a read result breaks the read→edit workflow.
+    const TIERING_EXEMPT_TOOLS = new Set(['read_file', 'read_section'])
+    const ctxWin = this.deps.config.contextWindow
+    if (ctxWin >= 500_000) {
+      for (let i = 0; i < toolResults.length; i++) {
+        const tr = toolResults[i]!
+        if (tr.type !== 'tool_result') continue
+        const tu = input.toolUses[i]
+        const toolName = tu?.name ?? 'unknown'
+        if (TIERING_EXEMPT_TOOLS.has(toolName)) continue
+        const content = typeof tr.content === 'string' ? tr.content : ''
+        const target = typeof tu?.input?.file_path === 'string' ? tu.input.file_path
+          : typeof tu?.input?.path === 'string' ? tu.input.path
+          : toolName
+        // Reuse a tool-level artifact when present — it holds the untruncated
+        // original, and saving a second (already budget-truncated) copy both
+        // wastes disk and shadows the better artifact.
+        const existingArtifactId = extractTrailingArtifactId(content)
+        const tiered = await tierToolResult(
+          toolName,
+          content,
+          String(target),
+          this.deps.artifactStore,
+          ctxWin,
+          existingArtifactId,
+        )
+        if (tiered.tier > 0) {
+          toolResults[i] = { ...tr, content: tiered.content }
+        }
+      }
+    }
+
+    // Drain steer guidance ONLY when there is a tool_result to attach it to.
+    // onSteerDrain() empties the buffer, so calling it without a valid injection
+    // target (e.g. abort broke the loop before any result, or last block is not
+    // a tool_result) would discard the guidance. Peek the target first; if absent,
+    // leave the buffer intact so the next tool-using turn injects it.
+    //
+    // Runs AFTER budgets/storm-guard/tiering: those transforms replace content
+    // wholesale (tier-2 minimal, budget-summarized), and appending steer text
+    // before them silently dropped the user's guidance for large results.
+    const lastResult = toolResults.length > 0 ? toolResults[toolResults.length - 1]! : null
+    if (lastResult && lastResult.type === 'tool_result') {
+      const steerText = input.callbacks.onSteerDrain?.()
+      if (steerText) {
+        const existing = typeof lastResult.content === 'string' ? lastResult.content : ''
+        toolResults[toolResults.length - 1] = { ...lastResult, content: existing + '\n\n' + steerText }
+      }
+    }
+
+    // ── Lossy Observation Guard: detect negative facts in collapsed/truncated tool results
+    // and inject VERIFICATION_REQUIRED marker before the model reads them.
+    for (let i = 0; i < toolResults.length; i++) {
+      const tr = toolResults[i]!
+      if (tr.type === 'tool_result' && typeof tr.content === 'string') {
+        const guarded = guardLossyToolResult(tr.content)
+        if (guarded !== tr.content) {
+          toolResults[i] = { ...tr, content: guarded }
+        }
+      }
+    }
 
     this.deps.addToolResults(toolResults)
 

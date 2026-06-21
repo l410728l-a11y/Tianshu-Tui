@@ -2,13 +2,12 @@ import { existsSync } from 'fs'
 import { stat, readFile } from 'node:fs/promises'
 import { extname } from 'path'
 import type { Tool, ToolCallParams } from './types.js'
-import { truncateContent } from './truncation.js'
+import { truncateContent, buildPartialView } from './truncation.js'
 import { validatePath } from './path-validate.js'
 import { GitignoreFilter } from './gitignore.js'
 import { persistRawOutput } from './output-store.js'
 import { summarizeFileContent } from '../artifact/summarize.js'
 import { computeModelReadCap, DEFAULT_MODEL_READ_CAP, type ModelReadCap } from './model-read-cap.js'
-import { pruneThresholds } from '../compact/constants.js'
 import { getToolArtifactThreshold } from './artifact-threshold.js'
 import { debugLog } from '../utils/debug.js'
 import { decideReadPolicy } from './read-policy.js'
@@ -61,6 +60,44 @@ interface FileReadHistoryEntry {
 const fileReadHistory = new Map<string, FileReadHistoryEntry>()
 const FILE_READ_HISTORY_MAX = 200
 
+/** When enabled, repeated reads of unchanged files return a compact reference
+ *  instead of re-emitting the full content. Default-on (opt-out with RIVET_READ_REF=0).
+ *  Checked at call time (not module load) so tests can toggle dynamically. */
+function isReadRefEnabled(): boolean {
+  return process.env['RIVET_READ_REF'] !== '0'
+}
+
+/** Minimum modelContent bytes for read-ref to apply. Smaller repeats stay
+ *  as direct content to avoid wasted round-trips for tiny fragments. */
+const READ_REF_THRESHOLD = 2048
+
+/** Telemetry: cumulative bytes saved via read-ref (avoided cacheCreate). */
+let readRefSavedBytes = 0
+/** Telemetry: number of read-ref shortcuts executed. */
+let readRefCount = 0
+
+/** Session-level file edit tracking: records which files this session has
+ *  successfully written to. Used by staleness detection to disambiguate
+ *  "modified externally" from "you edited this yourself earlier."
+ *  Intentionally NOT cleared on compaction — the agent should always know
+ *  which files it has touched, even after long sessions. */
+const sessionFileEdits = new Set<string>()
+
+/** Mark a file as having been written by this session. Call after any
+ *  successful write (edit_file, hash_edit, write_file, apply_patch). */
+export function markSessionFileEdit(canonicalPath: string): void {
+  sessionFileEdits.add(canonicalPath)
+}
+
+/** Check whether this session has previously written to this file. */
+export function wasFileEditedBySession(canonicalPath: string): boolean {
+  return sessionFileEdits.has(canonicalPath)
+}
+
+/** Test-only: reset session edit tracking between unit tests. */
+export function __resetSessionFileEditsForTests(): void {
+  sessionFileEdits.clear()
+}
 function readHistoryKey(cwd: string, canonicalPath: string, offset: number, limit: number | undefined): string {
   return `${cwd}::${canonicalPath}::${offset}::${limit ?? 'all'}`
 }
@@ -79,10 +116,33 @@ function trimFileReadHistory(): void {
   for (let i = 0; i < drop; i++) fileReadHistory.delete(sorted[i]![0])
 }
 
+/**
+ * Returns true when a prior read of the same file (same offset/limit, or a full-file
+ * read that subsumes this request) was recorded with a matching mtime — meaning the
+ * file has NOT been modified since it was last read.
+ */
+export function isUnchangedRepeatRead(
+  canonical: string,
+  currentMtimeMs: number,
+  dedupKey: string,
+  offset: number,
+  limit: number | undefined,
+): boolean {
+  const priorSame = readHistory.get(dedupKey)
+  if (priorSame && priorSame.mtimeMs === currentMtimeMs) return true
+  const fullPrior = fileReadHistory.get(canonical)
+  if (fullPrior && fullPrior.mtimeMs === currentMtimeMs && offset === 1 && !limit) return true
+  return false
+}
+
+/** Test-only: clear dedup state between unit tests. */
 /** Test-only: clear dedup state between unit tests. */
 export function __resetReadHistoryForTests(): void {
   readHistory.clear()
   fileReadHistory.clear()
+  sessionFileEdits.clear()
+  readRefSavedBytes = 0
+  readRefCount = 0
 }
 
 /** Return the last known mtimeMs for a file from the read history, or null if never read. */
@@ -112,6 +172,31 @@ export function __setFileReadMtimeForTests(canonicalPath: string, mtimeMs: numbe
     modelBytes: 0,
     recordedAt: Date.now(),
   })
+}
+
+/**
+ * Register a file as "seen" via grep (or other non-read_file tool).
+ * This allows hash_edit's position-only mode to succeed after grep
+ * without requiring a full read_file call.
+ *
+ * Only registers if the file has NOT been read before (avoids overwriting
+ * a more detailed entry from read_file).
+ */
+export function registerGrepFileAccess(canonicalPath: string, mtimeMs: number): void {
+  if (fileReadHistory.has(canonicalPath)) return
+  fileReadHistory.set(canonicalPath, {
+    mtimeMs,
+    totalLines: 0,
+    rawBytes: 0,
+    modelBytes: 0,
+    recordedAt: Date.now(),
+  })
+  trimFileReadHistory()
+}
+
+/** Return cumulative read-ref telemetry for cacheCreate cost analysis (B4). */
+export function getReadRefStats(): { savedBytes: number; count: number } {
+  return { savedBytes: readRefSavedBytes, count: readRefCount }
 }
 
 async function sliceFromArtifact(
@@ -240,6 +325,18 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
   const policy = decideReadPolicy({ filePath, sizeBytes: fileSize, hasExplicitRange })
 
   if (fileSize > MAX_TOOL_INPUT_BYTES && !hasExplicitRange) {
+    if (policy.action === 'partial') {
+      // Large source file: read and return PARTIAL view instead of hard error
+      const content = await readFile(filePath, 'utf-8')
+      const cap = options.modelCap ?? DEFAULT_MODEL_READ_CAP
+      const partialContent = buildPartialView(content, filePath, cap.maxChars)
+      return {
+        canonicalPath: filePath,
+        rawContent: content,
+        modelContent: partialContent,
+        uiContent: buildFileUiOutput(content, 80),
+      }
+    }
     const sizeKB = (fileSize / 1024).toFixed(0)
     const estLines = Math.ceil(fileSize / 80)
     throw new Error(
@@ -262,6 +359,17 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
       canonicalPath: filePath,
       rawContent: content,
       modelContent: truncateContent(preview, cap.maxChars, cap.headChars, cap.tailChars),
+      uiContent: buildFileUiOutput(content, 80),
+    }
+  }
+
+  // PARTIAL view for source files that fit in memory but exceed the model cap
+  if (policy.action === 'partial' && !hasExplicitRange) {
+    const partialContent = buildPartialView(content, filePath, cap.maxChars)
+    return {
+      canonicalPath: filePath,
+      rawContent: content,
+      modelContent: partialContent,
       uiContent: buildFileUiOutput(content, 80),
     }
   }
@@ -289,10 +397,16 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
     content = lines.slice(startIdx, endIdx).join('\n')
   }
 
+  // full-with-hint: append editing guidance for medium-sized files
+  const modelContent = truncateContent(content, cap.maxChars, cap.headChars, cap.tailChars)
+  const hint = policy.action === 'full-with-hint'
+    ? `\n\n── Note: this file is ${content.split('\n').length} lines. For editing, consider: grep to locate target → hash_edit with anchors. ──`
+    : ''
+
   return {
     canonicalPath: filePath,
     rawContent: content,
-    modelContent: truncateContent(content, cap.maxChars, cap.headChars, cap.tailChars),
+    modelContent: modelContent + hint,
     uiContent: buildFileUiOutput(content, 50),
   }
 }
@@ -308,14 +422,8 @@ export const READ_FILE_TOOL: Tool = {
 - Use offset and limit ONLY when you specifically need a known sub-range (e.g. a function at line 800-900); never as a workaround for "the file might be too long"
 - This tool reads text files only (UTF-8). Binary files (images, PDFs, executables) will be rejected
 - Do NOT re-read a file that you already read in the current session unless you have edited it since — your earlier tool_result is still in context
-
-### Examples
-Good: read_file(file_path="/abs/path/src/app.ts")  → returns the whole file
-Good: read_file(file_path="/abs/path/src/app.ts", offset=100, limit=50)  → only when you know you want lines 100-150
-Good: read_file(file_paths=["/abs/a.ts", "/abs/b.ts"])  → read multiple files in one call (saves turns)
-Bad:  read_file(file_path="src/app.ts")  → relative path
-Bad:  splitting a file into 6 temp files via write_file and reading them back  → wasteful, just call read_file once
-Bad:  re-reading the same file you already read this session  → look at your previous tool_result instead`,
+- Files > ~2000 lines: returned as PARTIAL view (first page + navigation hints). Use grep to locate, then read_file(offset, limit) for specific ranges. For editing: grep → hash_edit with anchors
+- read_file(file_paths=[...]) reads up to 5 files in one call — use instead of repeated single calls`,
     input_schema: {
       type: 'object',
       properties: {
@@ -386,6 +494,52 @@ Bad:  re-reading the same file you already read this session  → look at your p
       }
     } catch { /* fall through to real read; e.g. invalid path → let readFilePayload error normally */ }
 
+    // ── 重复读取检测 ──
+    // 检测本轮是否已读过同一文件且未变更，若是则在前端注入提醒。
+    const unchangedRepeat = (canonical && currentMtimeMs !== null && dedupKey)
+      ? isUnchangedRepeatRead(canonical, currentMtimeMs, dedupKey, offset, limit)
+      : false
+
+    let repeatWarning: string | null = null
+    if (unchangedRepeat) {
+      const priorSame = readHistory.get(dedupKey!)
+      const fullPrior = fileReadHistory.get(canonical!)
+      if (priorSame && priorSame.mtimeMs === currentMtimeMs) {
+        repeatWarning = `\n── read-dedup ──\n⚠ 此文件本轮已读取过，内容未变更 (${priorSame.modelBytes} bytes, ${priorSame.truncated ? '已截断' : '完整'})。请勿重复读取——回看上文结果即可。\n── read-dedup ──`
+      } else if (fullPrior && fullPrior.mtimeMs === currentMtimeMs && offset === 1 && !limit) {
+        repeatWarning = `\n── read-dedup ──\n⚠ 此文件本轮已完整读取过，内容未变更 (${fullPrior.totalLines} lines, ${fullPrior.modelBytes} bytes)。请勿重复读取——回看上文结果即可。\n── read-dedup ──`
+      }
+    }
+
+    // ── 重复读取引用化 (B2) ──
+    // When RIVET_READ_REF is enabled and this is an unchanged repeat read
+    // of a non-trivial file, return a compact reference instead of
+    // re-emitting the full content — avoiding a cacheCreate on bytes the
+    // model already has in its context.
+    if (unchangedRepeat && isReadRefEnabled()) {
+      const priorSame = readHistory.get(dedupKey!)
+      const fullPrior = fileReadHistory.get(canonical!)
+      const entryBytes = priorSame?.mtimeMs === currentMtimeMs ? priorSame.modelBytes : fullPrior?.modelBytes ?? 0
+      const totalLines = fullPrior?.mtimeMs === currentMtimeMs ? fullPrior.totalLines : 0
+
+      if (entryBytes > READ_REF_THRESHOLD) {
+        const relPath = canonical!.replace(params.cwd + '/', '')
+        const sizeHint = totalLines > 0
+          ? `${totalLines} 行，${entryBytes} bytes`
+          : `${entryBytes} bytes`
+        const ref = [
+          `[read-ref] ${relPath} 本会话已读且未变（${sizeHint}）。`,
+          `完整内容在你上文的 tool_result 中——回看即可。`,
+          `需要具体区段：read_section(file_path="${relPath}", section="L{N}-L{M}")`,
+        ].join('\n')
+        readRefSavedBytes += entryBytes
+        readRefCount++
+        debugLog(`[read-ref] file=${canonical} saved=${entryBytes} total-saved=${readRefSavedBytes} count=${readRefCount}`)
+        return { content: ref }
+      }
+      // Small fragment — fall through to normal read to avoid wasted round-trips
+    }
+
     try {
       payload = await readFilePayload(params.cwd, {
         filePath,
@@ -449,7 +603,7 @@ Bad:  re-reading the same file you already read this session  → look at your p
         recordDedup()
         recordFileDedup()
         return {
-          content: payload.modelContent,
+          content: repeatWarning ? repeatWarning + '\n' + payload.modelContent : payload.modelContent,
           uiContent: payload.uiContent,
           rawPath,
         }
@@ -474,8 +628,9 @@ Bad:  re-reading the same file you already read this session  → look at your p
       // Convention: [artifact:X] is always the LAST token in the content string.
       // prune.ts and stale-round.ts regex `/\[artifact:([A-Za-z0-9_-]+)]\s*$/`
       // depend on this position; any suffix (instructions, summary) goes BEFORE it.
+      const baseContent = payload.modelContent + summaryBlock + `\n[artifact:${artifactId}]`
       return {
-        content: payload.modelContent + summaryBlock + `\n[artifact:${artifactId}]`,
+        content: repeatWarning ? repeatWarning + '\n' + baseContent : baseContent,
         rawContent: payload.modelContent,
         uiContent: payload.uiContent,
         rawPath,
@@ -486,7 +641,7 @@ Bad:  re-reading the same file you already read this session  → look at your p
     recordDedup()
     recordFileDedup()
     return {
-      content: payload.modelContent,
+      content: repeatWarning ? repeatWarning + '\n' + payload.modelContent : payload.modelContent,
       uiContent: payload.uiContent,
       rawPath,
     }

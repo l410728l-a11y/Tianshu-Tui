@@ -5,8 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { executeToolUse, type ToolPipelineDeps } from '../tool-pipeline.js'
 import { createTurnBudget } from '../turn-budget.js'
+import { fingerprintToolCall } from '../trace-store.js'
 import type { EvidenceTrackerPublic } from '../evidence.js'
 import { ArtifactStore } from '../../artifact/store.js'
+import { _setSandboxBackendForTest, _resetSandboxBackendCache } from '../../tools/sandbox-profile.js'
+import { isWriteGranted, _resetGrantsForTest } from '../../tools/path-grants.js'
 
 const mockEvidence = {
   trackFileRead: () => {},
@@ -40,7 +43,7 @@ describe('executeToolUse', () => {
         fileHistory: undefined,
         contextClaimStore: undefined,
         sessionId: 'test-session',
-        promptEngine: { setStrategyShift: () => {}, setImpactHint: () => {} },
+        promptEngine: { setStrategyShift: () => {}, setImpactHint: () => {}, markGitDirty: () => {} },
       } as any,
       cwd: '/tmp/test',
       harness: {
@@ -123,6 +126,99 @@ describe('executeToolUse', () => {
     assert.ok(!content.includes('[策略信号：读取循环]'))
   })
 
+  it('VSW: injects verificationSnapshot into run_tests params when the manager returns a plan', async () => {
+    let seen: any
+    const deps = makeDeps({
+      ownershipLedger: { getOwnedFiles: () => ['a.ts'], getBaselineHead: () => 'head1' } as any,
+      verificationSnapshotManager: {
+        prepare: (owned: string[]) => ({ path: '/snap/dir', snapshotRef: 'head1+diffX', decision: { snapshot: true } as any, ownedFiles: owned }),
+        lastDecision: () => null,
+        currentSnapshotRef: () => 'head1+diffX',
+        destroy: () => {},
+      } as any,
+      config: {
+        ...makeDeps().config,
+        toolRegistry: {
+          execute: async (_name: string, params: any) => { seen = params.verificationSnapshot; return { content: 'ok', isError: false } },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+        },
+      } as any,
+    })
+
+    await executeToolUse(
+      { id: 'tu-rt', name: 'run_tests', input: {} },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.deepEqual(seen, { path: '/snap/dir', snapshotRef: 'head1+diffX' })
+  })
+
+  it('VSW: leaves verificationSnapshot unset when the manager returns null (in-place)', async () => {
+    let seen: any = 'sentinel'
+    const deps = makeDeps({
+      ownershipLedger: { getOwnedFiles: () => [], getBaselineHead: () => '' } as any,
+      verificationSnapshotManager: {
+        prepare: () => null,
+        lastDecision: () => null,
+        currentSnapshotRef: () => undefined,
+        destroy: () => {},
+      } as any,
+      config: {
+        ...makeDeps().config,
+        toolRegistry: {
+          execute: async (_name: string, params: any) => { seen = params.verificationSnapshot; return { content: 'ok', isError: false } },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+        },
+      } as any,
+    })
+
+    await executeToolUse(
+      { id: 'tu-rt2', name: 'run_tests', input: {} },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.equal(seen, undefined)
+  })
+
+  it('A1: tool timeout cascades an abort into the underlying op before rejecting', async () => {
+    let captured: AbortSignal | undefined
+    let abortedInTool = false
+    const loopController = new AbortController()
+    const deps = makeDeps({
+      abortSignal: loopController.signal,
+      config: {
+        ...makeDeps().config,
+        toolRegistry: {
+          // Underlying op that only settles when its abortSignal fires — proves
+          // that a tool-level timeout must cascade an abort (not merely reject the wrapper).
+          execute: (_name: string, params: any) => {
+            captured = params.abortSignal
+            return new Promise((resolve) => {
+              params.abortSignal?.addEventListener('abort', () => {
+                abortedInTool = true
+                resolve({ content: 'aborted', isError: true })
+              }, { once: true })
+            })
+          },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false, timeoutMs: () => 20 }),
+          needsApproval: () => false,
+        } as any,
+      } as any,
+    })
+
+    await executeToolUse(
+      { id: 'tu-timeout', name: 'grep', input: { pattern: 'x' } },
+      deps, noopCallbacks as any, 1, false,
+    ).catch(() => {})
+
+    assert.ok(captured, 'tool received a composed abortSignal via params')
+    assert.equal(captured!.aborted, true, 'composed signal aborted when the tool timed out')
+    assert.equal(abortedInTool, true, 'underlying op observed the abort')
+    assert.equal(loopController.signal.aborted, false, 'loop signal itself is not aborted by a single tool timeout')
+  })
+
   it('records applied plan_close as file_write in task ledger', async () => {
     const events: any[] = []
     const owned: string[] = []
@@ -133,6 +229,7 @@ describe('executeToolUse', () => {
       ownershipLedger: {
         registerOwned: (file: string) => { owned.push(file) },
         getOwnedFiles: () => owned,
+        getBaselineHead: () => '',
       } as any,
       config: {
         ...makeDeps().config,
@@ -166,6 +263,7 @@ describe('executeToolUse', () => {
       ownershipLedger: {
         registerOwned: (file: string) => { owned.push(file) },
         getOwnedFiles: () => owned,
+        getBaselineHead: () => '',
       } as any,
       config: {
         ...makeDeps().config,
@@ -201,6 +299,7 @@ describe('executeToolUse', () => {
       ownershipLedger: {
         registerOwned: () => {},
         getOwnedFiles: () => [],
+        getBaselineHead: () => '',
       } as any,
       config: {
         ...makeDeps().config,
@@ -233,6 +332,7 @@ describe('executeToolUse', () => {
       ownershipLedger: {
         registerOwned: () => {},
         getOwnedFiles: () => [],
+        getBaselineHead: () => '',
       } as any,
       config: {
         ...makeDeps().config,
@@ -271,6 +371,57 @@ describe('executeToolUse', () => {
     assert.equal(event.command, 'run_tests src/foo.test.ts')
     assert.equal(event.status, 'passed')
     assert.equal(event.meta.scope, 'targeted')
+  })
+
+  it('marks git dirty after successful deliver_task commit', async () => {
+    const events: any[] = []
+    let gitDirtyCalls = 0
+    const base = makeDeps()
+    const deps = makeDeps({
+      taskLedger: {
+        record: (event: any) => { events.push(event) },
+      } as any,
+      config: {
+        ...base.config,
+        promptEngine: {
+          setStrategyShift: () => {},
+          setImpactHint: () => {},
+          markGitDirty: () => { gitDirtyCalls++ },
+        },
+      } as any,
+    })
+
+    await executeToolUse(
+      { id: 'tu-deliver-commit', name: 'deliver_task', input: { commit: true, message: 'feat: x' } },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.equal(gitDirtyCalls, 1, 'markGitDirty must be called after successful deliver_task commit')
+    const event = events.at(-1)
+    assert.equal(event.type, 'git_action')
+  })
+
+  it('does not mark git dirty for deliver_task readiness check (commit=false)', async () => {
+    let gitDirtyCalls = 0
+    const base = makeDeps()
+    const deps = makeDeps({
+      taskLedger: { record: () => {} } as any,
+      config: {
+        ...base.config,
+        promptEngine: {
+          setStrategyShift: () => {},
+          setImpactHint: () => {},
+          markGitDirty: () => { gitDirtyCalls++ },
+        },
+      } as any,
+    })
+
+    await executeToolUse(
+      { id: 'tu-deliver-check', name: 'deliver_task', input: {} },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.equal(gitDirtyCalls, 0)
   })
 
   it('records run_tests parsed verification counts in task ledger meta', async () => {
@@ -364,10 +515,65 @@ describe('executeToolUse', () => {
     onCheckpoint: () => {},
   }
 
+  it('R2: blocks write_file when another session holds an exclusive claim (fail-closed)', async () => {
+    let executed = false
+    const fakeRegistry = {
+      acquireClaim: (_sid: string, _path: string, _type: string) => false,
+      checkClaim: (filePath: string) => ({ sessionId: 'peer-1234abcd', claimType: 'exclusive', filePath }),
+    }
+    let resultMsg = ''
+    const callbacks = {
+      ...noopCallbacks,
+      onToolResult: (_id: string, _name: string, content: string, isError?: boolean) => {
+        if (isError) resultMsg = content
+      },
+    }
+    const deps = makeDeps({
+      sessionRegistry: fakeRegistry as any,
+      sessionId: 'mine',
+      harness: {
+        executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: false, retried: false } },
+      } as any,
+    })
+
+    const result = await executeToolUse(
+      { id: 'tu-w', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps, callbacks as any, 1, false,
+    )
+
+    assert.equal((result.toolResult as any).is_error, true, 'must be an error tool result')
+    assert.equal(executed, false, 'harness must NOT execute the write when claim is contested')
+    assert.match((result.toolResult as any).content as string, /另一个会话/)
+    assert.match(resultMsg, /阻断/)
+  })
+
+  it('R2: allows write_file when the claim is uncontended (acquireClaim true)', async () => {
+    let executed = false
+    const fakeRegistry = {
+      acquireClaim: (_sid: string, _path: string, _type: string) => true,
+      checkClaim: () => null,
+    }
+    const deps = makeDeps({
+      sessionRegistry: fakeRegistry as any,
+      sessionId: 'mine',
+      harness: {
+        executeTool: async ({ execute }: any) => { executed = true; const r = await execute(); return { content: r.content, isError: r.isError ?? false, retried: false } },
+      } as any,
+    })
+
+    const result = await executeToolUse(
+      { id: 'tu-w2', name: 'write_file', input: { file_path: 'foo.ts', content: 'x' } },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.equal(executed, true, 'uncontended write must reach the harness (not blocked)')
+    assert.doesNotMatch((result.toolResult as any).content as string, /阻断/, 'must not be the R2 block message')
+  })
+
   it('executes a tool and returns result', async () => {
     const deps = makeDeps()
     const result = await executeToolUse(
-      { id: 'tu-1', name: 'read_file', input: { file_path: '/tmp/test.ts' } },
+      { id: 'tu-1', name: 'read_file', input: { file_path: 'test.ts' } },
       deps, noopCallbacks as any, 1, false,
     )
     assert.equal((result.toolResult as any).tool_use_id, 'tu-1')
@@ -376,12 +582,75 @@ describe('executeToolUse', () => {
     assert.equal(result.checkpointCreated, false)
   })
 
+  it('traces grep input keys when pattern disappears during repair', async () => {
+    const oldDebug = process.env.RIVET_DEBUG
+    const oldToolInputDebug = process.env.RIVET_DEBUG_TOOL_INPUT
+    const oldWarn = console.warn
+    const traceDir = mkdtempSync(join(tmpdir(), 'tool-input-trace-'))
+    const warnings: string[] = []
+    delete process.env.RIVET_DEBUG
+    delete process.env.RIVET_DEBUG_TOOL_INPUT
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+    try {
+      const deps = makeDeps({
+        config: {
+          ...makeDeps().config,
+          toolRegistry: {
+            execute: async () => ({ content: 'Error: pattern is required (non-empty string)', isError: true }),
+            get: () => ({
+              definition: {
+                input_schema: {
+                  type: 'object',
+                  properties: { pattern: { type: 'string' }, path: { type: 'string' }, context_lines: { type: 'integer' } },
+                  required: ['pattern'],
+                },
+              },
+              isConcurrencySafe: () => false,
+            }),
+            needsApproval: () => false,
+          },
+        } as any,
+        repairPipeline: {
+          run: () => ({
+            output: { path: 'src/bootstrap.ts', context_lines: 10 },
+            telemetry: [{ pass: 'test', fixType: 'dropPattern', toolName: 'grep', timestamp: 1 }],
+          }),
+        } as any,
+        cwd: traceDir,
+      })
+
+      await executeToolUse(
+        { id: 'tu-grep-trace', name: 'grep', input: { pattern: 'switchAgentRuntime', path: 'src/bootstrap.ts', context_lines: 10 } },
+        deps, noopCallbacks as any, 1, false,
+      )
+    } finally {
+      console.warn = oldWarn
+      if (oldDebug === undefined) delete process.env.RIVET_DEBUG
+      else process.env.RIVET_DEBUG = oldDebug
+      if (oldToolInputDebug === undefined) delete process.env.RIVET_DEBUG_TOOL_INPUT
+      else process.env.RIVET_DEBUG_TOOL_INPUT = oldToolInputDebug
+    }
+
+    assert.deepEqual(warnings, [], 'natural grep trace must not write directly to terminal stderr')
+    const tracePath = join(traceDir, '.rivet', 'sessions', 'test-session', 'tool-input-trace.jsonl')
+    assert.equal(existsSync(tracePath), true)
+    const trace = readFileSync(tracePath, 'utf8')
+    assert.match(trace, /\[tool-input-trace\]/)
+    assert.match(trace, /id=tu-grep-trace/)
+    assert.match(trace, /name=grep/)
+    assert.match(trace, /isError=true/)
+    assert.match(trace, /beforeHook=\["context_lines","path","pattern"\]/)
+    assert.match(trace, /afterHook=\["context_lines","path","pattern"\]/)
+    assert.match(trace, /afterRepair=\["context_lines","path"\]/)
+    rmSync(traceDir, { recursive: true, force: true })
+  })
+
   it('calls onToolResult callback', async () => {
     const deps = makeDeps()
     let called = false
     const cb = { ...noopCallbacks, onToolResult: () => { called = true } }
     await executeToolUse(
-      { id: 'tu-2', name: 'read_file', input: { file_path: '/tmp/x.ts' } },
+      { id: 'tu-2', name: 'read_file', input: { file_path: 'x.ts' } },
       deps, cb as any, 1, false,
     )
     assert.ok(called)
@@ -393,7 +662,7 @@ describe('executeToolUse', () => {
       repairHintTracker: { recordSuccess: () => { successCalled = true }, recordFailure: () => {} } as any,
     })
     await executeToolUse(
-      { id: 'tu-3', name: 'read_file', input: { file_path: '/tmp/y.ts' } },
+      { id: 'tu-3', name: 'read_file', input: { file_path: 'y.ts' } },
       deps, noopCallbacks as any, 1, false,
     )
     assert.ok(successCalled)
@@ -414,7 +683,7 @@ describe('executeToolUse', () => {
     })
 
     const result = await executeToolUse(
-      { id: 'tu-5', name: 'read_file', input: { file_path: '/tmp/huge.txt' } },
+      { id: 'tu-5', name: 'read_file', input: { file_path: 'huge.txt' } },
       deps, noopCallbacks as any, 1, false,
     )
 
@@ -510,7 +779,10 @@ describe('executeToolUse', () => {
     assert.equal((result.toolResult as any).is_error, false)
   })
 
-  it('requires approval for bash writes even with high confidence auto-safe mode', async () => {
+  it('requires approval for bash writes when NO sandbox boundary is active (fail-closed)', async () => {
+    // Without a kernel sandbox the write could escape the workspace, so the
+    // approval gate must stay closed even at high confidence.
+    _setSandboxBackendForTest('none')
     let approvalCalls = 0
     let executed = false
     const deps = makeDeps({
@@ -528,15 +800,52 @@ describe('executeToolUse', () => {
     })
     const callbacks = { ...noopCallbacks, onApprovalRequired: async () => { approvalCalls++; return false } }
 
-    const result = await executeToolUse(
-      { id: 'tu-bash-write', name: 'bash', input: { command: 'echo hello > out.txt' } },
-      deps, callbacks as any, 1, false,
-    )
+    try {
+      const result = await executeToolUse(
+        { id: 'tu-bash-write', name: 'bash', input: { command: 'echo hello > out.txt' } },
+        deps, callbacks as any, 1, false,
+      )
 
-    assert.equal(approvalCalls, 1)
-    assert.equal(executed, false)
-    assert.equal((result.toolResult as any).is_error, true)
-    assert.match((result.toolResult as any).content, /requires user approval/)
+      assert.equal(approvalCalls, 1)
+      assert.equal(executed, false)
+      assert.equal((result.toolResult as any).is_error, true)
+      assert.match((result.toolResult as any).content, /requires user approval/)
+    } finally {
+      _resetSandboxBackendCache()
+    }
+  })
+
+  it('autonomy-first: bash writes do NOT require approval when a sandbox boundary is active', async () => {
+    // The kernel boundary confines writes to the workspace and B2 rollback makes
+    // them reversible, so an unattended run must not be interrupted for approval.
+    _setSandboxBackendForTest('seatbelt')
+    let approvalCalls = 0
+    let executed = false
+    const deps = makeDeps({
+      config: {
+        ...makeDeps().config,
+        approvalMode: 'auto-safe',
+        permissions: { allow: [] },
+        toolRegistry: {
+          execute: async () => { executed = true; return { content: 'wrote', isError: false } },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+        },
+      } as any,
+      getSensorium: () => ({ momentum: 0.8, pressure: 0.2, confidence: 0.95, complexity: 0.2, freshness: 0.9, stability: 0.9 }),
+    })
+    const callbacks = { ...noopCallbacks, onApprovalRequired: async () => { approvalCalls++; return false } }
+
+    try {
+      await executeToolUse(
+        { id: 'tu-bash-write-sb', name: 'bash', input: { command: 'echo hello > out.txt' } },
+        deps, callbacks as any, 1, false,
+      )
+      assert.equal(approvalCalls, 0, 'sandboxed bash write must not prompt for approval')
+      assert.equal(executed, true, 'sandboxed bash write should execute')
+    } finally {
+      _resetSandboxBackendCache()
+    }
   })
 
   it('lets explicit allowlist override bash write approval', async () => {
@@ -595,6 +904,100 @@ describe('executeToolUse', () => {
     assert.equal((result.toolResult as any).is_error, false)
   })
 
+  it('out-of-workspace write_file forces an approval prompt even in auto-safe, and records a grant on approval', async () => {
+    _resetGrantsForTest()
+    const workspace = mkdtempSync(join(tmpdir(), 'rivet-ws-'))
+    const external = mkdtempSync(join(tmpdir(), 'rivet-ext-'))
+    const target = join(external, 'out.txt')
+    let approvalCalls = 0
+    let executed = false
+    const deps = makeDeps({
+      cwd: workspace,
+      config: {
+        ...makeDeps().config,
+        approvalMode: 'auto-safe',
+        permissions: { allow: [] },
+        toolRegistry: {
+          execute: async () => { executed = true; return { content: 'wrote', isError: false } },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+        },
+      } as any,
+    })
+    const callbacks = { ...noopCallbacks, onApprovalRequired: async () => { approvalCalls++; return true } }
+    try {
+      const result = await executeToolUse(
+        { id: 'tu-oow-write', name: 'write_file', input: { file_path: target, content: 'x' } },
+        deps, callbacks as any, 1, false,
+      )
+      assert.equal(approvalCalls, 1, 'out-of-workspace write must prompt despite auto-safe')
+      assert.equal(executed, true, 'op proceeds after approval')
+      assert.equal((result.toolResult as any).is_error, false)
+      assert.equal(isWriteGranted(target), true, 'subtree grant recorded on approval')
+    } finally {
+      _resetGrantsForTest()
+      rmSync(external, { recursive: true, force: true })
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('denying the out-of-workspace prompt blocks the op and records no grant', async () => {
+    _resetGrantsForTest()
+    const external = mkdtempSync(join(tmpdir(), 'rivet-ext-'))
+    const target = join(external, 'out.txt')
+    let executed = false
+    const deps = makeDeps({
+      config: {
+        ...makeDeps().config,
+        approvalMode: 'auto-safe',
+        permissions: { allow: [] },
+        toolRegistry: {
+          execute: async () => { executed = true; return { content: 'wrote', isError: false } },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+        },
+      } as any,
+    })
+    const callbacks = { ...noopCallbacks, onApprovalRequired: async () => false }
+    try {
+      const result = await executeToolUse(
+        { id: 'tu-oow-deny', name: 'write_file', input: { file_path: target, content: 'x' } },
+        deps, callbacks as any, 1, false,
+      )
+      assert.equal(executed, false)
+      assert.equal((result.toolResult as any).is_error, true)
+      assert.match((result.toolResult as any).content, /requires user approval/)
+      assert.equal(isWriteGranted(target), false, 'no grant on denial')
+    } finally {
+      _resetGrantsForTest()
+      rmSync(external, { recursive: true, force: true })
+    }
+  })
+
+  it('in-workspace read_file does not trigger the out-of-workspace gate', async () => {
+    _resetGrantsForTest()
+    let approvalCalls = 0
+    const deps = makeDeps({
+      config: {
+        ...makeDeps().config,
+        approvalMode: 'auto-safe',
+        permissions: { allow: [] },
+        toolRegistry: {
+          execute: async () => ({ content: 'ok', isError: false }),
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+        },
+      } as any,
+    })
+    const callbacks = { ...noopCallbacks, onApprovalRequired: async () => { approvalCalls++; return true } }
+    await executeToolUse(
+      { id: 'tu-inws-read', name: 'read_file', input: { file_path: 'src/file.ts' } },
+      deps, callbacks as any, 1, false,
+    )
+    assert.equal(approvalCalls, 0, 'in-workspace read must not prompt')
+    _resetGrantsForTest()
+  })
+
   it('P1.3: strips trailing whitespace from tool result content', async () => {
     const deps = makeDeps()
     // Override tool registry to return content with trailing whitespace.
@@ -621,13 +1024,79 @@ describe('executeToolUse', () => {
     assert.ok(rawContent.includes('hello world'),
       'tool result must still contain the payload')
   })
+
+  describe('doom-loop blocked gate (deadlock fix)', () => {
+    const cb = { onToolResult: () => {}, onApprovalRequired: async () => false } as any
+    // A fingerprint window where read_file('looping.ts','error') repeats to the
+    // blocking threshold — that exact call is the offender.
+    function loopingTraceStore() {
+      const offenderFp = fingerprintToolCall('read_file', { file_path: 'looping.ts' }, 'error')
+      return { events: [], toolFingerprints: Array(6).fill(offenderFp), bashClassFingerprints: [] } as any
+    }
+
+    it('blocks the offending call when doomLevel is blocked', async () => {
+      const deps = makeDeps({ getDoomLoopLevel: () => 'blocked' as const, traceStore: loopingTraceStore() })
+      const result = await executeToolUse(
+        { id: 'tu-offend', name: 'read_file', input: { file_path: 'looping.ts' } },
+        deps, cb, 1, false,
+      )
+      assert.equal((result.toolResult as any).is_error, true)
+      assert.ok(((result.toolResult as any).content as string).includes('Recovery: try a different tool'))
+    })
+
+    it('lets a DIFFERENT tool through under blocked — the deadlock fix', async () => {
+      // Before the fix this returned is_error with "Repeated identical failures";
+      // now a non-offending call executes normally so the window can refresh.
+      let executed = false
+      const deps = makeDeps({
+        getDoomLoopLevel: () => 'blocked' as const,
+        traceStore: loopingTraceStore(),
+        config: {
+          ...makeDeps().config,
+          toolRegistry: {
+            execute: async () => { executed = true; return { content: 'todo updated', isError: false } },
+            get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+            needsApproval: () => false,
+          },
+        } as any,
+      })
+      const result = await executeToolUse(
+        { id: 'tu-different', name: 'todo', input: { action: 'list' } },
+        deps, cb, 1, false,
+      )
+      assert.equal(executed, true, 'different tool must actually execute under blocked')
+      assert.notEqual((result.toolResult as any).is_error, true)
+    })
+
+    it('lets the same tool with DIFFERENT input through under blocked', async () => {
+      let executed = false
+      const deps = makeDeps({
+        getDoomLoopLevel: () => 'blocked' as const,
+        traceStore: loopingTraceStore(),
+        config: {
+          ...makeDeps().config,
+          toolRegistry: {
+            execute: async () => { executed = true; return { content: 'file body', isError: false } },
+            get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+            needsApproval: () => false,
+          },
+        } as any,
+      })
+      const result = await executeToolUse(
+        { id: 'tu-diff-input', name: 'read_file', input: { file_path: 'other.ts' } },
+        deps, cb, 1, false,
+      )
+      assert.equal(executed, true, 'same tool / different target must execute under blocked')
+      assert.notEqual((result.toolResult as any).is_error, true)
+    })
+  })
 })
 
 // ── Artifact Intercept 端到端验证 ──────────────────────────────────────
 // 验证 delegate_batch worker 内部 pipeline 的 artifactIntercept 行为：
 // 1. 大输出非 read 工具 → 被拦截并持久化到磁盘
 // 2. 返回内容变为 [artifact:ID] 摘要引用
-// 3. read-class 工具（read_file, grep 等）不被拦截
+// 3. read_file/read_section 不被拦截（模型的眼睛）；grep/glob/bash 等搜索工具在 3x 阈值下可拦截
 // 4. 两个独立 ArtifactStore 实例互不干扰（worker 隔离）
 
 describe('artifactIntercept in tool pipeline', () => {
@@ -656,7 +1125,7 @@ describe('artifactIntercept in tool pipeline', () => {
         fileHistory: undefined,
         contextClaimStore: undefined,
         sessionId: 'test-session',
-        promptEngine: { setStrategyShift: () => {}, setImpactHint: () => {} },
+        promptEngine: { setStrategyShift: () => {}, setImpactHint: () => {}, markGitDirty: () => {} },
       } as any,
       cwd: '/tmp/test',
       harness: {
@@ -743,6 +1212,43 @@ describe('artifactIntercept in tool pipeline', () => {
     }
   })
 
+  it('does NOT re-wrap grep output already carrying a trailing artifact ref (L0→L1 double-save)', async () => {
+    setup()
+    try {
+      // Simulate an L0-wrapped grep result: large inline body + trailing [artifact:] marker.
+      // 40000 chars exceeds the budget-scaled READ threshold (2500*3*3=22500 when
+      // remainingBudgetFraction=1), so the current startsWith check would re-save.
+      const l0Wrapped =
+        'G'.repeat(40000) +
+        '\n\nmatches summary\nUse read_section(artifactId="preexisting-l0", section="L1-L200") to expand.\n[artifact:preexisting-l0]'
+      const deps = makeDepsWithStore({
+        config: {
+          ...makeDepsWithStore().config,
+          toolRegistry: {
+            execute: async () => ({ content: l0Wrapped, isError: false }),
+            get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+            needsApproval: () => false,
+          },
+        } as any,
+      })
+
+      const result = await executeToolUse(
+        { id: 'tu-grep-double', name: 'grep', input: { pattern: 'x' } },
+        deps, noopCallbacks as any, 1, false,
+      )
+
+      const content = (result.toolResult as any).content as string
+      // L1 must NOT create a new artifact for an already-wrapped result.
+      assert.equal(store.list().length, 0,
+        'L1 must not double-save a grep result that already carries a trailing artifact ref')
+      // The original L0 artifact ref must survive untouched.
+      assert.ok(content.includes('[artifact:preexisting-l0]'),
+        'original L0 artifact ref must survive')
+    } finally {
+      cleanup()
+    }
+  })
+
   it('does NOT intercept read_file output (read-class tool bypass)', async () => {
     setup()
     try {
@@ -759,7 +1265,7 @@ describe('artifactIntercept in tool pipeline', () => {
       })
 
       const result = await executeToolUse(
-        { id: 'tu-read-bypass', name: 'read_file', input: { file_path: '/tmp/big.ts' } },
+        { id: 'tu-read-bypass', name: 'read_file', input: { file_path: 'big.ts' } },
         deps, noopCallbacks as any, 1, false,
       )
 
@@ -771,6 +1277,46 @@ describe('artifactIntercept in tool pipeline', () => {
 
       // No artifacts should be created
       assert.equal(store.list().length, 0, 'read_file should not create artifacts')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('delivers a large skill body COMPLETE and inline (fidelity-exempt, no artifact, no truncation)', async () => {
+    setup()
+    try {
+      // 20000 chars — well above the 7500 effective artifact threshold, so a
+      // non-exempt tool (see run_tests test above) would be summarized to an
+      // [artifact:...] ref. The skill tool must NOT: it loads instructions the
+      // model will follow verbatim, so the body must arrive whole.
+      const skillBody = `<skill name="huge">\n${'Z'.repeat(20000)}\n</skill>`
+      const deps = makeDepsWithStore({
+        config: {
+          ...makeDepsWithStore().config,
+          toolRegistry: {
+            execute: async () => ({ content: skillBody, isError: false }),
+            get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+            needsApproval: () => false,
+          },
+        } as any,
+      })
+
+      const result = await executeToolUse(
+        { id: 'tu-skill-fidelity', name: 'skill', input: { name: 'huge' } },
+        deps, noopCallbacks as any, 1, false,
+      )
+
+      const content = (result.toolResult as any).content as string
+      assert.ok(!content.startsWith('[artifact:'),
+        `skill output must not be artifact-intercepted, got: ${content.slice(0, 100)}`)
+      assert.ok(!content.includes('[truncated'),
+        'skill output must not be head/tail truncated')
+      assert.ok(!content.includes('<stored '),
+        'skill output must not be collapsed to a budget preview')
+      // The ENTIRE body survives intact.
+      assert.ok(content.includes('Z'.repeat(20000)),
+        'full skill body must be present inline')
+      assert.equal(store.list().length, 0, 'skill should not create artifacts')
     } finally {
       cleanup()
     }
@@ -821,7 +1367,7 @@ describe('artifactIntercept in tool pipeline', () => {
       })
 
       const result = await executeToolUse(
-        { id: 'tu-error-artifact', name: 'bash', input: { command: 'npm test' } },
+        { id: 'tu-error-artifact', name: 'run_tests', input: { command: 'npm test' } },
         deps, noopCallbacks as any, 1, false,
       )
 
@@ -938,7 +1484,7 @@ describe('artifactIntercept in tool pipeline', () => {
       const largeOutput1 = 'Worker1 findings: '.repeat(600) // ~10800 chars (>7500 effective threshold)
       const largeOutput2 = 'Worker2 review: '.repeat(600) // ~9600 chars
 
-      // Worker 1: bash tool with large output
+      // Worker 1: inspect_project tool with large output (no L0 wrap → L1 intercepts)
       const deps1 = makeDepsWithStore({
         artifactStore: store1,
         config: {
@@ -970,7 +1516,7 @@ describe('artifactIntercept in tool pipeline', () => {
 
       // Execute both workers
       const result1 = await executeToolUse(
-        { id: 'tu-w1', name: 'bash', input: { command: 'npm test' } },
+        { id: 'tu-w1', name: 'inspect_project', input: {} },
         deps1, noopCallbacks as any, 1, false,
       )
       const result2 = await executeToolUse(
@@ -1025,7 +1571,7 @@ describe('phase-aware prediction recording', () => {
         fileHistory: undefined,
         contextClaimStore: undefined,
         sessionId: 'test-session',
-        promptEngine: { setStrategyShift: () => {}, setImpactHint: () => {} },
+        promptEngine: { setStrategyShift: () => {}, setImpactHint: () => {}, markGitDirty: () => {} },
       } as any,
       cwd: '/tmp/test',
       harness: {
@@ -1116,7 +1662,7 @@ describe('phase-aware prediction recording', () => {
     })
 
     await executeToolUse(
-      { id: 'tu-read-fail', name: 'read_file', input: { file_path: '/nonexistent' } },
+      { id: 'tu-read-fail', name: 'read_file', input: { file_path: 'nonexistent' } },
       deps, noopCallbacks as any, 1, false,
     )
 

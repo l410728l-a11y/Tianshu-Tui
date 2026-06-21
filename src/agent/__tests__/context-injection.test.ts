@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ContextInjectionController } from '../context-injection.js'
+import { AdvisoryBus } from '../advisory-bus.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { ContextClaimStore } from '../../context/claim-store.js'
@@ -26,6 +27,7 @@ function makeController(input: {
   claimStore?: ContextClaimStore
   repairHint?: string | null
   toolHistory?: ToolHistoryEntry[]
+  advisoryBus?: AdvisoryBus
 } = {}): ContextInjectionController {
   const session = input.session ?? new SessionContext()
   const engine = input.engine ?? makeEngine()
@@ -42,6 +44,7 @@ function makeController(input: {
     getRepairHintTracker: () => repairHintTracker,
     getContextClaimStore: () => input.claimStore,
     getPlaybookStore: () => undefined,
+    advisoryBus: input.advisoryBus,
   })
 }
 
@@ -81,22 +84,33 @@ describe('ContextInjectionController', () => {
       const request = engine.buildOaiRequest([{ role: 'user', content: 'next' }])
       const joined = request.messages.map(m => typeof m.content === 'string' ? m.content : '').join('\n')
       assert.doesNotMatch(joined, /<active-claims/)
-      assert.ok(claimStore.listClaims().some(c => c.consumers.some(consumer => consumer.kind === 'prompt')))
+      // Claims are no longer falsely marked as consumed by prompt on refresh
+      assert.ok(claimStore.listClaims().every(c => c.consumers.length === 0))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('projects repair hint through prompt engine (cerebellar hint is harness-only)', () => {
+  it('routes repair hint through A1 advisory bus (legacy <repair-hint> block removed)', () => {
+    const bus = new AdvisoryBus()
     const engine = makeEngine()
-    const controller = makeController({ engine, repairHint: '<repair-hint tool="read_file">check path</repair-hint>' })
+    const controller = makeController({ engine, repairHint: 'check path', advisoryBus: bus })
 
     controller.refreshRepairHint()
     controller.setCerebellarHint('hint')
 
+    // A1: repair hint should go to bus, not to prompt engine's legacy block
     const request = engine.buildOaiRequest([{ role: 'user', content: 'next' }])
     const joined = request.messages.map(m => typeof m.content === 'string' ? m.content : '').join('\n')
-    assert.match(joined, /&lt;repair-hint tool=&quot;read_file&quot;&gt;check path&lt;\/repair-hint&gt;/)
+    // Legacy <repair-hint> block should NOT appear
+    assert.doesNotMatch(joined, /<repair-hint/)
+    // Cerebellar hint should NOT appear as raw text in context
     assert.doesNotMatch(joined, /Prediction error rate elevated/)
+
+    // Bus should contain both entries
+    const rendered = bus.render()
+    assert.match(rendered, /check path/)
+    assert.match(rendered, /Prediction error rate elevated/)
+    assert.match(rendered, /<星域-advisory>/)
   })
 })

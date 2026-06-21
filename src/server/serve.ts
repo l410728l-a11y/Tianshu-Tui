@@ -1,0 +1,722 @@
+/**
+ * `rivet serve` — HTTP+SSE Runtime API entry, extracted from the legacy Ink
+ * entry so it ships from the release build (`dist/main.js`). Used directly as a
+ * localhost sidecar by 天枢桌面版 (desktop/).
+ *
+ * Guardrails: binds 127.0.0.1 only; Bearer token fail-closed; reuses the
+ * existing AgentLoop / ArtifactStore — no runtime rewrite, only an API surface.
+ */
+import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { startServer } from './index.js'
+import { createRoutes, type ServerState } from './routes.js'
+import { RuntimeSessionManager } from './session-manager.js'
+import { FileSessionPersistence } from './session-persistence.js'
+import { buildSessionRoutes } from './session-routes.js'
+import { buildHealthRoute } from './health-route.js'
+import { buildScheduleRoutes } from './schedule-routes.js'
+import { buildConfigRoutes } from './config-routes.js'
+import { CronScheduler } from './cron-scheduler.js'
+import { CronWiring } from './cron-wiring.js'
+import { buildMcpRoutes } from './mcp-api.js'
+import { McpManager } from '../mcp/manager.js'
+import { CronLock } from './cron-lock.js'
+import { TaskRegistry } from './task-registry.js'
+import { JsonTaskStore } from './task-store.js'
+import { SessionRuntimePool } from './session-runtime-pool.js'
+import { loadConfig } from '../config/manager.js'
+import { resolveApiKey } from '../api/factory.js'
+import { createAuthProvider } from '../auth/registry.js'
+import type { AuthProvider } from '../auth/types.js'
+import { SessionPersist } from '../agent/session-persist.js'
+import { FileHistory } from '../agent/file-history.js'
+import { loadProjectRules } from '../context/rules-loader.js'
+import { createDefaultToolRegistry } from '../tools/default-registry.js'
+import { AgentLoop } from '../agent/loop.js'
+import type { ApprovalMode } from '../agent/loop-types.js'
+import { SessionContext } from '../agent/context.js'
+import { SessionRegistry } from '../agent/session-registry.js'
+import { createTaskLedger } from '../agent/task-ledger.js'
+import { createOwnershipLedger } from '../agent/ownership-ledger.js'
+import { createWorktreeBaseline } from '../agent/worktree-baseline.js'
+import { captureGitBaseline, createInteractiveToolRegistry, createAgentRuntime, type RuntimeRefs } from '../bootstrap.js'
+import { createRecallTool } from '../tools/recall.js'
+import { createRememberTool } from '../tools/remember.js'
+import { DomainKnowledgeStore } from '../agent/domain-knowledge-store.js'
+import { ProviderHealthTracker } from '../agent/provider-health.js'
+import type { Config, ProviderConfig, ModelConfig } from '../config/schema.js'
+
+export interface ServeContext {
+  config: Config
+  provider: ProviderConfig
+  model: ModelConfig
+  apiKey: string
+  auth?: AuthProvider
+}
+
+/**
+ * Resolve provider/model/auth/apiKey once at server start. Throws a descriptive
+ * Error (caught by the CLI entry) when the runtime is not configured.
+ */
+export function resolveServeContext(loader: () => Config = loadConfig): ServeContext {
+  const config = loader()
+  const provider = config.provider.providers[config.provider.default]
+  if (!provider) {
+    throw new Error(`Provider "${config.provider.default}" not configured`)
+  }
+
+  let auth: AuthProvider | undefined
+  let apiKey = ''
+  if (provider.auth?.type === 'oauth') {
+    auth = createAuthProvider(provider.auth, process.env, provider.apiKey)
+    if (!auth.isAuthenticated()) {
+      throw new Error(`Provider "${provider.name}" OAuth authentication is required before starting the server`)
+    }
+  } else {
+    apiKey = resolveApiKey(provider)
+  }
+
+  const model = provider.models[0]
+  if (!model) {
+    throw new Error(`Provider "${provider.name}" has no configured models`)
+  }
+
+  return { config, provider, model, apiKey, auth }
+}
+
+export interface BuiltAgent {
+  agent: AgentLoop
+  sessionId: string
+}
+
+/**
+ * Wave J: sidecar 级共享运行时状态——跨 session + switchModel 保持，避免
+ * createAgentRuntime per-call new 导致状态丢失。`runServe` 顶层创建一份，
+ * 透传给每个 buildManagedAgent / assembleAgentLoop。
+ *
+ * 当前共享对象：
+ * - providerHealth: 进程级单例，所有 session 共享 provider 健康统计
+ *   （registerProvider 幂等，重复注册不重置）
+ * - domainStores: cwd-keyed 缓存，同 cwd 多 session 复用同一个磁盘绑定的
+ *   DomainKnowledgeStore（避免重复 load + 跨 session lessons 可见）
+ * - sameCwdRunningCount: late-bound (Wave F)——RuntimeSessionManager 创建后
+ *   回写。给 verificationSnapshotManager 做多 session worktree 冲突检测；
+ *   修复硬编码 () => 0 假设（TUI 单 session 路径不受影响，sidecar 走真实计数）。
+ *
+ * 未来候选：bandit gates evaluation 结果缓存（避免 switchModel 重算）。
+ */
+export interface SharedRuntime {
+  providerHealth: ProviderHealthTracker
+  domainStores: Map<string, DomainKnowledgeStore>
+  /** late-bound: 在 sessions = new RuntimeSessionManager(...) 之后由 runServe
+   *  回写。值为 null 时退化为 0（sessions 尚未初始化的窗口期）。 */
+  sameCwdRunningCount: ((cwd: string, excludeSessionId?: string) => number) | null
+  /** Server-level MCP manager — one connection pool for all sessions. */
+  mcpManager: McpManager | null
+}
+
+/** sidecar 内部：按 cwd 取/建 DomainKnowledgeStore，多 session 共享同一实例。 */
+function getOrCreateDomainStore(shared: SharedRuntime, cwd: string): DomainKnowledgeStore {
+  const existing = shared.domainStores.get(cwd)
+  if (existing) return existing
+  const store = new DomainKnowledgeStore(join(cwd, '.rivet', 'knowledge'))
+  shared.domainStores.set(cwd, store)
+  return store
+}
+
+/**
+ * A resolved provider/model/auth tuple for one model id — the cross-provider
+ * lookup result that switchModel rebuilds an agent on. Mirrors the resolution
+ * logic in bootstrap.switchAgentRuntime (provider/OAuth/apiKey handling).
+ */
+export interface ResolvedModelSpec {
+  provider: ProviderConfig
+  apiKey: string
+  auth?: AuthProvider
+  model: { id: string; maxTokens: number; contextWindow: number; reasoningEffort?: ModelConfig['reasoningEffort'] }
+}
+
+/**
+ * Resolve a model id (or alias) to its provider/apiKey/auth/model spec, scanning
+ * every configured provider. Returns null when the id is unknown or the target
+ * provider has no usable API key (kept fail-closed, like switchAgentRuntime).
+ */
+export function resolveModelSpec(ctx: ServeContext, modelId: string): ResolvedModelSpec | null {
+  for (const [provName, prov] of Object.entries(ctx.config.provider.providers)) {
+    const found = prov.models.find((m) => m.id === modelId || m.alias === modelId)
+    if (!found) continue
+
+    let provider = ctx.provider
+    let apiKey = ctx.apiKey
+    let auth = ctx.auth
+
+    if (prov.auth?.type === 'oauth') {
+      if (provName !== ctx.provider.name) {
+        provider = prov
+        apiKey = ''
+        auth = createAuthProvider(prov.auth, process.env, prov.apiKey)
+      }
+    } else {
+      const provKey =
+        prov.apiKey ??
+        process.env[prov.apiKeyEnv ?? ''] ??
+        (() => { try { return resolveApiKey(prov) } catch { return undefined } })()
+      if (!provKey) return null
+      if (provName !== ctx.provider.name) {
+        provider = prov
+        apiKey = provKey
+        auth = undefined
+      }
+    }
+
+    return {
+      provider,
+      apiKey,
+      auth,
+      model: {
+        id: found.id,
+        maxTokens: found.maxTokens,
+        contextWindow: found.contextWindow,
+        reasoningEffort: found.reasoningEffort,
+      },
+    }
+  }
+  return null
+}
+
+/** Enumerate every selectable model across all configured providers. */
+export function listAllModels(ctx: ServeContext): { id: string; alias: string; provider: string; contextWindow?: number }[] {
+  const out: { id: string; alias: string; provider: string; contextWindow?: number }[] = []
+  for (const [provName, prov] of Object.entries(ctx.config.provider.providers)) {
+    for (const m of prov.models) {
+      out.push({ id: m.id, alias: m.alias ?? m.id, provider: provName, contextWindow: m.contextWindow })
+    }
+  }
+  return out
+}
+
+/**
+ * Per-session, model-independent pieces. Built once and reused across model
+ * rebuilds so switchModel preserves conversation (same SessionContext) and
+ * shared stores (claims/file-history/playbook/tools/ledgers).
+ */
+interface SessionStores {
+  persist: SessionPersist
+  claimStore: ReturnType<SessionPersist['createClaimStore']>
+  fileHistory: FileHistory
+  toolRegistry: ReturnType<typeof createDefaultToolRegistry>
+  session: SessionContext
+  taskLedger: ReturnType<typeof createTaskLedger>
+  ownershipLedger: ReturnType<typeof createOwnershipLedger>
+  /** RuntimeRefs 在 createInteractiveToolRegistry 中被工具体内闭包持有；
+   *  Wave C: assembleAgentLoop 通过 createAgentRuntime 装配 coordinator 后
+   *  回写 refs.coordinator，让 5 个 coordinator 依赖工具激活。 */
+  refs: RuntimeRefs
+}
+
+// playbookStore 由 createAgentRuntime 内部自管（bootstrap.ts:726
+// `playbookStore: new PlaybookStore(cwd)`），sidecar 不再代为构造——
+// 历史 Wave A 短暂保留的 stores.playbookStore 是死字段，Wave C 后无消费者，已删。
+
+function buildSessionStores(
+  ctx: ServeContext,
+  cwd: string,
+  sessionId: string,
+  registry?: SessionRegistry,
+  shared?: SharedRuntime,
+): SessionStores {
+  const persist = new SessionPersist(sessionId, cwd)
+  const claimStore = persist.createClaimStore()
+  persist.injectDurableClaims(claimStore)
+  for (const rule of loadProjectRules(cwd)) claimStore.propose(rule)
+  const fileHistory = new FileHistory(persist.getBackupDir(), sessionId)
+  const session = new SessionContext()
+
+  // sidecar 工具装配——复用 bootstrap 的 createInteractiveToolRegistry，与 TUI 端
+  // 共享一套装配链。Wave C 后所有工具（含 coordinator 依赖工具）均通过
+  // refs 闭包后绑定 coordinator，assembleAgentLoop 通过 createAgentRuntime
+  // 装配 coordinator 后回写 refs.coordinator，工具被激活。
+  const refs: RuntimeRefs = {
+    coordinator: null,
+    fileHistory,
+    claimStore,
+    sessionId,
+    sessionRegistry: registry ?? null,
+    taskLedger: null,
+    ownershipLedger: null,
+    verificationSnapshotManager: null,
+    deliveryGate: null,
+    meridianIndexer: null,
+    mcpManager: null,
+    lspManager: null,
+    banditState: null,
+    promptEngine: null,
+    // Wave F: 通过 SharedRuntime → RuntimeSessionManager.sameCwdRunningCount
+    // 注入真实计数；shared 缺失或 manager 未就绪退化为 0（保持 TUI 兼容行为）。
+    getSameCwdRunningSessions: shared
+      ? () => shared.sameCwdRunningCount?.(cwd, sessionId) ?? 0
+      : undefined,
+    goalTrackerRef: { current: null },
+  }
+  const { registry: toolRegistry } = createInteractiveToolRegistry(refs, ctx.config, cwd)
+
+  // recall / remember：bootstrap 在 createInteractiveToolRegistry 外装的两个工具，
+  // 这里复用 sidecar 已有的 claimStore + session 完成对齐。
+  toolRegistry.register(createRecallTool(claimStore, {
+    sessionId,
+    getTurn: () => session.getTurnCount(),
+  }))
+  toolRegistry.register(createRememberTool(claimStore, {
+    sessionId,
+    getTurn: () => session.getTurnCount(),
+  }))
+
+  // taskLedger / ownershipLedger 由 createInteractiveToolRegistry 的 B1 装配段
+  // 原地填入 refs；fallback 仅用于装配失败时不破坏 assembleAgentLoop 的 deps。
+  const taskLedger = refs.taskLedger ?? createTaskLedger({ taskId: sessionId })
+  const ownershipLedger = refs.ownershipLedger ?? createOwnershipLedger({
+    baseline: createWorktreeBaseline(captureGitBaseline(cwd)),
+    taskLedger,
+  })
+
+  // Register MCP tools (if the server-level manager has already initialized).
+  // Late-init: sessions created before MCP finishes connecting won't get MCP
+  // tools, but subsequent sessions will.
+  const mcpMgr = shared?.mcpManager
+  if (mcpMgr) {
+    const mcpTools = mcpMgr.getAllTools()
+    for (const tool of mcpTools) {
+      toolRegistry.register(tool)
+    }
+  }
+
+  return { persist, claimStore, fileHistory, toolRegistry, session, taskLedger, ownershipLedger, refs }
+}
+
+/**
+ * Assemble an AgentLoop from prebuilt session stores + a resolved model spec.
+ * Reusing `stores.session` across calls is what lets switchModel hot-swap the
+ * model while keeping the conversation history intact.
+ *
+ * Wave C: 通过 bootstrap.createAgentRuntime 装配——它会构造 DelegationCoordinator
+ * 并填到 stores.refs.coordinator，激活之前注册占位的 5 个 coordinator 依赖工具
+ * （delegate_task / delegate_batch / team_orchestrate / council_convene /
+ * plan_task）以及 deliver_task 的审查 worker spawn 路径。与 TUI bootstrap 路径
+ * 共享同一份装配逻辑，行为完全等价。
+ */
+function assembleAgentLoop(
+  ctx: ServeContext,
+  cwd: string,
+  sessionId: string,
+  stores: SessionStores,
+  spec: ResolvedModelSpec,
+  approvalMode: ApprovalMode | undefined,
+  registry?: SessionRegistry,
+  shared?: SharedRuntime,
+): AgentLoop {
+  // Wave J: domainKnowledgeStore 优先从 sidecar SharedRuntime.domainStores
+  // 按 cwd 取；fallback 是 per-call new（与 bootstrap 单 session 行为一致——
+  // 用于 buildAgentLoop legacy /prompt 路径未传 shared 的情况）。
+  const domainKnowledgeStore = shared
+    ? getOrCreateDomainStore(shared, cwd)
+    : new DomainKnowledgeStore(join(cwd, '.rivet', 'knowledge'))
+
+  // sessionRegistry 透传：bootstrap.createAgentRuntime 通过 refs.sessionRegistry
+  // 间接接到 AgentLoop，所以在调装配前先回写 refs（buildSessionStores 已经接收
+  // 过 registry，但 switchModel 重建路径需要在每次调用都确保 refs 同步）。
+  if (registry) stores.refs.sessionRegistry = registry
+
+  const { agent } = createAgentRuntime({
+    provider: spec.provider,
+    apiKey: spec.apiKey,
+    auth: spec.auth,
+    config: ctx.config,
+    sessionId,
+    cwd,
+    toolRegistry: stores.toolRegistry,
+    persist: stores.persist,
+    claimStore: stores.claimStore,
+    fileHistory: stores.fileHistory,
+    refs: stores.refs,
+    domainKnowledgeStore,
+    modelId: spec.model.id,
+    session: stores.session,
+    // Wave J: 跨 session 复用 ProviderHealthTracker，让 switchModel 不丢
+    // provider 健康累积；coordinator 冷层路由有正确依据。
+    sharedProviderHealth: shared?.providerHealth,
+  })
+
+  // approvalMode 在 createAgentRuntime 内部未接收；构造后立即覆盖
+  // （setApprovalMode 直接 mutate config.approvalMode，与构造时设等价）。
+  if (approvalMode) agent.setApprovalMode(approvalMode)
+
+  return agent
+}
+
+/**
+ * Build a fully-wired AgentLoop for one session rooted at `cwd`. Each call gets
+ * its own SessionPersist / claim store / FileHistory / PlaybookStore / tool
+ * registry / PromptEngine (via createAgentConfig) and its own ArtifactStore
+ * (created internally by AgentLoop, keyed by sessionId) — so concurrent
+ * sessions never share prompt cache state or artifacts.
+ *
+ * R1: when a shared `registry` is supplied (desktop multi-session path), each
+ * session also gets its own TaskLedger + OwnershipLedger and the registry is
+ * threaded into AgentLoop config so file claims / OwnershipGuard / cross-session
+ * conflict blocking become live. Omitting `registry` (CLI / single-session)
+ * keeps the previous behavior byte-for-byte.
+ */
+export function buildAgentLoop(
+  ctx: ServeContext,
+  cwd: string,
+  sessionId: string = randomUUID(),
+  registry?: SessionRegistry,
+  approvalMode?: ApprovalMode,
+  shared?: SharedRuntime,
+): BuiltAgent {
+  const stores = buildSessionStores(ctx, cwd, sessionId, registry, shared)
+  const spec: ResolvedModelSpec = {
+    provider: ctx.provider,
+    apiKey: ctx.apiKey,
+    auth: ctx.auth,
+    model: {
+      id: ctx.model.id,
+      maxTokens: ctx.model.maxTokens,
+      contextWindow: ctx.model.contextWindow,
+      reasoningEffort: ctx.model.reasoningEffort,
+    },
+  }
+  const agent = assembleAgentLoop(ctx, cwd, sessionId, stores, spec, approvalMode, registry, shared)
+  return { agent, sessionId }
+}
+
+/**
+ * Build a ManagedAgent whose underlying AgentLoop can be hot-swapped onto a new
+ * model (switchModel) without losing the conversation. The shared SessionStores
+ * (including SessionContext) are built once; switchModel re-assembles only the
+ * AgentLoop on a freshly resolved model spec and re-points the holder, so every
+ * delegating method below transparently uses the live agent.
+ */
+function buildManagedAgent(
+  ctx: ServeContext,
+  cwd: string,
+  sessionId: string,
+  registry: SessionRegistry | undefined,
+  approvalMode: ApprovalMode | undefined,
+  shared?: SharedRuntime,
+): import('./session-manager.js').ManagedAgent {
+  const stores = buildSessionStores(ctx, cwd, sessionId, registry, shared)
+  let spec: ResolvedModelSpec = {
+    provider: ctx.provider,
+    apiKey: ctx.apiKey,
+    auth: ctx.auth,
+    model: {
+      id: ctx.model.id,
+      maxTokens: ctx.model.maxTokens,
+      contextWindow: ctx.model.contextWindow,
+      reasoningEffort: ctx.model.reasoningEffort,
+    },
+  }
+  let agent = assembleAgentLoop(ctx, cwd, sessionId, stores, spec, approvalMode, registry, shared)
+  return {
+    run: (prompt, callbacks, images) => agent.run(prompt, callbacks, images),
+    abort: () => agent.abort(),
+    setApprovalMode: (mode) => agent.setApprovalMode(mode),
+    enterPlanMode: () => agent.enterPlanMode(),
+    exitPlanMode: () => agent.exitPlanMode(),
+    setActivePlan: (plan) => agent.setActivePlan(plan),
+    listArtifacts: () => agent.artifactStore?.list() ?? [],
+    readArtifact: (artifactId) => agent.artifactStore?.readRaw(artifactId) ?? Promise.resolve(null),
+    getMessages: () => agent.session.getMessages(),
+    replaceMessages: (msgs) => { agent.session.replaceMessages(msgs); agent.config.promptEngine.resetAppendixBaseline() },
+    rewindToMessages: (msgs) => { agent.session.rewindToMessages(msgs); agent.config.promptEngine.resetAppendixBaseline() },
+    // PlusMenu — star domain (delegate to the live agent).
+    setSessionDomain: (domain) => agent.setSessionDomain(domain),
+    resetSessionDomain: () => agent.resetSessionDomain(),
+    getSessionDomain: () => agent.getSessionDomain(),
+    // PlusMenu — skills (per-session discovery filter on the live agent).
+    setDisabledSkills: (names) => agent.setDisabledSkills(names),
+    // PlusMenu — model hot-switch (rebuild on the same SessionContext).
+    // Wave C-followup P0: createAgentRuntime 在 refs 上原地装新 coordinator/
+    // providerHealth/runtimeFactory，但旧 coordinator 的 stallSweep 定时器与
+    // 在途 worker AbortController 仍持有句柄。sidecar 长驻进程 + 频繁
+    // switchModel 会累积泄漏。先 capture old，装新后调 shutdown 释放。
+    // Wave J: 透传 shared 让 switchModel 后仍复用 providerHealth/domainStore，
+    // 健康数据不丢、knowledge 不重 load。
+    switchModel: (modelId) => {
+      const next = resolveModelSpec(ctx, modelId)
+      if (!next) return null
+      const oldCoordinator = stores.refs.coordinator
+      spec = next
+      agent = assembleAgentLoop(ctx, cwd, sessionId, stores, spec, approvalMode, registry, shared)
+      if (oldCoordinator && oldCoordinator !== stores.refs.coordinator) {
+        try { oldCoordinator.shutdown() } catch { /* best-effort: shutdown is fail-open */ }
+      }
+      return spec.model.id
+    },
+    // Context usage display (desktop header progress bar).
+    getEstimatedTokens: () => agent.session.getEstimatedTokens(),
+    getContextWindow: () => spec.model.contextWindow,
+    // Wave L: 进程退出释放本 session 的 coordinator timer + in-flight worker
+    // 句柄。abort() 仅中止当前 turn；shutdown() 是终结性操作。
+    shutdown: () => {
+      try { stores.refs.coordinator?.shutdown() } catch { /* best-effort */ }
+    },
+  }
+}
+
+export interface RunServeOptions {
+  port?: number
+  token?: string
+  /** Override the serve context (tests inject a fake). */
+  context?: ServeContext
+  /** Directory for durable desktop session storage. Defaults to ~/.rivet/desktop/sessions. */
+  sessionDir?: string
+  /** Disable persistence (tests / ephemeral). */
+  ephemeral?: boolean
+  /**
+   * R1 — shared cross-session registry (file claims / OwnershipGuard / conflict
+   * blocking). Tests inject a pre-built one; production creates it async at boot.
+   * When absent, concurrency features stay dormant and behavior is unchanged.
+   */
+  sessionRegistry?: SessionRegistry
+}
+
+export interface RunningServer {
+  port: number
+  close: () => void
+  sessions: RuntimeSessionManager
+  scheduler?: CronScheduler
+}
+
+/**
+ * Start the runtime API server. Returns the bound port, a close() that aborts
+ * all in-flight work, and the RuntimeSessionManager backing the multi-session
+ * API. Throws if no token is available (fail-closed).
+ */
+export function runServe(opts: RunServeOptions = {}): RunningServer {
+  const apiToken = (opts.token ?? process.env.RIVET_SERVER_TOKEN)?.trim()
+  if (!apiToken) {
+    throw new Error('RIVET_SERVER_TOKEN is required for rivet serve')
+  }
+  const port = opts.port ?? 3100
+  const ctx = opts.context ?? resolveServeContext()
+  const startedAt = Date.now()
+
+  // R1 — one shared SessionRegistry for the whole sidecar. Created async (the
+  // SQLite backend dynamic-imports better-sqlite3); sessions are created
+  // seconds later by user interaction, by which time it's resolved. Tests pass a
+  // pre-built registry. Ephemeral mode (tests) skips it → behavior unchanged.
+  let sessionRegistry: SessionRegistry | undefined = opts.sessionRegistry
+  if (!sessionRegistry && !opts.ephemeral) {
+    const registryDir = process.env.RIVET_DESKTOP_DIR ?? join(homedir(), '.rivet', 'desktop')
+    void SessionRegistry.create(registryDir)
+      .then((r) => { sessionRegistry = r })
+      .catch((err) => {
+        // Registry init failed (e.g. better-sqlite3 native build missing).
+        // Concurrency features stay dormant; surface the cause instead of
+        // silently swallowing it so the failure is diagnosable in logs.
+        console.error('[serve] SessionRegistry unavailable:', (err as Error)?.message ?? err)
+      })
+  }
+
+  // N1: durable session storage so sessions survive sidecar restarts.
+  const persistence = opts.ephemeral
+    ? undefined
+    : new FileSessionPersistence(
+        opts.sessionDir ??
+          process.env.RIVET_DESKTOP_SESSION_DIR ??
+          join(homedir(), '.rivet', 'desktop', 'sessions'),
+      )
+
+  // Wave J: sidecar 级 SharedRuntime——providerHealth 跨 session 共享让
+  // health 统计累积；domainStores 按 cwd 缓存避免重复磁盘 load + 跨 session
+  // lessons 可见。runServe 进程级单例，传给每个 buildManagedAgent。
+  // Wave F: sameCwdRunningCount 是 late-bound——sessions 创建后才能引用，
+  // 先置 null，sessions 就绪后回写。getSameCwdRunningSessions getter 对
+  // sessions 未就绪的窗口期会回退 0（安全）。
+  const sharedRuntime: SharedRuntime = {
+    providerHealth: new ProviderHealthTracker(),
+    domainStores: new Map(),
+    sameCwdRunningCount: null,
+    mcpManager: null,
+  }
+
+  // Initialize MCP manager asynchronously — connects to configured servers,
+  // discovers tools, and registers them to the shared runtime. Fire-and-forget
+  // so server startup isn't blocked on slow MCP servers.
+  void (async () => {
+    try {
+      const mgr = new McpManager(ctx.config.mcp)
+      await mgr.initialize()
+      sharedRuntime.mcpManager = mgr
+      serverLogger.info(`MCP: ${mgr.getStates().filter(s => s.status === 'connected').length} servers connected, ${mgr.getAllTools().length} tools`)
+    } catch (err) {
+      serverLogger.warn('MCP initialization failed:', (err as Error)?.message ?? err)
+    }
+  })()
+
+  // Multi-session manager (M0.5): each session is an independent AgentLoop,
+  // adapted to the manager's ManagedAgent surface (run/abort + artifacts). The
+  // manager's session id is threaded into buildAgentLoop so the agent's stores
+  // align with the session.
+  const sessions = new RuntimeSessionManager({
+    createAgent: (cwd, sessionId, approvalMode) =>
+      buildManagedAgent(ctx, cwd ?? process.cwd(), sessionId ?? randomUUID(), sessionRegistry, approvalMode, sharedRuntime),
+    defaultCwd: process.cwd(),
+    persistence,
+    // R1 — late-bound getter: registry resolves async after server start.
+    getSessionRegistry: () => sessionRegistry,
+    // PlusMenu — provider model source + default for the model picker.
+    listModels: () => listAllModels(ctx),
+    defaultModelId: ctx.model.id,
+  })
+
+  // Wave F: sessions 现已就绪——把真实 sameCwdRunningCount 回写到 SharedRuntime。
+  // 之后任何 buildManagedAgent → buildSessionStores 创建的 refs.getSameCwdRunningSessions
+  // 都会读到这条真实值；verificationSnapshotManager 的多 session 冲突检测真正生效。
+  sharedRuntime.sameCwdRunningCount = (cwd, excludeSessionId) =>
+    sessions.sameCwdRunningCount(cwd, excludeSessionId)
+
+  // Legacy single-prompt path (M0): one-shot POST /prompt SSE.
+  const activeAgents = new Set<AgentLoop>()
+  let activeAgent: AgentLoop | null = null
+  const state: ServerState = {
+    running: false,
+    apiToken,
+    abort: () => {
+      for (const agent of activeAgents) agent.abort()
+      sessions.abortAll()
+    },
+  }
+
+  const routes = createRoutes(state, {
+    createAgent: () => {
+      // Wave J: legacy /prompt 路径同样复用 sharedRuntime——避免与
+      // /sessions/:id/prompt 路径间健康统计不一致。
+      const { agent, sessionId } = buildAgentLoop(ctx, process.cwd(), undefined, undefined, undefined, sharedRuntime)
+      activeAgents.add(agent)
+      activeAgent = agent
+      state.running = true
+      state.sessionId = sessionId
+      return {
+        run: async (prompt, callbacks) => {
+          try {
+            await agent.run(prompt, callbacks)
+          } finally {
+            activeAgents.delete(agent)
+            if (activeAgent === agent) activeAgent = activeAgents.values().next().value ?? null
+            state.running = activeAgents.size > 0
+            state.sessionId = activeAgent?.config.sessionId
+          }
+        },
+        abort: () => agent.abort(),
+      }
+    },
+  })
+
+  // Multi-session routes (M0.5 → M3): /sessions/*. R3 rollback routes consult
+  // the live registry to build an OwnershipGuard, so thread it in via getter.
+  Object.assign(routes, buildSessionRoutes(sessions, apiToken, () => sessionRegistry))
+
+  // Config routes: provider + API key management for the desktop settings UI.
+  Object.assign(routes, buildConfigRoutes(apiToken))
+
+  // MCP routes: server management + live status for the desktop MCP settings UI.
+  Object.assign(routes, buildMcpRoutes(() => sharedRuntime.mcpManager, apiToken))
+
+  // Open file in system editor — thin wrapper so the Desktop webview can
+  // request the sidecar to open a local path without needing a Tauri plugin.
+  routes['POST /open-file'] = (body) => {
+    const filePath = (body as Record<string, unknown>)?.path
+    if (typeof filePath !== 'string' || !filePath) {
+      return { status: 400, body: { error: 'Missing path' } }
+    }
+    import('node:child_process').then(({ execFile }) => {
+      const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open'
+      execFile(opener, [filePath], () => {})
+    })
+    return { status: 200, body: { opened: filePath } }
+  }
+
+  // N1: GET /health — sidecar liveness for the desktop crash-reconnect banner.
+  const version = process.env.npm_package_version ?? '2.9.0'
+  // registryOk lets the desktop tell "sidecar up but concurrency dormant" apart
+  // from a healthy sidecar. In ephemeral/test mode (no registry wired) it reads
+  // true so existing single-session behavior is unchanged.
+  Object.assign(
+    routes,
+    buildHealthRoute(sessions, startedAt, version, apiToken, () =>
+      opts.ephemeral ? true : sessionRegistry !== undefined,
+    ),
+  )
+
+  // N3: async orchestration — cron scheduler → task registry → runtime pool that
+  // spins up *visible* sessions. Disabled in ephemeral mode (tests) to avoid
+  // leaking timers.
+  let scheduler: CronScheduler | undefined
+  let wiring: CronWiring | undefined
+  if (!opts.ephemeral) {
+    const rivetDir = process.env.RIVET_DESKTOP_DIR ?? join(homedir(), '.rivet', 'desktop')
+    scheduler = new CronScheduler({ schedulePath: join(rivetDir, 'scheduled_tasks.json') })
+    const registry = new TaskRegistry({ taskStore: new JsonTaskStore(join(rivetDir, 'tasks')) })
+    const runtimePool = new SessionRuntimePool({ manager: sessions, defaultCwd: process.cwd() })
+    // CronLock: with multiple sidecars pointed at the same desktop dir, exactly
+    // one wins the lock and runs the scheduler — the rest stay idle instead of
+    // double-firing every scheduled task.
+    const lock = new CronLock({ lockPath: join(rivetDir, 'scheduled_tasks.lock') })
+    wiring = new CronWiring({ scheduler, registry, runtimePool, lock })
+    void wiring.start().catch(() => { /* non-fatal: scheduler stays idle */ })
+    Object.assign(routes, buildScheduleRoutes(scheduler, apiToken))
+  }
+
+  const server = startServer(port, routes, apiToken)
+  return {
+    port,
+    sessions,
+    scheduler,
+    close: () => {
+      for (const agent of activeAgents) agent.abort()
+      sessions.abortAll()
+      // Wave L: 与 TUI createShutdownHandler 对称——abort 中止 turn 后，对所有
+      // session 显式 shutdown 释放 coordinator stallSweep + 在途 worker 句柄。
+      // 进程退出 OS 会回收，但显式 shutdown 语义清晰、对齐双侧路径。
+      sessions.shutdownAll()
+      void wiring?.stop()
+      wiring?.dispose()
+      scheduler?.stop()
+      // Kill MCP child processes synchronously — async shutdown() may not
+      // complete before the process exits, leaving orphaned subprocesses.
+      sharedRuntime.mcpManager?.killChildrenSync()
+      server.close()
+    },
+  }
+}
+
+/**
+ * CLI command handler for `rivet serve [--port N]`. Wires signal handlers and
+ * prints the listening banner. Exits non-zero on misconfiguration.
+ */
+export function serveCommand(args: string[]): void {
+  const portIdx = args.indexOf('--port')
+  const port = parseInt(portIdx >= 0 ? args[portIdx + 1]! : '3100', 10)
+
+  let server: RunningServer
+  try {
+    server = runServe({ port })
+  } catch (err) {
+    console.error((err as Error).message)
+    process.exit(1)
+  }
+
+  const shutdownServer = () => {
+    server.close()
+    process.exit(0)
+  }
+  process.on('SIGINT', shutdownServer)
+  process.on('SIGTERM', shutdownServer)
+
+  console.log(`Rivet Runtime API listening on http://localhost:${port}`)
+  console.log('Endpoints: GET /status, POST /abort, POST /prompt, /sessions/*')
+}

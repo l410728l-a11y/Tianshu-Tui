@@ -1,10 +1,12 @@
 import { readFile, stat } from 'node:fs/promises'
 import { createHash } from 'crypto'
+import { relative } from 'node:path'
 import type { Tool, ToolCallParams } from './types.js'
 import { validatePath } from './path-validate.js'
 import { syntaxCheck } from './syntax-check.js'
-import { getFileReadMtime, refreshFileReadMtime } from './read-file.js'
+import { getFileReadMtime, refreshFileReadMtime, markSessionFileEdit } from './read-file.js'
 import { writeFileAtomicAsync } from '../fs-atomic.js'
+import { trackFileChange } from '../agent/recovery-stack.js'
 
 /**
  * Compute a 8-char hex hash of a line's content (stripped of trailing \r).
@@ -104,17 +106,26 @@ edit_file). Use when you just read the file — never chain position-only calls.
 
 ### Hash computation
 The hash is SHA256(line_content_without_trailing_cr)[0:8].
-Use read_file first to see current content, then construct anchors from the lines you want to target.`,
+Use read_file first to see current content, then construct anchors from the lines you want to target.
+
+### grep → hash_edit direct path (large file editing)
+For large files, you can skip read_file entirely:
+1. grep(pattern="targetCode", path="/abs/path/file.ts") → grep results include hash_edit anchor hints
+2. Copy the anchor from the hints (e.g. L580:a1b2c3d4)
+3. hash_edit(file_path="/abs/path/file.ts", anchors=["L580:a1b2c3d4"], new_string="replacement")
+This avoids the read→truncate→re-read loop for large files.
+
+**Note:** For large new_string blocks, the message history keeps only a short pointer (file_path + size) instead of the full replacement text. The edit is still applied to disk in full — use \`read_file\` to review the current content in a later turn.`,
     input_schema: {
       type: 'object',
       properties: {
-        file_path: { type: 'string', description: 'Absolute path to the file to edit' },
+        file_path: { type: 'string', description: 'Absolute path to the file to edit. Provide this parameter first.' },
         anchors: {
           type: 'array',
           items: { type: 'string' },
           description: '1-3 anchors in "L<line>:<8-char-hex>" (full) or "L<line>" (position-only) format. First and last define the inclusive replacement range.',
         },
-        new_string: { type: 'string', description: 'Replacement text for the anchored block. Use "" to delete.' },
+        new_string: { type: 'string', description: 'Replacement text for the anchored block. Use "" to delete. Provide this parameter last.' },
       },
       required: ['file_path', 'anchors', 'new_string'],
     },
@@ -123,7 +134,7 @@ Use read_file first to see current content, then construct anchors from the line
   async execute(params: ToolCallParams) {
     let filePath: string
     try {
-      filePath = validatePath(params.cwd, params.input.file_path as string)
+      filePath = validatePath(params.cwd, params.input.file_path as string, 'write')
     } catch {
       return { content: 'Error: Path escapes project directory', isError: true }
     }
@@ -178,14 +189,13 @@ Use read_file first to see current content, then construct anchors from the line
     if (posOnly) {
       const lastReadMtime = getFileReadMtime(filePath)
       if (lastReadMtime !== null && currentMtime !== lastReadMtime) {
-        return {
-          content: [
-            `hash_edit position-only stale guard: ${filePath} was modified since your last read_file.`,
-            `Last read mtime: ${lastReadMtime}, current mtime: ${currentMtime}.`,
-            'Re-read the relevant portion and retry with updated anchors, or use full L<num>:<hash> anchors.',
-          ].join('\n'),
-          isError: true,
-        }
+        // Auto-refresh stale mtime instead of rejecting. Position-only anchors
+        // are verified by the line-existence check below — if line numbers
+        // shifted beyond file bounds, the verification loop catches it.
+        // This avoids the common self-interference case where a prior hash_edit
+        // in the same turn changes mtime, making the next position-only call
+        // stale even though its anchors point to a different part of the file.
+        refreshFileReadMtime(filePath, currentMtime)
       }
     }
 
@@ -207,6 +217,71 @@ Use read_file first to see current content, then construct anchors from the line
     }
 
     if (mismatches.length > 0) {
+      // ── Stale recovery: attempt to find anchor content in current file ──
+      // When full-hash anchors go stale (e.g. after a prior edit shifted line
+      // numbers), search ±N lines around the expected position for matching
+      // content. If ALL mismatching anchors are recovered, apply the edit with
+      // updated anchors. If ANY cannot be found, fall through to the error.
+      const SEARCH_WINDOW = 50
+      const allFullHash = mismatches.every(m => m.anchor.hash !== null)
+      if (allFullHash) {
+        const recoveredAnchors: Anchor[] = anchors.map(a => ({ line: a.line, hash: a.hash }))
+        let allRecovered = true
+        let recoveredCount = 0
+
+        for (const m of mismatches) {
+          const targetHash = m.anchor.hash!
+          const searchStart = Math.max(1, m.anchor.line - SEARCH_WINDOW)
+          const searchEnd = Math.min(lines.length, m.anchor.line + SEARCH_WINDOW)
+          let found = false
+          for (let i = searchStart; i <= searchEnd; i++) {
+            if (hashLine(lines[i - 1]!) === targetHash) {
+              // Update this anchor to its new position
+              const idx = recoveredAnchors.findIndex(a => a.line === m.anchor.line && a.hash === m.anchor.hash)
+              if (idx >= 0) recoveredAnchors[idx] = { line: i, hash: targetHash }
+              found = true
+              recoveredCount++
+              break
+            }
+          }
+          if (!found) {
+            allRecovered = false
+            break
+          }
+        }
+
+        if (allRecovered && recoveredAnchors.every(a => a.line > 0)) {
+          // Re-validate ascending order after recovery
+          let orderOk = true
+          for (let i = 1; i < recoveredAnchors.length; i++) {
+            if (recoveredAnchors[i]!.line <= recoveredAnchors[i - 1]!.line) { orderOk = false; break }
+          }
+          if (orderOk) {
+            const firstLine = recoveredAnchors[0]!.line
+            const lastLine = recoveredAnchors[recoveredAnchors.length - 1]!.line
+            const newString = params.input.new_string as string
+
+            const before = lines.slice(0, firstLine - 1)
+            const after = lines.slice(lastLine)
+            const newLines = newString === '' ? [] : newString.split('\n')
+            const newContent = [...before, ...newLines, ...after].join('\n')
+
+            const relPath = relative(params.cwd, filePath)
+            trackFileChange(params.cwd, { filePath: relPath, action: 'edit', toolCallId: params.toolUseId ?? 'hash_edit' })
+
+            await writeFileAtomicAsync(filePath, newContent)
+            refreshFileReadMtime(filePath, (await stat(filePath)).mtimeMs)
+            markSessionFileEdit(filePath)
+            const warn = syntaxCheck(filePath, newContent)
+            const recoveredInfo = recoveredCount > 0
+              ? ` (auto-recovered ${recoveredCount} stale anchors)`
+              : ''
+            return { content: `hash_edit${recoveredInfo} applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines` + (warn ? '\n\n' + warn : '') }
+          }
+        }
+      }
+
+      // Recovery not possible — return the original stale diagnostic
       return {
         content: formatStaleDiagnostic(filePath, anchors, lines, mismatches),
         isError: true,
@@ -224,8 +299,13 @@ Use read_file first to see current content, then construct anchors from the line
     const newLines = newString === '' ? [] : newString.split('\n')
     const newContent = [...before, ...newLines, ...after].join('\n')
 
+    // Record file change for recovery tracking (backup created by trackFileChange)
+    const relPath = relative(params.cwd, filePath)
+    trackFileChange(params.cwd, { filePath: relPath, action: 'edit', toolCallId: params.toolUseId ?? 'hash_edit' })
+
     await writeFileAtomicAsync(filePath, newContent)
     refreshFileReadMtime(filePath, (await stat(filePath)).mtimeMs)
+    markSessionFileEdit(filePath)
     const warn = syntaxCheck(filePath, newContent)
     return { content: `hash_edit applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines` + (warn ? '\n\n' + warn : '') }
   },

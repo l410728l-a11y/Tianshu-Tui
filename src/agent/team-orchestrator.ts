@@ -8,7 +8,9 @@ import { createTeamSchedulerBandit, parallelismForTeamSchedulerArm, recommendTea
 import { applyTeamSchedulerInfluence, evaluateTeamSchedulerGate } from './team-scheduler-gate.js'
 import { buildTeamSchedulerShadowEvent, type TeamSchedulerShadowEvent } from './team-scheduler-shadow.js'
 import { buildGatedInfluenceAuditEvent, type GatedInfluenceAuditEvent } from './gated-influence-audit.js'
-import { buildPlannerObjective, mergePerspectives, normalizePerspective, parsePerspectiveResult, type TeamPerspectivePlan } from './team-perspectives.js'
+import { buildPlannerObjective, mergePerspectivesByRole, normalizePerspective, parsePerspectiveResult, type TeamPerspectivePlan } from './team-perspectives.js'
+import { selectExpertSet } from './expert-router.js'
+import { loadTeamPlanSkeleton, saveTeamPlanSkeleton, type TeamPlanCacheStore } from './team-plan-cache.js'
 
 export interface TeamOrchestratorDeps {
   delegateBatch(
@@ -22,12 +24,18 @@ export interface TeamOrchestratorDeps {
   recordGatedInfluenceAudit?: (event: GatedInfluenceAuditEvent) => void
   teamSchedulerState?: TeamSchedulerBanditState
   sessionId?: string
+  /** Track 2: team max 计划骨架缓存 — 命中则跳过三视角 planner fanout。 */
+  planCacheStore?: TeamPlanCacheStore
 }
 
 export interface TeamRunInput {
   mode: 'standard' | 'max'
   objective: string
   planMarkdown?: string
+  /** Pre-parsed team tasks — skip Markdown parsing entirely.
+   *  When provided, both planMarkdown and max planner fanout are bypassed.
+   *  This is the bridge for plan_task → team_orchestrate integration. */
+  tasks?: TeamTask[]
   maxParallel?: number
   parentTurnId?: string
   abortSignal?: AbortSignal
@@ -36,6 +44,14 @@ export interface TeamRunInput {
   /** Dispatch this wave index (default 0). Main controller increments after
    *  integrating each wave's diffs to drive multi-wave execution. */
   fromWave?: number
+  /** T9 P3: real-time worker activity upstream — injected into every
+   *  dispatched DelegationRequest so the TeamPanel can show live progress. */
+  onActivity?: DelegationRequest['onActivity']
+  /** Fleet viz: invoked once the wave plan is computed but BEFORE workers are
+   *  dispatched, so the UI can render the wave/task DAG (all waiting) up front
+   *  and overlay running state from live worker activity. The summary carries
+   *  waves+tasks but no `run`. */
+  onPlanReady?: (summary: TeamRunSummary, fromWave: number) => void
 }
 
 export interface TeamRunSummary {
@@ -47,6 +63,8 @@ export interface TeamRunSummary {
   blocked: string[]
   packet: string
   run?: CoordinatorRun
+  /** Track 2: true when the max-mode planner fanout was skipped via plan cache. */
+  planCacheHit?: boolean
 }
 
 function isFileScopedPatcher(task: TeamTaskDraft): boolean {
@@ -260,6 +278,7 @@ async function dispatchWaveAt(
     ...waves.slice(fromWave + 1).map(w => `${w.taskIds.join(', ')}: waiting for wave ${w.id} to complete`),
   ]
   const requests = waveToRequests(dispatchWave, taskMap, input.parentTurnId ?? 'team')
+  if (input.onActivity) for (const r of requests) r.onActivity = input.onActivity
   if (requests.length === 0) {
     return {
       mode: input.mode,
@@ -270,6 +289,21 @@ async function dispatchWaveAt(
       blocked: remainingBlocked,
       packet: `team: wave ${targetWave.id} produced no dispatchable requests.`,
     }
+  }
+
+  // Fleet viz: surface the wave/task DAG before dispatch so the TUI can show
+  // the plan (all waiting) immediately; running state is overlaid from live
+  // worker activity. No `run` yet → all tasks render as waiting.
+  if (input.onPlanReady) {
+    input.onPlanReady({
+      mode: input.mode,
+      planned,
+      tasks,
+      waves,
+      dispatched: requests.length,
+      blocked: remainingBlocked,
+      packet: `[wave ${fromWave + 1}/${waves.length}] dispatching ${requests.length} workers…`,
+    }, fromWave)
   }
 
   const run = await deps.delegateBatch(requests, 'all_required', input.abortSignal)
@@ -303,29 +337,73 @@ async function dispatchWaveAt(
 export async function runTeamSkeleton(input: TeamRunInput, deps: TeamOrchestratorDeps): Promise<TeamRunSummary> {
   const maxParallel = Math.max(1, Math.min(input.maxParallel ?? 3, 5))
 
+  // ── Fast path: pre-parsed tasks (plan_task → team_orchestrate bridge) ──
+  if (input.tasks && input.tasks.length > 0) {
+    const enrichedTasks = input.tasks
+    const waves = groupTeamTasks(enrichedTasks)
+    const taskMap = new Map(enrichedTasks.map(t => [t.id, t]))
+
+    if (waves.length === 0) {
+      return {
+        mode: 'standard',
+        planned: [],
+        tasks: enrichedTasks,
+        waves: [],
+        dispatched: 0,
+        blocked: ['pre-parsed tasks produced no dispatchable waves'],
+        packet: 'team: pre-parsed tasks — no waves to dispatch.',
+      }
+    }
+
+    return dispatchWaveAt(waves, input.fromWave ?? 0, {
+      taskMap,
+      tasks: enrichedTasks,
+      planned: [],
+      input,
+      deps,
+    })
+  }
+
   const drafts = input.mode === 'standard' && input.planMarkdown
     ? parseTeamTaskDrafts(input.planMarkdown)
     : []
   const enrichedTasks = input.planMarkdown ? parseTeamTasks(input.planMarkdown) : []
 
   if (input.mode === 'max') {
-    const perspectives = ['tianquan', 'tianfu', 'tianxuan'] as const
-    const plannerRequests: DelegationRequest[] = perspectives.map(perspective => ({
-      parentTurnId: `team:planner-${perspective}`,
-      objective: buildPlannerObjective(perspective, input.objective),
-      kind: 'plan',
-      profile: 'reviewer',
-      scope: {},
-      authority: perspective,
-    }))
-    const plannerRun = await deps.delegateBatch(plannerRequests, 'all_required', input.abortSignal)
+    // Track 2 plan cache: a fresh skeleton for the same/similar objective
+    // skips the 3-perspective planner fanout entirely. This also keeps wave
+    // indices stable when the main controller re-enters per fromWave.
+    const cached = loadTeamPlanSkeleton(deps.planCacheStore, input.objective, 'max')
+    let mergedTasks: TeamTask[]
+    let plannerRun: CoordinatorRun | undefined
+    if (cached) {
+      mergedTasks = cached.tasks
+    } else {
+      // Dynamic council: route the mission to a complementary expert set
+      // (base + constraint + challenger + any matched specialist) instead of a
+      // hardcoded trio. Flash (tierLock:'cheap') reviewer planners, one round.
+      const perspectives = selectExpertSet(input.objective)
+      const plannerRequests: DelegationRequest[] = perspectives.map(perspective => ({
+        parentTurnId: `team:planner-${perspective}`,
+        objective: buildPlannerObjective(perspective, input.objective),
+        kind: 'plan',
+        profile: 'reviewer',
+        scope: {},
+        authority: perspective,
+        onActivity: input.onActivity,
+      }))
+      plannerRun = await deps.delegateBatch(plannerRequests, 'all_required', input.abortSignal)
 
-    const planFor = (perspective: TeamPerspectivePlan['perspective']): TeamPerspectivePlan => {
-      const result = plannerRun.results.find(r => r.workOrderId.includes(`planner-${perspective}`))
-      return result ? parsePerspectiveResult(perspective, result) : normalizePerspective(perspective, {})
+      const planFor = (perspective: string): TeamPerspectivePlan => {
+        const result = plannerRun!.results.find(r => r.workOrderId.includes(`planner-${perspective}`))
+        return result ? parsePerspectiveResult(perspective, result) : normalizePerspective(perspective, {})
+      }
+      const merged = mergePerspectivesByRole(perspectives.map(planFor))
+      mergedTasks = merged.tasks
+      if (mergedTasks.length > 0) {
+        saveTeamPlanSkeleton(deps.planCacheStore, { objective: input.objective, mode: 'max', tasks: mergedTasks })
+      }
     }
-    const merged = mergePerspectives(planFor('tianquan'), planFor('tianfu'), planFor('tianxuan'))
-    const mergedTasks = merged.tasks
     const waves = groupTeamTasks(mergedTasks)
     const taskMap = new Map(mergedTasks.map(t => [t.id, t]))
 
@@ -338,17 +416,19 @@ export async function runTeamSkeleton(input: TeamRunInput, deps: TeamOrchestrato
         dispatched: 0,
         blocked: ['max planning produced no dispatchable tasks'],
         packet: 'team max: planners returned no tasks to dispatch.',
-        run: plannerRun,
+        ...(plannerRun ? { run: plannerRun } : {}),
+        ...(cached ? { planCacheHit: true } : {}),
       }
     }
 
-    return dispatchWaveAt(waves, input.fromWave ?? 0, {
+    const summary = await dispatchWaveAt(waves, input.fromWave ?? 0, {
       taskMap,
       tasks: mergedTasks,
       planned: [],
       input,
       deps,
     })
+    return cached ? { ...summary, planCacheHit: true } : summary
   }
 
   const waves = groupTeamTasks(enrichedTasks)
@@ -369,6 +449,7 @@ export async function runTeamSkeleton(input: TeamRunInput, deps: TeamOrchestrato
     }
 
     const requests = teamTasksToDelegationRequests(selected, input.parentTurnId ?? 'team')
+    if (input.onActivity) for (const r of requests) r.onActivity = input.onActivity
     const run = await deps.delegateBatch(requests, 'all_required', input.abortSignal)
     try {
       deps.recordTeamWaveTelemetry?.(buildTeamWaveTelemetry({

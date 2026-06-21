@@ -14,7 +14,7 @@ export interface AnthropicClientConfig {
 }
 
 interface AnthropicContentBlock {
-  type: 'text' | 'thinking' | 'tool_use' | 'tool_result'
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'image'
   text?: string
   thinking?: string
   id?: string
@@ -22,6 +22,7 @@ interface AnthropicContentBlock {
   input?: Record<string, unknown>
   tool_use_id?: string
   content?: string
+  source?: { type: 'base64'; media_type: string; data: string }
   cache_control?: { type: 'ephemeral'; ttl?: '1h' }
 }
 
@@ -64,6 +65,13 @@ export class AnthropicClient implements StreamClient {
     const body = this.buildRequestBody(request)
 
     await withStructuredRetry(async () => {
+      // 共享 lifecycle controller（见 openai-client 同名注释）：传给 fetch，
+      // 由外部 signal 联动并在 processSSEStream 的 finally 中 abort。
+      const lifecycle = new AbortController()
+      if (signal) {
+        if (signal.aborted) lifecycle.abort()
+        else signal.addEventListener('abort', () => lifecycle.abort(), { once: true })
+      }
       const response = await fetchWithTimeout(`${this.config.baseUrl.replace(/\/+$/, '')}/v1/messages`, {
         method: 'POST',
         headers: {
@@ -73,7 +81,7 @@ export class AnthropicClient implements StreamClient {
           'Accept': 'text/event-stream',
         },
         body: JSON.stringify(body),
-        signal,
+        signal: lifecycle.signal,
       }, this.config.thinkingBudget && this.config.thinkingBudget > 0 ? 90_000 : 45_000)
 
       if (!response.ok) {
@@ -92,7 +100,7 @@ export class AnthropicClient implements StreamClient {
         throw err
       }
 
-      await this.processSSEStream(response, callbacks, signal)
+      await this.processSSEStream(response, callbacks, signal, lifecycle)
     }, signal, {
       maxTotalDurationMs: 10 * 60_000,
       onRetry: (info) => {
@@ -225,6 +233,20 @@ export class AnthropicClient implements StreamClient {
 
   private convertMessage(msg: OaiMessage): AnthropicMessage {
     if (msg.role === 'user') {
+      // Multimodal: pass through content parts; Anthropic supports native image_url.
+      if (Array.isArray(msg.content)) {
+        return {
+          role: 'user',
+          content: msg.content.map(p => {
+            if (p.type === 'text') return { type: 'text', text: p.text }
+            // Convert OpenAI image_url format to Anthropic's image block format.
+            const url = p.image_url.url
+            const m = url.match(/^data:(image\/[a-z+]+);base64,(.+)$/)
+            if (m) return { type: 'image', source: { type: 'base64', media_type: m[1]!, data: m[2]! } }
+            return { type: 'text', text: `[unsupported image: ${url.slice(0, 50)}]` }
+          }),
+        }
+      }
       return {
         role: 'user',
         content: [{ type: 'text', text: msg.content }],
@@ -281,6 +303,8 @@ export class AnthropicClient implements StreamClient {
     response: Response,
     callbacks: StreamCallbacks,
     signal?: AbortSignal,
+    /** 共享 lifecycle controller：finally 中 abort 以拆 fetch 连接。见 stream() 注释。 */
+    lifecycle?: AbortController,
   ): Promise<void> {
     const reader = response.body?.getReader()
     if (!reader) throw new Error('No response body')
@@ -350,12 +374,14 @@ export class AnthropicClient implements StreamClient {
         if (streamTimedOut) throw new Error('Anthropic SSE stream idle timeout (180s)')
         if (done) break
         receivedFirstChunk = true
-        resetIdleTimer()
 
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() ?? ''
 
+        // keepalive 感知：Anthropic 心跳是 `data: {"type":"ping"}` 事件（非注释行），
+        // 故"进展"判定须排除 ping —— 只有真实内容事件才重置 idle timer。
+        let sawContentEvent = false
         for (const line of lines) {
           const trimmed = line.trim()
 
@@ -369,6 +395,7 @@ export class AnthropicClient implements StreamClient {
           try { parsed = JSON.parse(data) } catch { continue }
 
           const type = parsed.type as string
+          if (type !== 'ping') sawContentEvent = true
 
           switch (type) {
             case 'message_start': {
@@ -455,12 +482,16 @@ export class AnthropicClient implements StreamClient {
             }
           }
         }
+        // 仅在收到真实内容事件（排除 ping 心跳）时重置 idle timer
+        if (sawContentEvent) resetIdleTimer()
       }
     } finally {
       if (idleTimer) clearTimeout(idleTimer)
       if (maxStreamTimer) clearTimeout(maxStreamTimer)
       if (signalCleanup) signalCleanup()
       reader.releaseLock()
+      // 拆 fetch 连接（见 openai-client 同名注释）。
+      lifecycle?.abort()
     }
 
     // Emit text content block

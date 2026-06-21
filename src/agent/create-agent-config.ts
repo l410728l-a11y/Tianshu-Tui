@@ -1,7 +1,9 @@
-import { createProviderClient } from '../api/factory.js'
+import { createProviderClient, resolveApiKey } from '../api/factory.js'
 import { resolveCapabilities } from '../api/provider.js'
 import { PromptEngine } from '../prompt/engine.js'
+import { detectModelFamily } from '../prompt/static.js'
 import { createVolatileSnapshot } from '../prompt/volatile-snapshot.js'
+import { FallbackStreamClient } from '../api/fallback-client.js'
 import type { AgentConfig } from './loop-types.js'
 import type { CompactionConfig } from '../compact/constants.js'
 import type { ToolDefinition } from '../api/types.js'
@@ -27,12 +29,17 @@ export interface AgentConfigInput {
   sessionId: string
   toolDefinitions: ToolDefinition[]
   provider: ProviderConfig
+  /** All configured providers — needed for resolving fallback chain. */
+  allProviders?: Record<string, ProviderConfig>
   sessionMemoryBlock?: string
   approvalMode?: 'auto-accept' | 'auto-safe' | 'manual' | 'dangerously-skip-permissions'
   songlineEnabled?: boolean
   hearthObserveEnabled?: boolean
   antiAnchoring?: AntiAnchoringConfig
   intentRetrievalRouter?: IntentRetrievalRouterConfigInput
+  autoDelegateEnabled?: boolean
+  autoReasoning?: boolean
+  crossSessionEnabled?: boolean
   auth?: AuthProvider
   habituationThreshold?: number
   /** Optional permission config — allowlists, bash command prefixes, etc. */
@@ -47,6 +54,7 @@ export interface MainAgentConfigInputParams {
   sessionId: string
   toolDefinitions: ToolDefinition[]
   provider: ProviderConfig
+  allProviders?: Record<string, ProviderConfig>
   sessionMemoryBlock?: string
   auth?: AuthProvider
   habituationThreshold?: number
@@ -62,12 +70,16 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
     sessionId: params.sessionId,
     toolDefinitions: params.toolDefinitions,
     provider: params.provider,
+    allProviders: params.allProviders,
     sessionMemoryBlock: params.sessionMemoryBlock,
     approvalMode: params.config.agent.approval as 'auto-accept' | 'auto-safe' | 'manual' | 'dangerously-skip-permissions',
     songlineEnabled: params.config.agent.songlineEnabled,
     hearthObserveEnabled: params.config.agent.hearthObserveEnabled,
+    crossSessionEnabled: params.config.agent.crossSessionEnabled,
     antiAnchoring: params.config.agent.antiAnchoring,
     intentRetrievalRouter: params.config.agent.intentRetrievalRouter,
+    autoDelegateEnabled: params.config.agent.autoDelegateEnabled,
+    autoReasoning: params.config.agent.autoReasoning,
     auth: params.auth,
     habituationThreshold: params.habituationThreshold,
     permissions: params.config.agent.permissions as PermissionConfig,
@@ -76,7 +88,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
 
 export function createAgentConfig(input: AgentConfigInput): Pick<
   AgentConfig,
-  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'providerProfile' | 'primaryClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'permissions'
+  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'providerProfile' | 'providerName' | 'primaryClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'autoDelegateEnabled' | 'permissions'
 > {
   const { model, apiKey, cwd, provider } = input
   const capabilities = resolveCapabilities(provider.name, provider.capabilities)
@@ -84,7 +96,7 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     ? 64000
     : Math.min(16000, Math.floor(model.contextWindow * 0.02))
 
-  const client = createProviderClient(provider, capabilities, {
+  const primaryClient = createProviderClient(provider, capabilities, {
     apiKey,
     model: model.id,
     reasoningEffort: model.reasoningEffort,
@@ -92,17 +104,21 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     thinkingBudget,
     auth: input.auth,
     sessionId: input.sessionId,
- })
+  })
+
+  const client = buildFallbackChain(primaryClient, provider, model, input)
 
   const promptEngine = new PromptEngine({
     model: model.id,
     maxTokens: model.maxTokens,
-    staticCtx: { tools: input.toolDefinitions },
+    staticCtx: { tools: input.toolDefinitions, modelFamily: detectModelFamily(model.id) },
     volatileCtx: createVolatileSnapshot({
       cwd,
       sessionMemoryBlock: input.sessionMemoryBlock,
    }),
     habituationThreshold: input.habituationThreshold ?? 5,
+    prefixCache: capabilities.prefixCacheStrategy,
+    appendixDelta: process.env['RIVET_APPENDIX_DELTA'] === '1',
  })
 
   return {
@@ -111,18 +127,54 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     contextWindow: model.contextWindow,
     compact: input.compact,
     providerProfile: getProviderProfile(provider.name, model.contextWindow),
-    primaryClient: client,
+    providerName: provider.name,
+    primaryClient: primaryClient,
     sessionId: input.sessionId,
     approvalMode: input.approvalMode,
     songlineEnabled: input.songlineEnabled,
     hearthObserveEnabled: input.hearthObserveEnabled,
+    crossSessionEnabled: input.crossSessionEnabled,
     antiAnchoring: input.antiAnchoring,
     intentRetrievalRouter: input.intentRetrievalRouter,
-    autoReasoning: true,
+    autoDelegateEnabled: input.autoDelegateEnabled,
+    autoReasoning: input.autoReasoning ?? true,
     reasoningFloor: model.reasoningEffort,
     // GLM turn-level thinking: disable thinking on tool execution turns
     // to prevent reasoning_content accumulation and context window stalls.
     turnLevelThinking: provider.name === 'glm',
     permissions: input.permissions,
  }
+}
+
+function buildFallbackChain(
+  primary: import('../api/stream-client.js').StreamClient,
+  provider: ProviderConfig,
+  model: ModelSpec,
+  input: AgentConfigInput,
+): import('../api/stream-client.js').StreamClient {
+  const fallbackNames = provider.fallback
+  if (!fallbackNames?.length || !input.allProviders) return primary
+
+  const entries = fallbackNames
+    .filter(name => name !== provider.name && input.allProviders![name])
+    .map(name => ({
+      name,
+      create: () => {
+        const fp = input.allProviders![name]!
+        const fCaps = resolveCapabilities(fp.name, fp.capabilities)
+        let fApiKey: string
+        try { fApiKey = resolveApiKey(fp) } catch { return primary }
+        const fModel = fp.models.find(m => m.id === model.id) ?? fp.models[0]!
+        return createProviderClient(fp, fCaps, {
+          apiKey: fApiKey,
+          model: fModel.id,
+          maxTokens: fModel.maxTokens,
+          reasoningEffort: model.reasoningEffort,
+          sessionId: input.sessionId,
+        })
+      },
+    }))
+
+  if (entries.length === 0) return primary
+  return new FallbackStreamClient(primary, provider.name, entries)
 }

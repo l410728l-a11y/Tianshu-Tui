@@ -26,13 +26,17 @@ import type { Tool, ToolCallParams, ToolResult } from '../tools/types.js'
 import type { TaskLedger } from './task-ledger.js'
 import type { OwnershipLedger } from './ownership-ledger.js'
 import type { DeliveryGateV2 } from './delivery-gate-v2.js'
+import { filterExternalNoise } from './delivery-gate-v2.js'
 import { summarizeOwnershipHealth } from './ownership-health.js'
 import { commitScopedFiles, type ScopedCommitResult } from './scoped-git-commit.js'
 import { buildReviewPrincipleChecklist } from './review-principle-checklist.js'
 import { checkCommitCohesion } from './commit-cohesion.js'
-import { isCrossModule, isFixContext, shouldRouteReviewWorkflow, type ChangeSet } from './review-discipline.js'
-import { routeReviewWorkflow, type ReviewRouterDeps, type ReviewOutcome } from './review-router.js'
+import { isCrossModule, isFixContext, shouldRouteReviewWorkflow, type ChangeSet, type ReviewScale } from './review-discipline.js'
+import { routeReviewWorkflow, reviewWorkflowBudgetMs, type ReviewRouterDeps, type ReviewOutcome, type ReviewMode } from './review-router.js'
 import { isReviewDisciplineEnabled } from '../config/review-discipline-config.js'
+import type { ReviewConfig } from '../config/schema.js'
+import { recordAutoReviewRun } from './review-health.js'
+import { detectWroteButNeverRead, formatWroteButNeverRead, detectReadButNeverProduced, formatReadButNeverProduced } from './wiring-nudge.js'
 import { readUnacknowledged, acknowledgeAll, type RecoveryEntry } from './recovery-journal.js'
 
 export interface B1Context {
@@ -55,6 +59,41 @@ export interface B1Context {
   reviewDeps?: ReviewRouterDeps
   /** Re-entrancy guard: child review contexts must not recursively trigger review routing. */
   reviewDepth?: number
+  /** Task dependency depth — upgrades review scale for wiring/system tasks.
+   *  Accept a getter so the value is resolved at review-time, not context-creation time. */
+  getDepthLayer?: () => import('../context/task-contract.js').TaskDepthLayer | undefined
+  /** Test hook for the wrote-but-never-read static check. */
+  detectWroteButNeverRead?: typeof detectWroteButNeverRead
+  /** Test hook for the read-but-never-produced (虚假绿灯) static check. */
+  detectReadButNeverProduced?: typeof detectReadButNeverProduced
+  /** VSW: current active snapshotRef. When provided, the gate drops verifications
+   *  whose snapshotRef is stale (owned diff changed since they ran). Absent →
+   *  no supersession (unchanged default). */
+  getCurrentSnapshotRef?: () => string | undefined
+  /** True when a goal tracker is actively driving auto-continuation.
+   *  When active, post-commit auto-review is suppressed (L1 nudge-only)
+   *  to prevent child review workers from stalling the goal loop. */
+  isGoalActive?: () => boolean
+  /** True when the goal tracker deactivated with reason='achieved'.
+   *  Signals deliver_task to auto-upgrade the final commit review to L3. */
+  isGoalAchieved?: () => boolean
+  /** Review configuration snapshot (subset of agent.review). Used for per-config
+   *  gating of auto review (review.skipAuto) without re-reading the full Config.
+   *  Optional: absent → no-skip (preserves current behavior). */
+  reviewConfig?: ReviewConfig
+}
+
+// ── Post-commit review batching ──
+// When multiple deliver_task commits fire in quick succession (e.g. splitting
+// a large changeset into area-scoped commits), each would trigger a separate
+// review worker — wasteful when one review can cover the whole session's work.
+// Cooldown: after a review launches, skip subsequent launches within this window.
+const POST_COMMIT_REVIEW_COOLDOWN_MS = 30_000
+let lastPostCommitReviewAt = 0
+
+/** Test-only: reset the module-level cooldown so it does not leak across cases. */
+export function resetPostCommitReviewCooldown(): void {
+  lastPostCommitReviewAt = 0
 }
 
 function parseNulFileList(output: string): string[] {
@@ -128,10 +167,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
 - force: set to true to override the cohesion gate when committing many files across multiple areas. Use sparingly.
 
 ### Complex spec delivery checklist
-When the task implements a complex spec or cross-module integration, include these entries in the checklist parameter before commit:
-- fact-flow graph verified: every spec field/constraint has producer → intermediate structure → consumer/write target → assertion
-- condition matrix verified: combined gates (source × severity × apply, etc.) are covered per cell
-- counterexample tests verified: at least one test would fail for checklist-only/happy-path implementations, missing call contracts, type-without-consumer, or truthy/falsy sentinel mistakes.`,
+For complex specs or cross-module integration, include checklist entries: fact-flow graph verified, condition matrix verified, counterexample tests verified.`,
       input_schema: {
         type: 'object',
         properties: {
@@ -164,6 +200,15 @@ When the task implements a complex spec or cross-module integration, include the
             },
             description: 'Task completion audit entries. For complex specs include fact-flow graph verified, condition matrix verified, and counterexample tests verified/deferred.',
           },
+          review_level: {
+            type: 'string',
+            enum: ['L2', 'L3'],
+            description: 'Explicitly set review workflow depth. L2 = single adversarial verifier. L3 = Review Squadron (5 inspectors). When omitted, review level is auto-classified from change structure (default: L1 nudge-only). Use this to manually trigger deeper review for high-risk or critical-path changes.',
+          },
+          skipAutoReview: {
+            type: 'boolean',
+            description: 'Suppress automatic post-commit review. Set automatically when a goal tracker is active (goal-driven auto-continuation). Set manually to bypass review for trivial or urgent changes.',
+          },
         },
       },
     },
@@ -174,34 +219,45 @@ When the task implements a complex spec or cross-module integration, include the
       ctx.ownership.autoOwnFromLedger()
       const currentDirtyFiles = ctx.getCurrentDirtyFiles?.(params.cwd) ?? collectCurrentDirtyFiles(params.cwd)
       if (currentDirtyFiles) ctx.ownership.autoOwnFromBaseline(currentDirtyFiles)
-      const report = ctx.gate.getReport([], currentDirtyFiles)
+      const report = ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.())
+
+      // C-fix (session 803d897d): cap file lists and filter external noise.
+      // 67 untracked .test-tmp files used to drown the GREEN/YELLOW signal.
+      const FILE_LIST_CAP = 5
+      const renderFileList = (files: string[], extraHiddenCount = 0): string[] => {
+        if (files.length === 0 && extraHiddenCount === 0) return ['  (none)']
+        const shown = files.slice(0, FILE_LIST_CAP).map(f => `  ${f}`)
+        const hidden = files.length - Math.min(files.length, FILE_LIST_CAP) + extraHiddenCount
+        if (hidden > 0) shown.push(`  (+${hidden} more${extraHiddenCount > 0 ? `, ${extraHiddenCount} junk/gitignored` : ''})`)
+        return shown
+      }
+      const externalSplit = filterExternalNoise(report.externalFiles, params.cwd)
 
       const lines: string[] = [
         `Delivery Gate: ${report.state}`,
         `Task: ${report.taskId}`,
         '',
         `Owned files (${report.ownedFileCount}):`,
-        ...(report.ownedFiles.length > 0
-          ? report.ownedFiles.map(f => `  ${f}`)
-          : ['  (none)']),
+        ...renderFileList(report.ownedFiles),
         '',
         `Co-owned files (${report.coOwnedFileCount}):`,
-        ...(report.coOwnedFiles.length > 0
-          ? report.coOwnedFiles.map(f => `  ${f}`)
-          : ['  (none)']),
+        ...renderFileList(report.coOwnedFiles),
         '',
         `Historical owned files (${report.historicalOwnedFileCount}):`,
-        ...(report.historicalOwnedFiles.length > 0
-          ? report.historicalOwnedFiles.map(f => `  ${f}`)
-          : ['  (none)']),
+        ...renderFileList(report.historicalOwnedFiles),
         '',
         `External files (${report.externalFileCount}):`,
-        ...(report.externalFiles.length > 0
-          ? report.externalFiles.map(f => `  ${f}`)
-          : ['  (none)']),
+        ...renderFileList(externalSplit.files, externalSplit.noiseCount),
         '',
         `Verifications: ${report.verificationCount}`,
       ]
+
+      // 层 1a: echo latest verification totals so agents copy real numbers
+      // into delivery reports instead of guessing from memory.
+      if (report.latestVerificationTotals) {
+        const v = report.latestVerificationTotals
+        lines.push(`  Latest: ${v.passed} pass ${v.failed} fail ${v.skipped} skip — ${v.command}`)
+      }
 
       const hasVerificationDiagnostics = report.currentBlockingFailure
         || report.staleFailureCandidates > 0
@@ -217,8 +273,12 @@ When the task implements a complex spec or cross-module integration, include the
         }
         if (report.toolInvocationFailureCandidates.length > 0) {
           lines.push('  Tool invocation failure candidates:')
-          for (const candidate of report.toolInvocationFailureCandidates) {
+          const shown = report.toolInvocationFailureCandidates.slice(0, 2)
+          for (const candidate of shown) {
             lines.push(`    - ${candidate}`)
+          }
+          if (report.toolInvocationFailureCandidates.length > 2) {
+            lines.push(`    ... and ${report.toolInvocationFailureCandidates.length - 2} more`)
           }
         }
         if (report.shortestNextStep) {
@@ -238,19 +298,13 @@ When the task implements a complex spec or cross-module integration, include the
         }
       }
 
-      // Memory-driven review checklist (non-blocking, informational only)
+      // Memory-driven review checklist (non-blocking, informational only).
+      // Deferred: only append after commit determination so it doesn't
+      // clutter the primary gate output.
       const projectMemory = ctx.getProjectMemoryContent?.(params.cwd) ?? readProjectMemory(params.cwd)
-      const checklist = projectMemory
+      const reviewChecklist = projectMemory
         ? buildReviewPrincipleChecklist({ knowledgeMarkdown: projectMemory, changedFiles: report.ownedFiles })
         : []
-      if (checklist.length > 0) {
-        lines.push('', 'Review principle checklist:')
-        for (const item of checklist) {
-          lines.push(`  - ${item.question}`)
-          lines.push(`    Source: ${item.source}`)
-          lines.push(`    Reason: ${item.reason}`)
-        }
-      }
 
       const health = summarizeOwnershipHealth({
         ownedFiles: report.ownedFiles,
@@ -322,7 +376,22 @@ When the task implements a complex spec or cross-module integration, include the
           lines.push(`  ⚠️  NOT DONE: ${entry.item}`)
         }
         if (incomplete.length > 0) {
-          lines.push('', '  ⚠️  Incomplete tasks detected. Verify these are intentionally deferred, not forgotten.')
+          // P2: wave-split detection — when a large plan has been partially executed,
+          // suggest finishing the current wave before starting the next batch.
+          const totalCount = auditList.length
+          const doneCount = complete.length
+          // E-fix: threshold lowered from >5 to >=4 — a 5-task plan executed in
+          // one unbroken batch is exactly the failure mode (session 803d897d).
+          if (totalCount >= 4) {
+            const remainingRatio = incomplete.length / totalCount
+            if (remainingRatio > 0.4) {
+              lines.push('', `  💡 ${incomplete.length}/${totalCount} tasks remaining (${Math.round(remainingRatio * 100)}%). Consider pausing after this wave — typecheck+test the completed batch, then continue with the next ${Math.min(incomplete.length, 3)} tasks.`)
+            } else {
+              lines.push('', `  ⚠️  ${incomplete.length} of ${totalCount} tasks incomplete. Verify these are intentionally deferred to the next wave, not forgotten.`)
+            }
+          } else {
+            lines.push('', '  ⚠️  Incomplete tasks detected. Verify these are intentionally deferred, not forgotten.')
+          }
         }
       }
 
@@ -414,7 +483,7 @@ When the task implements a complex spec or cross-module integration, include the
         }
 
         const postAdoptionReport = adoptFiles && Array.isArray(adoptFiles) && adoptFiles.length > 0
-          ? ctx.gate.getReport([], currentDirtyFiles)
+          ? ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.())
           : report
         if (postAdoptionReport.state === 'RED') {
           lines.push('', '❌ Cannot commit: delivery gate is RED after adoption.')
@@ -458,52 +527,27 @@ When the task implements a complex spec or cross-module integration, include the
           lines.push('', '⚠️ Cross-session claim conflicts overridden with force=true. Verify the other session has finished or approved the takeover.')
         }
 
-        // Review discipline gate: deliverable commits pass through the review route when wired.
-        // L1 stays advisory, while L2/L3 require independent evidence before commit.
-        // The reviewDepth guard prevents verifier/patcher child contexts from recursively reviewing themselves.
-        // RIVET_REVIEW_DISCIPLINE=0 / false / off / no disables the gate (default: enabled).
-        const change: ChangeSet = {
-          files: filesToCommit,
-          crossModule: isCrossModule(filesToCommit),
-          isFix: isFixContext(message),
+        // ── PRE-COMMIT GATES (blocking) ──────────────────────────────────
+        // Static checks that don't need worker API calls — run before commit.
+
+        // D-fix: cheap static wrote-but-never-read check. Mechanically catches
+        // the modelOverride class of dead wiring (field/symbol added, zero
+        // read-side consumers) at the moment of delivery. YELLOW, non-blocking.
+        try {
+          const deadSymbols = (ctx.detectWroteButNeverRead ?? detectWroteButNeverRead)(params.cwd, filesToCommit)
+          lines.push(...formatWroteButNeverRead(deadSymbols))
+        } catch {
+          // best-effort: never let the nudge break delivery
         }
-        if (reviewDepth === 0 && shouldRouteReviewWorkflow(change) && isReviewDisciplineEnabled()) {
-          const route = ctx.routeReviewWorkflow ?? (ctx.reviewDeps ? routeReviewWorkflow : undefined)
-          if (!route || !ctx.reviewDeps) {
-            if (!forceGate) {
-              lines.push('', '❌ ReviewRouter RED (unwired): review dependencies are unavailable.')
-              lines.push('   → Wire reviewDeps/routeReviewWorkflow, or use force=true only when an equivalent independent review has already been captured.')
-              return { content: lines.join('\n'), isError: true }
-            }
-            lines.push('', '⚠️ ReviewRouter skipped (force=true): review dependencies are unavailable. Verify equivalent independent review evidence exists.')
-          } else {
-            // REVIEW_TIMEOUT: cap review workflow at 90s to prevent tool timeout (120s default).
-            // If review times out, reject with a clear message rather than crashing.
-            const REVIEW_TIMEOUT_MS = 90_000
-            let outcome: ReviewOutcome
-            try {
-              const timeoutPromise = new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('Review workflow timed out')), REVIEW_TIMEOUT_MS),
-              )
-              outcome = await Promise.race([route(change, ctx.reviewDeps), timeoutPromise])
-            } catch (err) {
-              const reason = err instanceof Error ? err.message : String(err)
-              lines.push('', `⚠️  Review workflow ${reason.includes('timed out') ? 'timed out' : 'failed'}: ${reason}`)
-              lines.push('   → Use force=true to skip review for this delivery.')
-              return { content: lines.join('\n'), isError: true }
-            }
-            if (outcome.verdict === 'rejected' || outcome.escalated) {
-              lines.push('', `❌ ReviewRouter RED (${outcome.tier}): ${outcome.evidence ?? 'adversarial review did not verify this delivery'}`)
-              if (typeof outcome.rounds === 'number') lines.push(`   Rounds: ${outcome.rounds}`)
-              lines.push('   → Fix the review finding, collect command + observed output evidence, then re-run deliver_task.')
-              return { content: lines.join('\n'), isError: true }
-            }
-            if (outcome.verdict === 'verified') {
-              lines.push('', `✅ ReviewRouter verified (${outcome.tier}): ${outcome.evidence ?? 'verified'}`)
-            } else if (outcome.verdict === 'nudge') {
-              lines.push('', `⚠️ ReviewRouter nudge (${outcome.tier}): apply review disciplines before committing.`)
-            }
-          }
+
+        // 虚假绿灯对偶检查：字段被生产代码读取，却只有测试 fixture 赋值、生产无写入点
+        // = fixture 伪造了真实系统不产出的形状。YELLOW，非阻断。仅抓子型A（生产零写入）；
+        // 子型B（写入点存在但运行时永空）是 review 门的职责。
+        try {
+          const falseGreen = (ctx.detectReadButNeverProduced ?? detectReadButNeverProduced)(params.cwd, filesToCommit)
+          lines.push(...formatReadButNeverProduced(falseGreen))
+        } catch {
+          // best-effort: never let the nudge break delivery
         }
 
         // Cohesion gate: RED if files span too many areas (unless force=true)
@@ -520,6 +564,16 @@ When the task implements a complex spec or cross-module integration, include the
           lines.push('', '  ⚠️ Cohesion gate overridden with force=true. Verify this is truly one logical unit.')
         }
 
+        // ── COMMIT (no longer blocked by review) ─────────────────────────
+        // Review is post-commit (advisory) — the commit must land first so
+        // the main loop never stalls on a slow/timeout review worker.
+
+        // Capture HEAD before the commit so the result carries verifiable
+        // evidence that a new commit actually landed (vs. agent guessing from
+        // a possibly-stale git status snapshot).
+        const headBefore = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: params.cwd, encoding: 'utf-8', timeout: 5000 })
+        const headBeforeHash = headBefore.status === 0 ? headBefore.stdout.trim() : null
+
         const executor = ctx.commitOwnedFiles ?? ((cwd, files, msg) => commitScopedFiles({ cwd, files, message: msg }))
         const commitResult = executor(params.cwd, filesToCommit, message)
         if (!commitResult.ok) {
@@ -529,7 +583,16 @@ When the task implements a complex spec or cross-module integration, include the
         lines.push('', `✅ Scoped commit created with message: "${message}"`)
         lines.push(`   Files: ${filesToCommit.join(', ') || '(none)'}`)
         if (commitResult.output) lines.push(`   ${commitResult.output}`)
-        // Post-commit truth readback: verify actual landed changes + surface hash
+        // Post-commit truth readback: verify HEAD actually moved + surface hash.
+        const headAfter = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: params.cwd, encoding: 'utf-8', timeout: 5000 })
+        const headAfterHash = headAfter.status === 0 ? headAfter.stdout.trim() : null
+        if (headBeforeHash && headAfterHash) {
+          if (headBeforeHash !== headAfterHash) {
+            lines.push(`   VERIFIED: HEAD moved ${headBeforeHash} → ${headAfterHash}. The commit is real — do NOT re-attempt it.`)
+          } else {
+            lines.push(`   ⚠️ WARNING: HEAD did not move (still ${headAfterHash}). The commit may not have landed — verify with git log before retrying.`)
+          }
+        }
         const readback = spawnSync('git', ['-c', 'core.quotePath=false', 'show', '--stat', '--format=%h%d', 'HEAD'], { cwd: params.cwd, encoding: 'utf-8', timeout: 10_000 })
         if (readback.status === 0 && readback.stdout.trim()) {
           lines.push('', '--- actual changes (git show --stat) ---')
@@ -537,6 +600,134 @@ When the task implements a complex spec or cross-module integration, include the
         }
         // Acknowledge recovery journal entries — the commit confirms intent was preserved.
         if (recoveries.length > 0) acknowledgeAll(params.cwd)
+
+        // ── POST-COMMIT REVIEW (advisory, non-blocking) ──────────────────
+        // Review runs AFTER the commit so a slow/timeout worker never stalls
+        // the main loop or blocks delivery. Findings are surfaced as warnings;
+        // the commit has already landed and cannot be un-done by review.
+        // The reviewDepth guard prevents verifier/patcher child contexts from
+        // recursively reviewing themselves.
+        // RIVET_REVIEW_DISCIPLINE=0 / false / off / no disables the gate (default: enabled).
+        const explicitReviewLevel = params.input.review_level as ReviewScale | undefined
+        const skipAutoReview = params.input.skipAutoReview === true
+          || ctx.isGoalActive?.() === true
+          || ctx.reviewConfig?.skipAuto === true
+        const goalAchieved = ctx.isGoalAchieved?.() === true
+
+        // Goal-achieved commit: auto-upgrade to L3 for final review sweep.
+        // Best-effort — if review deps are unavailable the commit still lands.
+        const effectiveReviewLevel: ReviewScale | undefined = goalAchieved && !explicitReviewLevel
+          ? 'L3'
+          : explicitReviewLevel
+
+        const change: ChangeSet = {
+          files: filesToCommit,
+          crossModule: isCrossModule(filesToCommit),
+          isFix: isFixContext(message),
+          goalActive: ctx.isGoalActive?.() === true,
+          ...(effectiveReviewLevel ? { forceLevel: effectiveReviewLevel } : {}),
+        }
+
+        // Suppress auto review when goal is active OR caller explicitly skips.
+        // Goal-driven auto-continuation can't afford child review worker stalls.
+        if (skipAutoReview) {
+          lines.push('', '⏭ 自动审查已跳过（goal 模式或 skipAutoReview）。')
+        } else if (reviewDepth === 0 && shouldRouteReviewWorkflow(change) && isReviewDisciplineEnabled()) {
+          // Batch: skip if a review was already launched within the cooldown window.
+          const now = Date.now()
+          if (now - lastPostCommitReviewAt < POST_COMMIT_REVIEW_COOLDOWN_MS) {
+            lines.push('', '⏭ 提交后审查合并：上一轮审查仍在冷却窗口内，本轮合并入上一轮。')
+          } else {
+            const route = ctx.routeReviewWorkflow ?? (ctx.reviewDeps ? routeReviewWorkflow : undefined)
+            if (!route || !ctx.reviewDeps) {
+              // Advisory: review deps unavailable is a caveat, not a blocker.
+              lines.push('', '⚠️ 提交后审查跳过：审查依赖不可用（ReviewRouter 未接入）。')
+            } else {
+              const reviewMode: ReviewMode = change.forceLevel ? 'manual' : 'auto'
+              const REVIEW_TIMEOUT_MS = reviewWorkflowBudgetMs(reviewMode, change.forceLevel)
+              const reviewAbort = new AbortController()
+              if (params.abortSignal) {
+                if (params.abortSignal.aborted) {
+                  lines.push('', '⚠️ 提交后审查跳过：工具已取消。')
+                } else {
+                  params.abortSignal.addEventListener('abort', () => reviewAbort.abort(), { once: true })
+                }
+              }
+              if (!params.abortSignal?.aborted) {
+                // 进度可见：通过 onOutput streaming 回调推送中间状态，
+                // 用户在审查运行期间看到进度而非黑盒等待。
+                const budgetSec = Math.round(REVIEW_TIMEOUT_MS / 1000)
+                params.onOutput?.(`\n⏳ 提交后审查启动中 (${reviewMode}${change.forceLevel ? ' ' + change.forceLevel : ''}, ≤${budgetSec}s)...\n`)
+                lastPostCommitReviewAt = Date.now()
+                let outcome: ReviewOutcome
+                let reviewTimer: NodeJS.Timeout | undefined
+                try {
+                  const timeoutPromise = new Promise<never>((_, reject) => {
+                    reviewTimer = setTimeout(() => {
+                      reviewAbort.abort()
+                      reject(new Error('Review workflow timed out'))
+                    }, REVIEW_TIMEOUT_MS)
+                  })
+                  outcome = await Promise.race([
+                    route(change, ctx.reviewDeps, { abortSignal: reviewAbort.signal, mode: reviewMode, depthLayer: ctx.getDepthLayer?.() }),
+                    timeoutPromise,
+                  ])
+                } catch (err) {
+                  const reason = err instanceof Error ? err.message : String(err)
+                  // Review is best-effort post-commit: a timeout/crash never blocks
+                  // delivery — the commit already landed. Report honestly.
+                  outcome = {
+                    tier: reviewMode === 'auto' ? 'auto' : (effectiveReviewLevel ?? 'L2'),
+                    verdict: 'inconclusive',
+                    rounds: 0,
+                    evidence: `post-commit review DID NOT run (${reason.includes('timed out') ? 'timed out' : 'infra failure'}: ${reason})`,
+                    infraFailures: [{ kind: reason.includes('timed out') ? 'timeout' : 'crash', claim: reason }],
+                  }
+                } finally {
+                  if (reviewTimer) clearTimeout(reviewTimer)
+                }
+                // Review infra health observability (/status): auto runs only.
+                if (reviewMode === 'auto' && outcome.rounds !== undefined && outcome.verdict !== 'nudge') {
+                  if (outcome.verdict === 'inconclusive') {
+                    recordAutoReviewRun({ ran: false, failureKinds: (outcome.infraFailures ?? []).map(f => f.kind) })
+                  } else {
+                    recordAutoReviewRun({ ran: true, ...(outcome.recoveredByRetry ? { recoveredByRetry: true } : {}) })
+                  }
+                }
+                if (outcome.verdict === 'rejected' || outcome.escalated) {
+                  // Advisory: the commit has already landed. Surface the finding
+                  // as a strong warning + follow-up recommendation, not a block.
+                  lines.push('', `⚠️ 审查门发现问题 (${outcome.tier})：${outcome.evidence ?? '对抗性审查未验证此交付'}`)
+                  if (typeof outcome.rounds === 'number') lines.push(`   轮次：${outcome.rounds}`)
+                  lines.push('   → 提交已落地。请在后续提交中处理审查发现。')
+                } else if (outcome.verdict === 'verified') {
+                  if (outcome.infraFailures && outcome.infraFailures.length > 0) {
+                    lines.push('', `⚠️ 审查门 YELLOW (${outcome.tier})：审查基础设施有注意事项，交付已通过可用证据验证。`)
+                    lines.push(`   ${outcome.evidence ?? '已通过审查基础设施注意事项验证'}`)
+                  } else {
+                    lines.push('', `✅ 审查通过 (${outcome.tier})：${outcome.evidence ?? '已验证'}`)
+                  }
+                } else if (outcome.verdict === 'inconclusive') {
+                  lines.push('', `⚠️ 审查未决 (${outcome.tier})：${outcome.evidence ?? '提交后审查未运行（基础设施故障）'}`)
+                  lines.push('   → 此变更未经审查。运行 /review max 进行完整编队审查。')
+                } else if (outcome.verdict === 'nudge') {
+                  lines.push('', `⚠️ 审查提醒 (${outcome.tier})：请在后续工作中应用审查纪律。`)
+                }
+              }
+              }
+          }
+        }
+      }
+
+      // Append review principle checklist at end (non-blocking, informational)
+      if (reviewChecklist.length > 0) {
+        lines.push('', '审查原则清单：')
+        for (const item of reviewChecklist.slice(0, 2)) {
+          lines.push(`  - ${item.question}`)
+        }
+        if (reviewChecklist.length > 2) {
+          lines.push(`  ... 还有 ${reviewChecklist.length - 2} 条原则`)
+        }
       }
 
       return { content: lines.join('\n') }
@@ -548,5 +739,15 @@ When the task implements a complex spec or cross-module integration, include the
 
     isConcurrencySafe: () => true,
     isEnabled: () => true,
+
+    // Review is now post-commit (advisory). The commit itself is sub-second,
+    // and the review worker budget no longer blocks the main loop — the tool
+    // timeout must still dominate the review budget so the worker can finish,
+    // but the main loop is never stalled waiting for it to gate the commit.
+    timeoutMs: (params) => {
+      const level = params?.input?.review_level as ReviewScale | undefined
+      const mode: ReviewMode = level ? 'manual' : 'auto'
+      return reviewWorkflowBudgetMs(mode, level) + 60_000
+    },
   }
 }

@@ -85,6 +85,40 @@ describe('output-store', () => {
       const result = buildModelOutput('', meta)
       assert.ok(result.includes('lines=0'))
     })
+
+    it('empty output is marked as confirmed empty (not collapsed)', () => {
+      const result = buildModelOutput('', meta)
+      assert.ok(result.includes('[output complete: 0 lines — confirmed empty]'),
+        'genuinely empty output must be explicitly marked so the model does not confuse it with collapsed output')
+      assert.ok(!result.includes('truncated'), 'empty output must not show truncated marker')
+    })
+
+    it('complete output is marked as output complete', () => {
+      const small = Array.from({ length: 5 }, (_, i) => `line ${i}`).join('\n')
+      const result = buildModelOutput(small, meta)
+      assert.ok(result.includes('output complete'), 'full output must be marked complete')
+      assert.ok(!result.includes('truncated'), 'full output must not show truncated')
+    })
+
+    it('success truncation footer includes rawPath recovery hint when available', () => {
+      const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n')
+      const result = buildModelOutput(lines, { ...meta, rawPath: '/tmp/rivet-raw/abc.raw' })
+      assert.ok(result.includes('full output: read_file /tmp/rivet-raw/abc.raw'),
+        'footer must tell the model how to recover full output instead of re-running the command')
+      assert.ok(result.includes('不要重跑命令'))
+    })
+
+    it('large failed-output truncation footer includes rawPath recovery hint', () => {
+      const lines = Array.from({ length: 500 }, (_, i) => `line ${i}`).join('\n')
+      const result = buildModelOutput(lines, { ...meta, exitCode: 1, rawPath: '/tmp/rivet-raw/def.raw' })
+      assert.ok(result.includes('full output: read_file /tmp/rivet-raw/def.raw'))
+    })
+
+    it('omits recovery hint when rawPath is absent', () => {
+      const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n')
+      const result = buildModelOutput(lines, meta)
+      assert.ok(!result.includes('full output: read_file'))
+    })
   })
 
   describe('buildUiOutput', () => {

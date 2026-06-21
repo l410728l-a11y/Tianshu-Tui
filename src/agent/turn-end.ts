@@ -42,10 +42,7 @@ export function processTurnEnd(deps: TurnEndDeps): TurnEndResult {
     config.promptEngine.setTaskProgress(taskState)
  }
 
-  const mirror = session.getTurnCount() > 3
-    ? detectMirror(trajectory.getEntries())
-    : null
-  config.promptEngine.setBehaviorMirror(mirror)
+  // behaviorMirror removed — computed but never rendered into prompt (dead plumbing)
 
   if (config.modelCards && config.modelCards.length > 1 && config.getCurrentModel) {
     const currentModel = config.getCurrentModel()
@@ -56,7 +53,6 @@ export function processTurnEnd(deps: TurnEndDeps): TurnEndResult {
     const inference = inferTaskType(recentCalls)
     if (inference) {
       const recommended = recommendModelForTask(inference.task, config.modelCards)
-      config.promptEngine.setRoutingReason(`${inference.task} · ${recommended.model} ${inference.reason}`)
       if (recommended.model !== currentModel && config.onModelSwitch) {
         routingMetrics.record({
           turn: session.getTurnCount(),
@@ -79,7 +75,15 @@ export function processTurnEnd(deps: TurnEndDeps): TurnEndResult {
   if (decisions.length > 3) decisions = decisions.slice(-3)
   config.promptEngine.setDecisions(decisions)
 
-  const badge = evidence.buildBadge()
+  // Track 3 门禁合一：v2（GREEN/YELLOW/RED，归因感知）注入时为权威；
+  // 评估失败时回退 v1，badge 永不因门禁崩溃缺席。
+  let gateV2: ReturnType<NonNullable<AgentConfig['deliveryGateV2']>> | undefined
+  try {
+    gateV2 = config.deliveryGateV2?.([...evidence.getState().filesModified])
+  } catch {
+    gateV2 = undefined
+  }
+  const badge = evidence.buildBadge(gateV2)
 
   return { decisions, badge }
 }

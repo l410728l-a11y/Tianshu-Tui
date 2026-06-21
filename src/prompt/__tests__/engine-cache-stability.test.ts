@@ -44,11 +44,9 @@ describe('ice-mirror: cache stability', () => {
     const frozen = buildStableVolatileBlock({
       ...baseCtx,
       toolHistory: [{ tool: 'read_file', target: 'x', status: 'success' as const }],
-      behaviorMirror: 'test mirror',
       decisions: ['decision 1'],
     })
     assert.ok(!frozen.includes('<tool-history'))
-    assert.ok(!frozen.includes('<behavior-mirror'))
     assert.ok(!frozen.includes('<decisions'))
   })
 
@@ -253,14 +251,14 @@ describe('habituation: three-zone consolidation', () => {
     }
 
     const req = engine.buildOaiRequest([{ role: 'user', content: 'final' }])
-    // P1: consolidated block is in the standalone appendix (last message)
-    const appendix = req.messages[req.messages.length - 1]!
+    // consolidated block is now in the trailer prefix (before ---), not a standalone appendix.
+    const trailer = req.messages[req.messages.length - 1]!
     assert.ok(
-      typeof appendix.content === 'string' && appendix.content.includes('<consolidated>'),
-      'Consolidated block should appear in standalone appendix after threshold',
+      typeof trailer.content === 'string' && trailer.content.includes('<consolidated>'),
+      'Consolidated block should appear in trailer prefix after threshold',
     )
     assert.ok(
-      typeof appendix.content === 'string' && appendix.content.includes('tianshu'),
+      typeof trailer.content === 'string' && trailer.content.includes('tianshu'),
       'Consolidated should contain domain name',
     )
   })
@@ -286,13 +284,16 @@ describe('habituation: three-zone consolidation', () => {
     const frozenBase = (engine as unknown as { frozenBase: string }).frozenBase
     assert.ok(user.startsWith('msg 1'), `user should start with 'msg 1', got '${user.slice(0, 30)}...'`)
     assert.ok(!histVol.includes('<consolidated>'), 'Historical volatile must stay frozen for prefix cache')
-    assert.equal(freshVol, frozenBase, 'Latest trailer must equal frozen base (appendix is standalone)')
-    // P1: consolidated block is in standalone appendix
-    const appendix = req.messages[req.messages.length - 1]!
-    assert.ok(
-      typeof appendix.content === 'string' && appendix.content.includes('<consolidated>'),
-      'Standalone appendix must include consolidated dynamic appendix',
-    )
+    assert.ok(freshVol.startsWith(frozenBase), 'Latest trailer prefix must start with frozen base')
+    assert.ok(freshVol.includes('<consolidated>'), 'Latest trailer prefix must include consolidated block before user content')
+    // consolidated block is now in the trailer prefix (before ---), not the appendix.
+    // Verify it appears between frozenBase and the --- separator.
+    const trailer = req.messages[req.messages.length - 1]!
+    const trailerContent = typeof trailer.content === 'string' ? trailer.content : ''
+    const sepIdx = trailerContent.indexOf('\n---\n')
+    const prefix = sepIdx >= 0 ? trailerContent.slice(0, sepIdx) : ''
+    assert.ok(prefix.includes('<consolidated>'),
+      'Consolidated block must be in trailer prefix, not appendix')
   })
 
   it('dehabituation removes field from consolidated block', () => {
@@ -305,19 +306,19 @@ describe('habituation: three-zone consolidation', () => {
     }
 
     let req = engine.buildOaiRequest([{ role: 'user', content: 'check' }])
-    // P1: consolidated block is in standalone appendix (last message)
-    let appendix = req.messages[req.messages.length - 1]!
+    // consolidated block is in the trailer prefix (before ---), not the appendix
+    let trailer = req.messages[req.messages.length - 1]!
     assert.ok(
-      typeof appendix.content === 'string' && appendix.content.includes('<consolidated>'),
+      typeof trailer.content === 'string' && trailer.content.includes('<consolidated>'),
     )
 
     engine.setActiveDomain({ name: 'tianji', volatileBlock: 'other', motto: 'other-motto' })
     req = engine.buildOaiRequest([{ role: 'user', content: 'after change' }])
-    appendix = req.messages[req.messages.length - 1]!
+    trailer = req.messages[req.messages.length - 1]!
     // After domain change, consolidated may still be present; check it changed
     assert.ok(
-      typeof appendix.content === 'string',
-      'Standalone appendix should exist',
+      typeof trailer.content === 'string',
+      'Trailer should exist',
     )
   })
 
@@ -338,18 +339,45 @@ describe('habituation: three-zone consolidation', () => {
     ], [{ tool: 'read_file', target: 'x', status: 'success' }])
 
     const histVol = (req.messages[1] as { content: string }).content
+    const frozenBase = (engine as unknown as { frozenBase: string }).frozenBase
 
     const { fresh: freshVol, user } = latestUserTrailer(req.messages)
     assert.ok(user.startsWith('read'), 'user should start with "read"')
 
-    // P1: FRESH equals volatileBlock (FROZEN only), appendix is standalone
-    assert.ok(histVol.startsWith(freshVol),
-      'FROZEN snapshot must start with volatileBlock prefix')
-    const appendix = req.messages[req.messages.length - 1]!
-    assert.ok(
-      typeof appendix.content === 'string' && appendix.content.includes('<consolidated>'),
-      'Standalone appendix must include consolidated dynamic appendix',
-    )
+    // FROZEN (volatileBlock) is byte prefix of both historical & fresh trailer.
+    // freshVol now includes consolidatedBlock between frozenBase and '---'.
+    assert.ok(freshVol.startsWith(frozenBase),
+      'Fresh trailer prefix must start with frozen base')
+    assert.ok(histVol.startsWith(frozenBase),
+      'Historical snapshot must start with frozen base')
+    // consolidated block is in the trailer prefix, not the appendix
+    assert.ok(freshVol.includes('<consolidated>'),
+      'Fresh trailer prefix must include consolidated dynamic appendix')
+  })
+
+  it('consolidated prefix stays byte-identical across turns after promotion — cacheable', () => {
+    const engine = createEngineH(3)
+    engine.setPhaseHint('execute')
+
+    // Warm up: promote tracker until consolidatedBlock is non-empty.
+    for (let t = 0; t < 5; t++) {
+      engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+      engine.buildOaiRequest([{ role: 'user', content: `msg ${t}` }])
+    }
+
+    // Turn N: extract the prefix (volatileBlock + consolidatedBlock, before \n---\n).
+    engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+    const req1 = engine.buildOaiRequest([{ role: 'user', content: 'turn-n' }])
+    const { fresh: prefix1 } = latestUserTrailer(req1.messages)
+
+    // Turn N+1: same domain, new user message — prefix must be byte-identical.
+    engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+    const req2 = engine.buildOaiRequest([{ role: 'user', content: 'turn-n1' }])
+    const { fresh: prefix2 } = latestUserTrailer(req2.messages)
+
+    assert.ok(prefix1.includes('<consolidated>'), 'Turn N prefix must include consolidated block')
+    assert.equal(prefix1, prefix2,
+      'volatileBlock + consolidatedBlock prefix must be byte-identical across turns → cacheable')
   })
 
   it('disabling habituation (threshold=0) falls back to v1 behavior', () => {
@@ -369,6 +397,58 @@ describe('habituation: three-zone consolidation', () => {
     const req = engine.buildOaiRequest([{ role: 'user', content: 'test' }])
     const vol = (req.messages[1] as { content: string }).content
     assert.ok(!vol.includes('<consolidated>'), 'No consolidated when habituation disabled')
+  })
+})
+
+describe('deepseek-native fast promotion: star-domain enters consolidated on turn 1', () => {
+  it('star-domain promoted to consolidated on first user message', () => {
+    const engine = new PromptEngine({
+      model: 'deepseek-v4-pro',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test' },
+      prefixCache: 'deepseek-native',
+    })
+    engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    const trailer = req.messages[req.messages.length - 1]!
+    const content = typeof trailer.content === 'string' ? trailer.content : ''
+    const beforeSep = content.split('\n---\n')[0]!
+    assert.ok(beforeSep.includes('<consolidated>'), 'consolidated block must exist on turn 1')
+    assert.ok(beforeSep.includes('tianshu'), 'consolidated block must contain star-domain')
+  })
+
+  it('non-deepseek model does NOT fast-promote on turn 1', () => {
+    const engine = new PromptEngine({
+      model: 'glm-5.2',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test' },
+      prefixCache: 'none',
+    })
+    engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    const trailer = req.messages[req.messages.length - 1]!
+    const content = typeof trailer.content === 'string' ? trailer.content : ''
+    const beforeSep = content.split('\n---\n')[0]!
+    assert.ok(!beforeSep.includes('<consolidated>'), 'no consolidated on turn 1 for non-deepseek')
+  })
+
+  it('star-domain removed from appendix after fast promotion', () => {
+    const engine = new PromptEngine({
+      model: 'deepseek-v4-pro',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test' },
+      prefixCache: 'deepseek-native',
+    })
+    engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'test' }])
+    const trailer = req.messages[req.messages.length - 1]!
+    const content = typeof trailer.content === 'string' ? trailer.content : ''
+    const afterSep = content.split('\n---\n').slice(1).join('\n---\n')
+    const domainInAppendix = afterSep.includes('<star-domain')
+    assert.ok(!domainInAppendix, 'star-domain must NOT appear in appendix (after ---) when fast-promoted')
   })
 })
 
@@ -533,40 +613,26 @@ describe('sessionState injection — cache safety + path coverage', () => {
     })
   }
 
-  it('sessionState reaches fresh volatile block under tracker-enabled (default) path', () => {
+  it('sessionState reaches fresh volatile block as <progress> under tracker-enabled (default) path', () => {
     const engine = makeEngine(5)
     engine.setSessionState('<session-state>\nTask: alpha [executing]\n</session-state>')
 
     const req = engine.buildOaiRequest([{ role: 'user', content: 'hello' }])
-    // P1: sessionState is in standalone appendix (last message), not in user message
     const appendix = req.messages[req.messages.length - 1]!
-    assert.match(
-      typeof appendix.content === 'string' ? appendix.content : '',
-      /<session-state>/,
-      'sessionState must appear in standalone appendix when tracker enabled',
-    )
-    assert.match(
-      typeof appendix.content === 'string' ? appendix.content : '',
-      /Task: alpha/,
-    )
+    const content = typeof appendix.content === 'string' ? appendix.content : ''
+    assert.match(content, /<progress>/, 'sessionState must appear as <progress> in appendix when tracker enabled')
+    assert.match(content, /Task: alpha/)
   })
 
-  it('sessionState reaches fresh volatile block under tracker-disabled (fallback) path', () => {
+  it('sessionState reaches fresh volatile block as <progress> under tracker-disabled (fallback) path', () => {
     const engine = makeEngine(0)
     engine.setSessionState('<session-state>\nTask: beta [verifying]\n</session-state>')
 
     const req = engine.buildOaiRequest([{ role: 'user', content: 'hello' }])
-    // P1: sessionState is in standalone appendix (last message)
     const appendix = req.messages[req.messages.length - 1]!
-    assert.match(
-      typeof appendix.content === 'string' ? appendix.content : '',
-      /<session-state>/,
-      'sessionState must appear in standalone appendix when tracker disabled',
-    )
-    assert.match(
-      typeof appendix.content === 'string' ? appendix.content : '',
-      /Task: beta/,
-    )
+    const content = typeof appendix.content === 'string' ? appendix.content : ''
+    assert.match(content, /<progress>/, 'sessionState must appear as <progress> in appendix when tracker disabled')
+    assert.match(content, /Task: beta/)
   })
 
   it('volatile block stays byte-identical across 5 tool-call turns even when setSessionState is called per turn', () => {
@@ -685,3 +751,305 @@ describe('sessionState injection — cache safety + path coverage', () => {
       'Historical retrieval must return identical bytes (frozen snapshot)')
   })
 })
+
+describe('SR append: convergence/hook injection cache stability', () => {
+  function makeEngine() {
+    return new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test/project', gitStatus: 'Current branch: main', rivetMd: '# Test' },
+    })
+  }
+
+  // Regression guard for 5fedd9b6. SR injection must be APPEND-ONLY: a reminder
+  // lands at the tail and leaves every prior message byte-identical. Message
+  // *count* stability is irrelevant — DeepSeek's exact-prefix cache keys on the
+  // token sequence, so rewriting any earlier message invalidates the prefix from
+  // that point and forces a rebuild of every tool output after it. A 2M window
+  // isolates pure prefix behavior (no pruning/masking).
+  it('SR injection is append-only — all prior messages stay byte-identical', () => {
+    const engine = makeEngine()
+    const CW = 2_000_000
+    const base: OaiMessage[] = [
+      { role: 'user', content: 'task' },
+      { role: 'assistant', content: 'doing work...' },
+      { role: 'tool', tool_call_id: 'x', content: 'BIG TOOL OUTPUT '.repeat(80) } as OaiMessage,
+      { role: 'assistant', content: 'done' },
+    ]
+    const req1 = engine.buildOaiRequest([...base], undefined, CW)
+
+    // Corrected appendSystemReminder behavior: SR is a NEW tail user message,
+    // never a rewrite of the mid-array 'task' message.
+    const withSR: OaiMessage[] = [
+      ...base,
+      { role: 'user', content: '<system-reminder>\nconvergence kick\n</system-reminder>' },
+    ]
+    const req2 = engine.buildOaiRequest([...withSR], undefined, CW)
+
+    // The entire prefix (everything before the SR) must be untouched.
+    for (let i = 0; i < req1.messages.length; i++) {
+      assert.equal(
+        JSON.stringify(req2.messages[i]),
+        JSON.stringify(req1.messages[i]),
+        `message ${i} must be byte-identical after SR append (prefix cache stability)`,
+      )
+    }
+    // SR is exactly one new tail entry and visible to the model.
+    assert.equal(req2.messages.length, req1.messages.length + 1, 'SR adds exactly one tail entry')
+    const last = req2.messages.at(-1)!
+    assert.ok(
+      typeof last.content === 'string' && last.content.includes('convergence kick'),
+      'SR text must be visible in the request',
+    )
+  })
+})
+
+describe('appendixDelta config + cross-turn state (task 2/7)', () => {
+  it('appendixDelta defaults to undefined (no behavior change)', () => {
+    const engine = new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test', gitStatus: 'M src/foo.ts' },
+    })
+    // Without appendixDelta, trailer should be plain <context-update> (no seq)
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'hello' }])
+    const appendix = req.messages[req.messages.length - 1]!
+    assert.ok(
+      typeof appendix.content === 'string' && appendix.content.includes('<context-update>'),
+      'should have <context-update> wrapper',
+    )
+    assert.ok(
+      !(typeof appendix.content === 'string' && /seq=/.test(appendix.content)),
+      'should NOT have seq attribute (delta disabled)',
+    )
+  })
+
+  it('appendixDelta: true — config is accepted, engine constructs without error', () => {
+    // Full seq/baseline behavior verified in task 3 tests — here we just confirm
+    // the engine accepts the flag and doesn't throw on construction.
+    const engine = new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test', gitStatus: 'M src/foo.ts' },
+      appendixDelta: true,
+    })
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'hello' }])
+    assert.ok(req.messages.length > 0, 'engine should produce messages')
+  })
+
+  it('invalidateFreshCache resets delta baseline (verified via re-baseline in task 3)', () => {
+    // Task 2 scope: verify the engine doesn't crash when toggling actionableTurn
+    // with appendixDelta enabled. The actual baseline reset verification is in
+    // task 3 where delta rendering is implemented.
+    const engine = new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test', gitStatus: 'M src/foo.ts' },
+      appendixDelta: true,
+    })
+    engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    engine.setActionableTurn(false)
+    engine.setActionableTurn(true)
+    const req = engine.buildOaiRequest([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second' },
+    ])
+    assert.ok(req.messages.length > 0, 'engine should still produce messages after reset')
+  })
+})
+
+describe('appendixDelta rendering (task 3/7: delta computation)', () => {
+  function makeEngine(appendixDelta?: boolean) {
+    return new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: {
+        cwd: '/test',
+        gitStatus: 'M src/foo.ts',
+        rivetMd: '# Test',
+        workingSet: ['src/foo.ts'],
+      },
+      appendixDelta,
+    })
+  }
+
+  /** Extract the last standalone appendix message from a request. */
+  function getAppendix(req: ReturnType<PromptEngine['buildOaiRequest']>): string {
+    const last = req.messages[req.messages.length - 1]!
+    return typeof last.content === 'string' ? last.content : ''
+  }
+
+  it('delta OFF: trailer has plain <context-update> (no seq)', () => {
+    const engine = makeEngine(false)
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'hello' }])
+    const app = getAppendix(req)
+    assert.match(app, /<context-update>/)
+    assert.doesNotMatch(app, /seq=/)
+  })
+
+  it('delta ON: first message emits full baseline with seq="1"', () => {
+    const engine = makeEngine(true)
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'hello' }])
+    const app = getAppendix(req)
+    assert.match(app, /<context-update seq="1">/)
+    assert.ok(!app.includes('mode="delta"'), 'baseline should not have mode="delta"')
+    assert.match(app, /<git-status>/, 'baseline should contain git-status block')
+  })
+
+  it('delta ON: second user message with no changes emits self-closing tag', () => {
+    const engine = makeEngine(true)
+    // First user message: baseline
+    engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    // Second user message: same volatileCtx, no changes → nothing changed
+    const req = engine.buildOaiRequest([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second' },
+    ])
+    const app = getAppendix(req)
+    // seq should increment; with no changes, self-closing
+    assert.match(app, /<context-update seq="2"\/>/)
+  })
+
+  it('delta ON: tool-call turn reuses cached appendix (seq does not increment)', () => {
+    const engine = makeEngine(true)
+    const req1 = engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    const app1 = getAppendix(req1)
+    // Same user message, same array length → cachedAppendix reuse (no rebuild)
+    const req2 = engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    const app2 = getAppendix(req2)
+    assert.equal(app1, app2, 'tool-call turn should reuse cached appendix')
+  })
+
+  it('delta ON: after invalidateFreshCache, re-emits full baseline', () => {
+    const engine = makeEngine(true)
+    engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    engine.setActionableTurn(false)
+    engine.setActionableTurn(true)
+    const req = engine.buildOaiRequest([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second' },
+    ])
+    const app = getAppendix(req)
+    // After reset: full baseline (no mode="delta")
+    assert.match(app, /<context-update seq="\d+">/)
+    assert.ok(!app.includes('mode="delta"'), 'after reset should be full baseline')
+  })
+})
+
+describe('frozen snapshot byte-identity under delta (task 5/7)', () => {
+  it('historical user message trailer is byte-identical to when it was last', () => {
+    // Construct: user1 → assistant1 → user2 (new boundary)
+    // Assert: user1 as historical === user1 when it was last (byte-identical)
+    const engine = new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: {
+        cwd: '/test',
+        gitStatus: 'M src/foo.ts',
+        rivetMd: '# Test',
+        workingSet: ['src/foo.ts'],
+      },
+      appendixDelta: true,
+    })
+
+    // First message — user1 is last, captures its frozen merged
+    const req1 = engine.buildOaiRequest([
+      { role: 'user', content: 'first message' },
+    ])
+    // Extract user1's full merged content (from the result messages)
+    const user1Merged1 = (req1.messages[1] as { content: string }).content
+
+    // Second message — user1 becomes historical, user2 is last
+    const req2 = engine.buildOaiRequest([
+      { role: 'user', content: 'first message' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second message' },
+    ])
+
+    // user1 is now historical — find it (it's before the assistant message)
+    const histMsg = req2.messages.find(m =>
+      typeof m.content === 'string' && m.content.includes('first message')
+    )
+    assert.ok(histMsg, 'historical user1 message must exist in req2')
+    const user1Merged2 = (histMsg as { content: string }).content
+
+    // THE critical assertion: byte-identical
+    assert.equal(
+      user1Merged1, user1Merged2,
+      'user1 frozen merged must be byte-identical when retrieved as historical (delta must not rewrite history)',
+    )
+  })
+
+  it('frozenFallbackRebuilds does not increase due to delta', () => {
+    const engine = new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test', gitStatus: 'M src/foo.ts' },
+      appendixDelta: true,
+    })
+
+    engine.buildOaiRequest([{ role: 'user', content: 'msg1' }])
+    const stats1 = engine.getCacheEventStats()
+
+    engine.buildOaiRequest([
+      { role: 'user', content: 'msg1' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'msg2' },
+    ])
+    const stats2 = engine.getCacheEventStats()
+
+    assert.equal(stats2.frozenFallbackRebuilds, stats1.frozenFallbackRebuilds,
+      'delta should not cause additional frozen fallback rebuilds')
+  })
+})
+
+describe('resetAppendixBaseline after history rewrite (task 6/7)', () => {
+  it('resetAppendixBaseline forces next emit to be a full baseline', () => {
+    const engine = new PromptEngine({
+      model: 'test-model',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test', gitStatus: 'M src/foo.ts', rivetMd: '# Test' },
+      appendixDelta: true,
+    })
+
+    // Turn 1: baseline (seq=1)
+    engine.setDecisions(['decision one'])
+    engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+
+    // Turn 2: should be delta or self-closing (seq=2)
+    engine.buildOaiRequest([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second' },
+    ])
+
+    // After reset: turn 3 should be a full baseline (seq=3, no mode="delta")
+    engine.resetAppendixBaseline()
+    const req3 = engine.buildOaiRequest([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'second' },
+      { role: 'assistant', content: 'ok2' },
+      { role: 'user', content: 'third' },
+    ])
+    // Find the message with context-update seq= (skip system prompt which has
+    // a static 'context-update-protocol' rule mentioning <context-update>)
+    const lastUser = req3.messages.filter(m => m.role === 'user').at(-1)!
+    const content3 = typeof lastUser.content === 'string' ? lastUser.content : ''
+    assert.match(content3, /<context-update seq="\d+">/, 'after reset, last user trailer should have full baseline with seq')
+    assert.ok(!content3.includes('mode="delta"'), 'after reset should NOT have mode="delta"')
+    assert.ok(content3.includes('decision one'), 'baseline should contain the decision content')
+  })
+})
+

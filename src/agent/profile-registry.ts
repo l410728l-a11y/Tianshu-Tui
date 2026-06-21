@@ -5,10 +5,12 @@
  * 统一到单一数据源，同时支持 .rivet/agents/ 目录加载用户自定义 profile。
  */
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { progressiveTimeout, WORKER_EXIT_GRACE_MS } from './timeout-ladder.js'
 
 export type AgentRole = 'brain' | 'hands' | 'readonly' | 'readonly_plus_test'
+
+/** delegate_task / delegate_batch 缺省 worker profile（与 tools/delegate-task.ts 一致） */
+export const DEFAULT_DELEGATE_PROFILE = 'code_scout' as const
 
 /** 单个 Profile 的完整定义 */
 export interface ProfileDefinition {
@@ -24,8 +26,14 @@ export interface ProfileDefinition {
   defaultKind?: string
   /** 默认 maxTokens budget */
   defaultMaxTokens?: number
+  /** 默认 timeout budget (ms)。review/plan 型 profile 应远大于 code_scout。
+   *  不设置时回退到 progressiveTimeout(sessionTurn)。 */
+  defaultTimeoutMs?: number
   /** 是否为内置 profile */
   builtIn?: boolean
+  /** Lock model tier — prevents escalation even on consecutive failures.
+   *  Flash-army profiles set this to 'cheap' so the bandit never wastes Pro tokens. */
+  tierLock?: import('./model-tier-policy.js').ModelTier
 }
 
 /** 内置只读工具集 */
@@ -61,6 +69,7 @@ Do NOT modify any files.`,
     allowedTools: ['delegate_task', 'delegate_batch'],
     expertisePrompt: `You are a planner. Analyze the task, decompose it, and delegate to appropriate workers. You have access to delegation tools only.`,
     defaultKind: 'plan',
+    defaultTimeoutMs: 600_000, // 10min — plan/decompose needs deep thinking
     builtIn: true,
   },
   {
@@ -68,13 +77,40 @@ Do NOT modify any files.`,
     role: 'readonly',
     allowedTools: [...READ_ONLY_TOOLS],
     expertisePrompt: `You are a code reviewer. Read the code carefully, identify issues, and provide actionable feedback.`,
+    defaultTimeoutMs: 600_000, // 10min — review needs thorough analysis
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+  {
+    // 议事会席位专家 —— 单轮会诊出意见，不执行。
+    // 关键：故意 NOT 设 tierLock。reviewer 的 tierLock:'cheap' 会让
+    // recommendModelTier 直接 short-circuit 成 cheap，天权/天府高风险席永远
+    // 升不到 strong；council_expert 让 authority→tier 升级路径正常生效。
+    name: 'council_expert',
+    role: 'readonly',
+    allowedTools: [...READ_ONLY_TOOLS],
+    expertisePrompt: `You are a star-domain council seat expert. From your domain's perspective, review a single plan draft in ONE round and return only opinions — never execute.
+
+### Mandate
+- Read the draft objective and items, then critique from YOUR domain charter only.
+- Use your read-only tools (grep / repo_map / related_tests / read_file) to locate the real files each item touches before opining.
+- Surface additions, risks (with severity + mitigation), challenges (open questions), and alternatives.
+- Do NOT modify files. Do NOT dispatch sub-work. This is a single advisory round.
+
+### Output
+Return a JSON WorkerResult whose \`artifacts\` contains exactly ONE entry:
+{ "kind": "note", "title": "seat-contribution", "content": "<JSON string of your SeatContribution>" }
+SeatContribution = { authority, summary, additions, risks, challenges, alternatives }.
+PlanItem (additions[]) = { id, title, detail, files?: string[] } — set files to the paths the item will modify (from real code lookup, not guesses).`,
+    defaultKind: 'plan',
+    defaultTimeoutMs: 600_000, // 10min — 单轮会诊需充分读上下文
     builtIn: true,
   },
   {
     name: 'verifier',
     role: 'hands',
     allowedTools: [...WRITE_TOOLS],
-    expertisePrompt: `You are a verifier. Run tests, check type errors, and verify changes work correctly. You may write and edit test files.`,
+    expertisePrompt: `You are a verifier. Run tests, check type errors, and verify changes work correctly. You may write and edit test files — but ONLY test files. Do NOT modify implementation code under verification; if a fix is needed, report it and hand back to the main agent.`,
     defaultMaxTokens: 16384,
     defaultKind: 'verify',
     builtIn: true,
@@ -120,7 +156,9 @@ End every verification with:
 \`\`\`
 If failed or blocked, include: "counterexample": "the specific input/scenario that triggered the failure"`,
     defaultMaxTokens: 16384,
+    defaultTimeoutMs: 600_000, // 10min — adversarial verification requires deep probing
     defaultKind: 'verify',
+    tierLock: 'cheap',
     builtIn: true,
   },
   {
@@ -207,6 +245,173 @@ You are a diagnostic specialist. Your job is to find the ROOT CAUSE of a problem
 - Do NOT propose fixes that mask symptoms without addressing the root cause`,
     builtIn: true,
   },
+
+  {
+    name: 'designer',
+    role: 'readonly',
+    allowedTools: [...READ_ONLY_TOOLS],
+    expertisePrompt: `## Designer Methodology
+
+You are a design / frontend aesthetics specialist. You critique and propose UI/UX
+direction — you do not blindly apply visual tropes.
+
+### Process
+1. **Read the existing visual vocabulary first**: grep for theme color keys, read
+   existing components/styles. Match the established voice; do NOT invent a new palette.
+2. **Anchor in context**: use theme semantic colors / harmonious oklch — never raw hex,
+   never a palette pulled from nowhere.
+3. **Propose 3+ variations across dimensions** (color, density, hierarchy, interaction),
+   from a by-the-book version that matches existing patterns to more novel layouts.
+4. **Placeholders beat bad imitations**: when a real asset is missing, propose a placeholder.
+
+### Output
+- Report findings as concrete, dimension-spanning proposals with file:line anchors.
+- Flag where existing visual vocabulary is inconsistent.
+- Do NOT modify files — this profile is read-only; propose, the main agent applies.`,
+    defaultTimeoutMs: 600_000, // 10min — design exploration benefits from thorough context reading
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+
+  // ── Flash Army（低成本高吞吐子代理）────────────────────────────
+  // tierLock: 'cheap' — 永不升级到 balanced/strong，失败走断路器而非换模型。
+  // 专为机械性、可测试的重复工作设计：lint/type/import/format/test scaffold/doc sync。
+
+  {
+    name: 'lint_fixer',
+    role: 'hands',
+    allowedTools: ['read_file', 'edit_file', 'bash', 'run_tests'],
+    expertisePrompt: `You are a lint fixer. Run the project linter, apply auto-fixes, and report remaining issues.
+
+### Process
+1. Run the linter: \`npx eslint --fix <file>\` or the project's configured linter
+2. Read the output and fix any remaining violations by editing the file
+3. Re-run the linter to confirm all issues are resolved
+4. Report: fixed count, remaining count, file paths
+
+### Rules
+- Only fix lint/style violations — do NOT change logic or behavior
+- Preserve existing indentation style
+- If a violation requires a design decision, report it as an escalation`,
+    defaultMaxTokens: 8192,
+    defaultTimeoutMs: 120_000,
+    defaultKind: 'patch_proposal',
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+  {
+    name: 'test_scaffolder',
+    role: 'hands',
+    allowedTools: ['read_file', 'write_file', 'grep', 'glob'],
+    expertisePrompt: `You are a test scaffolder. Generate test file boilerplate from source interfaces and types.
+
+### Process
+1. Read the source file to understand exports, types, and function signatures
+2. Locate existing test patterns in the project (grep for describe/it/test)
+3. Write a test skeleton with: describe blocks, it placeholders, import statements, and basic happy-path assertions
+4. Follow the project's test runner conventions (node:test + node:assert/strict for this project)
+
+### Rules
+- Generate SKELETON tests — cover function signatures and basic cases
+- Do NOT implement complex test logic or mocks — the main agent will refine
+- Match existing test file naming: \`__tests__/<name>.test.ts\`
+- Include TODO comments for edge cases the main agent should fill in`,
+    defaultMaxTokens: 8192,
+    defaultTimeoutMs: 120_000,
+    defaultKind: 'patch_proposal',
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+  {
+    name: 'import_organizer',
+    role: 'hands',
+    allowedTools: ['read_file', 'edit_file', 'bash'],
+    expertisePrompt: `You are an import organizer. Sort imports, remove unused ones, and fix missing imports.
+
+### Process
+1. Read the file and analyze import statements
+2. Sort imports: node builtins first, then external packages, then internal (relative) imports
+3. Remove any unused imports (verify by checking usage in the file body)
+4. If the file has TypeScript \`import type\` — keep type imports separate from value imports
+
+### Rules
+- Do NOT change any non-import code
+- Preserve import aliases and named imports
+- If unsure whether an import is used (side-effect imports), leave it`,
+    defaultMaxTokens: 8192,
+    defaultTimeoutMs: 90_000,
+    defaultKind: 'patch_proposal',
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+  {
+    name: 'doc_syncer',
+    role: 'hands',
+    allowedTools: ['read_file', 'edit_file', 'grep', 'glob'],
+    expertisePrompt: `You are a documentation syncer. Update JSDoc, README sections, and inline comments to match code changes.
+
+### Process
+1. Read the changed source files
+2. Check if JSDoc comments are stale (parameter names, return types, descriptions)
+3. Update JSDoc to match current function signatures
+4. If a README or doc file references the changed API, update those references too
+
+### Rules
+- Only update documentation — do NOT change code behavior
+- Keep JSDoc concise: @param, @returns, brief description
+- Do NOT add redundant comments that just restate the code`,
+    defaultMaxTokens: 8192,
+    defaultTimeoutMs: 120_000,
+    defaultKind: 'patch_proposal',
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+  {
+    name: 'type_fixer',
+    role: 'hands',
+    allowedTools: ['read_file', 'edit_file', 'bash'],
+    expertisePrompt: `You are a type fixer. Run the TypeScript compiler and fix type errors.
+
+### Process
+1. Run: \`npx tsc --noEmit 2>&1\` to get all type errors
+2. For each error, read the file and apply the minimal fix
+3. Re-run tsc to confirm the fix resolved the error without introducing new ones
+
+### Fix strategies (in preference order)
+- Add missing type annotations
+- Fix incorrect type narrowing
+- Add missing properties to interfaces
+- Use type assertions ONLY as last resort (document why)
+
+### Rules
+- Fix types only — do NOT change runtime behavior
+- If a type error reveals a logic bug, report it as an escalation instead of fixing`,
+    defaultMaxTokens: 8192,
+    defaultTimeoutMs: 120_000,
+    defaultKind: 'patch_proposal',
+    tierLock: 'cheap',
+    builtIn: true,
+  },
+  {
+    name: 'format_checker',
+    role: 'readonly',
+    allowedTools: ['read_file', 'bash', 'grep'],
+    expertisePrompt: `You are a format checker. Check code formatting and report violations without fixing them.
+
+### Process
+1. Run the project formatter in check mode (e.g., \`npx prettier --check <files>\`)
+2. Parse the output to identify files with formatting violations
+3. Report: file paths, violation types, line numbers if available
+
+### Rules
+- Do NOT modify any files — read-only inspection only
+- Report results in structured format for the main agent to decide action`,
+    defaultMaxTokens: 4096,
+    defaultTimeoutMs: 60_000,
+    defaultKind: 'review',
+    tierLock: 'cheap',
+    builtIn: true,
+  },
 ]
 
 export class ProfileRegistry {
@@ -219,13 +424,16 @@ export class ProfileRegistry {
   }
 
   /** 从 .rivet/agents/ 目录加载用户自定义 profile */
-  loadFromDirectory(dir: string): { loaded: string[]; errors: string[] } {
+  async loadFromDirectory(dir: string): Promise<{ loaded: string[]; errors: string[] }> {
     const loaded: string[] = []
     const errors: string[] = []
     try {
+      const { readdirSync } = await import('node:fs')
+      const { join } = await import('node:path')
       const files = readdirSync(dir).filter(f => f.endsWith('.md') && f !== 'README.md')
       for (const file of files) {
         try {
+          const { readFileSync } = await import('node:fs')
           const content = readFileSync(join(dir, file), 'utf-8')
           const def = parseAgentMarkdown(content)
           if (this.profiles.has(def.name) && this.profiles.get(def.name)!.builtIn) {
@@ -321,3 +529,37 @@ function parseAgentMarkdown(content: string): ProfileDefinition {
 
 /** 全局单例 */
 export const profileRegistry = new ProfileRegistry()
+
+/**
+ * P0 超时对齐：delegate 工具层超时 = max(阶梯, 各 profile 预算) + 宽限。
+ *
+ * worker 内部预算（work-order.budget.timeoutMs）回退顺序是
+ * profile.defaultTimeoutMs → progressiveTimeout(sessionTurn)；外层工具超时
+ * 必须覆盖同一来源并加 WORKER_EXIT_GRACE_MS，否则外层先开枪 reject 整个
+ * delegate 调用，worker 的 blocked+partial-output 收尾路径永远走不到
+ * （reviewer/planner 600s 预算曾因此在 180s 工具超时下完全死接线）。
+ */
+/** Default worker pool concurrency (mirrors bootstrap `maxWorkers: 3`). */
+export const DEFAULT_DELEGATE_CONCURRENCY = 3
+
+export function delegationToolTimeoutMs(
+  sessionTurnCount: number | undefined,
+  profiles: ReadonlyArray<string | undefined>,
+  opts?: { taskCount?: number; maxWorkers?: number },
+): number {
+  let budget = progressiveTimeout(sessionTurnCount)
+  for (const name of profiles) {
+    const profileBudget = name ? profileRegistry.get(name)?.defaultTimeoutMs : undefined
+    if (profileBudget && profileBudget > budget) budget = profileBudget
+  }
+  // P0: a bounded worker pool runs a batch in sequential waves. A 5-task batch
+  // on a 3-worker pool needs ceil(5/3)=2 waves, so the outer tool timeout must
+  // cover ALL waves of the slowest single-task budget — otherwise it pre-empts a
+  // later wave with a hard reject and orphans those workers (no blocked/partial
+  // result salvage). Scaling by waves (not total task count) avoids over-inflating
+  // the ceiling while still never firing before the pool can drain.
+  const taskCount = Math.max(1, Math.floor(opts?.taskCount ?? profiles.length ?? 1))
+  const maxWorkers = Math.max(1, Math.floor(opts?.maxWorkers ?? DEFAULT_DELEGATE_CONCURRENCY))
+  const waves = Math.max(1, Math.ceil(taskCount / maxWorkers))
+  return budget * waves + WORKER_EXIT_GRACE_MS
+}

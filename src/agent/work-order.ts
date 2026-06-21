@@ -4,6 +4,7 @@ import type { CapabilityTask } from '../model/capability.js'
 import type { VerificationMetadata } from '../tools/types.js'
 import { profileRegistry } from './profile-registry.js'
 import { starDomainRegistry } from './star-domain-registry.js'
+import { progressiveTimeout } from './timeout-ladder.js'
 
 export const READ_ONLY_WORKER_TOOLS = ['read_file', 'read_section', 'glob', 'grep', 'diff', 'inspect_project', 'repo_map', 'repo_graph', 'related_tests'] as const
 
@@ -80,6 +81,16 @@ const workerBudgetSchema = z.object({
 
 export type WorkerBudget = z.infer<typeof workerBudgetSchema>
 
+/**
+ * Enforce a work order's per-profile turn budget against a runtime's generic
+ * default. The runtime factory hands back a broad default `maxTurns`; the work
+ * order's `budget.maxTurns` (e.g. a reviewer's 6) must win whenever it's
+ * tighter, otherwise the budget is decorative and workers run to the global cap.
+ */
+export function clampWorkerMaxTurns(runtimeDefault: number, budgetMaxTurns: number): number {
+  return Math.min(runtimeDefault, budgetMaxTurns)
+}
+
 export const workOrderSchema = z.object({
   id: z.string().min(1),
   parentTurnId: z.string().min(1),
@@ -97,6 +108,9 @@ export const workOrderSchema = z.object({
   domain: domainAreaSchema.optional(),
   workerCwd: z.string().optional(),
   reviewDepth: z.number().int().min(0).optional(),
+  /** B3: delegation nesting depth (0 = spawned by primary). Capped by the
+   *  coordinator at MAX_DELEGATION_DEPTH — nesting allowed but gated. */
+  delegationDepth: z.number().int().min(0).default(0),
   /** Star domain authority for cognitive injection (V3 Component A). */
   authority: z.string().optional(),
   /** Team planner risk tier for shadow-only model tier recommendation. */
@@ -192,10 +206,14 @@ export interface CreateReadOnlyWorkOrderInput {
   domain?: DomainArea
   /** Review-router re-entrancy depth propagated across delegation boundaries. */
   reviewDepth?: number
+  /** B3: delegation nesting depth (0 = spawned by primary). */
+  delegationDepth?: number
   /** Star domain authority for cognitive injection (V3 Component A). */
   authority?: string
   /** Team planner risk tier for shadow-only model tier recommendation. */
   riskTier?: 'low' | 'medium' | 'high'
+  /** B2: current session turn for progressive timeout calculation. */
+  sessionTurn?: number
 }
 
 function toolsForAuthority(tools: string[], authority?: string): string[] {
@@ -247,12 +265,13 @@ export function createReadOnlyWorkOrder(input: CreateReadOnlyWorkOrderInput): Wo
     aggregationPolicy: input.aggregationPolicy ?? 'primary_decides',
     budget: {
       maxTurns: input.budget?.maxTurns ?? 8,
-      maxTokens: input.budget?.maxTokens ?? 4096,
-      timeoutMs: input.budget?.timeoutMs ?? 180_000,
+      maxTokens: input.budget?.maxTokens ?? profileRegistry.get(input.profile)?.defaultMaxTokens ?? 4096,
+      timeoutMs: input.budget?.timeoutMs ?? profileRegistry.get(input.profile)?.defaultTimeoutMs ?? progressiveTimeout(input.sessionTurn),
       maxRetries: input.budget?.maxRetries ?? 2,
     },
     domain: input.domain,
     reviewDepth: input.reviewDepth,
+    delegationDepth: input.delegationDepth ?? 0,
     authority: input.authority,
     riskTier: input.riskTier,
   })
@@ -288,12 +307,13 @@ export function createWriteWorkOrder(input: CreateWriteWorkOrderInput): WorkOrde
     aggregationPolicy: input.aggregationPolicy ?? 'primary_decides',
     budget: {
       maxTurns: input.budget?.maxTurns ?? 8,
-      maxTokens: input.budget?.maxTokens ?? 16384,
-      timeoutMs: input.budget?.timeoutMs ?? 180_000,
+      maxTokens: input.budget?.maxTokens ?? profileRegistry.get(input.profile ?? 'patcher')?.defaultMaxTokens ?? 16384,
+      timeoutMs: input.budget?.timeoutMs ?? profileRegistry.get(input.profile ?? 'patcher')?.defaultTimeoutMs ?? progressiveTimeout(input.sessionTurn),
       maxRetries: input.budget?.maxRetries ?? 1,
     },
     domain: input.domain,
     reviewDepth: input.reviewDepth,
+    delegationDepth: input.delegationDepth ?? 0,
     authority: input.authority,
     riskTier: input.riskTier,
   })
@@ -380,11 +400,20 @@ function normalizeWorkerResult(raw: z.infer<typeof workerResultIngestSchema>): W
 }
 
 function parseWorkerResultObject(parsed: unknown, expectedWorkOrderId: string): WorkerResult {
-  // Fault tolerance: force workOrderId to the expected value.
-  // Cheap models may omit, blank, or hallucinate a different workOrderId.
+  // Fault tolerance for cheap models:
+  // - Force workOrderId to expected value (models may omit or hallucinate it).
+  // - Default missing status to 'blocked' (flash models frequently omit it).
+  // Only apply when the JSON has at least workOrderId (real worker packet),
+  // NOT for incidental JSON objects (e.g. {"note":"not the result"}).
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     const obj = parsed as Record<string, unknown>
-    obj.workOrderId = expectedWorkOrderId
+    const hasWorkOrderId = typeof obj.workOrderId === 'string' && obj.workOrderId.length > 0
+    if (hasWorkOrderId || typeof obj.summary === 'string') {
+      obj.workOrderId = expectedWorkOrderId
+      if (obj.status === undefined || obj.status === null || obj.status === '') {
+        obj.status = 'blocked'
+      }
+    }
   }
 
   const ingested = workerResultIngestSchema.parse(parsed)

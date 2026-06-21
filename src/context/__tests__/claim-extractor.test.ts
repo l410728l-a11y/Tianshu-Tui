@@ -200,6 +200,74 @@ describe('claim-extractor', () => {
     assert.match(proposals[0]!.text, /def5678/)
   })
 
+  it('commit fact text carries the turn anchor', () => {
+    const ctx: ToolResultContext = {
+      toolName: 'git',
+      input: { action: 'commit', message: 'feat: anchor' },
+      result: '[main abc9999] feat: anchor\n 1 file changed, 1 insertion(+)',
+      isError: false,
+    }
+    const proposals = extractClaimsFromToolResult(ctx, meta)
+    assert.equal(proposals.length, 1)
+    assert.match(proposals[0]!.text, new RegExp(`\\(turn ${meta.turn}\\)`))
+  })
+
+  it('parses the bracketed commit hash, not another hash embedded in the body', () => {
+    // Regression: commit messages routinely reference OTHER commits. The real
+    // new-commit hash is the bracketed one ([branch <hash>]); the old regex
+    // grabbed the first hex token (here the referenced 411a51f) and mislabeled
+    // ~61% of stored commit facts onto wrong/non-existent commits.
+    const ctx: ToolResultContext = {
+      toolName: 'git',
+      input: { action: 'commit', message: 'fix(server): H4 regression from 411a51f hash_edit' },
+      result: '[t9-ui-refactor 4dbaea0] fix(server): H4 regression from 411a51f hash_edit\n'
+        + ' 1 file changed, 3 insertions(+)\n\n--- actual changes (git show --stat) ---\n'
+        + '4dbaea0 (HEAD -> t9-ui-refactor)\n src/server/cron-scheduler.ts | 3 ++-',
+      isError: false,
+    }
+    const proposals = extractClaimsFromToolResult(ctx, meta)
+    assert.equal(proposals.length, 1)
+    assert.match(proposals[0]!.text, /^Commit 4dbaea0 /, 'must use bracketed hash 4dbaea0, not 411a51f')
+    assert.doesNotMatch(proposals[0]!.text, /Commit 411a51f/)
+  })
+
+  it('falls back to the git-show readback hash when no bracket is present', () => {
+    const ctx: ToolResultContext = {
+      toolName: 'deliver_task',
+      input: { commit: true, message: 'fix: scoped' },
+      // deliver_task output without a [branch hash] line still has the readback.
+      result: 'Delivery Gate: GREEN\n✅ Scoped commit created\n\n'
+        + '--- actual changes (git show --stat) ---\ndef5678 (HEAD -> main)\n src/a.ts | 3 ++-',
+      isError: false,
+    }
+    const proposals = extractClaimsFromToolResult(ctx, meta)
+    assert.equal(proposals.length, 1)
+    assert.match(proposals[0]!.text, /^Commit def5678 /)
+  })
+
+  it('throttles insignificant commits (no feat/fix prefix, < 3 files)', () => {
+    const ctx: ToolResultContext = {
+      toolName: 'git',
+      input: { action: 'commit', message: 'chore: update comments' },
+      result: '[main aaa1111] chore: update comments\n 1 file changed, 1 insertion(+)',
+      isError: false,
+    }
+    const proposals = extractClaimsFromToolResult(ctx, meta)
+    assert.equal(proposals.length, 0, 'insignificant commit should not produce a claim')
+  })
+
+  it('allows significant commit with 3+ files even without conventional prefix', () => {
+    const ctx: ToolResultContext = {
+      toolName: 'git',
+      input: { action: 'commit', message: 'update multiple modules' },
+      result: '[main bbb2222] update multiple modules\n 4 files changed\n\n--- actual changes (git show --stat) ---\nbbb2222 (HEAD -> main)\n src/a.ts | 1 +\n src/b.ts | 2 +-\n src/c.ts | 3 ++-\n 3 files changed, 4 insertions(+), 2 deletions(-)',
+      isError: false,
+    }
+    const proposals = extractClaimsFromToolResult(ctx, meta)
+    assert.equal(proposals.length, 1, 'commit touching 3+ files should persist')
+    assert.ok(proposals[0]!.tags.includes('commit_fact'))
+  })
+
   it('does not extract claim from failed commit', () => {
     const ctx: ToolResultContext = {
       toolName: 'git',

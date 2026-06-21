@@ -1,0 +1,215 @@
+/**
+ * T9 格式化函数 — 工具卡片（Claude Code 风格）。
+ *
+ * 渲染结构：
+ *   ● Run(npm test) (1.2s)
+ *     ⎿  前 4 行输出
+ *        … +25 lines (ctrl+o to expand)
+ *
+ * - 状态色：成功绿 ●、失败红 ●、进行中 dim ●
+ * - 参数摘要：复用 tool-label.ts 的 toolArgSummary + tool-family.ts 动词体系
+ * - 截断：默认头 N 行 + `… +N lines` 尾注；read 族用头+尾预览
+ * - diff 检测：write/edit 族结果经 isDiffContent() 检测后走红绿渲染
+ */
+
+import { color } from '../engine/ansi.js'
+import type { RivetTheme } from '../theme.js'
+import { getToolFamily } from '../tool-family.js'
+import { toolArgSummary } from '../tool-label.js'
+import { formatElapsed } from '../tool-elapsed.js'
+import { formatDiff, isDiffContent } from './diff.js'
+
+export interface FormatToolCardInput {
+  /** 工具名称 */
+  toolName: string
+  /** 工具输出内容 */
+  content: string
+  /** 是否为错误输出 */
+  isError?: boolean
+  /** 缩进深度（用于工具调用链的树形连接线） */
+  depth?: number
+  /** 原始文件路径（用于显示文件名） */
+  rawPath?: string
+  /** 折叠时显示的输出行数上限 */
+  maxLines?: number
+  /** 工具耗时（毫秒），可选 */
+  elapsedMs?: number
+  /** 是否正在流式输出中 */
+  streaming?: boolean
+  /** 工具输入参数（用于标题参数摘要） */
+  toolInput?: Record<string, unknown>
+  /** 完整展开（ctrl+o），不截断 */
+  expanded?: boolean
+}
+
+const DEFAULT_MAX_LINES = 4
+const READ_HEAD_LINES = 3
+const READ_TAIL_LINES = 5
+const DIFF_MAX_LINES = 20
+
+const BODY_FIRST_PREFIX = '⎿  '
+const BODY_CONT_PREFIX = '   '
+
+/** 标题动词：family verb 首字母大写（Run/Read/Patch/Write/Search/Find…） */
+function toolTitleVerb(toolName: string): string {
+  const verb = getToolFamily(toolName).verb
+  return verb.charAt(0).toUpperCase() + verb.slice(1)
+}
+
+/** 标题行文本（无色）：`Run(npm test)` 或 `Read(foo.ts)` */
+export function toolCardTitle(toolName: string, toolInput?: Record<string, unknown>, rawPath?: string): string {
+  const verb = toolTitleVerb(toolName)
+  let arg = toolInput ? toolArgSummary(toolName, toolInput) : ''
+  if (!arg && rawPath) arg = rawPath.split('/').pop() ?? rawPath
+  return arg ? `${verb}(${arg})` : verb
+}
+
+/** 缩进 body 行：第一行 `⎿  `，后续行对齐缩进 */
+function indentBody(bodyLines: readonly string[], indent: string, theme: RivetTheme): string[] {
+  return bodyLines.map((line, i) =>
+    `${indent}${i === 0 ? color(BODY_FIRST_PREFIX, theme.dim) : BODY_CONT_PREFIX}${line}`)
+}
+
+/**
+ * 格式化工具卡片为 ANSI 行数组（Claude Code ●/⎿ 结构）。
+ */
+export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): string[] {
+  const {
+    toolName,
+    content,
+    isError = false,
+    depth = 0,
+    rawPath,
+    elapsedMs,
+    streaming = false,
+    toolInput,
+    expanded = false,
+  } = input
+
+  const family = getToolFamily(toolName)
+  const indent = depth > 0 ? '  '.repeat(depth) : ''
+
+  // ── Header: ● Verb(arg) (elapsed) ───────────────────────────
+  const bulletColor = isError ? theme.error : streaming ? theme.dim : theme.success
+  const title = toolCardTitle(toolName, toolInput, rawPath)
+  const tColor = theme.toolColor(toolName)
+  let header = `${indent}${color('●', bulletColor)} ${color(title, tColor, { bold: true })}`
+  if (streaming) {
+    header += ` ${color('…', theme.dim)}`
+  } else if (elapsedMs !== undefined) {
+    header += ` ${color(`(${formatElapsed(elapsedMs)})`, theme.muted)}`
+  }
+
+  const lines: string[] = [header]
+
+  const trimmed = content.replace(/\n+$/, '')
+  if (!trimmed) {
+    lines.push(`${indent}${color(BODY_FIRST_PREFIX, theme.dim)}${color('(no output)', theme.muted)}`)
+    return lines
+  }
+
+  // ── Diff 分支：write/edit 族 + diff 内容 → 红绿渲染 ─────────
+  if (family.family === 'write' && isDiffContent(trimmed)) {
+    const diffLines = formatDiff({
+      content: trimmed,
+      maxLines: expanded ? Number.MAX_SAFE_INTEGER : DIFF_MAX_LINES,
+    }, theme)
+    lines.push(...indentBody(diffLines, indent, theme))
+    if (!expanded && trimmed.split('\n').length > DIFF_MAX_LINES) {
+      lines.push(`${indent}${BODY_CONT_PREFIX}${color('(ctrl+o to expand)', theme.muted)}`)
+    }
+    return lines
+  }
+
+  // ── 普通输出分支 ─────────────────────────────────────────────
+  const contentLines = trimmed.split('\n')
+  const totalLines = contentLines.length
+  const maxLines = input.maxLines ?? DEFAULT_MAX_LINES
+  // 正文是「数据」(命令输出/文件列表/git status)，用可读的 muted 前景。
+  // 绝不能用 theme.dim —— dim 是装饰专用色(分隔线/快捷键)，在墨夜底上 ~2:1
+  // 对比度几乎不可见，会把真实数据染到看不清。
+  const bodyColor = isError ? theme.error : theme.muted
+
+  const renderLine = (l: string) => color(l, bodyColor)
+
+  if (expanded || totalLines <= maxLines) {
+    lines.push(...indentBody(contentLines.map(renderLine), indent, theme))
+    if (rawPath && !expanded) {
+      lines.push(`${indent}${BODY_CONT_PREFIX}${color(`raw: ${rawPath.split('/').pop() ?? rawPath}`, theme.muted)}`)
+    }
+    return lines
+  }
+
+  // 截断：read 族用头+尾预览，其他工具用头 N 行
+  if (family.family === 'read') {
+    const head = contentLines.slice(0, READ_HEAD_LINES)
+    const tail = contentLines.slice(-READ_TAIL_LINES)
+    const omitted = totalLines - READ_HEAD_LINES - READ_TAIL_LINES
+    const body = [
+      ...head.map(renderLine),
+      color(`… +${omitted} lines (ctrl+o to expand)`, theme.muted),
+      ...tail.map(renderLine),
+    ]
+    lines.push(...indentBody(body, indent, theme))
+    return lines
+  }
+
+  const head = contentLines.slice(0, maxLines)
+  const omitted = totalLines - maxLines
+  const body = [
+    ...head.map(renderLine),
+    color(`… +${omitted} lines (ctrl+o to expand)`, theme.muted),
+  ]
+  lines.push(...indentBody(body, indent, theme))
+  return lines
+}
+
+/** 判断该工具结果在折叠渲染下是否被截断（供 ctrl+o 展开记录用） */
+export function isToolCardTruncated(input: Pick<FormatToolCardInput, 'toolName' | 'content' | 'maxLines'>): boolean {
+  const trimmed = input.content.replace(/\n+$/, '')
+  if (!trimmed) return false
+  const totalLines = trimmed.split('\n').length
+  const family = getToolFamily(input.toolName)
+  if (family.family === 'write' && isDiffContent(trimmed)) {
+    return totalLines > DIFF_MAX_LINES
+  }
+  return totalLines > (input.maxLines ?? DEFAULT_MAX_LINES)
+}
+
+// ── Live 进行中工具行 ──────────────────────────────────────────
+
+export interface FormatToolCardLiveInput {
+  toolName: string
+  /** 工具输入参数（标题摘要） */
+  toolInput?: Record<string, unknown>
+  /** 已累积的流式输出 */
+  outputTail?: string
+  /** 已运行时长（毫秒） */
+  elapsedMs?: number
+  /** 末尾输出显示行数 */
+  tailLines?: number
+  /** 终端列数 */
+  columns: number
+}
+
+/**
+ * live 区进行中工具的渲染：dim `●` 标题行 + 末 N 行输出（⎿ 缩进）。
+ */
+export function formatToolCardLive(input: FormatToolCardLiveInput, theme: RivetTheme): string[] {
+  const title = toolCardTitle(input.toolName, input.toolInput)
+  let header = `${color('●', theme.dim)} ${color(title, theme.dim, { bold: true })}`
+  if (input.elapsedMs !== undefined && input.elapsedMs >= 1000) {
+    header += ` ${color(`(${formatElapsed(input.elapsedMs)})`, theme.muted)}`
+  }
+
+  const lines: string[] = [header]
+  const tail = (input.outputTail ?? '').replace(/\n+$/, '')
+  if (tail) {
+    const tailCount = input.tailLines ?? 3
+    const maxWidth = Math.max(10, input.columns - 6)
+    const shown = tail.split('\n').slice(-tailCount).map(l =>
+      color(l.length > maxWidth ? l.slice(0, maxWidth - 1) + '…' : l, theme.dim))
+    lines.push(...indentBody(shown, '', theme))
+  }
+  return lines
+}

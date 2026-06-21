@@ -3,9 +3,10 @@ import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotoc
 import type { Tool } from '../tools/types.js'
 import type { McpConfig, McpServerConfig } from './config.js'
 import type { McpConnectionState } from './types.js'
-import { createMcpToolWrapper } from './wrapper.js'
+import { createMcpToolWrapper, createMcpConnectorConsent, type McpConnectorConsent } from './wrapper.js'
+import { classifyMcpError } from './failure-classifier.js'
 
-const DEFAULT_MCP_TIMEOUT_MS = 15_000
+const DEFAULT_MCP_TIMEOUT_MS = 60_000
 
 function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -39,6 +40,8 @@ export class McpManager {
   private states: Map<string, McpConnectionState> = new Map()
   private tools: Tool[] = []
   private timeoutMs: number
+  // Shared across all wrappers: first use of each connector requires explicit opt-in.
+  private connectorConsent: McpConnectorConsent = createMcpConnectorConsent()
 
   constructor(config: McpConfig) {
     this.config = config
@@ -102,10 +105,33 @@ export class McpManager {
     this.connections.clear()
   }
 
-  private async connectAndDiscover(serverId: string, serverConfig: McpServerConfig): Promise<void> {
+  /** Shut down a single server by id — for the REST API restart/remove flow. */
+  async shutdownServer(serverId: string): Promise<void> {
+    const conn = this.connections.get(serverId)
+    if (conn) {
+      try { await conn.transport.close() } catch { /* best-effort */ }
+      this.connections.delete(serverId)
+    }
+    // Remove the server's tools from the tool list
+    const prefix = `mcp__${serverId}__`
+    this.tools = this.tools.filter(t => !t.definition.name.startsWith(prefix))
+    this.states.delete(serverId)
+  }
+
+  /**
+   * Connect and discover tools for a single server. Public so the REST API can
+   * hot-add servers without a full restart.
+   */
+  async connectAndDiscover(serverId: string, serverConfig: McpServerConfig): Promise<void> {
+    return this._connectAndDiscover(serverId, serverConfig)
+  }
+
+  private async _connectAndDiscover(serverId: string, serverConfig: McpServerConfig): Promise<void> {
+    const transport: 'stdio' | 'sse' = serverConfig.command ? 'stdio' : 'sse'
     this.states.set(serverId, {
       serverId,
       status: 'connecting',
+      transport,
       toolCount: 0,
     })
 
@@ -135,24 +161,28 @@ export class McpManager {
                 isError: result.isError as boolean | undefined,
               }
             } catch (err) {
+              const classified = classifyMcpError(err)
               const current = this.states.get(serverId)
               this.states.set(serverId, {
                 serverId,
+                transport,
                 status: 'degraded',
                 toolCount: current?.toolCount ?? 0,
                 error: err instanceof Error ? err.message : String(err),
                 lastConnectedAt: current?.lastConnectedAt,
+                lastErrorClass: classified.class,
                 lastErrorAt: Date.now(),
               })
               throw err
             }
           }
-          return createMcpToolWrapper(serverId, mcpDef, perToolCallFn)
+          return createMcpToolWrapper(serverId, mcpDef, perToolCallFn, this.connectorConsent)
         })
 
         this.tools.push(...rivetTools)
         this.states.set(serverId, {
           serverId,
+          transport,
           status: 'connected',
           toolCount: mcpTools.length,
           lastConnectedAt: Date.now(),
@@ -164,11 +194,15 @@ export class McpManager {
         throw err
       }
     } catch (err) {
+      const classified = classifyMcpError(err)
       this.states.set(serverId, {
         serverId,
+        transport,
         status: 'error',
         toolCount: 0,
         error: err instanceof Error ? err.message : String(err),
+        lastErrorClass: classified.class,
+        lastErrorAt: Date.now(),
       })
     }
   }

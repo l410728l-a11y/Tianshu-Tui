@@ -1,11 +1,12 @@
 import type { OaiChatRequest, OaiMessage, OaiToolDefinition } from '../api/oai-types.js'
 import { semanticPruneLayer1 } from '../compact/semantic-prune.js'
+import { collapseToolResult } from '../compact/context-collapse.js'
 import { detectStaleness } from '../compact/staleness-detect.js'
 import { CACHE_ANCHOR_MESSAGES } from '../compact/constants.js'
 import { buildSystemPrompt, type StaticPromptContext } from './static.js'
 import type { ToolDefinition } from '../api/types.js'
-import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendix, buildConsolidatedBlock, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
-import { analyzeVolatilePayload, type VolatilePayloadReport } from '../context/payload-diagnostic.js'
+import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
+import { analyzeVolatilePayload, LARGE_VOLATILE_PAYLOAD_CHARS, type VolatilePayloadReport } from '../context/payload-diagnostic.js'
 import type { TaskState } from '../agent/task-state.js'
 import type { ContextClaim } from '../context/claims.js'
 import type { PlaybookBullet } from '../agent/playbook.js'
@@ -17,9 +18,38 @@ import {
   type DriftEvent,
 } from './fingerprint.js'
 import { FieldHabituationTracker } from './field-habituation.js'
+import { isSystemReminder } from './system-reminder.js'
 import { createContextLayer, createContextLayerReport, type ContextLayerReport } from './context-layer.js'
+import { debugLog } from '../utils/debug.js'
 
 export type { PrefixFingerprint, DriftEvent, ContextLayerReport }
+
+/**
+ * T7 request-time collapse: window fill-ratio above which the *full* pass runs
+ * (collapsing old tool results into summaries, not just the lightweight
+ * reasoning-strip + dup-fold). The full pass breaks the exact-prefix cache on
+ * DeepSeek-class providers, so it is deferred until the window is genuinely
+ * near-full. See the call site in {@link PromptEngine} for the cost rationale.
+ */
+const FULL_COLLAPSE_FILL_RATIO = 0.85
+
+/**
+ * T7 collapse FLOOR: below this window fill-ratio, request-time collapse does
+ * not run at all (neither the watermark advances nor any rewrite happens).
+ *
+ * Rationale (exact-prefix economics): old reasoning_content / tool results that
+ * sit in the cached prefix are CHEAP to keep — they serve from cache-read
+ * (~0.025元/M on V4-PRO). Collapsing them rewrites history, which breaks the
+ * exact-prefix cache from the touched message onward — a one-time cache-MISS
+ * rebuild (~3元/M, 120× the read price). Below the floor there is ample headroom
+ * to the window limit, so keeping cached tokens is strictly cheaper than the
+ * break. Session-overflow is handled separately by trySessionSplit at 86%, which
+ * already rewrites at a cold-start boundary. Observed motivation: a session at
+ * fillRatio ~0.2 took a 169K-token break when the watermark advanced for savings
+ * it had no need for (mqhs/ed32f759 uMsg9). Collapse only earns its break when
+ * the window is genuinely filling. Tunable.
+ */
+const COLLAPSE_FLOOR_FILL_RATIO = 0.5
 
 /** Fast non-crypto hash for content dedup (djb2 on first 2000 chars + length). */
 function simpleHash(s: string): string {
@@ -35,6 +65,12 @@ export interface PromptEngineConfig {
   staticCtx: StaticPromptContext
   volatileCtx: VolatileContext
   habituationThreshold?: number
+  attentionProfile?: { effectiveAttentionRatio: number; toolDensityThreshold: number; collapseAgeTurns: number }
+  /** Prefix cache mode — 'deepseek-native' enables immediate promotion of
+   *  session-constant fields (star-domain) to skip habituation warm-up. */
+  prefixCache?: 'deepseek-native' | 'anthropic-cache-control' | 'none'
+  /** Enable append-only delta context-update (only emit changed sub-blocks). */
+  appendixDelta?: boolean
 }
 
 export class PromptEngine {
@@ -50,6 +86,10 @@ export class PromptEngine {
   /** P1: cached dynamic appendix, appended as standalone message at end of result.
    *  Computed once when a new user message arrives, reused across tool-call turns. */
   private cachedAppendix: string = ''
+  /** P1: cached consolidated block from habituation tracker.
+   *  Stable across turns after promotion — placed BEFORE userContent so
+   *  it enters the prefix cache (unlike cachedAppendix, which sits after). */
+  private cachedConsolidated: string = ''
   /**
    * Frozen merged content for historical user messages (preserves prefix stability).
    * Maps user-message content → array of frozen snapshots. Array handles duplicate
@@ -60,26 +100,41 @@ export class PromptEngine {
   private frozenFetchIndex: Map<string, number> = new Map()
   /** Maximum total entries across all content keys before eviction kicks in. */
   private static readonly MAX_FROZEN_USER_MERGED = 64
+  /**
+   * Content key of the FIRST user message in the current session. Its frozen
+   * snapshot is the byte-0 anchor of the whole prefix — if eviction deletes it,
+   * the first user message rebuilds with the current (possibly swapped)
+   * volatileBlock → full 0% prefix cache break. Excluded from eviction.
+   */
+  private firstUserKey: string | null = null
   private taskProgress?: TaskState
-  private behaviorMirror?: string | null
-  private strategyShift?: string | null
   private repairHint?: string | null
-  private impactHint?: string | null
-  private routingReason?: string | null
-  private cerebellarHint?: string | null
-  private affordanceHint?: string | null
-  private policyGuidance?: string | null
+  private toolContext?: string | null
   private planCacheAdvisory?: string | null
+  /** U6: serialized PlanExecutionTrace appendix (survives compaction). */
+  private planTraceAppendix?: string | null
+  /** Approved-plan pointer (slug/title/path only) — dynamic appendix, never frozen. */
+  private activePlanPointer?: string
   private intentRetrievalRoute?: string | null
+  private taskDepthLayer?: import('../context/task-contract.js').TaskDepthLayer
+  private planMethodology?: import('../context/task-contract.js').PlanMethodology
+  private planMethodologyReason?: string
+  private skillAdvisoryBlock?: string | null
+  private crossSessionMemoryBlock?: string | null
+  private mentionContextBlock?: string | null
+  private harnessAdvisoryBlock?: string | null
   private decisions?: string[]
   private activeDomain?: VolatileContext['activeDomain']
   private activeClaims?: VolatileContext['activeClaims']
   private playbookLessons?: VolatileContext['playbookLessons']
+  private recentQuery?: string
+  private onLessonsRendered?: (ids: string[]) => void
   private sessionMemoryOverride?: string
   private contextLayerReportData: ContextLayerReport
   private phaseHint?: string
   private cognitiveProjection?: string
   private crossSessionEvents?: string
+  private companionPresence?: string
   private sessionStateText?: string
   private worktreeReality?: WorktreeReality
   /** Plan Mode state — when 'planning', rendered into volatile block */
@@ -88,11 +143,31 @@ export class PromptEngine {
    *  Replaces the old binary chat/task PromptMode — auto-detected from message content. */
   private actionableTurn: boolean = true
   private gitDirty = false
+  /**
+   * T7 watermark: request-copy collapse only applies to message indices below
+   * this boundary. Advancing only on 50K-token steps (not every turn) keeps the
+   * collapse boundary stable across requests — a sliding boundary would rewrite
+   * more request bytes every turn and permanently break the prefix cache.
+   */
+  private collapseWatermark = 0
+  /** Last 50K-token step at which the watermark was advanced. */
+  private collapseTokenStep = -1
+  /** Cache-event counters (P2-6 breadcrumbs): queried per-turn by cache logging. */
+  private frozenSnapshotClamps = 0
+  private frozenFallbackRebuilds = 0
+  private volatileSwapCount = 0
+  private toolsUpdateCount = 0
   /** Tracks message array length to detect true duplicate messages vs tool-call turns. */
   private lastMessageCount: number = 0
   /** Hash of last message array to distinguish exact same call from true duplicate. */
   private lastMessageHash: string = ''
   private userMessagesSinceGitRefresh = 0
+  /** Append-only delta: last emitted context-update sub-blocks (name→content). */
+  private lastEmittedAppendixParts: Map<string, string> = new Map()
+  /** Monotonic context-update sequence number (model orders updates by seq). */
+  private appendixSeq = 0
+  /** Whether a full baseline context-update was sent since last reset. */
+  private appendixBaselineSent = false
 
   constructor(config: PromptEngineConfig) {
     this.config = config
@@ -136,8 +211,17 @@ export class PromptEngine {
     const arr = this.frozenUserMerged.get(content)
     if (!arr || arr.length === 0) return undefined
     const idx = this.frozenFetchIndex.get(content) ?? 0
-    if (idx >= arr.length) return undefined
     this.frozenFetchIndex.set(content, idx + 1)
+    if (idx >= arr.length) {
+      // Eviction shortened this array (or dedup collapsed duplicates) — clamp
+      // to the last surviving snapshot instead of returning undefined. The
+      // undefined path would rebuild with the CURRENT volatileBlock, and if
+      // that block has swapped since, the first user message changes from
+      // byte 0 → full 0% prefix cache break (cache-log #28/#44 root cause).
+      this.frozenSnapshotClamps++
+      debugLog('prompt-engine', `frozen snapshot clamp: key len=${content.length} requested idx=${idx} surviving=${arr.length}`)
+      return arr[arr.length - 1]
+    }
     return arr[idx]
   }
 
@@ -147,27 +231,45 @@ export class PromptEngine {
     this.frozenFetchIndex.clear()
 
     // Compute GWT budget for dynamic appendix (context-update sub-blocks).
-    // Scales with context window; caps at 200K chars to prevent bloat.
-    // On 1M+ windows: 5% × 4 chars/token = 200K chars (hits cap).
-    // On 200K windows: 5% × 4 chars/token = 40K chars. Minimum 2K.
+    // Track 4 预算审计：旧上限 200K chars（1M 窗口 5%≈50K token）是
+    // payload-diagnostic 「large payload」阈值（12K chars）的 16 倍 —
+    // 每轮重建的 appendix 直接顶在 prefix cache 尾部，绝对量必须收紧。
+    // 新上限 = 4×LARGE_VOLATILE_PAYLOAD_CHARS = 48K chars（~12K token，
+    // 1M 下 ~1.2%）。小窗口仍按 5% 缩放（128K 窗口 → 25.6K chars，未触顶）。
     const appendixMaxChars = contextWindow && contextWindow > 0
-      ? Math.min(Math.max(Math.floor(contextWindow * 0.05 * 4), 2_000), 200_000)
+      ? Math.min(Math.max(Math.floor(contextWindow * 0.05 * 4), 2_000), 4 * LARGE_VOLATILE_PAYLOAD_CHARS)
       : undefined
 
     let firstUserIdx = -1
     let lastUserIdx = -1
     for (let i = 0; i < oaiMessages.length; i++) {
-      if (oaiMessages[i]!.role === 'user') {
+      const m = oaiMessages[i]!
+      // Injected <system-reminder> messages are pseudo-user messages — they
+      // must NOT act as user boundaries (no volatile swap, no appendix
+      // rebuild, no trailer merge). Otherwise every injection breaks the
+      // prefix cache mid-task.
+      if (m.role === 'user' && !isSystemReminder(m.content)) {
         if (firstUserIdx === -1) firstUserIdx = i
         lastUserIdx = i
       }
     }
 
+    // Remember the first user message's key so eviction never deletes its
+    // frozen snapshot (the byte-0 prefix anchor). Refreshed each call so it
+    // tracks the post-compaction anchor when history is rewritten.
+    if (firstUserIdx >= 0) {
+      const fm = oaiMessages[firstUserIdx]!
+      this.firstUserKey = typeof fm.content === 'string' ? fm.content : ''
+    }
+
     for (let i = 0; i < oaiMessages.length; i++) {
       const msg = oaiMessages[i]!
-      if (msg.role === 'user' && this.volatileBlock) {
+      if (msg.role === 'user' && isSystemReminder(msg.content)) {
+        // Pass through untouched: bare user message, byte-stable forever.
+        result.push(msg)
+      } else if (msg.role === 'user' && this.volatileBlock) {
         if (i === lastUserIdx) {
-          const userContent = msg.content
+          const userContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
 
           // Force rebuild for true duplicate messages — they need their own frozen entry.
           // A true duplicate: same content, same message count, but different message array
@@ -182,6 +284,18 @@ export class PromptEngine {
           this.lastMessageCount = oaiMessages.length
           this.lastMessageHash = msgHash
           if (userContent !== this.cachedFreshForUser || isDuplicate) {
+            // New user message boundary — apply any pending frozen base update.
+            // rebuildFrozenBase() defers the volatileBlock swap to this point
+            // so that tool-call turns within the same user message keep using
+            // the old stable volatileBlock → exact-prefix cache preserved.
+            if (this.frozenBase !== this.volatileBlock) {
+              this.volatileBlock = this.frozenBase
+              this.volatileSwapCount++
+              // Old frozen entries embed old volatileBlock, which byte-matches
+              // previous API calls — clearing them would force fallback with
+              // newVolatileBlock and cause full prefix cache break. Keep them:
+              // historical messages hit cache; only new user message misses.
+            }
             this.cachedFreshForUser = userContent
             this.userMessagesSinceGitRefresh++
             const refreshGit = this.gitDirty || this.userMessagesSinceGitRefresh >= 3
@@ -189,7 +303,7 @@ export class PromptEngine {
               this.gitDirty = false
               this.userMessagesSinceGitRefresh = 0
             }
-            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, behaviorMirror: this.behaviorMirror, strategyShift: this.strategyShift, repairHint: this.repairHint, impactHint: this.impactHint, routingReason: this.routingReason, cerebellarHint: this.cerebellarHint, affordanceHint: this.affordanceHint, policyGuidance: this.policyGuidance, planCacheAdvisory: this.planCacheAdvisory, intentRetrievalRoute: this.intentRetrievalRoute, decisions: this.decisions, activeDomain: this.activeDomain, activeClaims: this.activeClaims, playbookLessons: this.playbookLessons, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, ...(refreshGit ? { gitStatus: undefined } : {}) }
+            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: renderTaskDepthAdvisory(this.taskDepthLayer), planMethodologyAdvisory: renderPlanMethodologyAdvisory(this.planMethodology, this.planMethodologyReason), skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, decisions: this.decisions, activeDomain: this.activeDomain, activeClaims: this.activeClaims, playbookLessons: this.playbookLessons, recentQuery: this.recentQuery, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, ...(refreshGit ? { gitStatus: undefined } : {}) }
 
             if (this.tracker) {
               const fieldValues: Record<string, string> = {}
@@ -198,6 +312,13 @@ export class PromptEngine {
                 fieldValues['playbookLessons'] = dynamicCtx.playbookLessons.map(b => b.lesson).join('|')
               }
               this.tracker.recordTurn(fieldValues, this.phaseHint)
+
+              // Exact-prefix cache fast path: star-domain is a session constant
+              // on DeepSeek — skip habituation warm-up and promote immediately
+              // so it enters consolidatedBlock (before userContent) from turn 1.
+              if (this.config.prefixCache === 'deepseek-native' && fieldValues['activeDomain']) {
+                this.tracker.immediatePromote('activeDomain', fieldValues['activeDomain'])
+              }
 
               const habituatedContent = this.tracker.getHabituatedContent()
               const renderedHabituated = new Map<string, string>()
@@ -213,10 +334,9 @@ export class PromptEngine {
               const newConsolidated = buildConsolidatedBlock(renderedHabituated)
               if (newConsolidated !== this.consolidatedBlock) {
                 this.consolidatedBlock = newConsolidated
-                // volatileBlock stays at frozenBase — consolidatedBlock goes
-                // into dynamic appendix (injected after message history).
-                // Mutating volatileBlock here would break exact-prefix cache
-                // for all subsequent turns (5-20% hit rate drop per event).
+                // consolidatedBlock is placed BEFORE userContent (adjacent to volatileBlock)
+                // so its stable bytes enter the exact-prefix cache. Mutating volatileBlock
+                // would break the cache for all subsequent turns (5-20% hit rate drop).
               }
 
               const activeCtx = { ...dynamicCtx }
@@ -224,33 +344,45 @@ export class PromptEngine {
               if (habituated.has('activeDomain')) activeCtx.activeDomain = undefined
               if (habituated.has('playbookLessons')) activeCtx.playbookLessons = undefined
 
-              const activeAppendix = this.actionableTurn ? buildDynamicAppendix(activeCtx, appendixMaxChars) : ''
+              const activeAppendix = this.actionableTurn ? this.buildAppendixBody(activeCtx, appendixMaxChars) : ''
               const projection = this.actionableTurn ? this.cognitiveProjection : null
-              const fullAppendix = [projection, this.consolidatedBlock, activeAppendix].filter(Boolean).join('\n')
+              this.cachedConsolidated = this.consolidatedBlock
+              const fullAppendix = [projection, activeAppendix].filter(Boolean).join('\n')
               this.cachedAppendix = fullAppendix
             } else {
               if (this.actionableTurn) {
-                const appendix = buildDynamicAppendix(dynamicCtx, appendixMaxChars)
+                const appendix = this.buildAppendixBody(dynamicCtx, appendixMaxChars)
                 const projection = this.actionableTurn ? this.cognitiveProjection : null
+                this.cachedConsolidated = this.consolidatedBlock
                 this.cachedAppendix = projection ? [projection, appendix].filter(Boolean).join('\n') : appendix
               } else {
+                this.cachedConsolidated = ''
                 this.cachedAppendix = ''
               }
             }
           }
           // Trailer mode: merge volatileBlock (FROZEN) into last user message.
-          // Dynamic appendix is appended AFTER user content so the prefix
-          // (volatileBlock + userContent) stays stable across turns.
+          // consolidatedBlock (habituation-tracked stable blocks) is placed
+          // BEFORE userContent so it enters the prefix cache alongside volatileBlock.
+          // Dynamic appendix (per-turn volatile) is appended AFTER userContent.
           // Frozen snapshot captures the full content (including appendix),
           // so historical retrieval returns byte-identical content → cache hit.
-          let merged = this.volatileBlock + '\n---\n' + (typeof msg.content === 'string' ? msg.content : '')
+          let merged = this.volatileBlock
+          if (this.cachedConsolidated) {
+            merged += '\n' + this.cachedConsolidated
+          }
+          merged += '\n---\n' + (typeof msg.content === 'string' ? msg.content : '')
           if (this.cachedAppendix) {
             merged += '\n\n' + this.cachedAppendix
           }
           const key = typeof msg.content === 'string' ? msg.content : ''
           const arr = this.frozenUserMerged.get(key)
           if (arr) {
-            arr.push(merged)
+            // Dedup: within one user message, every tool-call turn re-invokes
+            // buildOaiRequest with identical merged content. Pushing each time
+            // bloats the array (7 turns = 7 copies) and prematurely triggers
+            // the 64-entry eviction that causes 0% cache breaks.
+            if (arr[arr.length - 1] !== merged) arr.push(merged)
           } else {
             this.frozenUserMerged.set(key, [merged])
           }
@@ -264,8 +396,14 @@ export class PromptEngine {
             // Fallback: trailer-merge volatileBlock to keep message count stable.
             // A 2-message fallback here would shift all subsequent indices and
             // break exact-prefix cache for the entire suffix.
+            // This path only fires when the key's snapshot array was fully
+            // evicted — if volatileBlock has swapped since, the FIRST user
+            // message changes from byte 0 → fatal 0% prefix break. Log it.
+            this.frozenFallbackRebuilds++
+            debugLog('prompt-engine', `FATAL-CACHE: frozen snapshots fully evicted for FIRST user message (len=${typeof msg.content === 'string' ? msg.content.length : 0}) — rebuilding with current volatileBlock`)
             const fc = typeof msg.content === 'string' ? msg.content : ''
-            result.push({ role: 'user', content: this.volatileBlock + '\n---\n' + fc })
+            const vb = this.cachedConsolidated ? this.volatileBlock + '\n' + this.cachedConsolidated : this.volatileBlock
+            result.push({ role: 'user', content: vb + '\n---\n' + fc })
           }
         } else {
           // Historical user message: use frozen merged content if available
@@ -277,8 +415,11 @@ export class PromptEngine {
             // Fallback: inject volatileBlock so the message still carries context.
             // Loses dynamic appendix vs frozen snapshot, causing one cache miss but
             // doesn't cascade (message count unchanged).
+            this.frozenFallbackRebuilds++
+            debugLog('prompt-engine', `frozen snapshots fully evicted for historical user message (len=${typeof msg.content === 'string' ? msg.content.length : 0}) — rebuilding with current volatileBlock`)
             const fc = typeof msg.content === 'string' ? msg.content : ''
-            result.push({ role: 'user', content: this.volatileBlock + '\n---\n' + fc })
+            const vb = this.cachedConsolidated ? this.volatileBlock + '\n' + this.cachedConsolidated : this.volatileBlock
+            result.push({ role: 'user', content: vb + '\n---\n' + fc })
           }
         }
       } else {
@@ -378,14 +519,74 @@ export class PromptEngine {
     while (totalFrozen > PromptEngine.MAX_FROZEN_USER_MERGED && this.frozenUserMerged.size > 0) {
       let maxKey = '', maxLen = 0
       for (const [k, arr] of this.frozenUserMerged) {
+        // Never evict the first user message's snapshot — it's the byte-0
+        // prefix anchor; losing it forces a full 0% cache rebuild.
+        if (k === this.firstUserKey) continue
         if (arr.length > maxLen) { maxKey = k; maxLen = arr.length }
       }
+      // Only the protected first-user key remains — stop rather than break it.
+      if (maxLen === 0) break
       if (maxLen <= 1) {
         this.frozenUserMerged.delete(maxKey)
       } else {
         this.frozenUserMerged.get(maxKey)!.shift()
       }
       totalFrozen--
+    }
+
+    // T7: Cache-Safe Context Collapse for 1M+ windows.
+    // Operates on the request copy only — session messages remain intact
+    // so DeepSeek exact-prefix cache is preserved up to the collapse point.
+    // Gated at 50% window usage, with a watermark boundary that only advances
+    // when crossing a 50K-token step — so the break happens once per step,
+    // not on every turn (rolling break would defeat the prefix cache).
+    if (contextWindow && contextWindow >= 200_000) {
+      const collapseAge = this.config.attentionProfile?.collapseAgeTurns ?? 8
+      let estChars = 0
+      for (const m of result) {
+        if (typeof m.content === 'string') estChars += m.content.length
+        // reasoning_content is echoed back on tool-call turns and can dominate
+        // token usage in tool-dense sessions — excluding it from the gate made
+        // reasoning-heavy sessions paradoxically never reach the 50% trigger.
+        if (m.role === 'assistant' && typeof m.reasoning_content === 'string') {
+          estChars += m.reasoning_content.length
+        }
+      }
+      const estTokens = Math.ceil(estChars / 4)
+      const fillRatio = estTokens / contextWindow
+
+      // Lightweight pass (0–85%): strip reasoning + fold duplicate grep/read.
+      // Full pass (>85%): also collapse old tool results via semantic summaries.
+      //
+      // The full pass rewrites old tool results into summaries. On exact-prefix
+      // providers (DeepSeek) that rewrite invalidates the whole prefix after the
+      // touched message — one full pass costs a real cache-miss rebuild of the
+      // collapsed region (observed: 240K tokens at 3元/M ≈ 0.71元 on a single
+      // request, ~27% of a session's total spend). estTokens here is a char/4
+      // estimate that *includes* echoed reasoning_content, so it runs well ahead
+      // of the real billed prompt. Triggering the full pass at 0.5 fired while
+      // the real prompt was only ~27% of the window — paying the cache break for
+      // headroom that was never needed. FULL_COLLAPSE_FILL_RATIO defers the full
+      // pass until the window is genuinely near-full (when avoiding overflow is
+      // worth more than cache protection); the lightweight pass still runs the
+      // whole time. Tunable: lower it to collapse more aggressively, raise it to
+      // protect cache longer.
+      if (fillRatio >= COLLAPSE_FLOOR_FILL_RATIO) {
+        // History rewrite (compact / session split) invalidates stored indices.
+        if (this.collapseWatermark > result.length) {
+          this.collapseWatermark = 0
+          this.collapseTokenStep = -1
+        }
+        const step = Math.floor(estTokens / 50_000)
+        if (step > this.collapseTokenStep) {
+          this.collapseTokenStep = step
+          this.collapseWatermark = computeCollapseBoundary(result, collapseAge)
+          debugLog('prompt-engine', `T7 watermark advanced: step=${step} boundary=${this.collapseWatermark} estTokens=${estTokens}`)
+        }
+        if (this.collapseWatermark > 0) {
+          requestTimeCollapse(result, this.collapseWatermark, contextWindow, fillRatio < FULL_COLLAPSE_FILL_RATIO)
+        }
+      }
     }
 
     return {
@@ -419,11 +620,22 @@ export class PromptEngine {
   updateTools(tools: ToolDefinition[]): void {
     this.config.staticCtx.tools = tools
     this.fingerprint = computeFingerprint(this.systemPrompt, tools, this.volatileBlock)
+    this.toolsUpdateCount++
   }
 
   /** Number of tool definitions (for prefix overhead estimation). */
   getToolCount(): number {
     return this.config.staticCtx.tools.length
+  }
+
+  /** Current cognitive projection length in chars (for cache-log observability). */
+  getCognitiveProjectionLength(): number {
+    return this.cognitiveProjection?.length ?? 0
+  }
+
+  /** Current cached appendix length in chars (for cache-log observability). */
+  getCachedAppendixLength(): number {
+    return this.cachedAppendix?.length ?? 0
   }
   updateSessionMemory(block: string): void {
     this.sessionMemoryOverride = block
@@ -434,10 +646,17 @@ export class PromptEngine {
   private rebuildFrozenBase(): void {
     const ctx = { ...this.config.volatileCtx, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock }
     this.frozenBase = buildStableVolatileBlock(ctx)
-    this.volatileBlock = this.frozenBase
-    // P1: frozen snapshots store volatileBlock format — clear stale entries
-    // when frozen base is rebuilt so historical messages use consistent format.
-    this.frozenUserMerged.clear()
+    // P1: Do NOT update volatileBlock or clear frozenUserMerged here.
+    // Changing volatileBlock mid-tool-loop mutates the merged user message
+    // content from byte 0 and breaks DeepSeek exact-prefix cache entirely
+    // (hit rate drops from 99%+ to ~16%). The frozenBase→volatileBlock swap
+    // is deferred to the next user-message boundary in buildOaiRequest(),
+    // which naturally triggers a full fresh rebuild — cache break at that
+    // point is unavoidable and acceptable.
+    //
+    // frozenUserMerged entries embed old volatileBlock format. They stay
+    // valid as long as volatileBlock hasn't changed. When volatileBlock
+    // eventually swaps, frozenUserMerged is cleared at that boundary.
   }
 
   setActionableTurn(actionable: boolean): void {
@@ -459,53 +678,107 @@ export class PromptEngine {
     this.playbookLessons = lessons
   }
 
+  setOnLessonsRendered(cb: (ids: string[]) => void): void {
+    this.onLessonsRendered = cb
+  }
+
+  setRecentQuery(query: string | null): void {
+    this.recentQuery = query ?? undefined
+  }
+
   setTaskProgress(state: TaskState): void {
     this.taskProgress = state
   }
 
-  setBehaviorMirror(mirror: string | null): void {
-    this.behaviorMirror = mirror
-  }
+  /** @deprecated Dead field — behaviorMirror never rendered into prompt. */
+  setBehaviorMirror(_mirror: string | null): void { /* noop */ }
 
-  setStrategyShift(hint: string | null): void {
-    this.strategyShift = hint
-  }
+  /** @deprecated Dead field — strategyShift never rendered into prompt. */
+  setStrategyShift(_hint: string | null): void { /* noop */ }
 
   setRepairHint(hint: string | null): void {
     this.repairHint = hint
   }
 
-  setImpactHint(hint: string | null): void {
-    this.impactHint = hint
+  /** @deprecated Dead field — impactHint never rendered into prompt. */
+  setImpactHint(_hint: string | null): void { /* noop */ }
+
+
+
+  setToolContext(ctx: string | null): void {
+    this.toolContext = ctx ?? undefined
   }
 
-  setRoutingReason(reason: string | null): void {
-    this.routingReason = reason
+  getToolContextLength(): number {
+    return this.toolContext?.length ?? 0
   }
 
-  getRoutingReason(): string | null {
-    return this.routingReason ?? null
-  }
-
-  setCerebellarHint(hint: string | null): void {
-    this.cerebellarHint = hint ?? undefined
-  }
-
+  /** @deprecated Use setToolContext. Kept for backward compat. */
   setAffordanceHint(hint: string | null): void {
-    this.affordanceHint = hint ?? undefined
+    // noop — merged into setToolContext
   }
 
+  /** @deprecated Use setToolContext. Kept for backward compat. */
   setPolicyGuidance(guidance: string | null): void {
-    this.policyGuidance = guidance ?? undefined
+    // noop — merged into setToolContext
   }
 
   setPlanCacheAdvisory(advisory: string | null): void {
     this.planCacheAdvisory = advisory ?? undefined
   }
 
+  /** U6: set serialized PlanExecutionTrace appendix (rendered in dynamic appendix, survives compaction). */
+  setPlanTraceAppendix(appendix: string | null): void {
+    this.planTraceAppendix = appendix ?? undefined
+  }
+
+  /**
+   * Set the approved-plan pointer (slug/title/path block). Rendered ONLY into
+   * the dynamic appendix — does NOT rebuild the frozen base or invalidate the
+   * fresh cache, so approving/revising a plan never shatters the prefix cache.
+   * Mirrors setPlanModeState / setWorktreeReality: the pointer refreshes at the
+   * next user-message boundary (which rebuilds the appendix anyway).
+   */
+  setActivePlan(pointer: string | null): void {
+    this.activePlanPointer = pointer ?? undefined
+  }
+
   setIntentRetrievalRoute(route: string | null): void {
     this.intentRetrievalRoute = route ?? undefined
     this.invalidateFreshCache()
+  }
+
+  setTaskDepthLayer(layer: import('../context/task-contract.js').TaskDepthLayer | undefined): void {
+    this.taskDepthLayer = layer
+  }
+
+  setPlanMethodology(methodology: import('../context/task-contract.js').PlanMethodology | undefined, reason?: string): void {
+    this.planMethodology = methodology
+    this.planMethodologyReason = reason
+  }
+
+  getPlanMethodology(): import('../context/task-contract.js').PlanMethodology | undefined {
+    return this.planMethodology
+  }
+
+  setSkillAdvisoryBlock(block: string | null): void {
+    this.skillAdvisoryBlock = block
+  }
+
+  setCrossSessionMemoryBlock(block: string | null): void {
+    this.crossSessionMemoryBlock = block
+  }
+
+  setMentionContextBlock(block: string | null): void {
+    this.mentionContextBlock = block
+  }
+
+  getTaskDepthLayer(): import('../context/task-contract.js').TaskDepthLayer | undefined {
+    return this.taskDepthLayer
+  }
+
+  setHarnessAdvisoryBlock(block: string | null): void {
+    this.harnessAdvisoryBlock = block ?? undefined
   }
 
   setDecisions(decisions: string[]): void {
@@ -514,6 +787,10 @@ export class PromptEngine {
 
   setCrossSessionEvents(events: string | null): void {
     this.crossSessionEvents = events ?? undefined
+  }
+
+  setCompanionPresence(block: string | null): void {
+    this.companionPresence = block ?? undefined
   }
 
   /**
@@ -560,8 +837,53 @@ export class PromptEngine {
   }
 
   private invalidateFreshCache(): void {
+    // P1 diagnostic: log caller when fresh cache is cleared mid-tool-loop.
+    // cachedFreshForUser should only be emptied at user-message boundaries.
+    // If cleared between tool-call turns, the appendix changes → prefix
+    // cache breaks → hit rate drops from 99%+ to ~16%.
+    if (this.cachedFreshForUser !== '') {
+      const err = new Error('invalidateFreshCache')
+      debugLog(`[fresh-cache] CLEARED cachedFreshForUser="${this.cachedFreshForUser.slice(0, 80)}..." by: ${err.stack?.split('\n').slice(2, 5).join(' → ') ?? 'unknown'}`)
+    }
     this.cachedFreshForUser = ''
     this.cachedAppendix = ''
+    this.cachedConsolidated = ''
+    // Delta baseline reset: force next context-update to be a full baseline.
+    this.lastEmittedAppendixParts = new Map()
+    this.appendixBaselineSent = false
+  }
+
+  /**
+   * Build the <context-update> body — full when delta off or baseline not yet
+   * sent, otherwise only changed sub-blocks. Mutates lastEmittedAppendixParts.
+   *
+   * Delta logic: compare current parts against last emitted. On new user
+   * boundary, emit full baseline (seq=1). Subsequent boundaries emit only
+   * changed sub-blocks (mode="delta"), or self-closing tag if nothing changed.
+   * Tool-call turns reuse cachedAppendix (never calling this method).
+   */
+  private buildAppendixBody(ctx: VolatileContext, maxChars?: number): string {
+    const parts = buildDynamicAppendixParts(ctx, maxChars)
+    if (!this.config.appendixDelta) {
+      if (parts.length === 0) return ''
+      return `<context-update>\n${parts.map(p => p.content).join('\n\n')}\n</context-update>`
+    }
+    this.appendixSeq++
+    const current = new Map<string, string>()
+    const changed: string[] = []
+    for (const p of parts) {
+      current.set(p.name, p.content)
+      if (this.lastEmittedAppendixParts.get(p.name) !== p.content) changed.push(p.content)
+    }
+    const sendFull = !this.appendixBaselineSent
+    this.lastEmittedAppendixParts = current
+    this.appendixBaselineSent = true
+    if (sendFull) {
+      if (parts.length === 0) return ''
+      return `<context-update seq="${this.appendixSeq}">\n${parts.map(p => p.content).join('\n\n')}\n</context-update>`
+    }
+    if (changed.length === 0) return `<context-update seq="${this.appendixSeq}"/>`
+    return `<context-update seq="${this.appendixSeq}" mode="delta">\n${changed.join('\n\n')}\n</context-update>`
   }
 
   /**
@@ -571,6 +893,31 @@ export class PromptEngine {
    */
   markGitDirty(): void {
     this.gitDirty = true
+  }
+
+  /**
+   * Force the next context-update to be a full baseline. Call after history
+   * rewrite/compaction drops messages carrying prior context-update blocks —
+   * the model needs a fresh full snapshot because delta's "absent = unchanged"
+   * semantics rely on the history still being present.
+   */
+  resetAppendixBaseline(): void {
+    this.lastEmittedAppendixParts = new Map()
+    this.appendixBaselineSent = false
+  }
+
+  /**
+   * Cache-event counters for cache-log breadcrumbs (P2-6).
+   * Cumulative since engine creation — callers diff across turns.
+   */
+  getCacheEventStats(): { volatileSwaps: number; frozenClamps: number; frozenFallbackRebuilds: number; collapseWatermark: number; toolsUpdates: number } {
+    return {
+      volatileSwaps: this.volatileSwapCount,
+      frozenClamps: this.frozenSnapshotClamps,
+      frozenFallbackRebuilds: this.frozenFallbackRebuilds,
+      collapseWatermark: this.collapseWatermark,
+      toolsUpdates: this.toolsUpdateCount,
+    }
   }
 
   /**
@@ -592,20 +939,18 @@ export class PromptEngine {
       ...this.config.volatileCtx,
       toolHistory,
       taskProgress: this.taskProgress,
-      behaviorMirror: this.behaviorMirror,
-      strategyShift: this.strategyShift,
-      repairHint: this.repairHint,
-      impactHint: this.impactHint,
-      routingReason: this.routingReason,
-      cerebellarHint: this.cerebellarHint,
-      affordanceHint: this.affordanceHint,
-      policyGuidance: this.policyGuidance,
+      toolContext: this.toolContext,
       planCacheAdvisory: this.planCacheAdvisory,
+      planTraceAppendix: this.planTraceAppendix,
       intentRetrievalRoute: this.intentRetrievalRoute,
+      taskDepthAdvisory: renderTaskDepthAdvisory(this.taskDepthLayer),
+      planMethodologyAdvisory: renderPlanMethodologyAdvisory(this.planMethodology, this.planMethodologyReason),
+      harnessAdvisoryBlock: this.harnessAdvisoryBlock,
       decisions: this.decisions,
       activeDomain: this.activeDomain ?? this.config.volatileCtx.activeDomain,
       activeClaims: this.activeClaims ?? this.config.volatileCtx.activeClaims,
       playbookLessons: this.playbookLessons ?? this.config.volatileCtx.playbookLessons,
+      recentQuery: this.recentQuery,
       sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock,
       sessionState: this.sessionStateText,
       worktreeReality: this.worktreeReality,
@@ -616,4 +961,160 @@ export class PromptEngine {
   getContextLayerReport(): ContextLayerReport {
     return this.contextLayerReportData
   }
+}
+
+/**
+ * Compute the T7 collapse boundary: the first message index AFTER the last
+ * message whose turn age >= collapseAge. Messages below this index are
+ * eligible for request-time collapse.
+ */
+export function computeCollapseBoundary(messages: OaiMessage[], collapseAge: number): number {
+  let currentTurn = 0
+  for (const m of messages) {
+    if (m.role === 'user') currentTurn++
+  }
+
+  let turnCounter = 0
+  let boundary = 0
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]!.role === 'user') turnCounter++
+    if (currentTurn - turnCounter >= collapseAge) boundary = i + 1
+  }
+  return boundary
+}
+
+/**
+ * Request-time collapse for 1M+ windows (T7).
+ * Mutates the request message array in-place — NOT the stored session messages.
+ * Tool results below boundaryIndex (a stable watermark held by PromptEngine)
+ * are replaced with semantic summaries. The watermark — rather than a per-call
+ * sliding age window — keeps the collapsed region byte-stable across requests.
+ *
+ * Reasoning stripping rides the same watermark: assistant `reasoning_content`
+ * below the boundary is dropped from the request copy. In tool-dense sessions
+ * reasoning accumulates linearly (DeepSeek requires echoing it on tool-call
+ * turns), becoming the dominant hidden token sink at 1M. Old rounds — the
+ * boundary trails the head by collapseAge (≥8) user turns, so the active
+ * thinking round is never touched — don't need their reasoning echoed, and
+ * because the strip happens at exactly the same boundary/step as the tool
+ * collapse, it adds zero additional prefix-cache breaks.
+ */
+export function requestTimeCollapse(messages: OaiMessage[], boundaryIndex: number, contextWindow: number, lightOnly = false): void {
+  let currentTurn = 0
+  for (const m of messages) {
+    if (m.role === 'user') currentTurn++
+  }
+
+  // Build dedup index: for each tool+target pair, track all occurrences
+  // below the boundary so older duplicates can be folded.
+  const toolOccurrences = new Map<string, number[]>()
+  const end = Math.min(boundaryIndex, messages.length)
+  for (let i = 0; i < end; i++) {
+    const msg = messages[i]!
+    if (msg.role !== 'tool' || msg.content.length < 200) continue
+    if (msg.content.startsWith('[collapsed ') || msg.content.startsWith('[storm-collapsed') || msg.content.startsWith('[tiered-')) continue
+    const toolName = inferToolName(messages, i)
+    if (toolName === 'grep' || toolName === 'search' || toolName === 'read_file') {
+      const target = inferToolTarget(messages, i, toolName)
+      if (target) {
+        const key = `${toolName}:${target}`
+        const indices = toolOccurrences.get(key)
+        if (indices) indices.push(i)
+        else toolOccurrences.set(key, [i])
+      }
+    }
+  }
+
+  // Indices of tool results that are superseded by a later call with the same target
+  const superseded = new Set<number>()
+  for (const indices of toolOccurrences.values()) {
+    if (indices.length > 1) {
+      for (let k = 0; k < indices.length - 1; k++) superseded.add(indices[k]!)
+    }
+  }
+
+  let turnCounter = 0
+  for (let i = 0; i < end; i++) {
+    const msg = messages[i]!
+    if (msg.role === 'user') turnCounter++
+
+    if (msg.role === 'assistant' && 'reasoning_content' in msg && msg.reasoning_content) {
+      const { reasoning_content: _dropped, ...rest } = msg
+      messages[i] = rest.content == null && !rest.tool_calls?.length
+        ? { ...rest, content: '' }
+        : rest
+      continue
+    }
+
+    if (msg.role !== 'tool') continue
+    if (msg.content.length < 200) continue
+    if (msg.content.startsWith('[collapsed ') || msg.content.startsWith('[storm-collapsed') || msg.content.startsWith('[tiered-')) continue
+
+    const toolName = inferToolName(messages, i)
+
+    // Dedup fold: if a newer call to the same tool+target exists below boundary,
+    // collapse this older result regardless of lightOnly mode.
+    if (superseded.has(i)) {
+      const target = inferToolTarget(messages, i, toolName)
+      messages[i] = { ...msg, content: `[collapsed ${toolName}: superseded by later ${toolName} on ${target ?? 'same target'}]` }
+      continue
+    }
+
+    // In light-only mode, skip full semantic collapse — only dedup + reasoning strip.
+    if (lightOnly) continue
+
+    const turnAge = currentTurn - turnCounter
+    const collapsed = collapseToolResult(toolName, msg.content, turnAge, contextWindow)
+    if (collapsed) {
+      messages[i] = { ...msg, content: collapsed.summary }
+    }
+  }
+}
+
+/**
+ * Extract tool target from the assistant's tool_call arguments.
+ * For grep/search: the pattern or path argument.
+ * For read_file: the file path argument.
+ */
+function inferToolTarget(messages: OaiMessage[], toolMsgIndex: number, toolName: string): string | null {
+  const toolMsg = messages[toolMsgIndex]!
+  if (toolMsg.role !== 'tool' || !('tool_call_id' in toolMsg)) return null
+  const toolCallId = (toolMsg as { tool_call_id?: string }).tool_call_id
+  if (!toolCallId) return null
+
+  for (let j = toolMsgIndex - 1; j >= 0; j--) {
+    const prev = messages[j]!
+    if (prev.role !== 'assistant') continue
+    const calls = (prev as { tool_calls?: Array<{ id: string; function: { arguments: string } }> }).tool_calls
+    if (!calls) continue
+    const call = calls.find(c => c.id === toolCallId)
+    if (!call) continue
+    try {
+      const args = JSON.parse(call.function.arguments) as Record<string, unknown>
+      if (toolName === 'grep' || toolName === 'search') {
+        return (args['pattern'] as string | undefined) ?? (args['query'] as string | undefined) ?? null
+      }
+      if (toolName === 'read_file') {
+        return (args['path'] as string | undefined) ?? (args['file'] as string | undefined) ?? null
+      }
+    } catch { return null }
+  }
+  return null
+}
+
+function inferToolName(messages: OaiMessage[], toolMsgIndex: number): string {
+  const toolMsg = messages[toolMsgIndex]!
+  if (toolMsg.role !== 'tool' || !('tool_call_id' in toolMsg)) return 'unknown'
+  const toolCallId = (toolMsg as { tool_call_id?: string }).tool_call_id
+  if (!toolCallId) return 'unknown'
+
+  for (let j = toolMsgIndex - 1; j >= 0; j--) {
+    const prev = messages[j]!
+    if (prev.role !== 'assistant') continue
+    const tc = (prev as { tool_calls?: Array<{ id: string; function?: { name: string } }> }).tool_calls
+    if (!tc) continue
+    const match = tc.find(c => c.id === toolCallId)
+    if (match?.function?.name) return match.function.name
+  }
+  return 'unknown'
 }

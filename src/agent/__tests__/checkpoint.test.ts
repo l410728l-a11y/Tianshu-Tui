@@ -10,7 +10,12 @@ import {
   rollbackToCheckpoint,
   listCheckpoints,
   recordAgentTouchedFile,
+  recordBashSideEffects,
+  makeOwnershipGuard,
+  pruneOrphanCheckpoints,
+  type ClaimLookup,
 } from '../checkpoint.js'
+import { homedir } from 'os'
 
 function makeTempGitRepo(): string {
   const repo = join(tmpdir(), `rivet-ck-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
@@ -29,6 +34,155 @@ function cleanupRepo(repo: string): void {
 }
 
 describe('checkpoint module', () => {
+  describe('pruneOrphanCheckpoints', () => {
+    it('removes checkpoint files whose cwd no longer exists', () => {
+      const rivetDir = join(homedir(), '.rivet')
+      mkdirSync(rivetDir, { recursive: true })
+      const deadCwd = join(tmpdir(), `rivet-ck-gone-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+      // deadCwd is never created → orphan.
+      const tag = `prunetest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const orphan = join(rivetDir, `checkpoint-${tag}.json`)
+      writeFileSync(orphan, JSON.stringify({ version: 2, hash: 'x', timestamp: Date.now(), label: 'auto', cwd: deadCwd, preExistingDirtyFiles: [], preExistingUntrackedFiles: [], agentTouchedFiles: [] }))
+      assert.ok(existsSync(orphan))
+
+      const removed = pruneOrphanCheckpoints()
+      assert.ok(removed >= 1, 'should remove at least the orphan we planted')
+      assert.equal(existsSync(orphan), false, 'orphan checkpoint must be deleted')
+    })
+
+    it('keeps checkpoints whose cwd still exists', () => {
+      const repo = makeTempGitRepo()
+      try {
+        const rivetDir = join(homedir(), '.rivet')
+        const tag = `prunekeep-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const live = join(rivetDir, `checkpoint-${tag}.json`)
+        writeFileSync(live, JSON.stringify({ version: 2, hash: 'x', timestamp: Date.now(), label: 'auto', cwd: repo, preExistingDirtyFiles: [], preExistingUntrackedFiles: [], agentTouchedFiles: [] }))
+        pruneOrphanCheckpoints()
+        assert.ok(existsSync(live), 'checkpoint with a live cwd must survive')
+        rmSync(live, { force: true })
+      } finally {
+        cleanupRepo(repo)
+      }
+    })
+  })
+
+  describe('recordBashSideEffects (B2: full rollback of shell side effects)', () => {
+    it('captures bash create/modify/delete and rolls them back, leaving pre-existing files alone', async () => {
+      const repo = makeTempGitRepo()
+      const sid = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      try {
+        await createCheckpoint(repo, 'auto', sid)
+        // Simulate bash side effects: create a new file, modify the tracked one.
+        writeFileSync(join(repo, 'created-by-bash.txt'), 'new')
+        writeFileSync(join(repo, 'initial.txt'), 'MUTATED')
+
+        const recorded = await recordBashSideEffects(repo, sid)
+        assert.ok(recorded.includes('created-by-bash.txt'), 'new file captured')
+        assert.ok(recorded.includes('initial.txt'), 'modified tracked file captured')
+
+        const preview = await getRollbackPreview(repo, sid)
+        assert.ok(preview, 'preview should exist')
+        const result = await rollbackToCheckpoint(repo, preview!.confirmationToken, sid)
+        assert.equal(result.success, true)
+
+        // Created file deleted, tracked file restored to committed content.
+        assert.equal(existsSync(join(repo, 'created-by-bash.txt')), false, 'bash-created file removed')
+        assert.equal(readFileSync(join(repo, 'initial.txt'), 'utf-8'), 'hello', 'tracked file restored')
+      } finally {
+        cleanupRepo(repo)
+      }
+    })
+
+    it('PARALLEL SAFETY: never rolls back a path owned by another live session', async () => {
+      const repo = makeTempGitRepo()
+      const sidA = `A-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      const sidB = `B-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      try {
+        await createCheckpoint(repo, 'auto', sidA)
+
+        // Session A's bash touches two files: its own + one that B owns.
+        writeFileSync(join(repo, 'a-owned.txt'), 'A change')
+        writeFileSync(join(repo, 'b-owned.txt'), 'A clobbered B!')
+
+        // Registry stub: B holds an exclusive claim on b-owned.txt.
+        const registry: ClaimLookup = {
+          reapStaleClaims: () => [],
+          checkClaim: (filePath: string) =>
+            filePath.endsWith('b-owned.txt')
+              ? { sessionId: sidB, claimType: 'exclusive' }
+              : null,
+        }
+        const guard = makeOwnershipGuard(registry, sidA, repo)
+
+        // Capture must NOT attribute b-owned.txt to session A.
+        const recorded = await recordBashSideEffects(repo, sidA, guard)
+        assert.ok(recorded.includes('a-owned.txt'))
+        assert.ok(!recorded.includes('b-owned.txt'), 'must not claim B-owned file')
+
+        // Even if a-owned set somehow contained it, rollback guard must skip it.
+        recordAgentTouchedFile(repo, 'b-owned.txt', sidA)
+        const preview = await getRollbackPreview(repo, sidA, guard)
+        assert.ok(preview)
+        const result = await rollbackToCheckpoint(repo, preview!.confirmationToken, sidA, guard)
+        assert.equal(result.success, true)
+        assert.ok((result.skipped ?? []).includes('b-owned.txt'), 'B-owned path reported as skipped')
+
+        // B's change is intact; A's own change reverted.
+        assert.equal(readFileSync(join(repo, 'b-owned.txt'), 'utf-8'), 'A clobbered B!', 'B-owned file untouched by A rollback')
+        assert.equal(existsSync(join(repo, 'a-owned.txt')), false, 'A own file reverted')
+      } finally {
+        cleanupRepo(repo)
+      }
+    })
+
+    it('records irreversible bash effects (curl POST) and surfaces them as unrevertable', async () => {
+      const repo = makeTempGitRepo()
+      const sid = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      try {
+        await createCheckpoint(repo, 'auto', sid)
+        // A command that mutates remote state but touches NO files on disk.
+        const recorded = await recordBashSideEffects(repo, sid, undefined, 'curl -X POST https://api.example.com/charge')
+        assert.deepEqual(recorded, [], 'no files changed on disk')
+
+        // Preview must still appear and carry the unrevertable caveat.
+        const preview = await getRollbackPreview(repo, sid)
+        assert.ok(preview, 'preview surfaces even with zero revertable files')
+        assert.match(preview!.text, /CANNOT be reverted/i)
+        assert.match(preview!.text, /network mutation/i)
+
+        const result = await rollbackToCheckpoint(repo, preview!.confirmationToken, sid)
+        assert.ok(result.unrevertable && result.unrevertable.length > 0, 'rollback result carries unrevertable caveats')
+        assert.match(result.unrevertable![0]!, /network mutation/i)
+      } finally {
+        cleanupRepo(repo)
+      }
+    })
+
+    it('combines file restore with unrevertable caveat when a command does both', async () => {
+      const repo = makeTempGitRepo()
+      const sid = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      try {
+        await createCheckpoint(repo, 'auto', sid)
+        writeFileSync(join(repo, 'log.txt'), 'wrote a log then published')
+        // Command both wrote a file and published a package.
+        const recorded = await recordBashSideEffects(repo, sid, undefined, 'npm publish > log.txt')
+        assert.ok(recorded.includes('log.txt'), 'file change captured')
+
+        const preview = await getRollbackPreview(repo, sid)
+        assert.ok(preview)
+        assert.match(preview!.text, /- log\.txt/)
+        assert.match(preview!.text, /publish/i)
+
+        const result = await rollbackToCheckpoint(repo, preview!.confirmationToken, sid)
+        assert.equal(result.success, true, 'file portion reverted')
+        assert.ok((result.unrevertable ?? []).some(e => /publish/i.test(e)), 'publish caveat surfaced')
+        assert.equal(existsSync(join(repo, 'log.txt')), false, 'bash-created file removed')
+      } finally {
+        cleanupRepo(repo)
+      }
+    })
+  })
+
   describe('createCheckpoint', () => {
     it('returns a valid Checkpoint with hash and timestamp in a git repo', async () => {
       const repo = makeTempGitRepo()

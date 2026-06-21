@@ -8,6 +8,7 @@ import {
   enforceCapacity,
   matchBullets,
   type PlaybookBullet,
+  type ExperienceSource,
 } from './playbook.js'
 
 export interface PlaybookStoreOptions {
@@ -26,6 +27,11 @@ const playbookBulletSchema = z.object({
   useCount: z.number().int().min(0),
   lastUsedAt: z.number().nullable(),
   importance: z.number().min(0).max(1),
+  details: z.string().optional(),
+  bulletIds: z.array(z.string()).optional(),
+  source: z.enum(['review-gate', 'test-failure', 'typecheck', 'delivery-gate', 'self-correction'] satisfies [ExperienceSource, ...ExperienceSource[]]).optional(),
+  errorSignal: z.string().optional(),
+  fixApproach: z.string().optional(),
 }) satisfies z.ZodType<PlaybookBullet>
 
 export function playbookPathForCwd(cwd: string): string {
@@ -74,14 +80,9 @@ export class PlaybookStore {
     this.save(enforceCapacity(merged, this.capacity))
   }
 
-  query(keywords: string[], topK = 3): PlaybookBullet[] {
+  query(keywords: string[], topK = 3, options: { minImportance?: number } = {}): PlaybookBullet[] {
     const playbook = this.load()
-    const matched = matchBullets(playbook, keywords, topK, { now: this.now() })
-    if (matched.length > 0) {
-      const replacements = new Map(matched.map(b => [b.id, b]))
-      this.save(playbook.map(b => replacements.get(b.id) ?? b))
-    }
-    return matched
+    return matchBullets(playbook, keywords, topK, { minImportance: options.minImportance })
   }
 
   recordUsage(ids: string[]): void {
