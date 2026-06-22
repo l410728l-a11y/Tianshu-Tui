@@ -810,6 +810,14 @@ export class TuiApp {
   /** 停用 overlay */
   deactivateOverlay(): void {
     this.overlay.deactivate()
+    // Alt screen exit restores the pre-overlay main screen frame, but the
+    // cursor position is unreliable. cursorUp(lastDisplayRows) in clear()
+    // starts from the wrong row, leaving old border lines unerased.
+    // Fix: send a large cursorUp to guarantee reaching the top of the
+    // terminal, then ERASE_SCREEN_END wipes everything, then renderLive
+    // draws the live frame cleanly from the top.
+    this.stdout.write('\x1B[999A\r\x1B[0J')
+    this.live.reset()
     this.renderLive()
   }
 
@@ -1020,8 +1028,8 @@ export class TuiApp {
       }
       if (key.name === 'return') {
         const entry = count > 0 ? this.overlayController.getData()?.domainPickerData?.().entries[cur] : undefined
-        this.deactivateOverlay()
         if (entry && this.overlayController.getDomainPickerExec()) this.overlayController.getDomainPickerExec()?.(entry.key)
+        this.deactivateOverlay()
         return true
       }
       return false
@@ -1040,8 +1048,8 @@ export class TuiApp {
       }
       if (key.name === 'return') {
         const entry = count > 0 ? this.overlayController.getData()?.modelPickerData?.().entries[cur] : undefined
-        this.deactivateOverlay()
         if (entry && this.overlayController.getModelPickerExec()) this.overlayController.getModelPickerExec()?.(entry.id)
+        this.deactivateOverlay()
         return true
       }
       return false
@@ -1060,8 +1068,8 @@ export class TuiApp {
       }
       if (key.name === 'return') {
         const entry = count > 0 ? this.overlayController.getData()?.themePickerData?.().entries[cur] : undefined
-        this.deactivateOverlay()
         if (entry && this.overlayController.getThemePickerExec()) this.overlayController.getThemePickerExec()?.(entry.name)
+        this.deactivateOverlay()
         return true
       }
       return false
@@ -1121,6 +1129,16 @@ export class TuiApp {
     this.commitAbove(() => {
       this.commit.write({ text, trailingNewline: true })
     })
+  }
+
+  /**
+   * Force a clean full redraw — physically erase the live region then repaint.
+   * Use after any state change that alters GlanceBar layout (theme color codes,
+   * domain name, model name) to prevent ghost rendering from stale lineCache.
+   */
+  forceRedraw(): void {
+    this.live.clear()
+    this.renderLive()
   }
 
   /**
@@ -1279,7 +1297,7 @@ export class TuiApp {
   setModelInfo(modelName: string, contextWindow?: number): void {
     this.state.modelName = modelName
     if (contextWindow !== undefined) this.metricsGlanceController.contextWindow = contextWindow
-    this.renderLive()
+    this.forceRedraw()
   }
 
   /** 设置外部 slash command 处理器（如 SlashRouter） */
@@ -1309,7 +1327,7 @@ export class TuiApp {
     if (!this.metricsGlanceController.delegationDomainOverride) {
       this.applyGlanceDomainDisplay()
     }
-    this.renderLive()
+    this.forceRedraw()
   }
 
   /** 注册 agent 星域同步（streaming ticker ~1Hz 读取 getSessionDomain） */
