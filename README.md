@@ -9,7 +9,7 @@ Terminal coding agent with prefix-cache optimization, multi-provider support, su
 ## Quick Start
 
 ```bash
-git clone <repo> && cd rivet
+git clone git@github.com:huiliyi37/Tianshu-Tui.git && cd rivet
 npm install && npm run build
 
 # Set API key
