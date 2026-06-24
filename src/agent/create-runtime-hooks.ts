@@ -179,6 +179,12 @@ export interface RuntimeHookDeps {
 }
 
 export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] {
+  // Phase contract (guarded by hook-sensorium-ordering.test.ts): perception stays
+  // in preTurn; vigor hooks stay in afterPerception/postTool. The sensorium they
+  // consume is produced by the TurnPerceptionController between phases, so vigor's
+  // dependency is satisfied by phase separation — not by array order here. Vigor
+  // also no-ops when sensorium is absent, so a misorder degrades safely. Keep both
+  // properties when adding/reordering hooks.
   const hooks: RuntimeHook[] = [
     createPerceptionRuntimeHook(),
     createSignalConsumerRuntimeHook({ advisoryBus: deps.advisoryBus }),
@@ -378,7 +384,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   }
 
   if (deps.autoDelegate) {
-    hooks.push(createDispatcherHook(deps.autoDelegate))
+    hooks.push(createDispatcherHook({ ...deps.autoDelegate, advisoryBus: deps.advisoryBus }))
   }
 
   if (deps.memoryLearning) {

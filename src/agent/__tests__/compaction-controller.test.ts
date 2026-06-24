@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { CompactionController, findSafeSplitPoint } from '../compaction-controller.js'
+import { CompactionController, findSafeSplitPoint, foldAgedRecallBlocks, RECALL_KEEP_RECENT } from '../compaction-controller.js'
+import { buildRecallMarker } from '../../compact/recall-marker.js'
 import { SessionContext } from '../context.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { PressureMonitor } from '../../context/pressure-monitor.js'
@@ -8,6 +9,8 @@ import type { TrajectoryEntry } from '../trajectory.js'
 import type { OaiChatRequest, OaiMessage } from '../../api/oai-types.js'
 import type { StreamCallbacks, StreamClient } from '../../api/stream-client.js'
 import { extractTaskContract } from '../../context/task-contract.js'
+import type { ProviderProfile } from '../../api/provider-profile.js'
+import type { CacheAdvisor } from '../../cache/advisor.js'
 
 function makeEngine(): PromptEngine {
   return new PromptEngine({
@@ -143,8 +146,10 @@ describe('CompactionController', () => {
     assert.equal(controller.refreshCacheDiagnostic(2), null)
   })
 
-  // P1.2: prune should NOT mutate session storage
-  it('P1.2: prune does NOT modify session message storage', async () => {
+  // P1.2: small-window (<200K) prune mutates session storage — this is
+  // intentional (only 1M+ windows use request-time T7 folding). Rivet
+  // targets DeepSeek V4 (1M window); small-window paths are not maintained.
+  it.skip('P1.2: prune does NOT modify session message storage (<200K — not supported)', async () => {
     const session = new SessionContext()
     // Build messages with several large-enough tool results to trigger prune.
     // On 128K contextWindow, prune.minChars=40_000. Each tool result is 50K →
@@ -188,14 +193,19 @@ describe('CompactionController', () => {
     )
   })
 
-  // Phase 2.1: On 1M+ windows, skip microCompactOai to preserve exact prefix cache.
-  // The 1M window has enough headroom — enforceContextCeiling (95%) remains as
-  // emergency last resort, but regular compaction is permanently disabled.
-  it('P2.1: skips compaction on 1M+ context window even when thresholds are crossed', async () => {
+  // Phase 2.1: On 1M+ windows the 60% partial-compact path needs BOTH a
+  // primaryClient AND enough messages to split (> anchor + recentToPreserve + 4
+  // ≈ 66). Here a client is wired but there are only 10 messages at 65% ratio,
+  // so tryPartialCompact bails (too few to split) and the full path (≥75%) is
+  // not reached — net result is no compaction, history left intact.
+  //
+  // NOTE: the previous version of this test omitted primaryClient entirely, so
+  // the 60%/75% branches were skipped on the `&& this.deps.primaryClient` gate
+  // and never actually exercised — a false green. The client is now provided so
+  // the branch is genuinely entered and the "too few messages" bail is tested.
+  it('P2.1: 1M window at 65% with too few messages does not compact', async () => {
     const session = new SessionContext()
-    // Create enough content to cross the 60% watch threshold on a 1M window.
-    // Balanced strategy: watch=0.60 → need 600K+ tokens.
-    // 10 messages × 65K tokens each = 650K tokens → 65% ratio → should trigger.
+    // 10 messages × 65K tokens each = 650K tokens → 65% ratio (60-75% band).
     const chunk = 'x'.repeat(260_000) // 260K chars / 4 ≈ 65K tokens
     const msgs = [
       { role: 'user' as const, content: chunk },
@@ -213,15 +223,22 @@ describe('CompactionController', () => {
     const tokensBefore = session.getEstimatedTokens()
     const messagesBefore = session.getMessages()
 
-    // Ratio check: must actually cross the threshold
     assert.ok(
-      tokensBefore / 1_000_000 >= 0.60,
-      `setup: tokens ${tokensBefore} must exceed 60% of 1M window`
+      tokensBefore / 1_000_000 >= 0.60 && tokensBefore / 1_000_000 < 0.75,
+      `setup: tokens ${tokensBefore} must land in the 60-75% partial band`
     )
 
     let refreshed = false
+    let streamCalled = false
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        streamCalled = true
+        callbacks.onTextDelta('summary')
+      },
+    }
     const controller = makeController(session, {
       contextWindow: 1_000_000,
+      primaryClient,
       refreshLedger: () => { refreshed = true },
     })
 
@@ -230,18 +247,270 @@ describe('CompactionController', () => {
       failures: { consecutiveFailures: 0 },
     })
 
-    // Core assertion: compaction must not happen on 1M+ window
-    assert.equal(result.compacted, false, 'must not compact on 1M+ window')
+    // 10 messages < 66 → partial bails before issuing an LLM request.
+    assert.equal(result.compacted, false, 'too few messages to partial-compact at 65%')
+    assert.equal(streamCalled, false, 'partial must bail before calling the model')
     assert.deepEqual(result.failures, { consecutiveFailures: 0 })
     assert.equal(refreshed, false)
 
-    // Storage must be untouched
     const messagesAfter = session.getMessages()
     assert.deepStrictEqual(
       messagesAfter.map(m => m.content),
       messagesBefore.map(m => m.content),
       'messages must be unchanged when compaction is skipped'
     )
+  })
+
+  // P2.1b: with a client AND enough messages, the 60% partial path actually
+  // fires — this is the branch the old false-green test never reached.
+  it('P2.1b: 1M window at 65% with enough messages triggers partial compact', async () => {
+    const session = new SessionContext()
+    // 70 messages × 10K tokens = 700K tokens → 70% ratio, and 70 > 66 so the
+    // partial split has room (anchor 2 + recent 60 + summary).
+    const chunk = 'x'.repeat(40_000) // 40K chars / 4 ≈ 10K tokens
+    const msgs = Array.from({ length: 70 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: chunk,
+    }))
+    session.replaceMessages(msgs)
+    const ratio = session.getEstimatedTokens() / 1_000_000
+    assert.ok(ratio >= 0.60 && ratio < 0.75, `setup: ratio ${ratio} must be in 60-75% band`)
+
+    let streamCalled = false
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        streamCalled = true
+        callbacks.onTextDelta('partial summary of old zone')
+      },
+    }
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+    })
+
+    const result = await controller.maybeCompact({
+      loopTurn: 0,
+      failures: { consecutiveFailures: 0 },
+    })
+
+    assert.equal(streamCalled, true, 'partial compact must call the model')
+    assert.equal(result.compacted, true, 'partial compact must succeed')
+    const after = session.getMessages()
+    assert.ok(after.length < 70, `expected fewer messages after partial compact, got ${after.length}`)
+    assert.match(String(after[2]?.content), /partial-compact-summary/)
+  })
+
+  // P2.1c: P2 gate — on a cache-preserving provider with a hot cache, the 1M
+  // partial path defers compaction instead of breaking the prefix.
+  it('P2.1c: 1M partial compact is delayed when cache-preserving provider cache is hot', async () => {
+    const session = new SessionContext()
+    const chunk = 'x'.repeat(40_000)
+    const msgs = Array.from({ length: 70 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: chunk,
+    }))
+    session.replaceMessages(msgs)
+
+    let streamCalled = false
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        streamCalled = true
+        callbacks.onTextDelta('summary')
+      },
+    }
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+      providerProfile: { cacheType: 'exact-prefix', persistent: true } as ProviderProfile,
+      cacheAdvisor: { shouldDelayCompact: () => true } as unknown as CacheAdvisor,
+    })
+
+    const result = await controller.maybeCompact({
+      loopTurn: 0,
+      failures: { consecutiveFailures: 0 },
+    })
+
+    assert.equal(result.compacted, false, 'cache-preserving + hot cache must defer compaction')
+    assert.equal(streamCalled, false, 'no LLM request when compaction is deferred')
+    assert.equal(session.getMessages().length, 70, 'history untouched when deferred')
+  })
+
+  // P2.1d: P1 — partial compact appends the authoritative task-anchor so
+  // constraints/scope survive even if the LLM summary drops them.
+  it('P2.1d: partial compact injects task-anchor appendix when a contract is active', async () => {
+    const session = new SessionContext()
+    const chunk = 'x'.repeat(40_000)
+    const msgs = Array.from({ length: 70 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: chunk,
+    }))
+    session.replaceMessages(msgs)
+
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        callbacks.onTextDelta('summary that omits the constraints')
+      },
+    }
+    const contract = extractTaskContract(
+      'Refactor compaction-controller.ts. Constraint: do not break the prefix cache. Touch src/agent/compaction-controller.ts only.',
+    )
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+      getActiveContract: () => contract,
+    })
+
+    const result = await controller.maybeCompact({
+      loopTurn: 0,
+      failures: { consecutiveFailures: 0 },
+    })
+
+    assert.equal(result.compacted, true)
+    const after = session.getMessages()
+    const tail = String(after[after.length - 1]?.content ?? '')
+    assert.match(tail, /task-anchor/, 'partial compact must append the task-anchor appendix')
+  })
+
+  // P3: partial compact persists heuristic session memories before history is
+  // replaced — the hook the loop callback uses to hot-refresh session memory.
+  it('P3: partial compact persists extracted memories before replacing history', async () => {
+    const session = new SessionContext()
+    const msgs = Array.from({ length: 70 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: i % 2 === 0
+        ? 'I always prefer prefix-cache safety. ' + 'x'.repeat(40_000)
+        : 'x'.repeat(40_000),
+    }))
+    session.replaceMessages(msgs)
+
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        callbacks.onTextDelta('summary')
+      },
+    }
+    const persisted: Array<{ text: string; kind: string; source: string }> = []
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+      persistMemories: mems => { persisted.push(...mems) },
+    })
+
+    const result = await controller.maybeCompact({
+      loopTurn: 0,
+      failures: { consecutiveFailures: 0 },
+    })
+
+    assert.equal(result.compacted, true)
+    assert.ok(persisted.length > 0, 'partial compact must persist extracted memories')
+    assert.ok(
+      persisted.some(m => m.kind === 'user_preference'),
+      'should extract the user preference from history before replacement',
+    )
+  })
+
+  // P6: llmCompact post-check — a summary that reflects the trajectory's error
+  // class / touched files is kept verbatim as a compact-summary.
+  it('P6: llmCompact keeps a summary that covers trajectory state', async () => {
+    const session = new SessionContext()
+    session.replaceMessages([
+      { role: 'user', content: 'fix the bug' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'continue' },
+      { role: 'assistant', content: 'done' },
+    ])
+    const trajectory: TrajectoryEntry[] = [
+      { turn: 1, tool: 'write_file', target: 'src/foo.ts', durationMs: 10, status: 'failed', errorClass: 'TS2322', inputSummary: 'edit', resultSummary: 'type error' },
+    ]
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        callbacks.onTextDelta('Fixed the TS2322 type error in src/foo.ts by adding a cast.')
+      },
+    }
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+      getTrajectoryEntries: () => trajectory,
+    })
+
+    const result = await controller.llmCompact()
+    assert.match(String(result), /<compact-summary/, 'covering summary kept as LLM compact')
+    assert.match(String(result), /TS2322/)
+  })
+
+  // P6: a summary that reflects NONE of the trajectory's material state falls
+  // back to the deterministic structured handoff.
+  it('P6: llmCompact falls back to structured handoff when summary covers nothing', async () => {
+    const session = new SessionContext()
+    session.replaceMessages([
+      { role: 'user', content: 'fix the bug' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'continue' },
+      { role: 'assistant', content: 'done' },
+    ])
+    const trajectory: TrajectoryEntry[] = [
+      { turn: 1, tool: 'write_file', target: 'src/foo.ts', durationMs: 10, status: 'failed', errorClass: 'TS2322', inputSummary: 'edit', resultSummary: 'type error' },
+    ]
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        callbacks.onTextDelta('We did some work and made progress on various things.')
+      },
+    }
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+      getTrajectoryEntries: () => trajectory,
+    })
+
+    const result = await controller.llmCompact()
+    assert.doesNotMatch(String(result), /<compact-summary/, 'non-covering summary must not be wrapped')
+    assert.match(String(result), /用户核心需求/, 'must fall back to the structured handoff')
+  })
+
+  // P7 (E2E): drive a real partial compact over a long history and assert the
+  // re-injected task-anchor still carries objective / file-scope / user
+  // constraint / completed+remaining todos — the deterministic backstop the LLM
+  // summary may have dropped. Complements the prompt-engine-level safety net in
+  // compact-prompt-contract.test.ts by exercising the compaction-controller lane.
+  it('P7 (E2E): long history → partial compact → anchor retains objective/constraints/todos', async () => {
+    const session = new SessionContext()
+    const msgs = Array.from({ length: 70 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: 'x'.repeat(40_000),
+    }))
+    session.replaceMessages(msgs)
+
+    const contract = extractTaskContract(
+      "Refactor src/auth.ts to use JWT. Don't touch the billing module.",
+      1,
+    )
+    const trajectory: TrajectoryEntry[] = [
+      { turn: 1, tool: 'read_file', target: 'src/auth.ts', durationMs: 5, status: 'success', inputSummary: 'read', resultSummary: 'ok' },
+    ]
+    const primaryClient: StreamClient = {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        // Summary deliberately elides the contract details — the anchor must
+        // carry them deterministically.
+        callbacks.onTextDelta('Earlier work elided.')
+      },
+    }
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient,
+      getActiveContract: () => contract,
+      getTrajectoryEntries: () => trajectory,
+      getStreamedText: () => 'Next step: migrate auth middleware',
+    })
+
+    const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
+    assert.equal(result.compacted, true)
+
+    const after = session.getMessages()
+    const tail = String(after[after.length - 1]?.content ?? '')
+    assert.match(tail, /<task-anchor authoritative="true"/, 'anchor present after partial compact')
+    assert.match(tail, /src\/auth\.ts/, 'objective/file-scope survives')
+    assert.match(tail, /billing/i, 'user hard-constraint survives')
+    assert.match(tail, /read_file auth\.ts/, 'completed todo survives')
+    assert.match(tail, /migrate auth middleware/, 'remaining todo survives')
   })
 
   // Phase 2.1: enforceContextCeiling MUST still fire on 1M+ windows.
@@ -854,6 +1123,133 @@ describe('CompactionController', () => {
   })
 })
 
+// ── layered archival + recall ───────────────────────────────────────────
+
+describe('CompactionController layered archival', () => {
+  function make1MSession(count = 70): SessionContext {
+    const session = new SessionContext()
+    const chunk = 'x'.repeat(40_000)
+    const msgs = Array.from({ length: count }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: chunk,
+    }))
+    session.replaceMessages(msgs)
+    return session
+  }
+
+  function summarizingClient(text = 'partial summary'): StreamClient {
+    return {
+      stream: async (_request: OaiChatRequest, callbacks: StreamCallbacks) => {
+        callbacks.onTextDelta(text)
+      },
+    }
+  }
+
+  it('partial compact archives the old zone and embeds a recall reference', async () => {
+    const session = make1MSession()
+    const anchor0 = session.getMessages()[0]!
+    const anchor1 = session.getMessages()[1]!
+
+    const saved: Array<{ target: string; rawContent: string }> = []
+    const archived: Array<[string, number]> = []
+    let counter = 0
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient: summarizingClient(),
+      archiveHistory: async (input) => {
+        saved.push({ target: input.target, rawContent: input.rawContent })
+        return `compact-history:id${counter++}`
+      },
+      onArchive: (id, turn) => { archived.push([id, turn]) },
+    })
+
+    const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
+    assert.equal(result.compacted, true)
+
+    // Archived exactly once, with the verbatim old zone serialized.
+    assert.equal(saved.length, 1)
+    assert.match(saved[0]!.rawContent, /--- turn:\d+ role:(user|assistant) ---/)
+    assert.equal(archived.length, 1)
+    assert.equal(archived[0]![0], 'compact-history:id0')
+
+    // Recall reference embedded into the partial-compact-summary message.
+    const after = session.getMessages()
+    const summaryMsg = after.find(m => String(m.content).includes('partial-compact-summary'))
+    assert.ok(summaryMsg, 'summary message must exist')
+    assert.match(String(summaryMsg!.content), /artifact:compact-history:id0/)
+    assert.match(String(summaryMsg!.content), /read_section/)
+
+    // Cache safety: the first two anchor messages are byte-identical.
+    assert.equal(after[0]!.content, anchor0.content)
+    assert.equal(after[1]!.content, anchor1.content)
+  })
+
+  it('checkpoint (ceiling) archives discarded history and embeds a recall reference', async () => {
+    const session = new SessionContext()
+    const huge = 'x'.repeat(80_000 * 4)
+    session.replaceMessages([
+      { role: 'user', content: 'anchor user' },
+      { role: 'assistant', content: 'anchor assistant' },
+      { role: 'user', content: huge },
+      { role: 'assistant', content: huge },
+      { role: 'user', content: huge },
+      { role: 'assistant', content: huge },
+    ])
+
+    const saved: string[] = []
+    let counter = 0
+    const controller = makeController(session, {
+      archiveHistory: async (input) => {
+        saved.push(input.target)
+        return `compact-history:ck${counter++}`
+      },
+    })
+
+    await controller.enforceContextCeiling()
+
+    const after = session.getMessages()
+    assert.equal(after[0]!.content, 'anchor user')
+    assert.equal(after[1]!.content, 'anchor assistant')
+    assert.equal(saved.length, 1, 'ceiling checkpoint archives the discarded zone')
+    const checkpoint = String(after[2]!.content)
+    assert.match(checkpoint, /<checkpoint-resume>/)
+    assert.match(checkpoint, /artifact:compact-history:ck0/)
+  })
+
+  it('is fail-soft: compaction succeeds even when archiving throws', async () => {
+    const session = make1MSession()
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient: summarizingClient(),
+      archiveHistory: async () => { throw new Error('disk full') },
+    })
+
+    const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
+    assert.equal(result.compacted, true, 'archive failure must not block compaction')
+    const after = session.getMessages()
+    const summaryMsg = after.find(m => String(m.content).includes('partial-compact-summary'))
+    assert.ok(summaryMsg, 'summary still produced')
+    assert.doesNotMatch(String(summaryMsg!.content), /artifact:compact-history/)
+  })
+
+  it('snapshots the pre-compaction transcript before replacing history', async () => {
+    const session = make1MSession()
+    const before = session.getMessages().length
+    const snapshots: Array<{ count: number; turn: number }> = []
+    const controller = makeController(session, {
+      contextWindow: 1_000_000,
+      primaryClient: summarizingClient(),
+      archiveHistory: async () => 'compact-history:snap',
+      backupTranscript: (messages, turn) => { snapshots.push({ count: messages.length, turn }) },
+    })
+
+    const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
+    assert.equal(result.compacted, true)
+    assert.equal(snapshots.length, 1, 'one snapshot per compaction')
+    assert.equal(snapshots[0]!.count, before, 'snapshot captures the full pre-compaction list')
+  })
+})
+
 // ── findSafeSplitPoint ──────────────────────────────────────────────────
 
 describe('findSafeSplitPoint', () => {
@@ -1015,5 +1411,59 @@ describe('findSafeSplitPoint', () => {
     const result = findSafeSplitPoint(msgs, 8, 2)
     // Should adjust to 6 (before the assistant) to keep the group intact
     assert.equal(result, 6)
+  })
+})
+
+describe('foldAgedRecallBlocks (A3 recall eviction)', () => {
+  const recall = (artifactId: string, section: string, body: string): OaiMessage => ({
+    role: 'tool',
+    tool_call_id: `tc_${section}`,
+    content: `${buildRecallMarker(artifactId, section)}\n${body}`,
+  })
+
+  it('folds aged recall blocks to pointers but keeps the most recent K', () => {
+    const total = RECALL_KEEP_RECENT + 3
+    const zone: OaiMessage[] = Array.from({ length: total }, (_, i) =>
+      recall('compact-history:h1', `L${i + 1}-L${i + 2}`, `verbatim block ${i} ${'z'.repeat(100)}`))
+
+    const folded = foldAgedRecallBlocks(zone, RECALL_KEEP_RECENT)
+    assert.equal(folded.length, zone.length)
+
+    // First 3 (aged) are folded to a one-line pointer (no body).
+    for (let i = 0; i < 3; i++) {
+      assert.equal(folded[i]!.content, `[recalled compact-history:h1 L${i + 1}-L${i + 2}]`)
+      assert.doesNotMatch(folded[i]!.content as string, /verbatim block/)
+    }
+    // Last K keep their verbatim body.
+    for (let i = 3; i < total; i++) {
+      assert.match(folded[i]!.content as string, /verbatim block/)
+    }
+    // Tool metadata preserved on folded messages.
+    assert.equal(folded[0]!.role, 'tool')
+    assert.equal(folded[0]!.tool_call_id, 'tc_L1-L2')
+  })
+
+  it('leaves non-recall messages untouched', () => {
+    const zone: OaiMessage[] = [
+      { role: 'user', content: 'a normal user turn' },
+      { role: 'assistant', content: 'a normal assistant turn' },
+    ]
+    const folded = foldAgedRecallBlocks(zone, RECALL_KEEP_RECENT)
+    assert.deepEqual(folded, zone)
+  })
+
+  it('is a no-op when recall count is within keepRecent', () => {
+    const zone: OaiMessage[] = [recall('compact-history:h1', 'L1-L2', 'body one' + 'q'.repeat(80))]
+    const folded = foldAgedRecallBlocks(zone, RECALL_KEEP_RECENT)
+    assert.deepEqual(folded, zone)
+  })
+
+  it('is idempotent — folding a folded pointer changes nothing further', () => {
+    const total = RECALL_KEEP_RECENT + 2
+    const zone: OaiMessage[] = Array.from({ length: total }, (_, i) =>
+      recall('compact-history:h1', `L${i + 1}-L${i + 2}`, `body ${i} ${'w'.repeat(60)}`))
+    const once = foldAgedRecallBlocks(zone, RECALL_KEEP_RECENT)
+    const twice = foldAgedRecallBlocks(once, RECALL_KEEP_RECENT)
+    assert.deepEqual(twice, once)
   })
 })

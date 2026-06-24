@@ -38,6 +38,7 @@ import { loadPersistedGrants } from './tools/path-grants.js'
 import { createDelegateBatchTool } from './tools/delegate-batch.js'
 import { createTeamOrchestrateTool } from './tools/team-orchestrate.js'
 import { createCouncilConveneTool } from './tools/council-convene.js'
+import { needsTemplatesInit } from './bootstrap/project-templates.js'
 import { debugLog } from './utils/debug.js'
 import { persistCouncilRoutingShadow } from './agent/council/council-routing.js'
 import { recordCouncilSession } from './agent/council/council-telemetry.js'
@@ -67,9 +68,9 @@ import { ASK_USER_QUESTION_TOOL } from './tools/ask-user-question.js'
 import { createRepoGraphTool } from './tools/repo-graph.js'
 import { SEMANTIC_SEARCH_TOOL } from './tools/semantic-search.js'
 import { WEB_SEARCH_TOOL } from './tools/web-search.js'
+import { APPLY_PATCH_TOOL } from './tools/apply-patch.js'
 import { createPlanTaskTool } from './tools/plan-task.js'
-import { createRecallTool } from './tools/recall.js'
-import { createRememberTool } from './tools/remember.js'
+import { createMemoryTool } from './tools/memory.js'
 import { MeridianIndexer } from './repo/meridian-indexer.js'
 import { loadProjectRules } from './context/rules-loader.js'
 import { loadProjectSkills } from './skills/skill-loader.js'
@@ -145,6 +146,9 @@ export interface BootstrapContext {
   cwd: string
   shutdown: () => void
   heartbeatInterval: ReturnType<typeof setInterval>
+  /** True when first-run template init is pending — TUI layer handles the
+   *  AGENTS.md prompt. Set by needsTemplatesInit() during bootstrap. */
+  templatesPendingAgents?: boolean
 }
 
 // ── HTTP Proxy ─────────────────────────────────────────────────
@@ -423,7 +427,7 @@ export function createInteractiveToolRegistry(
       store: refs.meridianIndexer?.getDb(),
     }).enabled,
     getSessionId: () => refs.sessionId ?? undefined,
-  }))
+  }, { defaultMaxParallel: config.agent.maxTeamParallel }))
 
   // council_convene — 单轮多星域会诊出计划（与 team_orchestrate 解耦，绝不派执行）。
   reg.register(createCouncilConveneTool({
@@ -446,10 +450,12 @@ export function createInteractiveToolRegistry(
   reg.register(createRepoGraphTool(() => refs.meridianIndexer))
 
   reg.register(SEMANTIC_SEARCH_TOOL)
-  // web_search: registered at the interactive layer (not the kernel default-registry,
-  // to preserve the ≤25 kernel budget). Available to the primary agent and referenced
-  // by PLAN_MODE_ALLOWED_TOOLS alongside recall.
-  reg.register(WEB_SEARCH_TOOL)
+  // APPLY_PATCH: EXTENDED layer — overlap with hash_edit covers >90% of
+  // use cases; kept here (interactive) for edge cases (e.g. git-format patches).
+  reg.register(APPLY_PATCH_TOOL)
+  // web_search is now in the kernel default-registry (CORE layer).
+  // Remove the interactive registration to avoid double-registration.
+  // PLAN_MODE_ALLOWED_TOOLS already references web_search alongside recall.
   reg.register(createPlanTaskTool({
     getCoordinator: () => refs.coordinator,
   }))
@@ -567,6 +573,8 @@ export function createAgentRuntime(deps: {
     allProviders: config.provider.providers,
     config,
     sessionId,
+    // 全量传入；门控统一在 createAgentConfig 内经 gateToolDefinitions 施加，
+    // 与 AgentLoop.updateTools() 共用同一过滤逻辑（避免 MCP/LSP 异步注册后被还原）。
     toolDefinitions: toolRegistry.getDefinitions(),
     sessionMemoryBlock: persist.buildMemoryBlock(),
     auth,
@@ -817,6 +825,7 @@ export function createAgentRuntime(deps: {
     sessionId: refs.sessionId ?? undefined,
     resumeEnabled: true,
     reviewOverrideCards: reviewOverrideCards.size > 0 ? reviewOverrideCards : undefined,
+    maxDelegationDepth: config.agent.maxDelegationDepth,
   })
 
   const agent = new AgentLoop(
@@ -824,6 +833,7 @@ export function createAgentRuntime(deps: {
       ...agentCfg,
       toolRegistry,
       maxTurns: config.agent.maxTurns,
+      maxAutoContinue: config.agent.maxAutoContinue,
       getSessionMemoryState: () => persist.getSessionMemoryState(),
       fileHistory,
       contextClaimStore: claimStore,
@@ -1236,6 +1246,11 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   // 4. Session infrastructure
   const { registry: sessionRegistry, sessionId, heartbeatInterval } = await createSessionInfrastructure()
 
+  // 4a. First-run template detection — set flag for TUI layer to prompt.
+  // We only detect here; actual file creation + sentinel write happens in
+  // main.ts after the user decides (so file creation and sentinel stay atomic).
+  const templatesPendingAgents = needsTemplatesInit(cwd)
+
   // 5. Session persist + claim store
   const persist = new SessionPersist(sessionId, cwd)
   const claimStore = persist.createClaimStore()
@@ -1332,12 +1347,8 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   // 10. Tool registry
   const { registry: toolRegistry } = createInteractiveToolRegistry(refs, config, cwd)
 
-  // 11. Recall + remember tools
-  toolRegistry.register(createRecallTool(claimStore, {
-    sessionId,
-    getTurn: () => session.getTurnCount(),
-  }))
-  toolRegistry.register(createRememberTool(claimStore, {
+  // 11. Memory tool (unified recall + remember)
+  toolRegistry.register(createMemoryTool(claimStore, {
     sessionId,
     getTurn: () => session.getTurnCount(),
     cwd,
@@ -1386,6 +1397,7 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     domainKnowledgeStore, meridianIndexer, cwd,
     shutdown,
     heartbeatInterval,
+    templatesPendingAgents,
   }
 
   return ctx

@@ -17,6 +17,42 @@ import { renderTaskAnchor, type TaskContract } from '../context/task-contract.js
 import type { TrajectoryEntry } from './trajectory.js'
 import type { CacheAdvisor } from '../cache/advisor.js'
 import { extractSessionMemories, type ExtractedMemory } from './session-memory-extract.js'
+import type { ArtifactSection } from '../artifact/types.js'
+import { serializeMessagesForArchive, buildArchiveCatalog, buildRecallRefBlock } from './compact-archive.js'
+import { parseRecallMarker } from '../compact/recall-marker.js'
+
+/**
+ * How many of the most-recent compact-history recall blocks in the recent zone
+ * to keep verbatim. The model just pulled these back; folding them immediately
+ * would cancel out the recall it asked for. Older recalls are folded to
+ * pointers (A3).
+ */
+export const RECALL_KEEP_RECENT = 10
+
+/**
+ * Fold aged compact-history recall blocks sitting in the recent zone back into
+ * one-line pointers. The original content remains in the source artifact and
+ * stays re-recallable; this only reclaims the recalled bytes that have aged out
+ * of the last `keepRecent` recalls. Idempotent: a folded pointer still parses
+ * as a recall marker, so re-running fold is a no-op. Non-recall messages and
+ * the most recent `keepRecent` recalls are returned untouched.
+ */
+export function foldAgedRecallBlocks(recentZone: OaiMessage[], keepRecent: number): OaiMessage[] {
+  const recallIdxs: number[] = []
+  for (let i = 0; i < recentZone.length; i++) {
+    const c = recentZone[i]!.content
+    if (typeof c === 'string' && parseRecallMarker(c)) recallIdxs.push(i)
+  }
+  if (recallIdxs.length <= keepRecent) return recentZone
+
+  const foldUpTo = recallIdxs.length - keepRecent
+  const agedIdxs = new Set(recallIdxs.slice(0, foldUpTo))
+  return recentZone.map((msg, i) => {
+    if (!agedIdxs.has(i)) return msg
+    const parsed = parseRecallMarker(msg.content as string)!
+    return { ...msg, content: `[recalled ${parsed.artifactId} ${parsed.section}]` }
+  })
+}
 
 /**
  * Extract the user intent chain: all user messages in order,
@@ -280,6 +316,25 @@ export interface CompactionControllerDeps {
    * survive verbatim even when the LLM summary above drifts or drops them.
    */
   getActiveContract?: () => TaskContract | undefined
+  /**
+   * Layered archival: persist a discarded message zone as a recallable
+   * `compact-history` artifact, returning its id (or null on failure).
+   * Wired to ArtifactStore.save in loop.ts. Archiving only writes to disk and
+   * never touches the prompt prefix — fully prefix-cache safe. Fail-soft:
+   * compaction must continue even if the archive write fails.
+   */
+  archiveHistory?: (input: ArchiveHistoryInput) => Promise<string | null>
+  /** Notified with the new artifact id + creation turn for recall observability. */
+  onArchive?: (artifactId: string, turn: number) => void
+  /** Snapshot the full pre-compaction message list for disaster recovery. */
+  backupTranscript?: (messages: OaiMessage[], turn: number) => void
+}
+
+export interface ArchiveHistoryInput {
+  rawContent: string
+  summary: string
+  sections: ArtifactSection[]
+  target: string
 }
 
 export interface MaybeCompactInput {
@@ -365,8 +420,19 @@ export class CompactionController {
         return { failures: input.failures, compacted: false }
       }
 
+      // P2: on exact-prefix providers (DeepSeek), the 1M LLM-compact paths used
+      // to bypass shouldDelayCompact entirely — breaking the prefix cache even
+      // when it was hot. Gate them through the same cache-protection check the
+      // non-1M tier path already uses (L430), so we only pay the cache-miss
+      // rebuild when the headroom is genuinely worth more than cache warmth.
+      const cachePreserving = this.isCachePreservingProvider()
+
       // T8: Partial Compact at 60% — earlier, lighter, preserves recent context.
       if (ratio >= 0.60 && ratio < 0.75 && this.deps.primaryClient) {
+        if (cachePreserving && this.deps.cacheAdvisor?.shouldDelayCompact(1, { estimatedTokens, contextWindow })) {
+          debugLog(`[partial-compact] 1M at ${(ratio * 100).toFixed(0)}% — cache healthy, delaying`)
+          return { failures: input.failures, compacted: false }
+        }
         debugLog(`[partial-compact] 1M window at ${(ratio * 100).toFixed(0)}% — trying partial compact`)
         const partialResult = await this.tryPartialCompact(60)
         if (partialResult) {
@@ -378,6 +444,13 @@ export class CompactionController {
 
       // Full LLM compact at 75% — fallback when partial was insufficient
       if (ratio >= 0.75 && this.deps.primaryClient) {
+        // P2: tier-2 delay check. At 75%+ pressure shouldDelayCompact rarely
+        // holds (protection = hitRate × (1 − pressure) ≤ 0.25 < 0.45), so this
+        // mainly defers the 75-80% band when the cache is exceptionally hot.
+        if (cachePreserving && this.deps.cacheAdvisor?.shouldDelayCompact(2, { estimatedTokens, contextWindow })) {
+          debugLog(`[llm-compact] 1M at ${(ratio * 100).toFixed(0)}% — cache healthy, delaying`)
+          return { failures: input.failures, compacted: false }
+        }
         // Try partial compact first (lighter)
         debugLog(`[llm-compact] 1M window at ${(ratio * 100).toFixed(0)}% — trying partial compact before full`)
         const partialResult = await this.tryPartialCompact(60)
@@ -392,7 +465,13 @@ export class CompactionController {
           return { failures: input.failures, compacted: false }
         }
         if (summary) {
-          this.replaceWithCheckpoint({
+          // P3: persist heuristic session memories BEFORE replaceWithCheckpoint
+          // wipes history (extractSessionMemories reads the live message list).
+          // Placed AFTER llmCompact so the compaction request itself still reuses
+          // the prefix cache with the pre-refresh frozen base — the persist
+          // callback hot-refreshes session memory, which rebuilds the frozen base.
+          this.persistExtractedMemories(this.deps.getTrajectoryEntries())
+          await this.replaceWithCheckpoint({
             tier: 2,
             reason: `LLM compact at ${(ratio * 100).toFixed(0)}% context (1M window graceful degradation)`,
             summary,
@@ -524,7 +603,7 @@ export class CompactionController {
         return
       }
       if (summary) {
-        this.replaceWithCheckpoint({
+        await this.replaceWithCheckpoint({
           tier: 4,
           reason: 'context ceiling exceeded; LLM compact checkpoint',
           summary,
@@ -559,7 +638,7 @@ export class CompactionController {
 
     const resumeContent = `<checkpoint-resume>\n${stateLines.join('\n')}\n</checkpoint-resume>`
 
-    this.replaceWithCheckpoint({
+    await this.replaceWithCheckpoint({
       tier: 4,
       reason: 'context ceiling exceeded; checkpoint-resume required',
       summary: resumeContent,
@@ -589,7 +668,7 @@ export class CompactionController {
         return false
       }
       if (summary) {
-        this.replaceWithCheckpoint({
+        await this.replaceWithCheckpoint({
           tier: 3,
           reason: `session split at ${(ratio * 100).toFixed(0)}% context (LLM compact)`,
           summary,
@@ -601,7 +680,30 @@ export class CompactionController {
       }
     }
 
-    // Fallback: structured extraction
+    // Fallback: deterministic structured handoff (no LLM available or it failed).
+    const taskState = extractTaskState(trajectory, this.deps.getStreamedText())
+    const handoffContent = this.buildHandoffFromState()
+
+    await this.replaceWithCheckpoint({
+      tier: 3,
+      reason: `session split at ${(ratio * 100).toFixed(0)}% context`,
+      summary: handoffContent,
+      maxFallback: this.deps.contextWindow * 0.3,
+      fallbackText: `<session-handoff>Session split at ${(ratio * 100).toFixed(0)}% context. ${taskState.current}</session-handoff>`,
+    })
+
+    debugLog(`[session-split] structured handoff ratio=${ratio.toFixed(2)} tokens=${this.deps.session.getEstimatedTokens()}`)
+
+    return true
+  }
+
+  /**
+   * P6: build the deterministic structured handoff from current session state
+   * (task-state + trajectory + recent reasoning). Shared by trySessionSplit's
+   * non-LLM fallback and llmCompact's post-check fallback.
+   */
+  private buildHandoffFromState(): string {
+    const trajectory = this.deps.getTrajectoryEntries()
     const messages = this.deps.session.getMessages()
     const taskState = extractTaskState(trajectory, this.deps.getStreamedText())
 
@@ -625,7 +727,7 @@ export class CompactionController {
 
     const recentTools = trajectory.slice(-10)
     const failures = trajectory.filter(t => t.status === 'failed' || t.status === 'retried-failed')
-    const handoffContent = buildStructuredHandoff({
+    return buildStructuredHandoff({
       taskState: {
         current: taskState.current,
         completed: taskState.completed,
@@ -650,22 +752,37 @@ export class CompactionController {
       })),
       stanceSummary: this.deps.getStanceSummary?.(),
     })
+  }
 
-    this.replaceWithCheckpoint({
-      tier: 3,
-      reason: `session split at ${(ratio * 100).toFixed(0)}% context`,
-      summary: handoffContent,
-      maxFallback: this.deps.contextWindow * 0.3,
-      fallbackText: `<session-handoff>Session split at ${(ratio * 100).toFixed(0)}% context. ${taskState.current}</session-handoff>`,
-    })
+  /**
+   * P6: post-check that an LLM summary reflects the material state recorded in
+   * the trajectory (failed error classes / touched files). Conservative — only
+   * fails when the summary reflects NONE of the dimensions that actually exist,
+   * to avoid false positives on legitimate paraphrasing.
+   */
+  private summaryCoversState(summary: string): boolean {
+    const trajectory = this.deps.getTrajectoryEntries()
+    const lower = summary.toLowerCase()
 
-    debugLog(
-      `[session-split] ratio=${ratio.toFixed(2)} files=${filesSeen.size} ` +
-      `reasoning_chars=${reasoningParts.join('').length} ` +
-      `tokens=${this.deps.session.getEstimatedTokens()}`
-    )
+    const failures = trajectory.filter(t => t.status === 'failed' || t.status === 'retried-failed')
+    const errorClasses = [...new Set(
+      failures.map(f => f.errorClass).filter((e): e is string => Boolean(e)),
+    )]
+    const fileBasenames = [...new Set(
+      trajectory
+        .map(t => t.target)
+        .filter((t): t is string => Boolean(t) && /\.[a-z0-9]{1,8}$/i.test(t))
+        .map(t => t.split('/').pop()!.toLowerCase()),
+    )]
 
-    return true
+    const covered: boolean[] = []
+    if (errorClasses.length > 0) covered.push(errorClasses.some(e => lower.includes(e.toLowerCase())))
+    if (fileBasenames.length > 0) covered.push(fileBasenames.some(f => lower.includes(f)))
+
+    // Nothing material in the trajectory → nothing to verify against.
+    if (covered.length === 0) return true
+    // Pass if at least one present dimension is reflected in the summary.
+    return covered.some(c => c)
   }
 
   refreshCacheDiagnostic(loopTurn: number): string | null {
@@ -718,11 +835,55 @@ export class CompactionController {
    * making the sequence safe to send.
    */
   private safeReplaceMessages(messages: OaiMessage[]): void {
+    // Optional pre-compaction transcript snapshot: capture the CURRENT (pre-replace)
+    // message list before it is overwritten. This is the single choke point for
+    // every compaction path, so one hook covers partial / checkpoint / micro.
+    this.maybeBackupTranscript()
     const preflight = runResumePreflightOai(messages)
     if (preflight.repaired) {
       debugLog(`[compact-preflight] repaired ${preflight.syntheticResultsInserted} orphan tool_call(s)`)
     }
     this.deps.session.replaceMessages(preflight.messages)
+  }
+
+  private maybeBackupTranscript(): void {
+    if (!this.deps.backupTranscript) return
+    try {
+      this.deps.backupTranscript(this.deps.session.getMessages(), this.deps.session.getTurnCount())
+    } catch {
+      // Disaster-recovery snapshot is best-effort; never block compaction.
+    }
+  }
+
+  /**
+   * Archive a discarded message zone to cold storage and return a recall
+   * reference block to embed in the surviving summary message. Returns null
+   * when archiving is unavailable, the zone is empty, or the write fails —
+   * compaction must never be blocked by archival (fail-soft).
+   */
+  private async archiveDiscardedHistory(
+    history: OaiMessage[],
+    reason: string,
+  ): Promise<{ id: string; ref: string } | null> {
+    if (!this.deps.archiveHistory) return null
+    if (history.length === 0) return null
+    try {
+      const { rawContent, sections, turnRanges } = serializeMessagesForArchive(history)
+      if (rawContent.trim().length === 0) return null
+      const turn = this.deps.session.getTurnCount()
+      const id = await this.deps.archiveHistory({
+        rawContent,
+        summary: `compacted ${history.length} messages at turn ${turn} (${reason})`,
+        sections,
+        target: `session-history@turn${turn}`,
+      })
+      if (!id) return null
+      this.deps.onArchive?.(id, turn)
+      const catalog = buildArchiveCatalog(turnRanges, id)
+      return { id, ref: buildRecallRefBlock(id, history.length, catalog) }
+    } catch {
+      return null
+    }
   }
 
   private persistExtractedMemories(trajectory: TrajectoryEntry[]): void {
@@ -769,19 +930,29 @@ export class CompactionController {
    * Called by both trySessionSplit (86% threshold, richer handoff) and
    * enforceContextCeiling (95% threshold, emergency fallback).
    */
-  private replaceWithCheckpoint(params: {
+  private async replaceWithCheckpoint(params: {
     tier: CompactTier
     reason: string
     summary: string
     maxFallback: number
     fallbackText: string
-  }): void {
+  }): Promise<void> {
     const messages = this.deps.session.getMessages()
     const anchorMessages = messages.slice(0, CACHE_ANCHOR_MESSAGES)
-    let candidate: OaiMessage[] = [...anchorMessages, { role: 'user', content: params.summary }]
+
+    // Layered archival: the messages after the anchor are about to be dropped
+    // and replaced by the summary. Archive them as a recallable compact-history
+    // artifact and embed the recall reference into the summary (and fallback)
+    // text — both are freshly-written messages, so the anchor prefix is intact.
+    const discarded = messages.slice(CACHE_ANCHOR_MESSAGES)
+    const archive = await this.archiveDiscardedHistory(discarded, params.reason)
+    const summaryText = archive ? `${params.summary}${archive.ref}` : params.summary
+    const fallbackText = archive ? `${params.fallbackText}${archive.ref}` : params.fallbackText
+
+    let candidate: OaiMessage[] = [...anchorMessages, { role: 'user', content: summaryText }]
 
     if (estimateOaiTokens(candidate) > params.maxFallback) {
-      candidate = [...anchorMessages, { role: 'user', content: params.fallbackText }]
+      candidate = [...anchorMessages, { role: 'user', content: fallbackText }]
     }
 
     // C4: append the authoritative task anchor at the tail (appendix region —
@@ -894,17 +1065,48 @@ export class CompactionController {
       const summary = chunks.join('').trim()
       if (summary.length === 0) return false
 
+      // Layered archival: archive the oldZone (verbatim) and embed a recall
+      // reference into the summary message so the model can read_section any
+      // earlier message instead of trusting the lossy LLM summary alone. The
+      // ref lives inside the freshly-written summary message — never the anchor
+      // prefix — so this stays prefix-cache safe. Fail-soft: a null archive
+      // simply means the summary ships without a recall pointer.
+      const archive = await this.archiveDiscardedHistory(oldZone, 'partial-compact')
+      const summaryBody = archive ? `${summary}${archive.ref}` : summary
+
       const summaryMessage: OaiMessage = {
         role: 'assistant',
-        content: `<partial-compact-summary turn="${this.deps.session.getTurnCount()}">\n${summary}\n</partial-compact-summary>`,
+        content: `<partial-compact-summary turn="${this.deps.session.getTurnCount()}">\n${summaryBody}\n</partial-compact-summary>`,
       }
 
-      const newMessages = [...anchor, summaryMessage, ...recentZone]
+      // P3: persist heuristic memories before history is replaced —
+      // extractSessionMemories reads the live message list, so it must run while
+      // the old zone is still present (same ordering as enforceContextCeiling).
+      this.persistExtractedMemories(this.deps.getTrajectoryEntries())
+
+      // P1: append the authoritative task anchor, matching replaceWithCheckpoint.
+      // The LLM summary above may drift or drop constraints/scope, and the
+      // preserved recent zone may not contain the original constraint
+      // declarations — without this anchor, partial compact has no deterministic
+      // fallback for the task contract (issue 1 × issue 2 crossover gap).
+      // A3: proactively evict aged compact-history recall blocks that are still
+      // sitting in the recent zone. A recall pulls a (potentially large) block
+      // back via read_section; once it has aged past the last RECALL_KEEP_RECENT
+      // recalls it can be folded back to a one-line pointer here — the original
+      // bytes remain in the artifact and stay re-recallable. The most recent
+      // recalls are kept verbatim: the model just asked for them.
+      const collapsedRecent = foldAgedRecallBlocks(recentZone, RECALL_KEEP_RECENT)
+
+      const newMessages = [...anchor, summaryMessage, ...collapsedRecent]
+      const anchorAppendix = this.buildTaskAnchorAppendix()
+      if (anchorAppendix) {
+        newMessages.push({ role: 'user', content: anchorAppendix })
+      }
       this.safeReplaceMessages(newMessages)
       this.deps.promptEngine.resetAppendixBaseline()
       this.deps.refreshLedger()
 
-      debugLog(`[partial-compact] success: ${messages.length} → ${newMessages.length} messages (removed ${oldZone.length} old, kept ${recentZone.length} recent)`)
+      debugLog(`[partial-compact] success: ${messages.length} → ${newMessages.length} messages (removed ${oldZone.length} old, kept ${recentZone.length} recent${anchorAppendix ? ', +task-anchor' : ''})`)
       return true
     } finally {
       this._llmCompactInFlight = false
@@ -987,6 +1189,15 @@ export class CompactionController {
 
       const summary = chunks.join('').trim()
       if (summary.length === 0) return null
+
+      // P6: post-check — if the summary reflects none of the material state
+      // (failed error classes / touched files) recorded in the trajectory, fall
+      // back to the deterministic structured handoff rather than trust a summary
+      // that likely dropped critical context.
+      if (!this.summaryCoversState(summary)) {
+        debugLog('[llm-compact] summary failed state-coverage post-check — using structured handoff')
+        return this.buildHandoffFromState()
+      }
 
       return `<compact-summary turn="${this.deps.session.getTurnCount()}" tokens="${this.deps.session.getEstimatedTokens()}">\n${summary}\n</compact-summary>`
     } finally {

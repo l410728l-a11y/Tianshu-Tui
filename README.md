@@ -2,12 +2,14 @@
 
 Terminal coding agent with prefix-cache optimization, multi-provider support, subagent orchestration, and a streaming TUI. 2700+ tests, typecheck clean.
 
-> 🇨🇳 [中文文档](README.zh-CN.md) · 📖 [English](README.md)
+> 🌐 [天枢官方落地页 →](docs/index.html) — 产品特性 · 架构深潜 · 三大差异化定位
+> ⚡ [mini-index 紧凑版 →](docs/mini-index.html) — 视觉锤 · 单文件 · 4 档响应式 · EN/中文切换
+> ✦ [starmap 星图版 →](docs/starmap.html) — 星图叙事 · 孤星→三星→七星 · 字号落差驱动 · 原生中英同屏
 
 ## Quick Start
 
 ```bash
-git clone git@github.com:huiliyi37/Tianshu-Tui.git && cd rivet
+git clone <repo> && cd rivet
 npm install && npm run build
 
 # Set API key

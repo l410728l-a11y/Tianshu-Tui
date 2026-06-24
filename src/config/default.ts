@@ -99,7 +99,7 @@ export const DEFAULT_CONFIG: Config = {
     antiAnchoring: {
       enabled: false,
       blindExploration: true,
-      mctsPlanning: true,
+      mctsPlanning: false,
       branches: 3,
       planningTurn: 1,
       projectionThreshold: 0.4,
@@ -113,6 +113,9 @@ export const DEFAULT_CONFIG: Config = {
       },
     },
     autoDelegateEnabled: false,
+    maxDelegationDepth: 2,
+    maxTeamParallel: 3,
+    maxAutoContinue: 1,
     intentRetrievalRouter: {
       enabled: true,
       classifier: 'heuristic',
@@ -140,6 +143,11 @@ export const DEFAULT_CONFIG: Config = {
     autoThreshold: 800_000,
     autoFloor: 500_000,
     model: 'deepseek-v4-flash',
+    qualityCompact: {
+      perTokenThreshold: 0.55,
+      subscriptionThreshold: 0.45,
+      subscriptionCeiling: 0.6,
+    },
   },
   cache: {
     enabled: true,

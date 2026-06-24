@@ -76,7 +76,7 @@ export const permissionsSchema = z.object({
 export const antiAnchoringSchema = z.object({
   enabled: z.boolean().default(false),
   blindExploration: z.boolean().default(true),
-  mctsPlanning: z.boolean().default(true),
+  mctsPlanning: z.boolean().default(false),
   branches: z.number().int().positive().default(3),
   planningTurn: z.number().int().positive().default(1),
   projectionThreshold: z.number().min(0).max(1).default(0.4),
@@ -123,6 +123,10 @@ export const reviewProfileOverrideSchema = z.object({
 export const reviewConfigSchema = z.object({
   profiles: z.record(z.string(), reviewProfileOverrideSchema).default({}),
   skipAuto: z.boolean().default(false),
+  /** Enable mechanical-change fast-path: docs-only and pure rename changes
+   *  bypass verification gate (unverified RED only) and skip review workers.
+   *  owned_failure RED is NEVER bypassed. Default true. */
+  mechanicalFastPath: z.boolean().default(true),
 }).default({})
 
 /** Inferred TS type for the review config block. Consumers (e.g. B1Context.reviewConfig)
@@ -142,12 +146,30 @@ export const agentSchema = z.object({
   crossSessionEnabled: z.boolean().default(true),
   /** T8 桌面化办公工具（create_document 等 7 个）。默认关闭以守住工具数 kernel budget（≤25）。 */
   desktopTools: z.boolean().default(false),
+  /** Tool gating: 主控工具分层门控。enabled 时只暴露 CORE_TOOLS 给主控，
+   *  EXTENDED 工具下放子代理。关闭则全量暴露（向后兼容）。 */
+  toolGating: z.object({
+    enabled: z.boolean().default(true),
+    /** 可选：覆盖默认 CORE 清单（工具名数组） */
+    coreTools: z.array(z.string()).optional(),
+    /** 可选：额外加入 CORE 的工具名（追加到默认清单） */
+    extraCore: z.array(z.string()).default([]),
+  }).default({ enabled: true }),
   /** Explicit opt-in for HEARTH anchor invariant observation (postTurn, diagnostic only). */
   hearthObserveEnabled: z.boolean().default(false),
   /** Explicit opt-in for anti-anchoring harness hooks (prompt-flow intervention). */
   antiAnchoring: antiAnchoringSchema,
   /** Explicit opt-in for auto-delegation of exploration tasks. Default off — workers cost API budget. */
   autoDelegateEnabled: z.boolean().default(false),
+  /** Max nesting depth for delegation (a worker delegating to a sub-worker). Default 2. */
+  maxDelegationDepth: z.number().int().positive().default(2),
+  /** Default max concurrent workers per team wave when input.maxParallel is unset. Clamped 1..5. */
+  maxTeamParallel: z.number().int().min(1).max(5).default(3),
+  /**
+   * Max auto-continue iterations per run when a no-tool turn shows action intent
+   * or an open task contract (phantom tool-call recovery). 0 disables. Clamped 0..3.
+   */
+  maxAutoContinue: z.number().int().min(0).max(3).default(1),
   /** Explicit opt-in for current-turn intent retrieval route guidance. */
   intentRetrievalRouter: intentRetrievalRouterSchema,
   /** @deprecated Use banditPromotion.teamScheduler ('forced') instead. True still works as forced. */
@@ -182,6 +204,18 @@ export const compactSchema = z.object({
    *  Retained for config compatibility; not read by the runtime. */
   autoFloor: z.number().int().positive().default(500_000),
   model: z.string().default('deepseek-v4-flash'),
+  /** T9 turn-0 quality-compaction trigger ratios (provider cost-aware).
+   *  Only the turn-0, phase-gated quality lever — mid-turn delay guards are
+   *  unaffected. Per-token cache-preserving providers (DeepSeek) skip T9
+   *  entirely regardless of these. */
+  qualityCompact: z.object({
+    /** Context ratio to trigger T9 on per-token providers (e.g. openai). */
+    perTokenThreshold: z.number().min(0).max(1).default(0.55),
+    /** Leaner ratio for cost-insensitive subscription providers (GLM/MiMo/Codex/Claude). */
+    subscriptionThreshold: z.number().min(0).max(1).default(0.45),
+    /** Ceiling ratio that fires T9 for subscription providers even with no phase transition. */
+    subscriptionCeiling: z.number().min(0).max(1).default(0.6),
+  }).default({}),
 })
 
 export const cacheSchema = z.object({

@@ -418,9 +418,9 @@ describe('deepseek-native fast promotion: star-domain enters consolidated on tur
     assert.ok(beforeSep.includes('tianshu'), 'consolidated block must contain star-domain')
   })
 
-  it('non-deepseek model does NOT fast-promote on turn 1', () => {
+  it('no-cache model does NOT fast-promote on turn 1', () => {
     const engine = new PromptEngine({
-      model: 'glm-5.2',
+      model: 'minimax-m3',
       maxTokens: 4096,
       staticCtx: { tools: [] },
       volatileCtx: { cwd: '/test' },
@@ -431,7 +431,24 @@ describe('deepseek-native fast promotion: star-domain enters consolidated on tur
     const trailer = req.messages[req.messages.length - 1]!
     const content = typeof trailer.content === 'string' ? trailer.content : ''
     const beforeSep = content.split('\n---\n')[0]!
-    assert.ok(!beforeSep.includes('<consolidated>'), 'no consolidated on turn 1 for non-deepseek')
+    assert.ok(!beforeSep.includes('<consolidated>'), 'no consolidated on turn 1 for no-cache provider')
+  })
+
+  it('GLM (deepseek-native) fast-promotes star-domain on turn 1', () => {
+    const engine = new PromptEngine({
+      model: 'glm-5.2',
+      maxTokens: 4096,
+      staticCtx: { tools: [] },
+      volatileCtx: { cwd: '/test' },
+      prefixCache: 'deepseek-native',
+    })
+    engine.setActiveDomain({ name: 'tianshu', volatileBlock: 'block', motto: 'motto' })
+    const req = engine.buildOaiRequest([{ role: 'user', content: 'first' }])
+    const trailer = req.messages[req.messages.length - 1]!
+    const content = typeof trailer.content === 'string' ? trailer.content : ''
+    const beforeSep = content.split('\n---\n')[0]!
+    assert.ok(beforeSep.includes('<consolidated>'), 'GLM implicit cache must fast-promote on turn 1')
+    assert.ok(beforeSep.includes('tianshu'), 'consolidated block must contain star-domain')
   })
 
   it('star-domain removed from appendix after fast promotion', () => {
@@ -599,6 +616,43 @@ describe('agent loop mode: volatile block cached across tool-call turns', () => 
       'Projection must appear in standalone appendix on new user message',
     )
     assert.equal(engine.checkDrift(), null)
+  })
+
+  it('one-shot ephemeral hint does NOT re-emit in the latest trailer once cleared (C1)', () => {
+    const engine = createEngine()
+    const stable = '<task-contract status="executing"><objective>do A</objective></task-contract>'
+    const lastContent = (req: { messages: { content: unknown }[] }): string => {
+      const last = req.messages[req.messages.length - 1]
+      return last && typeof last.content === 'string' ? last.content : ''
+    }
+
+    const base: OaiMessage[] = [
+      { role: 'user', content: 'task A' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function' as const, function: { name: 'read_file', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+    ]
+
+    // Boundary 1: hint is live → appears in the latest trailer.
+    engine.setCognitiveProjection(stable, 'EPHEMERAL-ONESHOT-HINT')
+    const m1: OaiMessage[] = [...base, { role: 'user', content: 'continue A' }]
+    const trailer1 = lastContent(engine.buildOaiRequest(m1))
+    assert.match(trailer1, /EPHEMERAL-ONESHOT-HINT/)
+    assert.match(trailer1, /<task-contract status="executing">/)
+
+    // Boundary 2: hint consumed (not re-set), stable unchanged → the latest trailer
+    // must NOT carry the hint. If the hint lived inside appendixDelta, the cumulative
+    // "absent = reuse last" protocol would re-surface it here.
+    engine.setCognitiveProjection(stable, null)
+    const m2: OaiMessage[] = [
+      { role: 'user', content: 'task A' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function' as const, function: { name: 'read_file', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      { role: 'user', content: 'continue A' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c2', type: 'function' as const, function: { name: 'read_file', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c2', content: 'ok' },
+      { role: 'user', content: 'now B' },
+    ]
+    assert.doesNotMatch(lastContent(engine.buildOaiRequest(m2)), /EPHEMERAL-ONESHOT-HINT/)
   })
 })
 

@@ -12,7 +12,7 @@ import { createThetaState, getThetaPhase } from './star-event.js'
 import { mapQueriedPheromones } from './pheromone-map.js'
 import { getGitInjectedContext } from '../prompt/volatile-git.js'
 import { detectWorktreeReality, type InjectedWorktreeContext } from './worktree-reality.js'
-import { advanceContractStatus, classifyPlanMethodology, classifyTaskDepth, classifyTurnMode, contractStatusFromPhaseClass, extractTaskContract, type TurnMode } from '../context/task-contract.js'
+import { advanceContractStatus, classifyPlanMethodology, classifyTaskDepth, classifyTurnMode, contractStatusFromPhaseClass, extractTaskContract, mergeFollowUpIntoContract, type TurnMode } from '../context/task-contract.js'
 import { skillRegistry } from '../skills/skill-loader.js'
 import { renderMemoryBlock } from '../memory/unified-memory.js'
 import { parseMentions, renderMentionContext } from '../tui/mention-parser.js'
@@ -26,7 +26,7 @@ import { classifySeason } from './cognitive-season.js'
 import { renderToolContext, type AffordanceState, adaptAffordanceFromHistory, computeAffordanceScores } from './affordance.js'
 import { selectPolicy } from './policy-selection.js'
 import { checkTddGate } from './tdd-gate.js'
-import { buildCognitivePromptProjection, createCognitiveLedger, getCognitivePhaseSnapshot } from '../context/cognitive-ledger.js'
+import { buildCognitiveProjectionParts, createCognitiveLedger, getCognitivePhaseSnapshot } from '../context/cognitive-ledger.js'
 import { formatImmuneContext } from './immune-context.js'
 
 /**
@@ -130,6 +130,7 @@ export class TurnStepProducer {
     this.self.thinkingOnlyRetries = 0
     this.self.lastThinkingContent = ''
     this.self.consecutiveNoToolTurns = 0
+    this.self.autoContinueCount = 0
     this.self.lastTurnTextFingerprint = ''
     this.self.evidence.reset()
     this.self.repairHintTracker = new RepairHintTracker()
@@ -197,7 +198,16 @@ export class TurnStepProducer {
     if (turnMode === 'task') {
       this.self.taskContract = extractTaskContract(userInput, this.self.session.getTurnCount())
     } else if (turnMode === 'followUp') {
-      // Inherit active contract — no new extraction
+      // P5: inherit the active contract, but fold in any new constraints/files
+      // from this follow-up (multi-line corrections whose constraint sits past
+      // the first line are classified followUp yet must reach the task-anchor).
+      if (this.self.taskContract) {
+        this.self.taskContract = mergeFollowUpIntoContract(
+          this.self.taskContract,
+          userInput,
+          this.self.session.getTurnCount(),
+        )
+      }
     } else if (!this.self.taskContract || this.self.taskContract.status === 'ready_to_deliver') {
       this.self.taskContract = undefined
     }
@@ -401,8 +411,10 @@ export class TurnStepProducer {
     const sycophancyHint = this.self.sycophancyTrap.getHint()
     const immuneHint = this.self._lastImmuneHint ? formatImmuneContext(this.self._lastImmuneHint) : undefined
     this.self._lastImmuneHint = undefined // consume once
-    const projection = actionable ? buildCognitivePromptProjection(cognitiveLedger, { sycophancyHint, immuneHint, yaoguangHint }) : ''
-    this.self.config.promptEngine.setCognitiveProjection(projection)
+    const { stable: projectionStable, ephemeral: projectionEphemeral } = actionable
+      ? buildCognitiveProjectionParts(cognitiveLedger, { sycophancyHint, immuneHint, yaoguangHint })
+      : { stable: '', ephemeral: '' }
+    this.self.config.promptEngine.setCognitiveProjection(projectionStable, projectionEphemeral)
 
     // ── CVM overhead tracking ──
     // 盘古呼吸：CVM 保护的资源（context）也是它消耗的资源。
@@ -410,7 +422,7 @@ export class TurnStepProducer {
     // chars / 4 ≈ tokens (crude but fast estimate for overhead ratio)
     if (actionable) {
       const toolCtxLen = this.self.config.promptEngine.getToolContextLength()
-      const cvmTokenEstimate = Math.ceil((projection.length + toolCtxLen) / 4)
+      const cvmTokenEstimate = Math.ceil((projectionStable.length + projectionEphemeral.length + toolCtxLen) / 4)
       this.self.pressureMonitor.recordCvmInjection(cvmTokenEstimate)
     }
   }
