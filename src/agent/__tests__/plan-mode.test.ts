@@ -4,7 +4,7 @@ import { checkPlanMode, PLAN_MODE_ALLOWED_TOOLS } from '../plan-mode.js'
 import { createDefaultToolRegistry } from '../../tools/default-registry.js'
 import { WEB_SEARCH_TOOL } from '../../tools/web-search.js'
 import { createRepoGraphTool } from '../../tools/repo-graph.js'
-import { createRecallTool } from '../../tools/recall.js'
+import { createMemoryTool } from '../../tools/memory.js'
 import type { ContextClaimStore } from '../../context/claim-store.js'
 
 describe('checkPlanMode', () => {
@@ -16,8 +16,8 @@ describe('checkPlanMode', () => {
 
   it('planning state allows read-only exploration tools', () => {
     const allowedTools = ['read_file', 'read_section', 'grep', 'glob', 'repo_map',
-      'inspect_project', 'related_tests', 'diff', 'todo', 'plan_close',
-      'repo_graph', 'web_fetch', 'web_search', 'recall']
+      'inspect_project', 'related_tests', 'diff', 'todo', 'plan',
+      'repo_graph', 'web_fetch', 'web_search', 'memory']
     for (const tool of allowedTools) {
       assert.deepEqual(checkPlanMode('planning', tool), { allowed: true }, `${tool} should be allowed`)
     }
@@ -62,7 +62,7 @@ describe('checkPlanMode', () => {
     const interactiveNames = [
       WEB_SEARCH_TOOL.definition.name,
       createRepoGraphTool(() => null).definition.name,
-      createRecallTool({} as ContextClaimStore).definition.name,
+      createMemoryTool({} as ContextClaimStore).definition.name,
     ]
     const available = new Set([...defaultNames, ...interactiveNames])
     for (const tool of PLAN_MODE_ALLOWED_TOOLS) {

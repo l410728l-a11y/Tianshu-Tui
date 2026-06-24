@@ -11,6 +11,7 @@ import { computeModelReadCap, DEFAULT_MODEL_READ_CAP, type ModelReadCap } from '
 import { getToolArtifactThreshold } from './artifact-threshold.js'
 import { debugLog } from '../utils/debug.js'
 import { decideReadPolicy } from './read-policy.js'
+import { foldCode } from '../compact/code-fold.js'
 
 // Cache GitignoreFilter instances by cwd to avoid re-reading .gitignore on every call
 const gitignoreCache = new Map<string, { filter: Promise<GitignoreFilter>; ts: number }>()
@@ -227,6 +228,19 @@ function getGitignoreFilter(cwd: string): Promise<GitignoreFilter> {
 const MAX_TOOL_INPUT_BYTES = 100 * 1024
 const LOG_PREVIEW_LINES = 80
 
+/**
+ * Fold code into a signature skeleton, then apply byte-level partial view truncation.
+ * If folding doesn't help (unknown lang, short file, or <30% reduction), fall back
+ * to the original content's partial view.
+ */
+function applyFoldThenPartial(content: string, filePath: string, cap: ModelReadCap): string {
+  const fold = foldCode(content, { filePath, maxLines: 200 })
+  if (fold.wasFolded && fold.foldedLines < fold.originalLines * 0.7) {
+    return buildPartialView(fold.folded, filePath, cap.maxChars)
+  }
+  return buildPartialView(content, filePath, cap.maxChars)
+}
+
 /** File extensions known to be binary — read_file rejects them with a clear error
  *  instead of returning garbled UTF-8 to the model. */
 const BINARY_EXTENSIONS = new Set([
@@ -329,7 +343,7 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
       // Large source file: read and return PARTIAL view instead of hard error
       const content = await readFile(filePath, 'utf-8')
       const cap = options.modelCap ?? DEFAULT_MODEL_READ_CAP
-      const partialContent = buildPartialView(content, filePath, cap.maxChars)
+      const partialContent = applyFoldThenPartial(content, filePath, cap)
       return {
         canonicalPath: filePath,
         rawContent: content,
@@ -365,7 +379,7 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
 
   // PARTIAL view for source files that fit in memory but exceed the model cap
   if (policy.action === 'partial' && !hasExplicitRange) {
-    const partialContent = buildPartialView(content, filePath, cap.maxChars)
+    const partialContent = applyFoldThenPartial(content, filePath, cap)
     return {
       canonicalPath: filePath,
       rawContent: content,
@@ -416,14 +430,11 @@ export const READ_FILE_TOOL: Tool = {
     name: 'read_file',
     description: `Read files from the filesystem with optional line range.
 
-### Usage
-- Always provide absolute file paths
-- Files up to ~50,000 lines are returned in full — DO NOT split them yourself by writing temp files and reading slices, just call read_file once
-- Use offset and limit ONLY when you specifically need a known sub-range (e.g. a function at line 800-900); never as a workaround for "the file might be too long"
-- This tool reads text files only (UTF-8). Binary files (images, PDFs, executables) will be rejected
-- Do NOT re-read a file that you already read in the current session unless you have edited it since — your earlier tool_result is still in context
-- Files > ~2000 lines: returned as PARTIAL view (first page + navigation hints). Use grep to locate, then read_file(offset, limit) for specific ranges. For editing: grep → hash_edit with anchors
-- read_file(file_paths=[...]) reads up to 5 files in one call — use instead of repeated single calls`,
+- Files up to ~50,000 lines returned in full — don't split them into slices yourself
+- Use offset/limit only for known sub-ranges (e.g. lines 800-900), not as a workaround for long files
+- Files > ~2000 lines returned as PARTIAL view with navigation hints
+- Don't re-read unchanged files — prior result is still in context
+- file_paths reads up to 5 files in one call`,
     input_schema: {
       type: 'object',
       properties: {

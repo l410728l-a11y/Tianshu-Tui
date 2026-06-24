@@ -3,7 +3,7 @@ import { recommendModelForTask } from '../model/capability.js'
 import type { ProviderConfig } from '../config/schema.js'
 import { filterToolRegistry, ToolRegistry } from '../tools/registry.js'
 import { ProviderHealthTracker } from './provider-health.js'
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -91,11 +91,13 @@ export interface WorkerActivityEvent {
  *  - `team:` — planner/task ids, so WorkOrderQueue can resolve dependency refs;
  *  - `council:` —议事会席位 id，让 runCouncil 能用 result.workOrderId 把每席
  *    结果绑回对应席位（=== `council:seat-${seat}`）。
+ *  - `batch:` — delegate_batch task index, so the model can declare cross-task
+ *    `dependsOn` and WorkOrderQueue can enforce ordering within one batch.
  * Returns undefined for ad-hoc turns — caller falls back to `wo_<uuid>`.
  * 取末两段（slice(-2)）以容忍 `prefix:team:T1` / `prefix:council:seat-x` 形态。
  */
 export function deriveStableWorkOrderId(parentTurnId: string): string | undefined {
-  return /\b(team|council):/.test(parentTurnId)
+  return /\b(team|council|batch):/.test(parentTurnId)
     ? parentTurnId.split(':').slice(-2).join(':')
     : undefined
 }
@@ -225,6 +227,8 @@ export interface DelegationCoordinatorConfig {
    *  repeatedly failing, preventing cascade waste. When omitted a default
    *  instance is created internally. */
   circuitBreaker?: CircuitBreakerManager
+  /** Max nesting depth for delegation. Falls back to MAX_DELEGATION_DEPTH when unset. */
+  maxDelegationDepth?: number
 }
 
 export function shouldDelegateObjective(objective: string, scope: WorkOrderScope): boolean {
@@ -270,6 +274,33 @@ function blockedDependencyResult(order: WorkOrder, unmetDeps: string[], failedDe
   }
 }
 
+/** Cap on persisted worker-result files under ~/.rivet/subagents/. Without a
+ *  TTL/cap this write-mostly sink grew unbounded (one+ file per worker, forever). */
+export const MAX_SUBAGENT_RESULTS = 500
+
+/** LRU-evict ~/.rivet/subagents/ down to `limit` files (oldest mtime first).
+ *  Best-effort and exported for testing. Returns the basenames evicted. */
+export function evictOldSubagentResults(dir: string, limit = MAX_SUBAGENT_RESULTS): string[] {
+  let files: string[]
+  try {
+    files = readdirSync(dir).filter(f => f.endsWith('.json'))
+  } catch {
+    return []
+  }
+  if (files.length <= limit) return []
+  const withMtime = files.map(f => {
+    let mtime = 0
+    try { mtime = statSync(join(dir, f)).mtimeMs } catch { /* ignore */ }
+    return { f, mtime }
+  })
+  withMtime.sort((a, b) => a.mtime - b.mtime)
+  const toEvict = withMtime.slice(0, files.length - limit).map(({ f }) => f)
+  for (const f of toEvict) {
+    try { unlinkSync(join(dir, f)) } catch { /* ignore */ }
+  }
+  return toEvict
+}
+
 /** Persist worker result to ~/.rivet/subagents/<orderId>.json for future resume/inspection. */
 function persistWorkerResult(result: WorkerResult, fingerprint?: string): void {
   try {
@@ -281,6 +312,8 @@ function persistWorkerResult(result: WorkerResult, fingerprint?: string): void {
     if (fingerprint) {
       writeFileSync(join(dir, `${fingerprint}.json`), json, 'utf-8')
     }
+    // Keep the sink bounded — LRU-evict once it exceeds the cap.
+    evictOldSubagentResults(dir)
   } catch {
     // Best-effort: never block primary session on persistence failure
   }
@@ -734,13 +767,14 @@ export class DelegationCoordinator {
       // delegate) but bounded. Reject, don't throw: the requesting worker
       // gets a structured blocked result it can act on.
       const depth = request.delegationDepth ?? 0
-      if (depth >= MAX_DELEGATION_DEPTH) {
+      const depthCap = this.config.maxDelegationDepth ?? MAX_DELEGATION_DEPTH
+      if (depth >= depthCap) {
         return {
           status: 'completed',
           results: [{
             workOrderId: `depth-capped-${request.parentTurnId}`,
             status: 'blocked',
-            summary: `Delegation rejected: max delegation depth (${MAX_DELEGATION_DEPTH}) reached — do the work inline instead of delegating further`,
+            summary: `Delegation rejected: max delegation depth (${depthCap}) reached — do the work inline instead of delegating further`,
             findings: [],
             artifacts: [],
             changedFiles: [],
@@ -1134,9 +1168,15 @@ export class DelegationCoordinator {
       const isAbort = (error instanceof Error && error.name === 'AbortError') || msg.includes('Delegation aborted')
       if (!isAbort) this.recordProviderOutcome(selected.model, false)
 
-      // T3: Flash→Pro escalation — retry with strong-tier model if budget allows
+      // T3: Flash→Pro escalation — retry with strong-tier model if budget allows.
+      // tierLock:'cheap' profiles (reviewer / adversarial_verifier) must NOT be
+      // escalated: review workers are deliberately pinned to a cheap/isolated
+      // model so they don't evict the main session's prefix cache (see
+      // .rivet/knowledge/debug-glm-cache-break-deliver-task.md). Honor the lock.
       const flashTier = inferModelTierFromCard(selected)
+      const tierLocked = profileRegistry.get(order.profile)?.tierLock === 'cheap'
       const canUpgrade = !isAbort
+        && !tierLocked
         && (order.budget.maxRetries > 0)
         && this.proUpgradeCount < DelegationCoordinator.MAX_PRO_UPGRADES
         && flashTier !== 'strong'
@@ -1335,12 +1375,13 @@ export class DelegationCoordinator {
     if (abortSignal) this.config.abortSignal = abortSignal
     try {
       // B3: depth-capped requests are rejected as blocked, not silently dropped.
+      const depthCap = this.config.maxDelegationDepth ?? MAX_DELEGATION_DEPTH
       const depthCapped: WorkerResult[] = requests
-        .filter(r => (r.delegationDepth ?? 0) >= MAX_DELEGATION_DEPTH)
+        .filter(r => (r.delegationDepth ?? 0) >= depthCap)
         .map(r => ({
           workOrderId: `depth-capped-${r.parentTurnId}`,
           status: 'blocked' as const,
-          summary: `Delegation rejected: max delegation depth (${MAX_DELEGATION_DEPTH}) reached — do the work inline instead of delegating further`,
+          summary: `Delegation rejected: max delegation depth (${depthCap}) reached — do the work inline instead of delegating further`,
           findings: [],
           artifacts: [],
           changedFiles: [],
@@ -1349,7 +1390,7 @@ export class DelegationCoordinator {
           evidenceStatus: 'blocked' as const,
         }))
       const runnables = requests.filter(r =>
-        (r.delegationDepth ?? 0) < MAX_DELEGATION_DEPTH && shouldDelegateObjective(r.objective, r.scope))
+        (r.delegationDepth ?? 0) < depthCap && shouldDelegateObjective(r.objective, r.scope))
       if (runnables.length === 0 && depthCapped.length === 0) {
         return { status: 'skipped', results: [], packet: await buildPrimaryWorkerPacket([]) }
       }

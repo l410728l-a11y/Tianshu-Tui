@@ -3,6 +3,7 @@ import { semanticPruneLayer1 } from '../compact/semantic-prune.js'
 import { collapseToolResult } from '../compact/context-collapse.js'
 import { detectStaleness } from '../compact/staleness-detect.js'
 import { CACHE_ANCHOR_MESSAGES } from '../compact/constants.js'
+import { estimateOaiTokens } from '../compact/micro.js'
 import { buildSystemPrompt, type StaticPromptContext } from './static.js'
 import type { ToolDefinition } from '../api/types.js'
 import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
@@ -119,6 +120,8 @@ export class PromptEngine {
   private taskDepthLayer?: import('../context/task-contract.js').TaskDepthLayer
   private planMethodology?: import('../context/task-contract.js').PlanMethodology
   private planMethodologyReason?: string
+  /** Advisory text — only set when methodology changes, null otherwise to avoid noise. */
+  private planMethodologyAdvisory: string | null = null
   private skillAdvisoryBlock?: string | null
   private crossSessionMemoryBlock?: string | null
   private mentionContextBlock?: string | null
@@ -133,6 +136,8 @@ export class PromptEngine {
   private contextLayerReportData: ContextLayerReport
   private phaseHint?: string
   private cognitiveProjection?: string
+  /** Per-turn one-shot cognitive hints, emitted outside appendixDelta (C1 fix). */
+  private cognitiveEphemeral?: string
   private crossSessionEvents?: string
   private companionPresence?: string
   private sessionStateText?: string
@@ -303,7 +308,7 @@ export class PromptEngine {
               this.gitDirty = false
               this.userMessagesSinceGitRefresh = 0
             }
-            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: renderTaskDepthAdvisory(this.taskDepthLayer), planMethodologyAdvisory: renderPlanMethodologyAdvisory(this.planMethodology, this.planMethodologyReason), skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, decisions: this.decisions, activeDomain: this.activeDomain, activeClaims: this.activeClaims, playbookLessons: this.playbookLessons, recentQuery: this.recentQuery, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, ...(refreshGit ? { gitStatus: undefined } : {}) }
+            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: renderTaskDepthAdvisory(this.taskDepthLayer), planMethodologyAdvisory: this.planMethodologyAdvisory, skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, decisions: this.decisions, activeDomain: this.activeDomain, activeClaims: this.activeClaims, playbookLessons: this.playbookLessons, recentQuery: this.recentQuery, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, cognitiveProjection: this.cognitiveProjection, ...(refreshGit ? { gitStatus: undefined } : {}) } as VolatileContext
 
             if (this.tracker) {
               const fieldValues: Record<string, string> = {}
@@ -345,16 +350,13 @@ export class PromptEngine {
               if (habituated.has('playbookLessons')) activeCtx.playbookLessons = undefined
 
               const activeAppendix = this.actionableTurn ? this.buildAppendixBody(activeCtx, appendixMaxChars) : ''
-              const projection = this.actionableTurn ? this.cognitiveProjection : null
               this.cachedConsolidated = this.consolidatedBlock
-              const fullAppendix = [projection, activeAppendix].filter(Boolean).join('\n')
-              this.cachedAppendix = fullAppendix
+              this.cachedAppendix = this.withEphemeralProjection(activeAppendix)
             } else {
               if (this.actionableTurn) {
                 const appendix = this.buildAppendixBody(dynamicCtx, appendixMaxChars)
-                const projection = this.actionableTurn ? this.cognitiveProjection : null
                 this.cachedConsolidated = this.consolidatedBlock
-                this.cachedAppendix = projection ? [projection, appendix].filter(Boolean).join('\n') : appendix
+                this.cachedAppendix = this.withEphemeralProjection(appendix)
               } else {
                 this.cachedConsolidated = ''
                 this.cachedAppendix = ''
@@ -542,17 +544,13 @@ export class PromptEngine {
     // not on every turn (rolling break would defeat the prefix cache).
     if (contextWindow && contextWindow >= 200_000) {
       const collapseAge = this.config.attentionProfile?.collapseAgeTurns ?? 8
-      let estChars = 0
-      for (const m of result) {
-        if (typeof m.content === 'string') estChars += m.content.length
-        // reasoning_content is echoed back on tool-call turns and can dominate
-        // token usage in tool-dense sessions — excluding it from the gate made
-        // reasoning-heavy sessions paradoxically never reach the 50% trigger.
-        if (m.role === 'assistant' && typeof m.reasoning_content === 'string') {
-          estChars += m.reasoning_content.length
-        }
-      }
-      const estTokens = Math.ceil(estChars / 4)
+      // Use the same CJK-aware accounting as the session layer
+      // (estimateOaiMessageTokens: cjk/1.2, ascii/4, plus tool_calls and the
+      // reasoning_content echoed back on tool-call turns). The old hand-rolled
+      // `chars/4` undercounted CJK text by ~3.3× and ignored tool_calls, so on
+      // CJK-heavy sessions the T7 gate fired far later than maybeCompact's
+      // ratio — leaving the two subsystems' compaction decisions uncoordinated.
+      const estTokens = estimateOaiTokens(result)
       const fillRatio = estTokens / contextWindow
 
       // Lightweight pass (0–85%): strip reasoning + fold duplicate grep/read.
@@ -753,8 +751,14 @@ export class PromptEngine {
   }
 
   setPlanMethodology(methodology: import('../context/task-contract.js').PlanMethodology | undefined, reason?: string): void {
+    const changed = this.planMethodology !== methodology
     this.planMethodology = methodology
     this.planMethodologyReason = reason
+    // Only inject the advisory when methodology changes or is first set.
+    // Repeated identical advisory every turn is pure noise (~60 tokens/turn).
+    this.planMethodologyAdvisory = changed
+      ? renderPlanMethodologyAdvisory(methodology, reason)
+      : null
   }
 
   getPlanMethodology(): import('../context/task-contract.js').PlanMethodology | undefined {
@@ -832,8 +836,21 @@ export class PromptEngine {
    * volatile block — projection refreshes only at user-message boundaries.
    * This preserves DeepSeek prefix cache across tool turns (~10% hit rate gain).
    */
-  setCognitiveProjection(projection: string | null): void {
+  setCognitiveProjection(projection: string | null, ephemeral?: string | null): void {
     this.cognitiveProjection = projection && projection.trim().length > 0 ? projection : undefined
+    // Ephemeral one-shot hints (sycophancy / yaoguang / immune) are stored
+    // separately and emitted OUTSIDE the appendixDelta context-update, so a
+    // hint shown once never persists via the cumulative "absent = reuse last"
+    // protocol. Only the state-derived stable projection participates in delta.
+    this.cognitiveEphemeral = ephemeral && ephemeral.trim().length > 0 ? ephemeral : undefined
+  }
+
+  /** Prepend per-turn ephemeral cognitive hints OUTSIDE the delta context-update.
+   *  cachedAppendix is frozen across a user message's tool turns, so this stays
+   *  stable within a turn sequence and only refreshes at the next user boundary. */
+  private withEphemeralProjection(appendix: string): string {
+    if (!this.cognitiveEphemeral) return appendix
+    return appendix ? `${this.cognitiveEphemeral}\n${appendix}` : this.cognitiveEphemeral
   }
 
   private invalidateFreshCache(): void {
@@ -944,7 +961,7 @@ export class PromptEngine {
       planTraceAppendix: this.planTraceAppendix,
       intentRetrievalRoute: this.intentRetrievalRoute,
       taskDepthAdvisory: renderTaskDepthAdvisory(this.taskDepthLayer),
-      planMethodologyAdvisory: renderPlanMethodologyAdvisory(this.planMethodology, this.planMethodologyReason),
+      planMethodologyAdvisory: this.planMethodologyAdvisory,
       harnessAdvisoryBlock: this.harnessAdvisoryBlock,
       decisions: this.decisions,
       activeDomain: this.activeDomain ?? this.config.volatileCtx.activeDomain,

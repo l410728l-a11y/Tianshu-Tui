@@ -1,6 +1,7 @@
 import { stat, readFile } from 'node:fs/promises'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
-import { ArtifactCorruptionError } from '../artifact/store.js'
+import { ArtifactCorruptionError, MAX_RANGE_LINES } from '../artifact/store.js'
+import { COMPACT_HISTORY_TOOL, buildRecallMarker } from '../compact/recall-marker.js'
 import { computeModelReadCap } from './model-read-cap.js'
 import { validatePath } from './path-validate.js'
 import { getFileReadMtime } from './read-file.js'
@@ -210,6 +211,49 @@ Good: read_section(file_path="src/tools/bash.ts", section="L100-L200")`,
       }
     }
 
+    // Compact-history recall fast path: long-thread archives routinely exceed the
+    // 2MB in-memory ceiling below, which would make their own catalog entries
+    // un-recallable. For a line range, stream just the requested lines (no whole
+    // file in memory, no 2MB gate). char ranges + normal artifacts fall through.
+    if (artifact.tool === COMPACT_HISTORY_TOOL && lineRange) {
+      try {
+        const ranged = await artifactStore.readLineRange(artifactId, lineRange.start, lineRange.end)
+        if (ranged === null) {
+          return {
+            content: `Error: Artifact ${artifactId} not found.`,
+            isError: true,
+          }
+        }
+        if (ranged.content.length === 0 && lineRange.start > ranged.totalLines) {
+          return {
+            content: `[Section ${section} out of range — artifact has ${ranged.totalLines} lines]`,
+            isError: false,
+          }
+        }
+        const cap = computeModelReadCap({
+          contextWindow: params.contextWindow,
+          providerProfile: params.providerProfile,
+        })
+        const maxChars = Math.max(cap.maxChars, LEGACY_MAX_SECTION_CHARS)
+        let body = ranged.content.length > maxChars
+          ? ranged.content.slice(0, maxChars) + `\n... [truncated at ${maxChars} chars]`
+          : ranged.content
+        if (ranged.capped) {
+          body += `\n... [range capped at ${MAX_RANGE_LINES} lines — request a narrower range to page]`
+        }
+        return {
+          content: `${buildRecallMarker(artifactId, section)}\n${body}`,
+          rawPath: artifact.rawPath,
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return {
+          content: `Error reading artifact ${artifactId}: ${message}`,
+          isError: true,
+        }
+      }
+    }
+
     try {
       // Guard against reading multi-MB raw files into memory.
       let _rawSize = 0
@@ -243,8 +287,15 @@ Good: read_section(file_path="src/tools/bash.ts", section="L100-L200")`,
         ? sectionContent.slice(0, maxChars) + `\n... [truncated at ${maxChars} chars]`
         : sectionContent
 
+      // Tag recalls of compacted-history blocks so the NEXT compaction can
+      // collapse this recalled content back to a pointer (recall-eviction)
+      // instead of re-archiving it verbatim and accumulating storage.
+      const content = artifact.tool === COMPACT_HISTORY_TOOL
+        ? `${buildRecallMarker(artifactId, section)}\n${truncated}`
+        : truncated
+
       return {
-        content: truncated,
+        content,
         rawPath: artifact.rawPath,
       }
     } catch (err) {

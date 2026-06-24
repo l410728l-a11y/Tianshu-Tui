@@ -28,10 +28,11 @@ import type { OwnershipLedger } from './ownership-ledger.js'
 import type { DeliveryGateV2 } from './delivery-gate-v2.js'
 import { filterExternalNoise } from './delivery-gate-v2.js'
 import { summarizeOwnershipHealth } from './ownership-health.js'
+import { classifyChange, createGitDiffProvider, isMechanicalFastPathEnabled } from './change-classification.js'
 import { commitScopedFiles, type ScopedCommitResult } from './scoped-git-commit.js'
 import { buildReviewPrincipleChecklist } from './review-principle-checklist.js'
 import { checkCommitCohesion } from './commit-cohesion.js'
-import { isCrossModule, isFixContext, shouldRouteReviewWorkflow, type ChangeSet, type ReviewScale } from './review-discipline.js'
+import { isCrossModule, isFixContext, shouldRouteReviewWorkflow, GENERAL_DEV_DISCIPLINES, type ChangeSet, type ReviewScale } from './review-discipline.js'
 import { routeReviewWorkflow, reviewWorkflowBudgetMs, type ReviewRouterDeps, type ReviewOutcome, type ReviewMode } from './review-router.js'
 import { isReviewDisciplineEnabled } from '../config/review-discipline-config.js'
 import type { ReviewConfig } from '../config/schema.js'
@@ -411,12 +412,28 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         )
 
         const forceGate = params.input.force === true
+
+        // Mechanical-change classification (computed once, reused for gate bypass
+        // and post-commit review). Only meaningful when fast-path is enabled.
+        let mechanicalClass: import('./change-classification.js').ChangeClassification | undefined
+        if (isMechanicalFastPathEnabled(ctx.reviewConfig)) {
+          mechanicalClass = classifyChange(
+            report.ownedFiles,
+            createGitDiffProvider(params.cwd, report.ownedFiles, currentDirtyFiles ?? undefined),
+          )
+        }
+
         if (report.state === 'RED') {
           // Stale failure candidates: failures that likely pre-date this change.
           // force=true allows override when all blocking failures look pre-existing.
           if (forceGate && report.staleFailureCandidates > 0) {
             lines.push('', '⚠️  RED overridden (force=true): stale failure candidates detected.')
             lines.push('   Verify these pre-existing failures are unrelated to your changes before proceeding.')
+          } else if (
+            report.attributionClass === 'unverified'
+            && mechanicalClass?.skipVerification
+          ) {
+            lines.push('', `✅ 机械式变更 (${mechanicalClass.class})，免验证交付：${mechanicalClass.reason}`)
           } else {
             lines.push('', '❌ Cannot commit: delivery gate is RED.')
             if (report.staleFailureCandidates > 0) {
@@ -486,15 +503,22 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           ? ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.())
           : report
         if (postAdoptionReport.state === 'RED') {
-          lines.push('', '❌ Cannot commit: delivery gate is RED after adoption.')
-          if (postAdoptionReport.blockingReason) {
-            lines.push(`  Reason: ${postAdoptionReport.blockingReason}`)
+          // Mechanical fast-path also applies to the post-adoption gate
+          // (when no adoption happens, postAdoptionReport === report, and the
+          // bypass was already decided above — don't re-block).
+          const postAdoptionBypass = postAdoptionReport.attributionClass === 'unverified'
+            && mechanicalClass?.skipVerification
+          if (!postAdoptionBypass) {
+            lines.push('', '❌ Cannot commit: delivery gate is RED after adoption.')
+            if (postAdoptionReport.blockingReason) {
+              lines.push(`  Reason: ${postAdoptionReport.blockingReason}`)
+            }
+            if (postAdoptionReport.currentBlockingFailure) {
+              lines.push(`  Detail: ${postAdoptionReport.currentBlockingFailure}`)
+            }
+            lines.push('  → Run verification for the adopted files, then re-run deliver_task.')
+            return { content: lines.join('\n'), isError: true }
           }
-          if (postAdoptionReport.currentBlockingFailure) {
-            lines.push(`  Detail: ${postAdoptionReport.currentBlockingFailure}`)
-          }
-          lines.push('  → Run verification for the adopted files, then re-run deliver_task.')
-          return { content: lines.join('\n'), isError: true }
         }
 
         // Resolve files to commit: subset from `files` param, or all owned
@@ -626,6 +650,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           isFix: isFixContext(message),
           goalActive: ctx.isGoalActive?.() === true,
           ...(effectiveReviewLevel ? { forceLevel: effectiveReviewLevel } : {}),
+          ...(mechanicalClass ? { changeClass: mechanicalClass } : {}),
         }
 
         // Suppress auto review when goal is active OR caller explicitly skips.
@@ -636,7 +661,9 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           // Batch: skip if a review was already launched within the cooldown window.
           const now = Date.now()
           if (now - lastPostCommitReviewAt < POST_COMMIT_REVIEW_COOLDOWN_MS) {
-            lines.push('', '⏭ 提交后审查合并：上一轮审查仍在冷却窗口内，本轮合并入上一轮。')
+            const sinceSec = Math.round((now - lastPostCommitReviewAt) / 1000)
+            const windowSec = Math.round(POST_COMMIT_REVIEW_COOLDOWN_MS / 1000)
+            lines.push('', `⏭ 提交后审查跳过：距上轮审查仅 ${sinceSec}s（<${windowSec}s 冷却窗口）。本轮变更未被审查，必要时用 \`/review\` 手动覆盖。`)
           } else {
             const route = ctx.routeReviewWorkflow ?? (ctx.reviewDeps ? routeReviewWorkflow : undefined)
             if (!route || !ctx.reviewDeps) {
@@ -712,6 +739,8 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                   lines.push('   → 此变更未经审查。运行 /review max 进行完整编队审查。')
                 } else if (outcome.verdict === 'nudge') {
                   lines.push('', `⚠️ 审查提醒 (${outcome.tier})：请在后续工作中应用审查纪律。`)
+                  lines.push('通用开发方法论：')
+                  for (const directive of GENERAL_DEV_DISCIPLINES) lines.push(`  - ${directive}`)
                 }
               }
               }

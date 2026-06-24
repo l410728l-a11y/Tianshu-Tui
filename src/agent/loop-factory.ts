@@ -13,10 +13,12 @@ import { join } from 'node:path'
 import { getSessionDir } from './session-persist.js'
 import type { AgentCallbacks } from './loop-types.js'
 import { diagnoseCacheMiss } from '../prompt/cache-diagnostic.js'
+import { computeCompactAttribution } from './compact-attribution.js'
+import { isCostInsensitiveProvider } from '../api/cost-model.js'
 import { isSystemReminder } from '../prompt/system-reminder.js'
 import { getReadRefStats } from '../tools/read-file.js'
 import { PlanTraceCoordinator } from './plan-trace-coordinator.js'
-import { CompactBoundaryCoordinator } from './compact-boundary-coordinator.js'
+import { CompactBoundaryCoordinator, DEFAULT_QUALITY_COMPACT_THRESHOLDS } from './compact-boundary-coordinator.js'
 import { TurnOrchestrator } from './turn-orchestrator.js'
 import { ReasoningEffortController } from './reasoning-effort-controller.js'
 import { IntentRetrievalRouteController } from './intent-retrieval-route-controller.js'
@@ -60,6 +62,14 @@ return new TurnStreamController({
           cacheRead: usage.cache_read_input_tokens,
           cacheCreate: usage.cache_creation_input_tokens,
           hitRate: `${hitRate}%`,
+          // Output token breakdown: total vs reasoning vs text. Phase 0 of the
+          // output-token optimization — lets us see whether the spend is in
+          // thinking (reasoning) or final prose (text) before any intervention.
+          output: usage.output_tokens,
+        }
+        if (usage.reasoning_tokens !== undefined) {
+          entry.reasoning = usage.reasoning_tokens
+          entry.text = Math.max(0, usage.output_tokens - usage.reasoning_tokens)
         }
         try {
           const messages = self.session.getMessages()
@@ -91,6 +101,22 @@ return new TurnStreamController({
           if (self.prevMsgCount > 0 && messages.length < self.prevMsgCount) entry.historyRewritten = true
           const wasRewritten = entry.historyRewritten === true
           self.prevMsgCount = messages.length
+
+          // Compact attribution: when history shrank, record whether the window
+          // was actually under pressure before the rewrite (compactPreRatio) and
+          // how much it reclaimed. Combined with this turn's hitRate (the cache
+          // cost), this makes "was the compact necessary?" answerable from the
+          // cache-log alone — see scripts/analyze-compact-events.ts.
+          const estTokensNow = self.session.getEstimatedTokens()
+          if (wasRewritten) {
+            Object.assign(entry, computeCompactAttribution(self.prevEstTokens, estTokensNow, self.config.contextWindow))
+            // Attach the archive id (if this rewrite archived its dropped zone)
+            // so the recall telemetry can be joined back to this turn. Consume
+            // once: clear so a later non-archiving rewrite doesn't reuse it.
+            if (self.lastArchive) entry.archiveId = self.lastArchive.id
+          }
+          self.lastArchive = null
+          self.prevEstTokens = estTokensNow
 
           // Engine event diffs (volatile swap / frozen clamp / fallback / tools)
           const stats = self.config.promptEngine.getCacheEventStats?.()
@@ -308,7 +334,6 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
       },
     },
     autoDelegate: (self.config.coordinatorRef && self.config.autoDelegateEnabled) ? {
-      coordinator: () => self.config.coordinatorRef?.() ?? null,
       getTaskContract: () => self.getTaskContract(),
       getSensorium: () => self.sensorium,
     } : undefined,
@@ -380,6 +405,9 @@ export function createCompactBoundaryCoordinator(self: AgentLoop): CompactBounda
     shouldDelayCompact: (threshold, ctx) => self.cacheAdvisor.shouldDelayCompact(threshold, ctx?.estimatedTokens !== undefined && ctx?.contextWindow !== undefined ? { estimatedTokens: ctx.estimatedTokens, contextWindow: ctx.contextWindow } : undefined),
     getStalePreviewChars: () => self.cacheAdvisor.getStalePreviewChars(),
     isCachePreservingProvider: () => self.compaction.isCachePreservingProvider(),
+    isCostInsensitiveProvider: () => isCostInsensitiveProvider(self.config.providerName),
+    getProviderName: () => self.config.providerName,
+    getQualityThresholds: () => self.config.compact.qualityCompact ?? DEFAULT_QUALITY_COMPACT_THRESHOLDS,
     injectImmuneSignal: signal => { self.immuneHook.injectSignal(signal as any) },
   })
 }
@@ -461,6 +489,11 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     setLatestFsWatcherState: (v) => { self.latestFsWatcherState = v },
     getConsecutiveNoToolTurns: () => self.consecutiveNoToolTurns,
     setConsecutiveNoToolTurns: (v) => { self.consecutiveNoToolTurns = v },
+    getAutoContinueCount: () => self.autoContinueCount,
+    setAutoContinueCount: (v) => { self.autoContinueCount = v },
+    getMaxAutoContinue: () => self.config.maxAutoContinue ?? 0,
+    getActiveContract: () => self.taskContract,
+    getDoomLoopLevel: () => self.getDoomLoopLevel(),
     getThinkingOnlyRetries: () => self.thinkingOnlyRetries,
     setThinkingOnlyRetries: (v) => { self.thinkingOnlyRetries = v },
     getLastThinkingContent: () => self.lastThinkingContent,

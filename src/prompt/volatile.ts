@@ -91,6 +91,25 @@ The user will respond with:
 </plan-mode>`
 }
 
+/**
+ * Phase 2B: output verbosity steering nudge.
+ *
+ * OPT-IN via RIVET_TERSE=1 (or ctx.tersenessEnabled) — OFF by default, so the
+ * default session is byte-for-byte unchanged. Cache-safe: this is only ever
+ * pushed into the DYNAMIC appendix, never the frozen base.
+ *
+ * Scope discipline: the nudge governs OUTPUT PROSE ONLY. It must never be read
+ * as license to skip verification, tests, evidence, or the delivery-report
+ * rigor mandated by AGENTS.md — that conflict is the classic terseness failure
+ * mode, so it is called out explicitly in the prompt text.
+ */
+export function renderTersenessNudge(escalate = false): string {
+  const strict = escalate
+    ? ' You appear to be repeating work or looping — be especially terse this turn: one short paragraph, no restated context.'
+    : ''
+  return `<output-style>Be terse in prose. Skip preambles, self-narration, and closing summaries. Do not reproduce code, file contents, or context already shown — reference it instead. Lead with the answer or the action.${strict} This governs OUTPUT PROSE ONLY — never reduce verification, testing, evidence-gathering, or delivery-report rigor.</output-style>`
+}
+
 export interface ToolHistoryEntry {
   tool: string
   target: string
@@ -190,6 +209,20 @@ export interface VolatileContext {
    *  渲染到 frozen base 中，session 全程稳定，prefix cache safe。
    *  Phase 1: 仅天璇胶囊。后续可扩展为多星域胶囊数组。 */
   seedCapsuleBlock?: string
+  /** Phase 2B output verbosity steering — opt-in, OFF by default. When unset,
+   *  falls back to the RIVET_TERSE=1 env flag. Cache-safe: rendered ONLY into the
+   *  dynamic appendix, so a default session's frozen base stays byte-for-byte
+   *  unchanged (engine-cache-stability tests pass without modification). */
+  tersenessEnabled?: boolean
+  /** When true, render a stricter terseness nudge (e.g. doom-loop / storm turns). */
+  tersenessEscalate?: boolean
+  /**
+   * Cognitive projection (task-contract + verification gap + cognitive mirror +
+   * uncertainty framing). Cache-safe: rendered ONLY into the dynamic appendix.
+   * When appendixDelta is enabled, the projection participates in delta diff —
+   * emitted only when changed, not every user-message boundary.
+   */
+  cognitiveProjection?: string | null
 }
 
 let rivetMdCache = new Map<string, { value: string | undefined; timestamp: number }>()
@@ -246,7 +279,16 @@ function escapeXml(text: string): string {
     .replaceAll('"', '&quot;')
 }
 
-/** Build stable volatile block — excludes per-turn dynamic sections for exact-prefix cache stability. */
+/**
+ * Build stable volatile block — excludes per-turn dynamic sections for exact-prefix cache stability.
+ *
+ * This strip list is the SINGLE SOURCE OF TRUTH for what stays in the frozen
+ * prefix vs. what is dynamic. buildVolatileBlockInternal must only render the
+ * KEEP set (fields NOT stripped below); anything stripped here is rendered in
+ * buildDynamicAppendixParts (and, for habituated constants, the <consolidated>
+ * block). Re-adding a stripped field's rendering to buildVolatileBlockInternal
+ * would be dead code (it is always undefined by the time the internal runs).
+ */
 export function buildStableVolatileBlock(ctx: VolatileContext): string {
   return buildVolatileBlockInternal({
     ...ctx,
@@ -317,9 +359,9 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // Sections that rarely change go first so their bytes stay in cache;
   // sections that change every turn go last so only the tail is new.
 
-  if (ctx.activeDomain) {
-    parts.push(`<star-domain name="${escapeXml(ctx.activeDomain.name)}" motto="${escapeXml(ctx.activeDomain.motto)}">${escapeXml(ctx.activeDomain.volatileBlock)}</star-domain>`)
-  }
+  // star-domain: NOT rendered here. As a session constant it is promoted into
+  // the <consolidated> block via habituation (engine.ts immediatePromote on
+  // DeepSeek), so emitting it in the per-turn appendix would duplicate the motto.
 
   // Historical lessons: rarely change after first few turns
   if (ctx.playbookLessons && ctx.playbookLessons.length > 0) {
@@ -339,9 +381,22 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
     }
   }
 
+  // Cognitive projection: task-contract + verification gap + cognitive mirror +
+  // uncertainty framing. Rarely changes within a task (only on status transitions
+  // or evidence updates). Under appendixDelta, emitted only when changed.
+  if (ctx.cognitiveProjection) {
+    parts.push(ctx.cognitiveProjection)
+  }
+
   // Unified progress block: merges session-state, task-progress, and decisions
   // into a single <progress> to eliminate triple repetition in the prompt.
-  const progressBlock = renderProgressBlock(ctx)
+  // C3 fix: only dedup the objective when the projection ACTUALLY carries it.
+  // The projection is non-empty in many cases without an objective (verification
+  // gap / cognitive mirror / one-shot hints, or a non-actionable contract which
+  // renders ''). Gating on mere non-emptiness silently dropped the objective from
+  // both progress AND projection. Gate on the real <objective> marker instead.
+  const projHasObjective = !!ctx.cognitiveProjection && ctx.cognitiveProjection.includes('<objective>')
+  const progressBlock = renderProgressBlock(ctx, projHasObjective)
   if (progressBlock) parts.push(progressBlock)
 
   // Tool history: most recent tools appended at end → prefix cacheable
@@ -364,7 +419,9 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
       .filter(e => e.tool === 'read_file' && e.status === 'success')
       .map(e => e.target)
       .filter((v, i, a) => a.indexOf(v) === i)
-    if (readFiles.length > 0) {
+    // Only emit when there are enough files to dedup or the history is long
+    // enough that re-reading becomes a real token-waste risk (C2: condition gate).
+    if (readFiles.length > 5 || ctx.toolHistory.length > 8) {
       const listed = readFiles.slice(0, 5).map(f => escapeXml(f)).join(', ')
       const tail = readFiles.length > 5 ? ` …及另外 ${readFiles.length - 5} 个文件` : ''
       parts.push(`<read-file-dedup-hint>已读取 ${readFiles.length} 个文件：${listed}${tail}。上述文件无需重复读取，除非磁盘内容已变更。</read-file-dedup-hint>`)
@@ -420,9 +477,12 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
     parts.push(ctx.crossSessionEvents)
   }
 
-  if (ctx.companionPresence) {
-    parts.push(ctx.companionPresence)
-  }
+  // Companion presence is NOT rendered into the model context — it is ambient
+  // cross-session metadata intended for the desktop sidecar UI, not the agent.
+  // Injecting it into the prompt creates a false multi-agent coordination
+  // signal and wastes context-window tokens with no task value. The heartbeat
+  // hook still writes .rivet/presence.json for UI consumption.
+  // (ctx.companionPresence rendering removed 2026-06-23)
 
   // Unified tool context: theta + EFE + top-3 ranking.
   // Replaces old separate affordance-hint + policy-guidance blocks.
@@ -468,6 +528,14 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // plan quality standard + diagram skeletons). Cache-safe — appendix only.
   if (ctx.planModeState === 'planning') {
     parts.push(renderPlanModeBlock())
+  }
+
+  // Phase 2B: output verbosity steering (opt-in via RIVET_TERSE=1, off by default).
+  // Cache-safe: dynamic appendix only — default sessions are byte-for-byte
+  // unchanged. Escalates on doom-loop/storm turns when the caller signals it.
+  const tersenessEnabled = ctx.tersenessEnabled ?? (process.env['RIVET_TERSE'] === '1')
+  if (tersenessEnabled) {
+    parts.push(renderTersenessNudge(ctx.tersenessEscalate ?? false))
   }
 
   if (parts.length === 0) return []
@@ -518,16 +586,23 @@ export interface SalientBlock {
  * into a single `<progress>` XML block. Eliminates triple repetition where
  * these three independent blocks each reported overlapping objective/status/decisions.
  */
-function renderProgressBlock(ctx: VolatileContext): string | null {
+function renderProgressBlock(ctx: VolatileContext, hasProjection?: boolean): string | null {
   // When sessionState is available, it's the richest source (objective + plan step
   // + modified files + decisions + failed tests). Extract its content and wrap as <progress>.
   if (ctx.sessionState) {
     // sessionState is pre-rendered as `<session-state>...\n</session-state>`
     // Re-wrap as <progress> to unify the tag namespace
-    const inner = ctx.sessionState
+    let inner = ctx.sessionState
       .replace(/^<session-state>\n?/, '')
       .replace(/\n?<\/session-state>$/, '')
-    return `<progress>\n${inner}\n</progress>`
+    // C1+C3: when cognitive projection carries the objective, strip it from progress
+    // to avoid duplicated objective lines (saves ~60-80 chars per boundary).
+    if (hasProjection) {
+      inner = inner.replace(/^Objective:.*\n?/m, '')
+    }
+    const trimmed = inner.trim()
+    if (!trimmed) return null
+    return `<progress>\n${trimmed}\n</progress>`
   }
 
   // Fallback: build from individual fields (early turns before sessionStateManager is ready)
@@ -588,8 +663,10 @@ export function assignSalience(blockContent: string): number {
   if (blockContent.startsWith('<tool-history>')) return 0.5
   if (blockContent.startsWith('<session-state>')) return 0.4 // legacy fallback
   if (blockContent.startsWith('<cross-session')) return 0.4
-  if (blockContent.startsWith('<companion-presence>')) return 0.4 // ambient presence, housekeeping tier
   if (blockContent.startsWith('<read-file-dedup-hint>')) return 0.3
+  // Output-style nudge (Phase 2B): tiny + governs the whole reply's prose —
+  // keep it above the drop line so budget pressure never silently removes it.
+  if (blockContent.startsWith('<output-style>')) return 0.75
   return 0.5 // default: moderate salience
 }
 
@@ -650,10 +727,6 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     parts.push('<locus relation="world">你在一个外部项目中工作。遵循项目自身的约定（AGENTS.md + .rivet.md）。验证深度匹配任务复杂度：简单修改跑 related tests，跨模块改动跑 full suite。</locus>')
   }
 
-  if (ctx.activeDomain) {
-    parts.push(`<star-domain name="${escapeXml(ctx.activeDomain.name)}" motto="${escapeXml(ctx.activeDomain.motto)}">${escapeXml(ctx.activeDomain.volatileBlock)}</star-domain>`)
-  }
-
   const md = ctx.rivetMd ?? readRivetMd(ctx.cwd)
   if (md) {
     // When codebase-index is present it already contains the module directory table
@@ -684,79 +757,23 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     parts.push(truncateBlock(ctx.projectIndexBlock, 4_000, 'codebase-index'))
   }
 
-  // Only render git status if explicitly provided — no cache fallback here.
-  // buildStableVolatileBlock passes gitStatus: undefined to keep FROZEN prefix stable;
-  // buildDynamicAppendix has its own cache fallback for the fresh git status.
-  const git = ctx.gitStatus ? summarizeGitStatus(ctx.gitStatus) : undefined
-  if (git) {
-    const lines = git.split('\n')
-    const commitIdx = lines.findIndex(l => l.startsWith('Recent commits:'))
-    if (commitIdx >= 0) {
-      const statusPart = lines.slice(0, commitIdx).join('\n').trim()
-      const commitsPart = lines.slice(commitIdx + 1).join('\n').trim()
-      if (statusPart) parts.push(`<git-status>\n${escapeXml(statusPart)}\n</git-status>`)
-      if (commitsPart) parts.push(`<recent-commits>\n${escapeXml(commitsPart)}\n</recent-commits>`)
-    } else {
-      parts.push(`<git-status>\n${escapeXml(git)}\n</git-status>`)
-    }
-  }
-
   if (ctx.workingSet && ctx.workingSet.length > 0) {
     const files = ctx.workingSet.map(file => `<file>${escapeXml(file)}</file>`).join('\n')
     parts.push(`<working-set>\n${files}\n</working-set>`)
-  }
-
-  // Harness-only fields omitted from LLM context (direction A: hard separation)
-
-  if (ctx.toolHistory && ctx.toolHistory.length > 0) {
-    const entries = ctx.toolHistory.map(e => {
-      const attrs = [`tool="${escapeXml(e.tool)}"`, `target="${escapeXml(e.target)}"`, `status="${e.status}"`]
-      if (e.error) attrs.push(`error="${escapeXml(e.error)}"`)
-      return `  <tool-summary ${attrs.join(' ')} />`
-    }).join('\n')
-    parts.push(`<tool-history recent="${ctx.toolHistory.length}">\n${entries}\n</tool-history>`)
-  }
-
-  if (ctx.taskProgress && ctx.taskProgress.completed.length > 0) {
-    const done = ctx.taskProgress.completed.map(s => `    <done>${escapeXml(s)}</done>`).join('\n')
-    const remaining = ctx.taskProgress.remaining.length > 0
-      ? '\n' + ctx.taskProgress.remaining.map(s => `    <next>${escapeXml(s)}</next>`).join('\n')
-      : ''
-    parts.push(`<task-progress steps="${ctx.taskProgress.completed.length}" current="${escapeXml(ctx.taskProgress.current)}">\n${done}${remaining}\n  </task-progress>`)
-  }
-
-  // Repair hint: routed through A1 harness-advisory bus
-
-  if (ctx.decisions && ctx.decisions.length > 0) {
-    const entries = ctx.decisions.map(d => `  <decision>${escapeXml(d)}</decision>`).join('\n')
-    parts.push(`<decisions recent="${ctx.decisions.length}">\n${entries}\n</decisions>`)
   }
 
   if (ctx.sessionMemoryBlock) {
     parts.push(`<session-memory>\n${escapeXml(ctx.sessionMemoryBlock)}\n</session-memory>`)
   }
 
-  if (ctx.playbookLessons && ctx.playbookLessons.length > 0) {
-    const { selected } = scoreLessons(ctx.playbookLessons, {
-      query: ctx.recentQuery,
-      recentToolTargets: ctx.toolHistory?.map(t => t.target),
-    })
-    if (selected.length > 0) {
-      const lessons = selected
-        .map(b => {
-          const base = `- ${escapeXml(b.lesson)} (${escapeXml(b.context)})`
-          return b.details ? `${base}\n  details: ${escapeXml(b.details)}` : base
-        })
-        .join('\n')
-      parts.push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
-      ctx.onLessonsRendered?.(selected.map(b => b.id))
-    }
-  }
-
-
-  // NOTE: plan-mode block is rendered in buildDynamicAppendix (cache-safe),
-  // not here — buildStableVolatileBlock forces planModeState undefined for the
-  // frozen base, so rendering it here would be dead code.
+  // NOTE: per-turn dynamic fields (activeDomain, gitStatus, toolHistory,
+  // taskProgress, decisions, playbookLessons, planModeState, worktreeReality,
+  // …) are NOT rendered here. buildStableVolatileBlock — the sole caller — forces
+  // them undefined to keep the FROZEN prefix byte-stable; they are rendered in
+  // buildDynamicAppendixParts (appendix) and, for habituated session-constants
+  // like activeDomain, in the <consolidated> block (see engine.ts habituation).
+  // The single source of truth for what stays frozen vs. dynamic is the strip
+  // list in buildStableVolatileBlock.
 
   return parts.length > 0 ? `<context>\n${parts.join('\n\n')}\n</context>` : ''
 }

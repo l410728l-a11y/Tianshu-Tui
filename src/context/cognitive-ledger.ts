@@ -98,11 +98,19 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
   const s = ledger.sensorium
   if (!s) return ''
 
-  const parts: string[] = [`verification_coverage="${formatDim(s.confidence)}"`]
+  // Coarse-grain confidence and complexity to avoid false precision in early turns.
+  // A 2-decimal float like "1.00" implies measurement granularity that doesn't exist
+  // before any tools have run. Use low/mid/high bands until evidence accumulates.
+  const hasEvidence = (ledger.evidence?.filesModified?.size ?? 0) > 0 || (ledger.evidence?.toolResults?.size ?? 0) > 0
+  const confLabel = !hasEvidence ? coarseLabel(s.confidence) : formatDim(s.confidence)
+  const parts: string[] = [`verification_coverage="${confLabel}"`]
 
   parts.push(`files_modified="${ledger.evidence.filesModified.size}"`)
 
-  if (s.complexity !== undefined) parts.push(`complexity="${formatDim(s.complexity)}"`)
+  if (s.complexity !== undefined) {
+    const cxLabel = !hasEvidence ? coarseLabel(s.complexity) : formatDim(s.complexity)
+    parts.push(`complexity="${cxLabel}"`)
+  }
   // momentum, freshness, pressure — routing-only: consumed by hooks from sensorium directly
   if (s.stability !== undefined) parts.push(`stability="${formatDim(s.stability)}"`)
 
@@ -136,6 +144,50 @@ function formatDim(value: number): string {
   return value.toFixed(2)
 }
 
+/** Coarse-grain a 0–1 value to low/mid/high for early-turn false-precision avoidance. */
+function coarseLabel(value: number): string {
+  if (value < 0.34) return 'low'
+  if (value < 0.67) return 'mid'
+  return 'high'
+}
+
+export interface CognitiveProjectionParts {
+  /** State-derived projection (contract + verification gap + mirror + uncertainty).
+   *  Delta-safe: changes in place when ledger state changes, so appendixDelta can
+   *  diff it by content. */
+  stable: string
+  /** Per-turn one-shot hints (sycophancy / yaoguang / immune). Must be emitted
+   *  OUTSIDE appendixDelta — under delta's cumulative "absent = reuse last"
+   *  protocol a one-shot hint would otherwise persist across turns. */
+  ephemeral: string
+}
+
+/**
+ * Split the cognitive projection into a delta-safe stable part and per-turn
+ * ephemeral hints. See {@link CognitiveProjectionParts}.
+ */
+export function buildCognitiveProjectionParts(
+  ledger: CognitiveLedger,
+  opts?: {
+    sycophancyHint?: string | null
+    immuneHint?: string | null
+    yaoguangHint?: string | null
+  },
+): CognitiveProjectionParts {
+  const stable = [
+    ledger.contract ? renderContractProjection(ledger.contract) : '',
+    buildVerificationGapProjection(ledger),
+    buildCognitiveMirror(ledger),
+    buildUncertaintyProjection(ledger),
+  ].filter(Boolean).join('\n')
+  const ephemeral = [
+    opts?.sycophancyHint ?? '',
+    opts?.yaoguangHint ?? '',
+    opts?.immuneHint ?? '',
+  ].filter(Boolean).join('\n')
+  return { stable, ephemeral }
+}
+
 export function buildCognitivePromptProjection(
   ledger: CognitiveLedger,
   opts?: {
@@ -144,15 +196,8 @@ export function buildCognitivePromptProjection(
     yaoguangHint?: string | null
   },
 ): string {
-  return [
-    ledger.contract ? renderContractProjection(ledger.contract) : '',
-    buildVerificationGapProjection(ledger),
-    buildCognitiveMirror(ledger),
-    buildUncertaintyProjection(ledger),
-    opts?.sycophancyHint ?? '',
-    opts?.yaoguangHint ?? '',
-    opts?.immuneHint ?? '',
-  ].filter(Boolean).join('\n')
+  const { stable, ephemeral } = buildCognitiveProjectionParts(ledger, opts)
+  return [stable, ephemeral].filter(Boolean).join('\n')
 }
 
 /**

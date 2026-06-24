@@ -12,13 +12,13 @@
     "ai",
     "cli"
   ],
-  "homepage": "https://github.com/huiliyi37/Tianshu-Tui#readme",
+  "homepage": "https://github.com/user/rivet#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/huiliyi37/Tianshu-Tui.git"
+    "url": "git+https://github.com/user/rivet.git"
   },
   "bugs": {
-    "url": "https://github.com/huiliyi37/Tianshu-Tui/issues"
+    "url": "https://github.com/user/rivet/issues"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -45,6 +45,7 @@
     "test:desktop": "node --import tsx --test-force-exit --test 'desktop/src/**/__tests__/*.test.ts'",
     "test:incremental": "tsx scripts/test-incremental.ts",
     "cache:audit": "tsx src/cache/cache-audit-cli.ts",
+    "tokens:audit": "tsx scripts/analyze-output-tokens.ts",
     "benchmark": "tsx scripts/run-benchmark.ts"
   },
   "dependencies": {

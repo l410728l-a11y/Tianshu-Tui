@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -325,7 +325,10 @@ describe('deliver-task — semantic task delivery tool', () => {
     const result = await tool.execute({ ...params, input: { commit: true, message: 'fix: scoped delivery' } })
 
     assert.equal(result.isError ?? false, false)
-    assert.deepEqual(routedChange, { files: ['src/a.ts'], crossModule: false, isFix: true, goalActive: false })
+    assert.equal(routedChange?.files.join(','), 'src/a.ts')
+    assert.equal(routedChange?.crossModule, false)
+    assert.equal(routedChange?.isFix, true)
+    assert.equal(routedChange?.goalActive, false)
     assert.deepEqual(calls, [{ files: ['src/a.ts'], message: 'fix: scoped delivery' }])
     assert.match(result.content, /审查通过 \(L2\)/)
   })
@@ -459,9 +462,37 @@ describe('deliver-task — semantic task delivery tool', () => {
     const result = await tool.execute({ ...params, input: { commit: true, message: 'feat: scoped delivery' } })
 
     assert.equal(result.isError ?? false, false)
-    assert.deepEqual(routedChange, { files: ['src/a.ts'], crossModule: false, isFix: false, goalActive: false })
+    assert.equal(routedChange?.files.join(','), 'src/a.ts')
+    assert.equal(routedChange?.crossModule, false)
+    assert.equal(routedChange?.isFix, false)
+    assert.equal(routedChange?.goalActive, false)
     assert.match(result.content, /审查通过 \(L2\)/)
     assert.match(result.content, /Scoped commit created/)
+  })
+
+  it('post-commit review cooldown reports an honest skip, not a false merge', async () => {
+    let routeCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => {
+        routeCalls++
+        return { tier: 'auto', verdict: 'verified', evidence: 'no blocking findings', rounds: 1 }
+      },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+    })
+
+    // First commit runs the review and arms the 30s cooldown.
+    await tool.execute({ ...params, input: { commit: true, message: 'feat: part 1' } })
+    // Second commit within the window hits the cooldown branch.
+    const second = await tool.execute({ ...params, input: { commit: true, message: 'feat: part 2' } })
+
+    assert.equal(routeCalls, 1, 'second review must be skipped by cooldown')
+    assert.match(second.content, /提交后审查跳过：距上轮审查/)
+    assert.doesNotMatch(second.content, /合并入上一轮/, 'must not claim a merge that never happens')
   })
 
   it('commit succeeds when review deps are not wired — advisory skip, not block', async () => {
@@ -1650,6 +1681,109 @@ Do not declare a streamed response duplicate in the middle of the stream.
       // adopt is ignored in status-only mode — no adoption log
       assert.match(result.content, /Delivery Gate: GREEN/)
       assert.doesNotMatch(result.content, /Adopted/)
+    })
+  })
+
+  // ── Mechanical-change fast-path (docs/rename bypass) ──
+
+  describe('mechanical-change fast-path', () => {
+    function tmpGitRepo(): string {
+      const dir = mkdtempSync(join(tmpdir(), 'mech-'))
+      const run = (args: string[]) => spawnSync('git', args, { cwd: dir })
+      run(['init', '-q'])
+      run(['config', 'user.email', 't@t']); run(['config', 'user.name', 't'])
+      writeFileSync(join(dir, 'README.md'), '# Base\n')
+      run(['add', '.']); run(['commit', '-qm', 'base'])
+      return dir
+    }
+
+    function tmpGitRepoWithTracked(file: string, content: string): string {
+      const dir = mkdtempSync(join(tmpdir(), 'mech-'))
+      const run = (args: string[]) => spawnSync('git', args, { cwd: dir })
+      run(['init', '-q'])
+      run(['config', 'user.email', 't@t']); run(['config', 'user.name', 't'])
+      mkdirSync(join(dir, 'src'), { recursive: true })
+      writeFileSync(join(dir, file), content)
+      run(['add', '.']); run(['commit', '-qm', 'base'])
+      return dir
+    }
+
+    it('docs-only untracked file bypasses RED gate and commits successfully', async () => {
+      const dir = tmpGitRepo()
+      // Create a new untracked docs file
+      writeFileSync(join(dir, 'CHANGELOG.md'), '# v2\n')
+
+      const { tool, params } = makeContext({
+        taskId: 't-docs',
+        ownedFiles: ['CHANGELOG.md'],
+        dirtyFiles: ['CHANGELOG.md'],
+        verifications: [],  // no verification → unverified RED
+        commitOwnedFiles: (_cwd, files, msg) => {
+          const add = spawnSync('git', ['add', ...files], { cwd: dir })
+          const commit = spawnSync('git', ['commit', '-qm', msg], { cwd: dir })
+          return { ok: add.status === 0 && commit.status === 0, output: '' }
+        },
+      })
+
+      const result = await tool.execute({ ...params, cwd: dir, input: { commit: true, message: 'docs: update changelog' } })
+      assert.equal(result.isError, undefined, `Expected successful commit, got error:\n${result.content}`)
+      assert.match(result.content, /机械式变更.*docs-only/)
+    })
+
+    it('normal code change with unverified RED is NOT bypassed', async () => {
+      const dir = tmpGitRepoWithTracked('src/a.ts', 'const x = 1\n')
+      // Modify the tracked code file
+      writeFileSync(join(dir, 'src/a.ts'), 'const x = 2\nconst y = 3\n')
+
+      const { tool, params } = makeContext({
+        taskId: 't-code',
+        ownedFiles: ['src/a.ts'],
+        dirtyFiles: ['src/a.ts'],
+        verifications: [],
+        commitOwnedFiles: () => ({ ok: true, output: '' }),
+      })
+
+      const result = await tool.execute({ ...params, cwd: dir, input: { commit: true, message: 'feat: change x' } })
+      assert.equal(result.isError, true)
+      assert.match(result.content, /Cannot commit/)
+    })
+
+    it('pure file rename (R100) bypasses RED gate — only the new path is owned', async () => {
+      const dir = tmpGitRepoWithTracked('src/old.ts', 'export const x = 1\n')
+      spawnSync('git', ['mv', 'src/old.ts', 'src/new.ts'], { cwd: dir }) // byte-identical rename
+
+      const { tool, params } = makeContext({
+        taskId: 't-rename',
+        ownedFiles: ['src/new.ts'],            // old path is pre-existing/external
+        dirtyFiles: ['src/old.ts', 'src/new.ts'],
+        verifications: [],                      // no verification → unverified RED
+        commitOwnedFiles: (_cwd, _files, msg) => {
+          const add = spawnSync('git', ['add', '-A'], { cwd: dir })
+          const commit = spawnSync('git', ['commit', '-qm', msg], { cwd: dir })
+          return { ok: add.status === 0 && commit.status === 0, output: '' }
+        },
+      })
+
+      const result = await tool.execute({ ...params, cwd: dir, input: { commit: true, message: 'refactor: rename old to new' } })
+      assert.equal(result.isError, undefined, `Expected rename bypass, got error:\n${result.content}`)
+      assert.match(result.content, /机械式变更.*rename-mechanical/)
+    })
+
+    it('owned_failure RED is NEVER bypassed even for docs files', async () => {
+      const dir = tmpGitRepo()
+      writeFileSync(join(dir, 'GUIDE.md'), '# Guide\n')
+
+      const { tool, params } = makeContext({
+        taskId: 't-fail',
+        ownedFiles: ['GUIDE.md'],
+        dirtyFiles: ['GUIDE.md'],
+        verifications: [{ command: 'npm test', status: 'failed' }],
+        commitOwnedFiles: () => ({ ok: true, output: '' }),
+      })
+
+      const result = await tool.execute({ ...params, cwd: dir, input: { commit: true, message: 'docs: guide' } })
+      assert.equal(result.isError, true)
+      assert.match(result.content, /Cannot commit/)
     })
   })
 })

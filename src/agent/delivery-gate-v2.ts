@@ -19,7 +19,7 @@
 import { spawnSync } from 'node:child_process'
 import type { TaskLedger } from './task-ledger.js'
 import type { OwnershipLedger } from './ownership-ledger.js'
-import type { VerificationAttribution } from './verification-attribution.js'
+import type { VerificationAttribution, AttributionClass } from './verification-attribution.js'
 import { getEffectiveVerifications } from './verification-attribution.js'
 import { summarizeOwnershipHealth } from './ownership-health.js'
 import type { VerificationMetadata } from '../tools/types.js'
@@ -98,6 +98,9 @@ export interface DeliveryGateResult {
   toolInvocationFailureCandidates: string[]
   currentBlockingFailure?: string
   shortestNextStep?: string
+  /** The verification attribution class that caused this gate state.
+   *  Used by deliver_task to decide mechanical-change bypass. */
+  attributionClass?: AttributionClass
 }
 
 export interface DeliveryReport {
@@ -123,6 +126,9 @@ export interface DeliveryReport {
   currentBlockingFailure?: string
   shortestNextStep?: string
   blockingReason?: string
+  /** The verification attribution class causing this gate state.
+   *  Used by deliver_task to decide mechanical-change bypass. */
+  attributionClass?: AttributionClass
   /** Full attribution result for diagnostics */
   attributionSummary: string
 }
@@ -324,6 +330,7 @@ export function createDeliveryGateV2(opts: {
           ...diagnostics,
       latestVerificationTotals,
           currentBlockingFailure: aggregate.reason,
+          attributionClass: 'owned_failure',
         }
 
       case 'tool_invocation_failure':
@@ -385,6 +392,7 @@ export function createDeliveryGateV2(opts: {
           ...diagnostics,
       latestVerificationTotals,
           currentBlockingFailure: `${ownedFiles.length} owned file(s) modified but unverified.`,
+          attributionClass: 'unverified',
         }
 
       default:
@@ -400,6 +408,7 @@ export function createDeliveryGateV2(opts: {
           ...diagnostics,
       latestVerificationTotals,
           currentBlockingFailure: 'Unknown verification state.',
+          attributionClass: 'unverified',
         }
     }
   }
@@ -427,6 +436,7 @@ export function createDeliveryGateV2(opts: {
       currentBlockingFailure: result.currentBlockingFailure,
       shortestNextStep: result.shortestNextStep,
       blockingReason: result.blockingReason,
+      attributionClass: result.attributionClass,
       attributionSummary: result.reason ?? 'No attribution available.',
     }
   }

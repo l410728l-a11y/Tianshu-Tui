@@ -4,6 +4,7 @@ import { SessionPersist, getSessionDir } from './session-persist.js'
 import { attachSessionPersistListener } from './session-persist-listener.js'
 import { PrewarmCache } from './prewarm.js'
 import { validatePathSafe } from '../tools/path-validate.js'
+import { gateToolDefinitions, isExtendedTool } from './tool-tiers.js'
 import type { CompactCircuitBreakerState, ContextAnchor } from '../context/types.js'
 import { EvidenceTracker } from './evidence.js'
 import { TurnHarness } from './turn-harness.js'
@@ -39,6 +40,7 @@ import { mintNumericId, buildAgentMark, VOID_SYMBOL } from './void-identity.js'
 import { buildDepartureMilestone } from '../constellation/milestone.js'
 import { appendMilestone } from '../constellation/store.js'
 import { ArtifactStore } from '../artifact/store.js'
+import { COMPACT_HISTORY_TOOL } from '../compact/recall-marker.js'
 import { SessionStateManager } from './session-state.js'
 import { isStarSoulEnabled } from './star-soul-gate.js'
 import { debugLog } from '../utils/debug.js'
@@ -53,6 +55,7 @@ import { createFsWatcher } from '../context/fs-watcher.js'
 import type { FsWatcherState } from '../context/fs-watcher.js'
 import { type CognitivePhaseSnapshot } from '../context/cognitive-ledger.js'
 import { CacheAdvisor } from '../cache/advisor.js'
+import type { RecallMetricsSummary } from '../cache/recall-metrics.js'
 import { createSycophancyTrap, type SycophancyTrap } from './sycophancy-trap.js'
 import { createP3Integration, P3Integration } from './p3-integration.js'
 import { ImmuneHook } from './immune-hook.js'
@@ -72,6 +75,7 @@ import type { Pheromone } from '../context/stigmergy.js'
 import type { PrefixFingerprint } from '../prompt/fingerprint.js'
 import type { SensoriumEntry } from './retrospect.js'
 import { join } from 'node:path'
+import { writeFileSync } from 'node:fs'
 import type { ApprovalMode, AgentConfig, AgentCallbacks } from './loop-types.js'
 import { recordToolHistory } from "./tool-history-recorder.js";
 import { requestThetaCheck } from "./theta-controller.js";
@@ -130,6 +134,7 @@ export class AgentLoop {
   thinkingOnlyRetries = 0
   lastThinkingContent = ''
   consecutiveNoToolTurns = 0
+  autoContinueCount = 0
   lastTurnTextFingerprint = ''
   lastTurnThinkingFingerprint = ''
   lastPrewarmAt = 0
@@ -200,6 +205,13 @@ export class AgentLoop {
   prevEngineStats = { volatileSwaps: 0, frozenClamps: 0, frozenFallbackRebuilds: 0, toolsUpdates: 0 }
   prevMsgCount = 0
   prevHitRate: number | null = null
+  /** Estimated context tokens at the end of the previous turn — baseline for
+   *  compact attribution (compactPreRatio / compactReclaimed in the cache-log). */
+  prevEstTokens = 0
+  /** The compact-history artifact most recently produced by a compaction, set in
+   *  the onArchive callback and consumed once when the rewrite turn's cache-log
+   *  entry is built (loop-factory attaches it as entry.archiveId, then clears). */
+  lastArchive: { id: string; turn: number } | null = null
   turnStream: TurnStreamController | null = null
   turnCompletion: TurnCompletionController
   toolExecution: ToolExecutionController
@@ -285,6 +297,8 @@ export class AgentLoop {
   recentTextFingerprints: string[] = []
   /** T2-02: Current effort shadow record (telemetry only in P0, influences effort in P3+) */
   _currentEffortShadow: EffortShadowRecord | null = null
+  /** 逃生口运行时挂载的 EXTENDED 工具名（经 /tools enable 加入）。updateTools 时作为豁免传入。 */
+  private readonly mountedExtras = new Set<string>()
 
   constructor(
     config: AgentConfig,
@@ -409,9 +423,54 @@ export class AgentLoop {
             createdAt,
           })
         }
+        // P3: hot-refresh the session-memory volatile block so memories extracted
+        // during compaction are visible in THIS session's prompt — not just the
+        // next session. rebuildFrozenBase defers the actual volatileBlock swap to
+        // the next user message boundary, and compaction runs at turn 0, so this
+        // stays prefix-cache safe. Mirrors the /remember slash-command path.
+        try {
+          this.config.promptEngine.updateSessionMemory(persist.buildMemoryBlock())
+        } catch { /* non-critical: memories are already persisted to disk */ }
       },
       getAbortSignal: () => this.abortController?.signal,
       getActiveContract: () => this.taskContract,
+      // Layered archival: persist discarded history as a recallable
+      // compact-history artifact. Disk-only write, never touches the prefix.
+      archiveHistory: async (input) => {
+        const store = this.artifactStore
+        if (!store) return null
+        try {
+          return await store.save({
+            tool: COMPACT_HISTORY_TOOL,
+            target: input.target,
+            rawContent: input.rawContent,
+            summary: input.summary,
+            sections: input.sections,
+          })
+        } catch {
+          return null
+        }
+      },
+      // Recall observability: register the archive turn so recall turn-distance
+      // can be computed when the model later read_sections this artifact.
+      onArchive: (artifactId, turn) => {
+        try { this.cacheAdvisor.registerArchive(artifactId, turn) } catch { /* non-critical */ }
+        // Stash for the cache-log: the rewrite turn's entry attaches this id so
+        // compaction necessity can be correlated with later recalls (consume-once).
+        this.lastArchive = { id: artifactId, turn }
+      },
+      // Optional disaster-recovery snapshot of the full pre-compaction transcript.
+      backupTranscript: (messages, turn) => {
+        const persist = this.persist
+        if (!persist) return
+        try {
+          const path = join(persist.getBackupDir(), `pre-compact-${turn}.jsonl`)
+          const body = messages.map(m => JSON.stringify(m)).join('\n') + '\n'
+          writeFileSync(path, body, 'utf-8')
+        } catch {
+          // Snapshot is best-effort; never block compaction.
+        }
+      },
     })
     // 在 AgentLoop 构造时立即设置 prefixOverhead，关闭 UI 启动到 maybeCompact 之间的窗口。
     // 否则首次响应前 GlanceBar 显示 ctx 0%、◧ 0/1.0M（数据未接入而非真的 0%）。
@@ -626,8 +685,69 @@ export class AgentLoop {
     this.config.promptEngine.updateSessionMemory(block)
   }
 
+  /**
+   * 应用工具门控后的定义集 — 构造期之外（MCP/LSP 注册刷新、逃生口挂载）的唯一过滤入口。
+   * 复用 createAgentConfig 同款 gateToolDefinitions，确保 updateTools 不会把 EXTENDED 工具
+   * 整个还原（历史 bug：MCP/LSP 初始化后 updateTools 拉全量 → 门控被毫秒内覆盖）。
+   */
+  private gatedToolDefinitions(): import('../api/types.js').ToolDefinition[] {
+    const all = this.config.toolRegistry.getDefinitions()
+    const gating = this.config.toolGating
+    if (!gating) return all
+    return gateToolDefinitions(all, {
+      enabled: gating.enabled,
+      coreOverride: gating.coreOverride,
+      extraCore: gating.extraCore,
+      domainTier: gating.domainTier,
+      mountedExtras: [...this.mountedExtras],
+    })
+  }
+
   updateTools(): void {
-    this.config.promptEngine.updateTools(this.config.toolRegistry.getDefinitions())
+    this.config.promptEngine.updateTools(this.gatedToolDefinitions())
+  }
+
+  /** 当前主控实际可见的工具名（已应用门控 + 运行时挂载）。 */
+  getActiveToolNames(): string[] {
+    return this.gatedToolDefinitions().map(d => d.name)
+  }
+
+  /**
+   * 逃生口：把一个 EXTENDED 工具临时挂回主控（在 turn 边界由 slash 命令触发）。
+   *
+   * 代价：挂载会改变 staticCtx.tools 的 fingerprint，对 exact-prefix 缓存的 provider
+   * （deepseek-native / anthropic-cache-control）造成一次性全前缀缓存失效；'none' provider 无代价。
+   *
+   * @returns 结构化结果，供 UI 渲染（status + 缓存影响）
+   */
+  enableTool(name: string): {
+    status: 'mounted' | 'already-active' | 'not-extended' | 'unknown' | 'gating-off'
+    cacheImpact: 'prefix-invalidated' | 'none'
+    prefixCacheStrategy: 'deepseek-native' | 'anthropic-cache-control' | 'none'
+  } {
+    const strategy = this.config.prefixCacheStrategy ?? 'none'
+    const cacheImpact: 'prefix-invalidated' | 'none' =
+      strategy === 'none' ? 'none' : 'prefix-invalidated'
+
+    // 门控未开 → 全量本就可见，无需挂载
+    if (!this.config.toolGating || !this.config.toolGating.enabled) {
+      return { status: 'gating-off', cacheImpact: 'none', prefixCacheStrategy: strategy }
+    }
+    // 工具必须真实注册
+    if (!this.config.toolRegistry.getDefinitions().some(d => d.name === name)) {
+      return { status: 'unknown', cacheImpact: 'none', prefixCacheStrategy: strategy }
+    }
+    // 仅 EXTENDED 工具需要逃生口；非 EXTENDED（CORE/MCP/LSP）默认已可见
+    if (!isExtendedTool(name)) {
+      return { status: 'not-extended', cacheImpact: 'none', prefixCacheStrategy: strategy }
+    }
+    // 已挂载 → 幂等
+    if (this.mountedExtras.has(name)) {
+      return { status: 'already-active', cacheImpact: 'none', prefixCacheStrategy: strategy }
+    }
+    this.mountedExtras.add(name)
+    this.updateTools()
+    return { status: 'mounted', cacheImpact, prefixCacheStrategy: strategy }
   }
 
   getTrajectoryStats(): { totalTools: number; failures: number; retries: number; avgDurationMs: number } {
@@ -863,6 +983,18 @@ export class AgentLoop {
     return this.session.getEstimatedTokens()
   }
 
+  /** Real context-window occupancy (anchor on last API prompt_tokens + tail
+   *  estimate) — for display only. See SessionContext.getRealOccupancy. */
+  getRealOccupancy(): number {
+    return this.session.getRealOccupancy()
+  }
+
+  /** Observe-only recall stats for compacted-history artifacts (for /context).
+   *  Cheap delegate — avoids the heavier getDebugInfo() build. */
+  getRecallSummary(): RecallMetricsSummary {
+    return this.cacheAdvisor.getRecallSummary()
+  }
+
   /** Model context window size in tokens. */
   getContextWindow(): number {
     return this.config.contextWindow
@@ -931,6 +1063,12 @@ export class AgentLoop {
         if (domainId) sp.updateMetadata({ domain: domainId })
       }
     } catch { /* ignore */ }
+    // Sink compact-history recall stats into the (gated) sensorium channel.
+    // Observe-only: collects turn-distance data for a future adaptive-window
+    // decision; it does NOT influence compaction thresholds today.
+    try {
+      this.telemetryWriter.write({ kind: 'recall-summary', ...this.cacheAdvisor.getRecallSummary() })
+    } catch { /* telemetry is best-effort */ }
   }
 
   async startFsWatcher(): Promise<void> {

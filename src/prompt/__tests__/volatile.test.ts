@@ -1,10 +1,23 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ContextLedger } from '../../context/types.js'
 import { buildVolatileBlock, buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendix, buildDynamicAppendixParts, appendixBlockName, assignSalience, selectTopKBlocks, renderPlanMethodologyAdvisory, stripFirstMarkdownTable, type VolatileContext, type SalientBlock } from '../volatile.js'
+
+/** Fallback temp dir for sandboxed environments where os.tmpdir() is read-only. */
+function sandboxTmpDir(): string {
+  const sys = tmpdir()
+  try {
+    mkdtempSync(join(sys, 'probe-'))
+    return sys
+  } catch {
+    const local = join(process.cwd(), '.test-tmp')
+    if (!existsSync(local)) mkdirSync(local, { recursive: true })
+    return local
+  }
+}
 
 function ledger(): ContextLedger {
   return {
@@ -52,7 +65,7 @@ describe('volatile context layers', () => {
   })
 
   it('does not inject project knowledge files into prompt context', () => {
-    const cwd = mkdtempSync(join(tmpdir(), 'volatile-knowledge-'))
+    const cwd = mkdtempSync(join(sandboxTmpDir(), 'volatile-knowledge-'))
     try {
       const knowledgeDir = join(cwd, '.rivet', 'knowledge')
       mkdirSync(knowledgeDir, { recursive: true })
@@ -97,7 +110,7 @@ describe('tool-history XML section', () => {
     assert.ok(!buildVolatileBlock(base).includes('<tool-history'))
   })
 
-  it('renders active star domain in latest context and excludes it from stable context', () => {
+  it('excludes active star domain from both stable and dynamic appendix (rendered in consolidated block by engine)', () => {
     const ctx: VolatileContext = {
       ...base,
       activeDomain: {
@@ -109,11 +122,10 @@ describe('tool-history XML section', () => {
 
     const latest = buildLatestTurnVolatileBlock(ctx)
     const stable = buildStableVolatileBlock(ctx)
-
-    assert.ok(latest.includes('<star-domain'))
-    assert.ok(latest.includes('name="破军&lt;域&gt;"'))
-    assert.ok(latest.includes('突破 &lt;边界&gt; &amp; 记录失败'))
-    assert.ok(!stable.includes('<star-domain'))
+    // star-domain is rendered in <consolidated> by engine.ts habituation,
+    // NOT in stable or dynamic appendix — avoids duplicate injection per turn.
+    assert.ok(!stable.includes('<star-domain'), 'stable must not contain star-domain')
+    assert.ok(!latest.includes('<star-domain'), 'dynamic appendix must not contain star-domain')
   })
 
   it('escapes XML special chars in targets', () => {
@@ -625,13 +637,13 @@ describe('GWT salience and Top-K selection', () => {
     it('preserves high-salience blocks when budget is constrained', () => {
       const ctx: VolatileContext = {
         cwd: '/repo',
-        activeDomain: { name: 'test', motto: 'test motto', volatileBlock: 'test block' },
         gitStatus: 'M src/main.ts',
         decisions: ['low priority decision'],
       }
-      // With moderate budget, star-domain (salience 1.0) should be preserved
+      // star-domain is no longer in dynamic appendix (moved to consolidated
+      // block by engine). git-status (salience 1.0) should be preserved.
       const limited = buildDynamicAppendix(ctx, 500)
-      assert.ok(limited.includes('star-domain'))
+      assert.ok(limited.includes('git-status'))
     })
 
     it('wraps output in <context-update> tags', () => {
@@ -728,9 +740,10 @@ describe('GWT salience and Top-K selection', () => {
       const parts = buildDynamicAppendixParts(ctx)
       assert.ok(parts.length > 0, 'should produce parts')
       const names = parts.map(p => p.name)
-      assert.ok(names.includes('star-domain'), `expected star-domain in ${names}`)
+      // star-domain is rendered in consolidated block, NOT in dynamic appendix parts
       assert.ok(names.includes('git-status'), `expected git-status in ${names}`)
       assert.ok(names.includes('progress'), `expected progress in ${names}`)
+      assert.ok(!names.includes('star-domain'), `star-domain should not be in dynamic appendix parts: ${names}`)
     })
 
     it('appendixBlockName extracts leading XML tag', () => {
@@ -779,7 +792,6 @@ describe('GWT salience and Top-K selection', () => {
       assert.equal(assignSalience('<task-depth layer="system">…</task-depth>'), 0.7)
       assert.equal(assignSalience('<plan-methodology route="full">…</plan-methodology>'), 0.7)
       assert.equal(assignSalience('<available-skills note="…">…</available-skills>'), 0.6)
-      assert.equal(assignSalience('<companion-presence>\n…\n</companion-presence>'), 0.4)
     })
 
     it('mentions/task-depth survive Top-K when a tiny budget would drop a 0.5 default', () => {
@@ -823,5 +835,40 @@ describe('stripFirstMarkdownTable', () => {
   it('returns text unchanged when no table is present', () => {
     const input = '# Just a heading\nSome text.\n'
     assert.equal(stripFirstMarkdownTable(input), input)
+  })
+})
+
+describe('progress objective dedup (C3)', () => {
+  const sessionState = '<session-state>\nObjective: ship the feature\nStep: writing code\n</session-state>'
+
+  it('keeps the objective when projection has no <objective> (only a one-shot hint)', () => {
+    const ctx: VolatileContext = {
+      cwd: '/repo',
+      sessionState,
+      cognitiveProjection: '【瑶光·复现即证】上轮回复引用了文件名但未读取任何文件。',
+    }
+    const appendix = buildDynamicAppendix(ctx)
+    assert.match(appendix, /Objective: ship the feature/)
+  })
+
+  it('keeps the objective when projection is a non-actionable contract (renders no objective)', () => {
+    const ctx: VolatileContext = {
+      cwd: '/repo',
+      sessionState,
+      cognitiveProjection: '<verification-gap claims="2" verified="0" />',
+    }
+    const appendix = buildDynamicAppendix(ctx)
+    assert.match(appendix, /Objective: ship the feature/)
+  })
+
+  it('strips the duplicate objective only when projection actually carries <objective>', () => {
+    const ctx: VolatileContext = {
+      cwd: '/repo',
+      sessionState,
+      cognitiveProjection: '<task-contract status="executing"><objective>ship the feature</objective></task-contract>',
+    }
+    const appendix = buildDynamicAppendix(ctx)
+    assert.doesNotMatch(appendix, /Objective: ship the feature/)
+    assert.match(appendix, /<objective>ship the feature<\/objective>/)
   })
 })

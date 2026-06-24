@@ -35,6 +35,7 @@ import { loadConstellation } from './constellation/store.js'
 import { formatMilestoneLine } from './constellation/format.js'
 import { join } from 'path'
 import { execSync } from 'child_process'
+import { applyProjectTemplates, recordTemplatesDecision } from './bootstrap/project-templates.js'
 
 // ── CLI args ───────────────────────────────────────────────────
 
@@ -556,7 +557,10 @@ async function main() {
     const cost = (normalInput * 1 + cacheRead * 0.1 + total.output_tokens * 4) / 1_000_000
     const maxTokens = ctx.agent.config.contextWindow ?? currentModel?.contextWindow ?? 0
     return {
-      estimatedTokens: session.getEstimatedTokens(),
+      // Real occupancy: anchor on last API prompt_tokens + estimate the tail
+      // appended since (provider-agnostic — works for DeepSeek/MiMo/GLM). Falls
+      // back to the calibrated estimate before the first response / post-compact.
+      estimatedTokens: session.getRealOccupancy(),
       maxTokens,
       cacheHitRate: session.getRecentTurnHitRate(3) ?? session.getCacheHitRate(),
       cost,
@@ -608,10 +612,46 @@ async function main() {
     shutdown(0)
   })
 
+  // ── First-run template prompt (before clearing screen) ───────
+  if (ctx.templatesPendingAgents && !args.includes('--dangerously-skip-permissions')) {
+    const { createInterface } = await import('node:readline/promises')
+    const rl = createInterface({ input: stdin, output: stdout })
+    try {
+      stdout.write('\n')
+      stdout.write('╭─ First-run setup ────────────────────────────────╮\n')
+      stdout.write('│ This project has no AGENTS.md or .rivet.md.     │\n')
+      stdout.write('│ Create them from templates?                      │\n')
+      stdout.write('╰──────────────────────────────────────────────────╯\n')
+      stdout.write('  [1] Create both (AGENTS.md + .rivet.md)\n')
+      stdout.write('  [2] Skip                         \n')
+      stdout.write('\n')
+      const answer = (await rl.question('Choice [1-2] (default: 1): ')).trim()
+      if (answer === '' || answer === '1') {
+        const result = applyProjectTemplates(process.cwd(), { agentsMode: 'overwrite' })
+        recordTemplatesDecision(process.cwd(), 'created', {
+          created: result.created,
+          appended: result.appended,
+          skipped: result.skipped,
+        })
+        stdout.write(`✓ Created: ${result.created.join(', ') || 'none'}\n`)
+      } else {
+        applyProjectTemplates(process.cwd(), { agentsMode: 'skip' })
+        recordTemplatesDecision(process.cwd(), 'declined')
+        stdout.write('Skipped template creation.\n')
+      }
+    } finally {
+      rl.close()
+    }
+  } else if (ctx.templatesPendingAgents) {
+    // headless / --dangerously-skip-permissions: silent .rivet.md, decline AGENTS.md
+    applyProjectTemplates(process.cwd(), { agentsMode: 'skip' })
+    recordTemplatesDecision(process.cwd(), 'declined')
+  }
+
   // ── Clear screen ─────────────────────────────────────────────
   stdout.write('\x1B[2J\x1B[H')
 
-  // ── Welcome message（精简 ≤3 行，自适应终端宽） ───────────────
+  // ── Welcome message（带边框与大标识品牌设计） ─────────────────
   const existingMsgCount = ctx.session.getMessages().length
   const welcomeLines = formatWelcome({
     modelName,
@@ -624,12 +664,11 @@ async function main() {
   for (const line of welcomeLines) {
     stdout.write(line + '\n')
   }
-  // 欢迎与底部 chrome 之间留一空行
-  stdout.write('\n')
 
-  process.stderr.write('\n')
-
-  // 首屏渲染底部 chrome（GlanceBar + 输入框），不必等第一次按键
+  // 自然流：欢迎页写完后直接渲染底部 chrome（GlanceBar + 输入框），
+  // 输入框以 append 模式落在欢迎页正下方。不再用 padding 撑底——padding 会
+  // 与 cursor-resident live region 的相对光标假设冲突，切换 model/theme/domain
+  // 提交内容触发滚动时造成顶部残影/塌行。随交互增长终端原生滚动自然把输入框保持在视口底部。
   app.start()
 }
 

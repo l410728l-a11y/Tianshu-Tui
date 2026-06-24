@@ -41,8 +41,8 @@ import { createTaskLedger } from '../agent/task-ledger.js'
 import { createOwnershipLedger } from '../agent/ownership-ledger.js'
 import { createWorktreeBaseline } from '../agent/worktree-baseline.js'
 import { captureGitBaseline, createInteractiveToolRegistry, createAgentRuntime, type RuntimeRefs } from '../bootstrap.js'
-import { createRecallTool } from '../tools/recall.js'
-import { createRememberTool } from '../tools/remember.js'
+import { loadProjectSkills } from '../skills/skill-loader.js'
+import { createMemoryTool } from '../tools/memory.js'
 import { DomainKnowledgeStore } from '../agent/domain-knowledge-store.js'
 import { ProviderHealthTracker } from '../agent/provider-health.js'
 import type { Config, ProviderConfig, ModelConfig } from '../config/schema.js'
@@ -230,6 +230,9 @@ function buildSessionStores(
   const claimStore = persist.createClaimStore()
   persist.injectDurableClaims(claimStore)
   for (const rule of loadProjectRules(cwd)) claimStore.propose(rule)
+  // Load skills into the shared registry (same as CLI bootstrap). Without this,
+  // skillRegistry.list() returns empty and the desktop PlusMenu shows no skills.
+  loadProjectSkills(cwd, { importFromClaude: ctx.config.skills?.importFromClaude })
   const fileHistory = new FileHistory(persist.getBackupDir(), sessionId)
   const session = new SessionContext()
 
@@ -261,15 +264,12 @@ function buildSessionStores(
   }
   const { registry: toolRegistry } = createInteractiveToolRegistry(refs, ctx.config, cwd)
 
-  // recall / remember：bootstrap 在 createInteractiveToolRegistry 外装的两个工具，
+  // memory (unified recall + remember)：bootstrap 在 createInteractiveToolRegistry 外装的工具，
   // 这里复用 sidecar 已有的 claimStore + session 完成对齐。
-  toolRegistry.register(createRecallTool(claimStore, {
+  toolRegistry.register(createMemoryTool(claimStore, {
     sessionId,
     getTurn: () => session.getTurnCount(),
-  }))
-  toolRegistry.register(createRememberTool(claimStore, {
-    sessionId,
-    getTurn: () => session.getTurnCount(),
+    cwd,
   }))
 
   // taskLedger / ownershipLedger 由 createInteractiveToolRegistry 的 B1 装配段
@@ -455,8 +455,9 @@ function buildManagedAgent(
       }
       return spec.model.id
     },
-    // Context usage display (desktop header progress bar).
-    getEstimatedTokens: () => agent.session.getEstimatedTokens(),
+    // Context usage display (desktop header progress bar) — real occupancy
+    // (last API prompt_tokens + tail estimate), provider-agnostic.
+    getEstimatedTokens: () => agent.session.getRealOccupancy(),
     getContextWindow: () => spec.model.contextWindow,
     // Wave L: 进程退出释放本 session 的 coordinator timer + in-flight worker
     // 句柄。abort() 仅中止当前 turn；shutdown() 是终结性操作。
