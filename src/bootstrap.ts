@@ -21,6 +21,7 @@ import type { BaselineSnapshot } from './agent/worktree-baseline.js'
 import type { ModelCapabilityCard } from './model/capability.js'
 
 import { loadConfig as loadLayeredConfig } from './config/manager.js'
+import { isProFeatureEnabled } from './config/pro-license.js'
 import { lastSessionPointerDir, rivetHome, stateDir } from './config/paths.js'
 import { setTargetConventions, applyConfiguredGitBashPath } from './platform.js'
 import { AgentLoop } from './agent/loop.js'
@@ -29,6 +30,7 @@ import { SessionContext } from './agent/context.js'
 import { SessionPersist, evictOldSessions, getSessionDir } from './agent/session-persist.js'
 import { decideStartupSession, RESUME_FRESHNESS_MS } from './agent/session-recovery.js'
 import { runResumePreflightOai } from './context/resume-preflight.js'
+import { createWriteEvidenceProbe } from './context/write-evidence-probe.js'
 import { FileHistory } from './agent/file-history.js'
 import { PromptEngine } from './prompt/engine.js'
 import { createDefaultToolRegistry } from './tools/default-registry.js'
@@ -81,7 +83,8 @@ import { ASK_USER_QUESTION_TOOL } from './tools/ask-user-question.js'
 import { createRepoGraphTool } from './tools/repo-graph.js'
 import { createRelatedTestsTool } from './tools/related-tests.js'
 import { SEMANTIC_SEARCH_TOOL } from './tools/semantic-search.js'
-import { WEB_SEARCH_TOOL } from './tools/web-search.js'
+import { buildSearchBackends } from './tools/web-search.js'
+import { buildFetchOptions } from './tools/web-fetch/build-options.js'
 import { APPLY_PATCH_TOOL } from './tools/apply-patch.js'
 import { createPlanTaskTool } from './tools/plan-task.js'
 import { createMemoryTool } from './tools/memory.js'
@@ -379,8 +382,13 @@ export function createInteractiveToolRegistry(
     desktopTools: config.agent.desktopTools,
     todoStore: refs.todoStore,
     // Computer Use（桌面 GUI 自动化）：EXTENDED 层，注册≠主控可见（tool gating
-    // 过滤），@Computer / /tools enable 挂载时才进主控视野。darwin/win32 gated。
+    // 过滤），@Computer / /tools enable 挂载时才进主控视野。darwin/win32 + Pro gated。
     computerUse: (process.platform === 'darwin' || process.platform === 'win32') && process.env.RIVET_COMPUTER_USE !== '0',
+    proEnabled: isProFeatureEnabled(config, 'computerUse'),
+    // web_search 后端链（DDG 默认 / Brave / Tavily），按 config.search 顺序 fallback。
+    searchBackends: buildSearchBackends(config),
+    // web_fetch 配置注入（超时/大小上限/UA/正文抽取）
+    fetchOptions: buildFetchOptions(config),
   })
 
   // delegate_task
@@ -1332,7 +1340,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
   }
 
   const rawMsgs = targetPersist.loadOai()
-  const preflight = runResumePreflightOai(rawMsgs)
+  const preflight = runResumePreflightOai(rawMsgs, { writeProbe: createWriteEvidenceProbe(ctx.cwd) })
 
   // 仅换会话身份,保留当前模型。
   let currentModelId: string | undefined

@@ -29,6 +29,7 @@ import {
   setDefaultProvider,
   setApiKey,
   setApiKeyEnv,
+  setProviderAllowProFallback,
   getRoutingConfig,
   setRoutingConfig,
   getEditorConfig,
@@ -49,6 +50,7 @@ import { modelConfigSchema, type ModelConfig } from '../config/schema.js'
 import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.js'
 import { listGrantedApps, revokeApp } from '../tools/computer-use/app-grants.js'
 import { createPlatformDriver, isComputerUsePlatform } from '../tools/computer-use/platform-driver.js'
+import { isProFeatureEnabled } from '../config/pro-license.js'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
@@ -67,6 +69,7 @@ export interface ProviderListItem {
   keyStatus: { source: 'inline' | 'env' | 'none'; ref: string }
   models: { id: string; alias?: string }[]
   isPreset: boolean
+  allowProFallback: boolean
 }
 
 export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandler> {
@@ -87,6 +90,7 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
           keyStatus: getApiKeyStatus(name),
           models: p.models.map(m => ({ id: m.id, alias: m.alias, contextWindow: m.contextWindow, maxTokens: m.maxTokens })),
           isPreset: (providerPresetKeys as string[]).includes(name),
+          allowProFallback: p.allowProFallback ?? false,
         })
       }
 
@@ -102,13 +106,14 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
     }, apiToken),
 
     'POST /config/providers': withAuth((body) => {
-      const { providerName, apiKey, apiKeyEnv, baseUrl, makeDefault, model } = body as {
+      const { providerName, apiKey, apiKeyEnv, baseUrl, makeDefault, model, allowProFallback } = body as {
         providerName?: string
         apiKey?: string
         apiKeyEnv?: string
         baseUrl?: string
         makeDefault?: boolean
         model?: ModelConfig
+        allowProFallback?: boolean
       }
       if (!providerName) return { status: 400, body: { error: 'providerName is required' } }
 
@@ -122,7 +127,7 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
 
       try {
-        setupProvider({ providerName, apiKey, apiKeyEnv, baseUrl, model: parsedModel, makeDefault })
+        setupProvider({ providerName, apiKey, apiKeyEnv, baseUrl, model: parsedModel, makeDefault, allowProFallback })
         return { status: 200, body: { ok: true, providerName } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
@@ -133,12 +138,13 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       // 凭空创建一个 OpenAI 兼容 provider（不依赖预设）——支持 Ollama/vLLM/
       // OpenAI 直连/第三方兼容端点。与 setupProvider 区别：后者要求 providerName
       // 在预设或已存在，本端点从零 materialize 一个完整 ProviderConfig。
-      const { providerName, apiKey, baseUrl, makeDefault, model } = body as {
+      const { providerName, apiKey, baseUrl, makeDefault, model, allowProFallback } = body as {
         providerName?: string
         apiKey?: string
         baseUrl?: string
         makeDefault?: boolean
         model?: ModelConfig
+        allowProFallback?: boolean
       }
       if (!providerName) return { status: 400, body: { error: 'providerName is required' } }
       if (!baseUrl) return { status: 400, body: { error: 'baseUrl is required' } }
@@ -156,6 +162,7 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
           ...(apiKey ? { apiKey } : {}),
           model: result.data,
           makeDefault,
+          allowProFallback,
         })
         return { status: 200, body: { ok: true, providerName } }
       } catch (err) {
@@ -206,6 +213,21 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       try {
         setDefaultProvider(name)
         return { status: 200, body: { ok: true, default: name } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    'PUT /config/providers/:name/allow-pro-fallback': withAuth((body, params) => {
+      const name = params?.name
+      if (!name) return { status: 400, body: { error: 'provider name is required' } }
+      const { allowProFallback } = (body ?? {}) as { allowProFallback?: unknown }
+      if (typeof allowProFallback !== 'boolean') {
+        return { status: 400, body: { error: 'allowProFallback boolean is required' } }
+      }
+      try {
+        setProviderAllowProFallback(name, allowProFallback)
+        return { status: 200, body: { ok: true, allowProFallback } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }
@@ -289,18 +311,22 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
     }, apiToken),
 
     // Computer Use (desktop GUI automation) status for the desktop settings UI:
-    // platform availability, system permission probe, and per-app grants.
+    // platform availability, Pro gating, system permission probe, and per-app grants.
     'GET /config/computer-use': withAuth(async () => {
-      const available = isComputerUsePlatform(process.platform) && process.env.RIVET_COMPUTER_USE !== '0'
+      const cfg = loadConfig()
+      const platformOk = isComputerUsePlatform(process.platform) && process.env.RIVET_COMPUTER_USE !== '0'
+      const proEnabled = isProFeatureEnabled(cfg, 'computerUse')
+      const proRequired = platformOk && !proEnabled
+      const available = platformOk && proEnabled
       const grants = listGrantedApps().map(g => ({ app: g.app, grantedAt: g.grantedAt }))
       if (!available) {
-        return { status: 200, body: { available: false, platform: process.platform, permissions: null, grants } }
+        return { status: 200, body: { available: false, proRequired, platform: process.platform, permissions: null, grants } }
       }
       let permissions: { accessibility: boolean; screenRecording: boolean; detail: string } | null = null
       try {
         permissions = await createPlatformDriver().checkPermissions()
       } catch { /* probe failure → permissions unknown, UI shows a hint */ }
-      return { status: 200, body: { available: true, platform: process.platform, permissions, grants } }
+      return { status: 200, body: { available: true, proRequired: false, platform: process.platform, permissions, grants } }
     }, apiToken),
 
     // Codex-style standing directory grants for the desktop settings UI.

@@ -2,22 +2,36 @@ import type { Message, ContentBlock } from '../api/types.js'
 import type { OaiMessage, OaiToolMessage, OaiAssistantMessage } from '../api/oai-types.js'
 import { groupIntoRounds, computeInvariantStatus, groupIntoRoundsOai } from './rounds.js'
 import type { ResumePreflightReport } from './types.js'
+import {
+  extractTargetPath,
+  formatWriteRecoveryContent,
+  type WriteProbe,
+} from './write-evidence-probe.js'
 
 // ─── orphan diagnostic: RIVET_DEBUG_ORPHAN=1 dumps adjacency-violation details ───
 const DEBUG_ORPHAN = process.env.RIVET_DEBUG_ORPHAN === '1'
 
-/** 写类工具——恢复时应告知模型"可能已成功，不需重试"。 */
-const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'hash_edit', 'apply_patch'])
-
-function syntheticResultContent(toolName?: string): string {
-  if (toolName && WRITE_TOOLS.has(toolName)) {
-    return '会话中断导致工具结果丢失——该写入操作很可能已经成功执行，文件已保存到磁盘。'
-      + '不要重试此操作：若需确认，先 read_file 检查文件当前状态。如果内容已存在，直接继续下一步。'
-  }
-  return '会话中断导致工具结果丢失——该工具可能已经成功执行。检查文件/缓冲区状态后再决定是否重试。'
+function syntheticResultContent(
+  toolName?: string,
+  filePath?: string,
+  writeProbe?: WriteProbe,
+  args?: unknown,
+): string {
+  const evidence = toolName && writeProbe && args !== undefined
+    ? writeProbe(toolName, args)
+    : undefined
+  return formatWriteRecoveryContent(toolName, filePath, evidence)
 }
 
-export function runResumePreflight(messages: Message[]): ResumePreflightReport {
+export interface OaiResumePreflightOptions {
+  /** Optional cwd-scoped disk probe for write-tool orphan synthesis (default on). */
+  writeProbe?: WriteProbe
+}
+
+export function runResumePreflight(
+  messages: Message[],
+  options?: OaiResumePreflightOptions,
+): ResumePreflightReport {
   const rounds = groupIntoRounds(messages)
   const invariant = computeInvariantStatus(rounds)
 
@@ -59,10 +73,12 @@ export function runResumePreflight(messages: Message[]): ResumePreflightReport {
       const blocks = asstMsg.content as ContentBlock[]
       const toolUse = blocks.find(b => b.type === 'tool_use' && b.id === id)
       const toolName = toolUse?.type === 'tool_use' ? toolUse.name : undefined
+      const filePath = toolUse?.type === 'tool_use' ? extractTargetPath(toolUse.input) : undefined
+      const args = toolUse?.type === 'tool_use' ? toolUse.input : undefined
       return {
         type: 'tool_result' as const,
         tool_use_id: id,
-        content: syntheticResultContent(toolName),
+        content: syntheticResultContent(toolName, filePath, options?.writeProbe, args),
         is_error: false,
       }
     })
@@ -209,7 +225,10 @@ function isToolAdjacencyCleanOai(messages: OaiMessage[]): boolean {
  * (a duplicate or truly orphaned result) is dropped. No-op — same array
  * reference, prefix cache untouched — when adjacency already holds.
  */
-export function runResumePreflightOai(messages: OaiMessage[]): OaiResumePreflightReport {
+export function runResumePreflightOai(
+  messages: OaiMessage[],
+  options?: OaiResumePreflightOptions,
+): OaiResumePreflightReport {
   if (isToolAdjacencyCleanOai(messages)) {
     return {
       messageCount: messages.length,
@@ -247,7 +266,13 @@ export function runResumePreflightOai(messages: OaiMessage[]): OaiResumePrefligh
         repaired.push({ role: 'tool', tool_call_id: tc.id, content: existing.content })
       } else {
         const toolName = tc.function?.name
-        repaired.push({ role: 'tool', tool_call_id: tc.id, content: syntheticResultContent(toolName) })
+        const filePath = extractTargetPath(tc.function?.arguments)
+        const args = tc.function?.arguments
+        repaired.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: syntheticResultContent(toolName, filePath, options?.writeProbe, args),
+        })
         inserted++
         if (DEBUG_ORPHAN) {
           // eslint-disable-next-line no-console

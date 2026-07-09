@@ -13,7 +13,7 @@ import { OPEN_PATH_TOOL } from './open-path.js'
 import { REQUEST_PATH_ACCESS_TOOL } from './request-path-access.js'
 import { SKILL_TOOL } from './skill.js'
 import { BROWSER_TOOL } from './browser.js'
-import { COMPUTER_USE_TOOL } from './computer-use/tool.js'
+import { createComputerUseTool } from './computer-use/tool.js'
 import { BASH_TOOL } from './bash.js'
 import { JOB_TOOL } from './job-tool.js'
 import { DIFF_TOOL } from './diff.js'
@@ -34,8 +34,10 @@ import { TODO_TOOL, createTodoTool } from './todo.js'
 import type { TodoStore } from './todo-store.js'
 import { ToolRegistry } from './registry.js'
 import type { Tool } from './types.js'
-import { WEB_FETCH_TOOL } from './web-fetch.js'
-import { WEB_SEARCH_TOOL } from './web-search.js'
+import { WEB_FETCH_TOOL, createWebFetchTool } from './web-fetch.js'
+import type { WebFetchOptions } from './web-fetch/tool.js'
+import { WEB_SEARCH_TOOL, createWebSearchTool } from './web-search.js'
+import type { SearchBackend } from './web-search.js'
 import { WRITE_FILE_TOOL } from './write-file.js'
 
 export interface DefaultRegistryOptions {
@@ -48,10 +50,21 @@ export interface DefaultRegistryOptions {
   /** Computer Use（桌面 GUI 自动化，macOS/Windows）。默认关闭：EXTENDED 层工具（主控 prompt 零成本），
    *  仅 darwin/win32 且 RIVET_COMPUTER_USE!=0 时由装配层开启；逐应用审批 fail-closed。 */
   computerUse?: boolean
+  /** Pro feature gate for computer_use. When false (default), the tool is disabled
+   *  even if computerUse=true. */
+  proEnabled?: boolean
   /** 多会话隔离：注入 per-session TodoStore。缺省回退全局 TODO_TOOL（defaultStore）。
    *  注意工具 definition（name/description/schema）与 TODO_TOOL 字节一致，仅 store 不同，
    *  不影响系统提示词前缀缓存。 */
   todoStore?: TodoStore
+  /** Ordered web_search backend chain built from config (DDG/Brave/Tavily).
+   *  Absent → the DDG-only default WEB_SEARCH_TOOL is registered. The tool
+   *  `definition` is byte-identical either way, so prefix cache is unaffected. */
+  searchBackends?: SearchBackend[]
+  /** web_fetch options built from config.fetch. Absent → the default
+   *  WEB_FETCH_TOOL is registered. The tool `definition` is byte-identical
+   *  either way, so prefix cache is unaffected. */
+  fetchOptions?: WebFetchOptions
 }
 
 export function createDefaultToolRegistry(extraTools: Tool[] = [], options: DefaultRegistryOptions = {}): ToolRegistry {
@@ -84,8 +97,16 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   registry.register(RUN_TESTS_TOOL)
   registry.register(GIT_TOOL)
   registry.register(options.todoStore ? createTodoTool(options.todoStore) : TODO_TOOL)
-  registry.register(WEB_FETCH_TOOL)
-  registry.register(WEB_SEARCH_TOOL)
+  registry.register(
+    options.fetchOptions
+      ? createWebFetchTool(undefined, options.fetchOptions)
+      : WEB_FETCH_TOOL,
+  )
+  registry.register(
+    options.searchBackends && options.searchBackends.length > 0
+      ? createWebSearchTool({ backends: options.searchBackends })
+      : WEB_SEARCH_TOOL,
+  )
   registry.register(INSPECT_PROJECT_TOOL)
   registry.register(REPO_MAP_TOOL)
   registry.register(RELATED_TESTS_TOOL)
@@ -97,8 +118,8 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   if (options.browserTool) {
     registry.register(BROWSER_TOOL)
   }
-  if (options.computerUse) {
-    registry.register(COMPUTER_USE_TOOL)
+  if (options.computerUse && options.proEnabled) {
+    registry.register(createComputerUseTool({ proEnabled: options.proEnabled }))
   }
   for (const tool of extraTools) registry.register(tool)
   return registry

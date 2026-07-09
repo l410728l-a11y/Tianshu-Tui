@@ -184,6 +184,19 @@ export const DEFAULT_CONFIG: Config = {
     minSystemTokens: 256,
     showHitRate: true,
   },
+  search: {
+    backends: ['duckduckgo'],
+    braveApiKeyEnv: 'BRAVE_API_KEY',
+    tavilyApiKeyEnv: 'TAVILY_API_KEY',
+    timeoutMs: 15_000,
+  },
+  fetch: {
+    timeoutMs: 15_000,
+    maxResponseBytes: 10_485_760,
+    maxRedirects: 5,
+    userAgent: 'Tianshu/1.0 (terminal coding agent)',
+    extractMainContent: true,
+  },
   mcp: {
     enabled: true,
     servers: {},
@@ -227,5 +240,12 @@ export const DEFAULT_CONFIG: Config = {
   ui: {},
   // 项目验证命令声明 — 默认空，由项目层 .rivet-config.json 覆盖（/init 生成）
   verify: {},
+  pro: {
+    enabled: false,
+    features: {
+      computerUse: false,
+      chatGateway: false,
+    },
+  },
   plugins: { enabled: {} },
 }

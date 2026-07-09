@@ -21,6 +21,8 @@ export const modelConfigSchema = z.object({
     cacheWrite: z.number().min(0).optional(),
     reasoning: z.number().min(0).optional(),
   }).optional(),
+  /** Model tier for routing/fallback decisions. Overrides name-based inference. */
+  tier: z.enum(['cheap', 'balanced', 'strong']).optional(),
 })
 
 export const authConfigSchema = z.discriminatedUnion('type', [
@@ -53,6 +55,9 @@ export const providerSchema = z.object({
   fallback: z.array(z.string()).optional(),
   /** Model to use when falling back to this provider (defaults to 'deepseek-v4-flash'). */
   fallbackModel: z.string().optional(),
+  /** Allow strong/pro tier models to be used as fallback. Default false to avoid
+   *  cold-start cache-miss cost on large-context pro models. */
+  allowProFallback: z.boolean().optional(),
   models: z.array(modelConfigSchema).min(1),
   thinking: z.enum(['enabled', 'disabled']).default('enabled'),
   maxTokens: z.number().int().positive().default(64000),
@@ -347,6 +352,35 @@ export const cacheSchema = z.object({
   showHitRate: z.boolean().default(true),
 })
 
+export const searchSchema = z.object({
+  /** Ordered backend chain for web_search. First available backend with a
+   *  non-empty result wins; the rest are skipped. Unknown names are ignored. */
+  backends: z.array(z.string()).default(['duckduckgo']),
+  /** Env var holding the Brave Search API key (subscription token). */
+  braveApiKeyEnv: z.string().default('BRAVE_API_KEY'),
+  /** Env var holding the Tavily Search API key. */
+  tavilyApiKeyEnv: z.string().default('TAVILY_API_KEY'),
+  /** Per-backend request timeout (ms). */
+  timeoutMs: z.number().int().positive().default(15_000),
+  /** Optional region/country hint passed to backends that support it (Brave). */
+  region: z.string().optional(),
+}).default({})
+
+export const fetchSchema = z.object({
+  /** Per-request timeout (ms) for web_fetch and URL import downloads. */
+  timeoutMs: z.number().int().positive().default(15_000),
+  /** Maximum response body size (bytes). Larger bodies are cancelled mid-read. */
+  maxResponseBytes: z.number().int().positive().default(10_485_760),
+  /** Maximum number of redirects to follow. */
+  maxRedirects: z.number().int().positive().default(5),
+  /** User-Agent header sent with fetch requests. */
+  userAgent: z.string().default('Tianshu/1.0 (terminal coding agent)'),
+  /** Extract <main>/<article> content from HTML instead of returning full page noise. */
+  extractMainContent: z.boolean().default(true),
+}).default({})
+
+export type FetchConfig = z.infer<typeof fetchSchema>
+
 export const editorSchema = z.object({
   /**
    * Target-OS conventions for file artifacts and the system-prompt OS hint.
@@ -495,6 +529,23 @@ export const verifySchema = z.object({
   lint: z.string().optional(),
 }).default({})
 
+export const proSchema = z.object({
+  /** Whether Pro features are active. Can also be enabled via RIVET_PRO=1
+   *  or by placing a non-empty key in ~/.rivet/pro.license. */
+  enabled: z.boolean().default(false),
+  /** Optional license key (opaque string). The runtime does not validate
+   *  signatures; online seat/validation is handled by a licensing service. */
+  licenseKey: z.string().optional(),
+  /** Per-feature Pro gates. When Pro is active, features default to enabled
+   *  unless explicitly set to false here. */
+  features: z.object({
+    computerUse: z.boolean().default(true),
+    chatGateway: z.boolean().default(true),
+  }).default({}),
+}).default({})
+
+export type ProConfig = z.infer<typeof proSchema>
+
 export const configSchema = z.object({
   provider: z.object({
     default: z.string(),
@@ -503,6 +554,8 @@ export const configSchema = z.object({
   agent: agentSchema.default({}),
   compact: compactSchema.default({}),
   cache: cacheSchema.default({}),
+  search: searchSchema,
+  fetch: fetchSchema,
   editor: editorSchema.default({}),
   mcp: mcpConfigSchema.default({}),
   workers: workersSchema,
@@ -511,6 +564,7 @@ export const configSchema = z.object({
   env: envSchema,
   ui: uiSchema,
   verify: verifySchema,
+  pro: proSchema,
   plugins: z.object({
     enabled: z.record(z.boolean()).default({}),
   }).default({}),
@@ -521,6 +575,8 @@ export type Config = {
   agent: AgentConfig
   compact: CompactConfig
   cache: CacheConfig
+  search: SearchConfig
+  fetch: FetchConfig
   editor: EditorConfig
   mcp: McpConfig
   workers: WorkersConfig
@@ -529,6 +585,7 @@ export type Config = {
   env: EnvConfig
   ui: UiConfig
   verify: VerifyConfig
+  pro: ProConfig
   plugins: { enabled: Record<string, boolean> }
 }
 
@@ -542,6 +599,7 @@ export type EditorEol = EditorConfig['eol']
 export type AgentConfig = z.infer<typeof agentSchema>
 export type CompactConfig = z.infer<typeof compactSchema>
 export type CacheConfig = z.infer<typeof cacheSchema>
+export type SearchConfig = z.infer<typeof searchSchema>
 export type WorkersConfig = z.infer<typeof workersSchema>
 export type SkillsConfig = z.infer<typeof skillsSchema>
 export type MirrorsConfig = z.infer<typeof mirrorsSchema>
