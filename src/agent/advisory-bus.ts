@@ -180,7 +180,7 @@ export function virtueEncouragementEntry(): AdvisoryEntry {
   return {
     key: 'virtue-encouragement',
     priority: 0.4,
-    category: 'encouragement',
+    category: 'discipline',
     content: variant,
     ttl: 1,
   }
@@ -190,7 +190,7 @@ export function testPassEncouragementEntry(testCount: number): AdvisoryEntry {
   return {
     key: 'test-pass-encouragement',
     priority: 0.35,
-    category: 'encouragement',
+    category: 'discipline',
     content: `【天府】${testCount} 个测试全部通过。代码质量守护有效。`,
     ttl: 1,
   }
@@ -200,7 +200,7 @@ export function vigorRecoveryEntry(): AdvisoryEntry {
   return {
     key: 'vigor-recovery',
     priority: 0.35,
-    category: 'encouragement',
+    category: 'discipline',
     content: '【天枢】执行能量恢复。你从低效状态走出来了，保持当前的行动节奏。',
     ttl: 1,
   }
@@ -250,6 +250,26 @@ export const HABITUATION_SILENCE_RENDERS = 4
 export const LIFT_MUTE_RENDERS = 10
 /** lift ≤ 此阈值判定为"提醒无真实增益"（成熟样本前提下） */
 export const LIFT_MUTE_THRESHOLD = 0
+
+// ─── W2 efficacy 负反馈环（incident 20b9714e）────────────────────────
+// efficacy 台账一直在如实记录 delivered/adopted，但发射侧从不回读——
+// convergence advisory 同会话送达 32 次、采纳 0 次仍照发不误。
+// 规则（仅会话内生效，不做跨会话全局静默）：
+//   delivered ≥ 3 且 adopted = 0 → 进入冷却，每次送达冷却翻倍（2→4→8…）
+//   delivered ≥ 6 仍零采纳 → 本会话静默该 key
+// fail-open 豁免：constitutional tier 或 priority ≥ 0.8 的条目不受此环约束。
+
+/** 进入冷却翻倍的最低会话内送达次数（零采纳前提） */
+export const EFFICACY_COOLDOWN_DELIVERED = 3
+/** 触发会话内静默的送达次数（零采纳前提） */
+export const EFFICACY_SILENCE_DELIVERED = 6
+/** 冷却初值（渲染周期），此后每次送达翻倍 */
+export const EFFICACY_BASE_COOLDOWN_RENDERS = 2
+
+/** 会话内 per-key 效能计数查询 — 由 AdvisoryReadback 会话统计实现 */
+export interface EfficacyStatsProvider {
+  (key: string): { delivered: number; adopted: number } | null
+}
 
 /** 习惯化查询接口 — 由 AdvisoryReadback 实现（结构化鸭子类型，便于测试） */
 export interface HabituationPolicy {
@@ -342,6 +362,18 @@ export class AdvisoryBus {
   /** 静音期满后的 probation 名单 — 放行一次送达以收集新证据,之后 lift 仍 ≤0 才再静音 */
   private liftProbation = new Set<string>()
   private ledgerLiftMuted = 0
+  // ── W6 CVM 开销节流（通道 B 降级）──
+  private overheadThrottled = false
+  /** 节流态下的隔周期投递开关：true = 本渲染周期跳过非豁免条目 */
+  private overheadSkipNext = false
+  // ── W2 efficacy 负反馈环 ──
+  private efficacyStats: EfficacyStatsProvider | null = null
+  /** 本会话被 efficacy 环静默的 key（delivered ≥ 6 且零采纳） */
+  private efficacySilenced = new Set<string>()
+  /** key → 剩余冷却渲染周期数 */
+  private efficacyCooldownRemaining = new Map<string, number>()
+  /** key → 上次冷却长度（下次送达时翻倍） */
+  private efficacyCooldownLength = new Map<string, number>()
 
   /** P1b：注入习惯化查询源（AdvisoryReadback）。缺省 = 不做习惯化对抗。 */
   setHabituationPolicy(policy: HabituationPolicy): void {
@@ -394,6 +426,26 @@ export class AdvisoryBus {
    *  缺省 = 不消费 lift（不静音,排序回退采纳率）。 */
   setLiftProvider(provider: (key: string) => number | null): void {
     this.liftProvider = provider
+  }
+
+  /** W2：注入会话内 efficacy 计数查询（AdvisoryReadback 会话统计）。
+   *  缺省 = 不做负反馈环（全回退旧行为）。 */
+  setEfficacyStatsProvider(provider: EfficacyStatsProvider): void {
+    this.efficacyStats = provider
+  }
+
+  /** W6 节流次序反转（incident 20b9714e）：CVM 开销越过 5% 阈值时，降级的
+   *  是通道 B（advisory，每条真金白银驻留 token）——非 constitutional、非
+   *  immediate、priority < 0.8 的条目隔个渲染周期送达（等效冷却翻倍）。
+   *  镜面等通道 A 附录块（appendixDelta 字节稳定，稳态近零成本）不受影响。 */
+  setOverheadThrottled(throttled: boolean): void {
+    this.overheadThrottled = throttled
+    if (!throttled) this.overheadSkipNext = false
+  }
+
+  /** 该 key 是否已被本会话 efficacy 环静默 — decision-shift 卡片同步抑制入口。 */
+  isEfficacySilenced(key: string): boolean {
+    return this.efficacySilenced.has(key)
   }
 
   /** 静音中的 key（习惯化 + 负 lift）— cockpit advisory 面板观测口。 */
@@ -489,6 +541,8 @@ export class AdvisoryBus {
    *   被静态 persona 顶掉——静音栈的一环。)
    */
   render(activeStarDomain?: string, turn = 0): string {
+    // T6 正向臂 keys——render 周期内 accumulated，在 effectivePriority 消费后随 render 结束丢弃
+    let positiveArmKeys = new Set<string>()
     // ── Phase 2 状态机:candidate → pending → confirmed/revoked ──
     // A. 先处理既有挂起（新条目在 B 段才入队——观察进度从下个渲染周期起算,
     //    否则 observe.turns=1 会在挂起当轮就被判到期,挂起形同虚设）:
@@ -580,6 +634,95 @@ export class AdvisoryBus {
       }
       this.recordDropped(droppedSilenced)
       all = kept
+    }
+
+    // ── W2 efficacy 负反馈环:发射前回读会话内 delivered/adopted ──
+    // delivered ≥ 3 且零采纳 → 冷却翻倍;delivered ≥ 6 仍零采纳 → 会话内静默。
+    // 与习惯化静音（ignoredStreak,依赖 expect 谓词）互补:无 expect 的 key
+    // （如 convergence 的多数变体）ignored 永远是 0,只有这条环能拦住它。
+    if (this.efficacyStats) {
+      for (const [k, v] of this.efficacyCooldownRemaining) {
+        if (v <= 1) this.efficacyCooldownRemaining.delete(k)
+        else this.efficacyCooldownRemaining.set(k, v - 1)
+      }
+      const droppedByEfficacy = new Set<string>()
+      const kept: AdvisoryEntry[] = []
+      for (const e of all) {
+        // fail-open:constitutional / 高优先级条目永不受负反馈环约束
+        if (e.tier === 'constitutional' || e.priority >= 0.8) {
+          kept.push(e)
+          continue
+        }
+        if (this.efficacySilenced.has(e.key)) {
+          droppedByEfficacy.add(e.key)
+          continue
+        }
+        const stats = this.efficacyStats(e.key)
+        if (!stats || stats.adopted > 0) {
+          kept.push(e)
+          continue
+        }
+        if (stats.delivered >= EFFICACY_SILENCE_DELIVERED) {
+          this.efficacySilenced.add(e.key)
+          droppedByEfficacy.add(e.key)
+          continue
+        }
+        if (stats.delivered >= EFFICACY_COOLDOWN_DELIVERED) {
+          if (this.efficacyCooldownRemaining.has(e.key)) {
+            droppedByEfficacy.add(e.key)
+            continue
+          }
+          // 放行本次送达,并把下次冷却翻倍（2→4→8…）
+          const next = (this.efficacyCooldownLength.get(e.key) ?? EFFICACY_BASE_COOLDOWN_RENDERS / 2) * 2
+          this.efficacyCooldownLength.set(e.key, next)
+          this.efficacyCooldownRemaining.set(e.key, next)
+        }
+        kept.push(e)
+      }
+      this.recordDropped(droppedByEfficacy)
+      all = kept
+
+      // ── T6 efficacy 正向臂：累计采纳 ≥3 → 冷却减半，有效 priority 排序加成 ──
+      // 负向臂让"说了没人听"的 key 退场，正向臂让"说了有人听"的 key 加速送达。
+      // 设计写"连续采纳 ≥3"，当前实现为累计 adopted ≥3（readback 无 adoptedStreak）。
+      // 累积口径 + 不 mutation + cap 0.79 三道防线确保不击穿豁免线。
+      // 注意：不 mutation e.priority——alive 跨渲染周期持有同一批引用，
+      // 原地 +=0.05 会复合累加，且 0.85 越 0.8 fail-open 豁免线导致永久逃逸负向臂。
+      // 有效 priority 仅在 render 周期内用于排序比较，不写入条目对象。
+      positiveArmKeys = new Set<string>()
+      for (const e of all) {
+        const stats = this.efficacyStats(e.key)
+        if (!stats || stats.adopted < 3) continue
+        positiveArmKeys.add(e.key)
+        // 冷却减半（作用于下次 cooldown，安全——修改的是 Map 不是条目对象）
+        const currentLen = this.efficacyCooldownLength.get(e.key)
+        if (currentLen && currentLen > 1) {
+          this.efficacyCooldownLength.set(e.key, Math.max(1, Math.floor(currentLen / 2)))
+        }
+      }
+    }
+
+    // ── W6 CVM 开销节流:通道 B 隔周期送达（等效冷却翻倍）──
+    // 5% 阈值下先降级 advisory（每条都是终身驻留 token），最后才轮到
+    // toolContext（8% 硬顶）；镜面任何档位不熄。fail-open 豁免与 efficacy
+    // 环同口径：constitutional / immediate / priority ≥ 0.8。
+    if (this.overheadThrottled) {
+      if (this.overheadSkipNext) {
+        this.overheadSkipNext = false
+        const droppedByOverhead = new Set<string>()
+        const kept: AdvisoryEntry[] = []
+        for (const e of all) {
+          if (e.tier === 'constitutional' || e.immediate === true || e.priority >= 0.8) {
+            kept.push(e)
+            continue
+          }
+          droppedByOverhead.add(e.key)
+        }
+        this.recordDropped(droppedByOverhead)
+        all = kept
+      } else {
+        this.overheadSkipNext = true
+      }
     }
 
     // ── Lift 消费端:负 lift 自动静音（"没提醒也会做"= 纯噪音）──
@@ -710,8 +853,16 @@ export class AdvisoryBus {
       if (lift !== undefined && lift !== null) return (lift + 1) / 2
       return this.adoptionRateProvider?.(key) ?? 0.5
     }
+    const effectivePriority = (e: AdvisoryEntry): number => {
+      if (positiveArmKeys.has(e.key)) {
+        return Math.max(e.priority, Math.min(0.79, e.priority + 0.05)) // 单调不减，cap 不越 0.8 豁免线
+      }
+      return e.priority
+    }
     const compareEntries = (a: AdvisoryEntry, b: AdvisoryEntry): number => {
-      if (b.priority !== a.priority) return b.priority - a.priority
+      const pa = effectivePriority(a)
+      const pb = effectivePriority(b)
+      if (pb !== pa) return pb - pa
       if (!this.adoptionRateProvider && !this.liftProvider) return 0
       return secondaryScore(b.key) - secondaryScore(a.key)
     }
@@ -795,9 +946,10 @@ export class AdvisoryBus {
       return ''
     }
 
-    const lines = sorted.map(e =>
-      `  <entry key="${escapeXml(e.key)}" priority="${e.priority.toFixed(2)}" category="${e.category}">${escapeXml(this.applyTone(e))}</entry>`
-    )
+    const lines = sorted.map(e => {
+      const ep = effectivePriority(e)
+      return `  <entry key="${escapeXml(e.key)}" priority="${ep.toFixed(2)}" category="${e.category}">${escapeXml(this.applyTone(e))}</entry>`
+    })
 
     // TTL 递减：TTL > 1 的条目保留到 alive，下轮继续
     this.alive = sorted
@@ -829,6 +981,9 @@ export class AdvisoryBus {
     this.liftMuteRemaining.clear()
     this.liftProbation.clear()
     this.ledgerLiftMuted = 0
+    this.efficacySilenced.clear()
+    this.efficacyCooldownRemaining.clear()
+    this.efficacyCooldownLength.clear()
   }
 }
 

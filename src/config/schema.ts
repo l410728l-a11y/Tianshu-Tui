@@ -233,6 +233,12 @@ export const agentSchema = z.object({
   autoReasoning: z.boolean().default(true),
   /** 默认星域（auto | tianshu | pojun ...）。新会话的初始星域将由此配置项决定。 */
   defaultDomain: z.string().default('auto'),
+  /**
+   * 重启后一键续跑的兜底模型（可选）。续跑严格沿用会话原模型（前缀缓存亲和）；
+   * 仅当原模型不可用且此项配置了可用模型时才切换续跑（UI 明示缓存将重建）。
+   * 未配置时 fail-closed：不自动续跑，引导开新会话。绝不静默回退默认模型。
+   */
+  resumeFallbackModel: z.string().optional(),
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. */
   songlineEnabled: z.boolean().default(false),
   /** Enable cross-session knowledge loading (memory block, playbook, companion presence).
@@ -480,6 +486,12 @@ export const envSchema = z.object({
    *  falls back to the normal probe chain (where git → common dirs → bundled
    *  PortableGit). */
   gitBashPath: z.string().optional(),
+  /** Absolute path to a custom `git.exe` (Windows) or `git` binary (macOS/Linux).
+   *  When set, it seeds `RIVET_GIT_PATH` at startup so the environment probe
+   *  (`/environment`) uses it directly instead of searching PATH. A real OS env
+   *  var of the same name always wins (explicit override). Empty/unset falls
+   *  back to the normal probe chain (PATH → common install dirs → bundled git). */
+  gitPath: z.string().optional(),
 }).default({})
 
 export const uiSchema = z.object({
@@ -541,6 +553,13 @@ export const proSchema = z.object({
   features: z.object({
     computerUse: z.boolean().default(true),
     chatGateway: z.boolean().default(true),
+    /** team_orchestrate mode:'max'（多视角 planner fanout）。 */
+    teamMax: z.boolean().default(true),
+    /** council_convene rounds≥2（反驳/辩论轮）。 */
+    councilMultiRound: z.boolean().default(true),
+    /** 无人值守自动化（付费版 v1 · T2）：非 always-review 审查策略 +
+     *  含 computer_use 的定时任务。 */
+    unattendedAutomation: z.boolean().default(true),
   }).default({}),
 }).default({})
 

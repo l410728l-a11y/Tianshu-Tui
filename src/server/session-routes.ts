@@ -49,6 +49,8 @@ import { sessionsDir } from '../config/paths.js'
 import { verifyAndExtract } from '../agent/checksum.js'
 import type { HookEntry, HookEvent, HooksConfig } from '../hooks/user-hooks-runner.js'
 import { loadHooksConfig, VALID_EVENTS } from '../hooks/user-hooks-runner.js'
+import { buildDistillPrompt } from '../prompt/rpa-distill.js'
+import { isProFeatureEnabled } from '../config/pro-license.js'
 
 export type ArtifactKind = 'plan' | 'task-list' | 'walkthrough' | 'diff' | 'screenshot' | 'test-result' | 'markdown' | 'html'
 
@@ -209,6 +211,36 @@ export function buildSessionRoutes(
         isolatedWorktree: data.isolatedWorktree === true,
       })
       return { status: 201, body: rec }
+    }, apiToken),
+
+    // RPA 录制蒸馏 — 桌面端把录制 JSONL 交来，组装蒸馏 prompt 并开一次性
+    // agent 会话，产出语义工作流文档（写到 session cwd 下的 workflowPath）。
+    // Pro 门禁归入 computerUse（录制回放本质依赖 computer_use）。
+    'POST /recordings/distill': withAuth((body) => {
+      const data = (body ?? {}) as { recordingId?: string; jsonl?: string; cwd?: string }
+      if (!data.recordingId || typeof data.recordingId !== 'string') {
+        return { status: 400, body: { error: 'Missing "recordingId"' } }
+      }
+      if (!data.jsonl || typeof data.jsonl !== 'string') {
+        return { status: 400, body: { error: 'Missing "jsonl"' } }
+      }
+      if (config && !isProFeatureEnabled(config, 'computerUse')) {
+        return { status: 403, body: { error: 'pro_required', feature: 'computerUse' } }
+      }
+      // recordingId 进入文件路径，先约束成安全 slug（防路径注入）。
+      const safeId = data.recordingId.replace(/[^a-zA-Z0-9_-]/g, '')
+      if (!safeId) return { status: 400, body: { error: 'Invalid "recordingId"' } }
+      const workflowPath = `.rivet/recordings/${safeId}.workflow.md`
+      const built = buildDistillPrompt({ recordingId: safeId, jsonl: data.jsonl, workflowPath })
+      if (!built.ok) {
+        return { status: 400, body: { error: built.error } }
+      }
+      const rec = manager.createSession({
+        cwd: data.cwd,
+        title: `蒸馏录制 · ${built.apps.join('/') || safeId}`,
+        prompt: built.prompt,
+      })
+      return { status: 201, body: { session: rec, workflowPath, eventCount: built.eventCount, apps: built.apps } }
     }, apiToken),
 
     // S — switch a session's autonomy level (监督 / 默认 / 自治). Live-mutates a
@@ -572,6 +604,18 @@ export function buildSessionRoutes(
       return { status: 200, body: manager.getSession(params!.id!) }
     }, apiToken),
 
+    // Phase 3 可靠性 — 一键续跑（resume_offer 卡片的服务端入口）。
+    // 缓存亲和 fail-closed：原模型不可用且未配置 agent.resumeFallbackModel 时
+    // 返回 409/model_unavailable，UI 降级为「开新会话」入口——绝不静默换默认模型。
+    'POST /sessions/:id/resume': withAuth((_body, params) => {
+      const result = manager.resumeRun(params!.id!)
+      if (!result.ok) {
+        const status = result.code === 'not_found' ? 404 : 409
+        return { status, body: { error: result.error, code: result.code } }
+      }
+      return { status: 200, body: { resumed: true, model: result.model, switched: result.switched } }
+    }, apiToken),
+
     // T3 — mid-run steering. Queues user guidance into a RUNNING session's steer
     // buffer; injected at the next tool boundary (no new turn). Idle → 409 so the
     // desktop knows to use /prompt instead. Bearer-gated.
@@ -594,9 +638,11 @@ export function buildSessionRoutes(
       return { status: 200, body: { aborted: true } }
     }, apiToken),
 
-    'GET /sessions/:id/events': withAuth((_body, params) => {
+    'GET /sessions/:id/events': withAuth(async (_body, params) => {
       const since = Number(params?.since ?? 0) || 0
-      const result = manager.getEvents(params!.id!, since)
+      // Async replay: first open of a lazily-rehydrated session reads the log
+      // off the main thread instead of stalling every other request on it.
+      const result = await manager.getEventsAsync(params!.id!, since)
       if (!result) return { status: 404, body: { error: 'Session not found' } }
       return { status: 200, body: result }
     }, apiToken),
@@ -890,24 +936,62 @@ export function buildSessionRoutes(
       return { status: 200, body: { path: relPath, entries } }
     }, apiToken),
 
-    'GET /sessions/:id/stream': withAuth((_body, params, _headers, res) => {
+    'GET /sessions/:id/stream': withAuth(async (_body, params, _headers, res) => {
       if (!res) return { status: 500, body: { error: 'SSE response stream is unavailable' } }
       const id = params!.id!
       const since = Number(params?.since ?? 0) || 0
-      const existing = manager.getEvents(id, since)
+      // Reconnect replay is the hot path for large logs — load it without
+      // blocking the loop (async read + off-thread parse), so concurrent
+      // streams keep their keepalives during someone else's big replay.
+      const existing = await manager.getEventsAsync(id, since)
       if (!existing) return { status: 404, body: { error: 'Session not found' } }
 
-      const sse = new SseStream(res)
-      for (const ev of existing.events) sse.send(ev.type, ev)
-      const unsubscribe = manager.subscribe(id, (ev) => sse.send(ev.type, ev))
+      // Tear down BOTH on peer death (write throws → onDead) and on the normal
+      // response 'close'. Without the onDead path a half-dead socket kept the
+      // subscription + keepalive alive: every append still fanned out to a
+      // stream that silently dropped it (viewer showed "live" with no events).
+      let unsubscribe: (() => void) | undefined
+      let keepalive: ReturnType<typeof setInterval> | undefined
+      const cleanup = () => {
+        if (keepalive) clearInterval(keepalive)
+        keepalive = undefined
+        unsubscribe?.()
+        unsubscribe = undefined
+      }
+      const sse = new SseStream(res, cleanup)
+      // Batch the replay: yield every REPLAY_BATCH events so a large reconnect
+      // (thousands of events) doesn't block the event loop — concurrent streams
+      // keep their keepalives and health pings get through. cork/uncork within
+      // each batch coalesces writes into one TCP segment.
+      const REPLAY_BATCH = 200
+      const canCork = typeof res.cork === 'function'
+      for (let i = 0; i < existing.events.length; i += REPLAY_BATCH) {
+        const end = Math.min(i + REPLAY_BATCH, existing.events.length)
+        if (canCork) res.cork()
+        for (let j = i; j < end; j++) sse.send(existing.events[j]!.type, existing.events[j]!)
+        if (canCork) res.uncork()
+        if (end < existing.events.length) await new Promise<void>((r) => setImmediate(r))
+      }
+      unsubscribe = manager.subscribe(id, (ev) => sse.send(ev.type, ev))
+      // The async replay above yields the loop, so events may have been
+      // appended between the snapshot and the subscribe — back-fill them now.
+      // This block is synchronous after subscribe, so no duplicates: listener
+      // fan-out can only happen on later ticks.
+      const gap = manager.getEvents(id, existing.lastSeq)
+      if (gap) for (const ev of gap.events) sse.send(ev.type, ev)
+      // A dead peer during the replay above means the subscription was created
+      // after onDead already fired — close it out now instead of leaking it.
+      if (sse.isClosed()) {
+        cleanup()
+        return { status: 200, handled: true }
+      }
       // Keepalive: a 30s comment heartbeat stops idle proxies from reaping the
       // connection and detects a half-dead socket (write throws → sse closes).
       // unref so the timer never keeps the process (or a test) alive on its own.
-      const keepalive = setInterval(() => sse.ping(), 30_000)
+      keepalive = setInterval(() => sse.ping(), 30_000)
       if (typeof keepalive.unref === 'function') keepalive.unref()
       res.on('close', () => {
-        clearInterval(keepalive)
-        unsubscribe?.()
+        cleanup()
         sse.close()
       })
       return { status: 200, handled: true }

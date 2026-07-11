@@ -3,9 +3,11 @@ import { basename, join, resolve, extname } from 'path'
 import { execFile } from 'child_process'
 import { existsSync } from 'fs'
 import type { Tool, ToolCallParams } from './types.js'
+import type { ArtifactStore } from '../artifact/store.js'
 import { expandHome } from '../platform.js'
 import { relativePosix } from '../path-format.js'
 import { httpFetchGuarded } from './net/http-fetch.js'
+import { extractDocumentText, isExtractableDocument, EXTRACTION_CAVEAT } from './doc-extract.js'
 
 const IMPORT_DIR = '.rivet/external'
 const PREVIEW_BYTES = 4000
@@ -47,6 +49,19 @@ export function parseGitHubUrl(url: string): { owner: string; repo: string; subp
   return { owner, repo, ref: ref ?? undefined, subpath: subpath || undefined }
 }
 
+/** Validate a git ref (branch/tag/commit) supplied by the model/URL before it
+ *  reaches `git clone --branch` / `git checkout`. The refs are passed as
+ *  `execFile` args (no shell), so the real risk is git *option injection*: a
+ *  ref like `--upload-pack=…` would be parsed as an option. Reject anything
+ *  starting with `-`, plus whitespace/control and the characters git itself
+ *  forbids in ref names (`~^:?*[\`). Returns true when the ref is safe. */
+export function isSafeGitRef(ref: string): boolean {
+  if (ref.length === 0 || ref.length > 255) return false
+  if (ref.startsWith('-')) return false
+  if (/[\s\x00-\x1f\x7f~^:?*[\\]/.test(ref)) return false
+  return true
+}
+
 async function ensureImportDir(cwd: string): Promise<string> {
   const dir = join(cwd, IMPORT_DIR)
   await mkdir(dir, { recursive: true })
@@ -73,6 +88,7 @@ async function buildResult(
   localPath: string,
   cwd: string,
   stats: { type: 'file' | 'directory'; size?: number; files?: number },
+  artifactStore?: ArtifactStore,
 ): Promise<{ content: string; uiContent: string }> {
   const relPath = relativePosix(cwd, localPath)
   let header = `Imported: ${source}\nLocal: ${relPath}\nType: ${stats.type}`
@@ -87,6 +103,34 @@ async function buildResult(
         ? `\n\n── Preview (first ${PREVIEW_BYTES} chars) ──\n${content.slice(0, PREVIEW_BYTES)}\n... (${content.length} total chars)`
         : `\n\n── Content ──\n${content}`
     } catch { /* binary / unreadable */ }
+  } else if (stats.type === 'file' && isExtractableDocument(localPath)) {
+    // Binary office document (PDF/DOCX/PPTX/…) — extract text via system
+    // toolchains so the content is usable as context, not just a blob on disk.
+    // Fail-open: extraction failure keeps the import and surfaces install advice.
+    const extraction = await extractDocumentText(localPath)
+    if (extraction.ok) {
+      const marked = `${EXTRACTION_CAVEAT}\n\n${extraction.text}`
+      let artifactNote = ''
+      if (artifactStore) {
+        try {
+          const artifactId = await artifactStore.save({
+            tool: 'import_resource',
+            target: source,
+            rawContent: marked,
+            summary: `Extracted text (${extraction.engine}) from ${basename(localPath)} — ${extraction.text.length} chars`,
+            sections: [],
+          })
+          artifactNote = `\nFull extracted text: read_section(artifactId="${artifactId}")\n[artifact:${artifactId}]`
+        } catch { /* artifact persistence is best-effort */ }
+      }
+      const truncated = extraction.text.length > PREVIEW_BYTES
+      const body = truncated
+        ? `${extraction.text.slice(0, PREVIEW_BYTES)}\n... (${extraction.text.length} total chars)`
+        : extraction.text
+      preview = `\n\n── Extracted text (engine: ${extraction.engine}) ──\n${EXTRACTION_CAVEAT}\n${body}${artifactNote}`
+    } else {
+      preview = `\n\n(Binary document imported. ${extraction.suggestion})`
+    }
   } else if (stats.type === 'file' && isImageFile(localPath)) {
     preview = '\n\n(Image file — imported but not viewable as text. Use file_info for metadata.)'
   }
@@ -135,9 +179,9 @@ export const IMPORT_RESOURCE_TOOL: Tool = {
     const gh = parseGitHubUrl(rawSource)
     if (gh) return await handleGitHubImport(params.cwd, importDir, gh, params.input.ref as string | undefined)
 
-    if (/^https?:\/\//i.test(rawSource)) return await handleUrlImport(params.cwd, importDir, rawSource)
+    if (/^https?:\/\//i.test(rawSource)) return await handleUrlImport(params.cwd, importDir, rawSource, params.artifactStore)
 
-    return handleLocalImport(params.cwd, importDir, rawSource)
+    return handleLocalImport(params.cwd, importDir, rawSource, params.artifactStore)
   },
 
   requiresApproval: () => true,
@@ -145,7 +189,7 @@ export const IMPORT_RESOURCE_TOOL: Tool = {
   isEnabled: () => true,
 }
 
-async function handleLocalImport(cwd: string, importDir: string, source: string): Promise<{ content: string; uiContent: string; isError?: boolean }> {
+async function handleLocalImport(cwd: string, importDir: string, source: string, artifactStore?: ArtifactStore): Promise<{ content: string; uiContent: string; isError?: boolean }> {
   const expanded = expandHome(source)
   const resolved = resolve(expanded)
 
@@ -173,7 +217,7 @@ async function handleLocalImport(cwd: string, importDir: string, source: string)
     await cp(resolved, targetPath, { force: true })
   }
 
-  return await buildResult(source, targetPath, cwd, { type: 'file', size: (await stat(resolved)).size })
+  return await buildResult(source, targetPath, cwd, { type: 'file', size: (await stat(resolved)).size }, artifactStore)
 }
 
 async function handleGitHubImport(
@@ -183,6 +227,13 @@ async function handleGitHubImport(
   explicitRef?: string,
 ): Promise<{ content: string; uiContent: string; isError?: boolean }> {
   const ref = explicitRef ?? gh.ref
+  if (ref !== undefined && !isSafeGitRef(ref)) {
+    return {
+      content: `Error: invalid git ref "${ref}". A branch/tag/commit must not start with "-" or contain whitespace/control characters.`,
+      isError: true,
+      uiContent: `Invalid ref: ${ref}`,
+    }
+  }
   const repoUrl = `https://github.com/${gh.owner}/${gh.repo}.git`
   const targetName = importTargetName(`${gh.owner}/${gh.repo}`)
   const targetPath = join(importDir, targetName)
@@ -197,18 +248,25 @@ async function handleGitHubImport(
   } else {
     try { await rm(targetPath, { recursive: true, force: true }) } catch { /* not existing is fine */ }
     try {
+      // `--` terminates option parsing before the positional repo/target args.
       const args = ['clone', '--depth', '1']
       if (ref) args.push('--branch', ref)
-      args.push(repoUrl, targetPath)
+      args.push('--', repoUrl, targetPath)
       await execAsync('git', args, { timeout: 120_000 })
     } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code
+      if (code === 'ENOENT') {
+        return { content: `Error: git is not installed or not on PATH — cannot clone ${repoUrl}. Install git and retry.`, isError: true, uiContent: `git not found` }
+      }
       const msg = err instanceof Error ? err.message : String(err)
       return { content: `Error cloning ${repoUrl}: ${msg}`, isError: true, uiContent: `Clone failed: ${gh.owner}/${gh.repo}` }
     }
   }
 
   if (ref && existsSync(join(targetPath, '.git'))) {
-    try { await execAsync('git', ['checkout', ref], { cwd: targetPath, timeout: 10_000 }) } catch { /* shallow */ }
+    // ref is validated (no leading `-`); trailing `--` disambiguates it from any
+    // pathspec so git treats it strictly as a revision.
+    try { await execAsync('git', ['checkout', ref, '--'], { cwd: targetPath, timeout: 10_000 }) } catch { /* shallow */ }
   }
 
   const effectivePath = gh.subpath ? join(targetPath, gh.subpath) : targetPath
@@ -229,7 +287,7 @@ async function handleGitHubImport(
   )
 }
 
-async function handleUrlImport(cwd: string, importDir: string, url: string): Promise<{ content: string; uiContent: string; isError?: boolean }> {
+async function handleUrlImport(cwd: string, importDir: string, url: string, artifactStore?: ArtifactStore): Promise<{ content: string; uiContent: string; isError?: boolean }> {
   let filename: string
   try {
     const parsed = new URL(url)
@@ -263,7 +321,7 @@ async function handleUrlImport(cwd: string, importDir: string, url: string): Pro
     return { content: `Error: download produced empty file from ${url}`, isError: true, uiContent: `Empty download: ${url}` }
   }
 
-  return await buildResult(url, targetPath, cwd, { type: 'file', size: s.size })
+  return await buildResult(url, targetPath, cwd, { type: 'file', size: s.size }, artifactStore)
 }
 
 async function countFiles(dir: string, maxDepth: number): Promise<number> {

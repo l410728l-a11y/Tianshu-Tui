@@ -19,11 +19,13 @@ import { activityProgressLine } from '../tools/worker-activity-stream.js'
 import { FileSessionPersistence } from './session-persistence.js'
 import { buildSessionRoutes } from './session-routes.js'
 import { buildHealthRoute } from './health-route.js'
+import { LoopHealthMonitor } from './loop-health.js'
 import { buildScheduleRoutes } from './schedule-routes.js'
 import { buildTaskRoutes } from './task-routes.js'
 import { buildConfigRoutes } from './config-routes.js'
 import { buildEnvRoute } from './env-route.js'
 import { buildProjectTemplatesRoutes } from './project-templates-routes.js'
+import { buildProjectDocsRoutes } from './project-docs-routes.js'
 import { CronScheduler } from './cron-scheduler.js'
 import { CronWiring } from './cron-wiring.js'
 import { buildMcpRoutes } from './mcp-api.js'
@@ -34,6 +36,7 @@ import { TaskRegistry } from './task-registry.js'
 import { JsonTaskStore } from './task-store.js'
 import { SessionRuntimePool } from './session-runtime-pool.js'
 import { loadConfig } from '../config/manager.js'
+import { isProFeatureEnabled } from '../config/pro-license.js'
 import { setTargetConventions, applyConfiguredGitBashPath } from '../platform.js'
 import { resolveApiKey } from '../api/factory.js'
 import type { OaiMessage } from '../api/oai-types.js'
@@ -711,9 +714,20 @@ function buildManagedAgent(
   approvalMode: ApprovalMode | undefined,
   shared?: SharedRuntime,
   reload?: () => ServeContext,
+  preferredModelId?: string,
 ): import('./session-manager.js').ManagedAgent {
   const stores = buildSessionStores(ctx, cwd, sessionId, registry, shared)
-  let spec: ResolvedModelSpec = resolveInitialSpec(ctx, reload)
+  // Model affinity: a rehydrated session carries the model its prefix cache
+  // was built on (record.model → preferredModelId). Build directly on it so a
+  // resumed conversation never silently lands on the default model. Falls back
+  // to the default only when the preferred id no longer resolves — resumeRun()
+  // gates that case fail-closed before it ever reaches a run.
+  let spec: ResolvedModelSpec =
+    (preferredModelId
+      ? reload
+        ? resolveModelSpecWithReload(ctx, preferredModelId, reload)
+        : resolveModelSpecWithReload(ctx, preferredModelId)
+      : null) ?? resolveInitialSpec(ctx, reload)
   let agent = assembleAgentLoop(ctx, cwd, sessionId, stores, spec, approvalMode, registry, shared)
   // Rebuild the loop on a new spec, preserving conversation + stores. Shared
   // by switchModel and the run pre-flight self-heal below.
@@ -1136,8 +1150,8 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
   // manager's session id is threaded into buildAgentLoop so the agent's stores
   // align with the session.
   const sessions = new RuntimeSessionManager({
-    createAgent: (cwd, sessionId, approvalMode) =>
-      buildManagedAgent(ctx, cwd ?? process.cwd(), sessionId ?? randomUUID(), sessionRegistry, approvalMode, sharedRuntime, specReload),
+    createAgent: (cwd, sessionId, approvalMode, modelId) =>
+      buildManagedAgent(ctx, cwd ?? process.cwd(), sessionId ?? randomUUID(), sessionRegistry, approvalMode, sharedRuntime, specReload, modelId),
     defaultCwd: process.cwd(),
     persistence,
     // R1 — late-bound getter: registry resolves async after server start.
@@ -1147,6 +1161,9 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
     listModels: () => listAllModelsWithReload(ctx),
     defaultModelId: ctx.model.id,
     defaultDomain: ctx.config.agent?.defaultDomain,
+    // 一键续跑兜底模型（可选，用户显式配置）。未配置时原模型不可用的续跑
+    // fail-closed —— 绝不静默回退默认模型（跨模型续跑会重建整条前缀缓存）。
+    resumeFallbackModel: ctx.config.agent?.resumeFallbackModel,
   })
 
   // Wave F: sessions 现已就绪——把真实 sameCwdRunningCount 回写到 SharedRuntime。
@@ -1217,6 +1234,9 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
   // Project templates route: first-run AGENTS.md / .rivet.md bootstrap for desktop UI.
   Object.assign(routes, buildProjectTemplatesRoutes(apiToken))
 
+  // Project docs route: read/write AGENTS.md / .rivet.md for the desktop settings UI.
+  Object.assign(routes, buildProjectDocsRoutes(apiToken))
+
   // MCP routes: server management + live status for the desktop MCP settings UI.
   Object.assign(routes, buildMcpRoutes(() => sharedRuntime.mcpManager, apiToken))
 
@@ -1262,6 +1282,10 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
 
   // N1: GET /health — sidecar liveness for the desktop crash-reconnect banner.
   const version = process.env.npm_package_version ?? '2.9.0'
+  // Event-loop lag telemetry: lets the desktop label a starved loop as
+  // "service busy" instead of a phantom "connection interrupted".
+  const loopHealth = new LoopHealthMonitor()
+  loopHealth.start()
   // registryOk lets the desktop tell "sidecar up but concurrency dormant" apart
   // from a healthy sidecar. In ephemeral/test mode (no registry wired) it reads
   // true so existing single-session behavior is unchanged.
@@ -1270,6 +1294,7 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
     buildHealthRoute(sessions, startedAt, version, apiToken, () =>
       opts.ephemeral ? true : sessionRegistry !== undefined,
     () => resolveServeContext().configured,
+    () => loopHealth.snapshot(),
     ),
   )
 
@@ -1291,7 +1316,13 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
     const lock = new CronLock({ lockPath: join(rivetDir, 'scheduled_tasks.lock') })
     wiring = new CronWiring({ scheduler, registry, runtimePool, lock })
     void wiring.start().catch(() => { /* non-fatal: scheduler stays idle */ })
-    Object.assign(routes, buildScheduleRoutes(scheduler, apiToken, () => wiring?.getStatus()))
+    Object.assign(routes, buildScheduleRoutes(scheduler, apiToken, {
+      getStatus: () => wiring?.getStatus(),
+      // 付费版 v1 · T5 — 非 always-review / 含 computer_use 的定时任务归 Pro。
+      // 用启动时的 ctx.config：Pro 状态经 RIVET_PRO 注入，激活后本就要求重启 sidecar。
+      isUnattendedAutomationEnabled: () =>
+        isProFeatureEnabled(ctx.config, 'unattendedAutomation'),
+    }))
     // Task audit/history API (execution records for the automations dashboard).
     // The scheduler + task-registry share this desktop dir, so events land in
     // .rivet/tasks/events alongside the task records.
@@ -1325,6 +1356,7 @@ export function runServe(opts: RunServeOptions = {}): RunningServer {
       sharedRuntime.mcpManager?.killChildrenSync()
       // Wave G: 释放 per-cwd 共享 Meridian/LSP 资源。
       disposeSharedCwdResources(sharedRuntime)
+      loopHealth.stop()
       server.close()
     },
   }

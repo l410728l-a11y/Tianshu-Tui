@@ -19,7 +19,7 @@
  * @task B1-8
  */
 
-import { readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join, isAbsolute } from 'node:path'
 import type { Tool, ToolCallParams, ToolResult } from '../tools/types.js'
@@ -46,6 +46,7 @@ import { auditDeliveryClaims, claimAuditEnabled } from './claim-audit.js'
 import { scanFilesForProbes, formatProbeHits, type ProbeHit } from './probe-detector.js'
 import { findApprovedPlanInventory, verifyRegressionInventory, formatInventoryReport, type InventorySearcher } from './regression-inventory.js'
 import { enqueuePostCommitReviewOutcome } from './post-commit-review-queue.js'
+import { isUiFilePath, isVisualVerifyTool } from './hooks/render-verify-hook.js'
 
 export interface B1Context {
   taskLedger: TaskLedger
@@ -110,6 +111,9 @@ export interface B1Context {
   getTaskContract?: () => import('../context/task-contract.js').TaskContract | undefined
   /** 层3 测试钩子：注入清单锚点搜索器（默认 git grep -F）。 */
   inventorySearcher?: InventorySearcher
+  /** W1 回归防线: Meridian blast-radius tests (EvidenceTracker.impactedTests).
+   *  Absent → coverage check disabled (unchanged behavior). */
+  getImpactedTests?: () => string[]
 }
 
 // ── Post-commit review batching ──
@@ -221,6 +225,27 @@ export function collectCurrentDirtyFiles(cwd: string): string[] | undefined {
   return [...files].sort()
 }
 
+/**
+ * W5 (render-verify): check whether the delivery includes UI file changes
+ * without any visual verification action (browser/computer_use/browser_debug).
+ * Returns a warning line, or null if no issue.
+ */
+export function detectMissingVisualVerify(
+  ownedFiles: readonly string[],
+  getEvents?: () => ReadonlyArray<import('./task-ledger.js').TaskLedgerEvent>,
+): string | null {
+  const uiFiles = ownedFiles.filter(f => isUiFilePath(f))
+  if (uiFiles.length === 0) return null
+
+  const events = getEvents?.() ?? []
+  const hasVisualVerify = events.some(
+    e => e.type === 'tool_exec' && e.tool && isVisualVerifyTool(e.tool),
+  )
+  if (hasVisualVerify) return null
+
+  return `⚠️ 渲染未验证：UI 文件已修改（${uiFiles.slice(0, 2).join(', ')}${uiFiles.length > 2 ? ' 等' : ''}），但未见 browser/computer_use 截图验证。交付前请检查渲染结果。`
+}
+
 export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) => B1Context): Tool {
   return {
     definition: {
@@ -294,7 +319,16 @@ For complex specs or cross-module integration, include checklist entries: fact-f
       ctx.ownership.autoOwnFromLedger()
       const currentDirtyFiles = ctx.getCurrentDirtyFiles?.(params.cwd) ?? collectCurrentDirtyFiles(params.cwd)
       if (currentDirtyFiles) ctx.ownership.autoOwnFromBaseline(currentDirtyFiles)
-      const report = ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.())
+      // W1 回归防线: feed Meridian blast radius into the gate. existsSync filters
+      // deleted/renamed tests (static-analysis false positives) into "uncoverable".
+      const impactedTests = ctx.getImpactedTests?.() ?? []
+      const moduleCoverage = impactedTests.length > 0
+        ? {
+            impactedTests,
+            testExists: (p: string) => existsSync(isAbsolute(p) ? p : join(params.cwd, p)),
+          }
+        : undefined
+      const report = ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.(), moduleCoverage)
 
       // C-fix (session 803d897d): cap file lists and filter external noise.
       // 67 untracked .test-tmp files used to drown the GREEN/YELLOW signal.
@@ -346,6 +380,15 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           lines.push('', `⚠️ 零测试交付：${presence.detail}`)
           lines.push('  交付报告中不要宣称"已验证"——这批源文件没有任何测试背书。')
         }
+      }
+
+      // W5 (render-verify): warn when UI files were changed without visual verification.
+      if (ctx.taskLedger && process.env.RIVET_RENDER_VERIFY !== '0') {
+        const visualWarn = detectMissingVisualVerify(
+          report.ownedFiles,
+          () => ctx.taskLedger.getEvents(),
+        )
+        if (visualWarn) lines.push('', visualWarn)
       }
 
       const hasVerificationDiagnostics = report.currentBlockingFailure
@@ -568,6 +611,27 @@ For complex specs or cross-module integration, include checklist entries: fact-f
             return { content: lines.join('\n'), isError: true }
           }
         }
+        // W1 回归防线: module_unverified 在 assess 层是 YELLOW（可带条件交付），
+        // 但 commit=true 是不可逆落地动作 → 升 RED 硬拦。force=true 是逃生口
+        // （用户确认波及测试为静态分析假阳性时）。
+        if (report.state === 'YELLOW' && report.attributionClass === 'module_unverified') {
+          if (forceGate) {
+            lines.push('', '⚠️  module_unverified overridden (force=true): impacted tests remain unverified.')
+            lines.push('   Confirm the uncovered tests are static-analysis false positives before proceeding.')
+          } else {
+            lines.push('', '❌ Cannot commit: impacted tests were never covered by a passed verification.')
+            lines.push(`  Reason: ${report.attributionSummary}`)
+            const uncovered = report.uncoveredImpactedTests ?? []
+            if (uncovered.length > 0) {
+              lines.push('', '  Uncovered impacted tests:')
+              for (const t of uncovered.slice(0, 10)) lines.push(`    ${t}`)
+              if (uncovered.length > 10) lines.push(`    (+${uncovered.length - 10} more)`)
+            }
+            lines.push('', '  → Run these tests (run_tests with filter) or a full-scope verification, then re-run deliver_task.')
+            lines.push('    If they are unrelated to your change (static-analysis false positive), use force=true.')
+            return { content: lines.join('\n'), isError: true }
+          }
+        }
         if (report.state === 'YELLOW') {
           const stanceHint = detectSymptomPatch(params.cwd)
           if (stanceHint) lines.push('', stanceHint)
@@ -625,7 +689,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         }
 
         const postAdoptionReport = adoptFiles && Array.isArray(adoptFiles) && adoptFiles.length > 0
-          ? ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.())
+          ? ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.(), moduleCoverage)
           : report
         if (postAdoptionReport.state === 'RED') {
           // Mechanical fast-path also applies to the post-adoption gate

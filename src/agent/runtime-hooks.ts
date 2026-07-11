@@ -21,6 +21,11 @@ export interface RuntimeToolEvent {
   /** Tool result content string — enables hooks to inspect output for lossy markers
    *  and other content-level signals without duplicating tool-pipeline logic. */
   resultContent?: string
+  /** Mode-level approximation: true when approvalMode requires interactive
+   *  approval for writes (i.e. not dangerously-skip-permissions). This is NOT
+   *  a per-call audit — allowlist auto-approves and "always allow" also count
+   *  as true. Used by virtue detection (礼) as a v1 heuristic. */
+  approvalRequired?: boolean
 }
 
 export interface RuntimeHookSnapshot {
@@ -45,6 +50,12 @@ export interface RuntimeHookSnapshot {
   touchedTsFiles?: boolean
   /** Component C: a real typecheck has run since the last TS edit. */
   sawTypecheckThisTask?: boolean
+  /** W5 (render-verify): a UI file (.tsx/.jsx/.vue/.svelte/.css/.html) was
+   *  written this session. Task-level, like touchedTsFiles. */
+  touchedUiFiles?: boolean
+  /** W5 (render-verify): a visual verification tool (browser / computer_use /
+   *  browser_debug) was used this session. */
+  sawVisualVerify?: boolean
   /** Reasoning spiral guard: length of last turn's thinking content.
    *  Populated from AgentLoop.lastThinkingContent.length in buildRuntimeSnapshot. */
   lastThinkingLength?: number

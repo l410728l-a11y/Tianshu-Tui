@@ -41,6 +41,10 @@ export interface RuntimeHandle {
     signal: AbortSignal,
     allowedTools?: string[],
     onSessionStart?: (sessionId: string) => void,
+    options?: {
+      /** 无人值守运行：会话内审批请求 fail-closed 中止（付费版 v1 · T2）。 */
+      unattended?: boolean
+    },
   ): Promise<RuntimeResult>
   /** 释放 runtime 回池 */
   release(): void
@@ -152,6 +156,7 @@ export class TaskRegistry {
         attempt: input.attempt ?? 1,
         ...(input.retryOf ? { retryOf: input.retryOf } : {}),
         ...(input.retry ? { retry: input.retry } : {}),
+        ...(input.unattended ? { unattended: true } : {}),
       }
 
       await this.store.save(r)
@@ -181,7 +186,7 @@ export class TaskRegistry {
    * 原子状态转换。
    * 终态不可被低优先级覆盖（cancelled > timed_out > failed > completed）。
    */
-  async transition(id: string, to: TaskStatus, extra?: { error?: string; result?: TaskRecord['result'] }): Promise<TaskRecord | null> {
+  async transition(id: string, to: TaskStatus, extra?: { error?: string; result?: TaskRecord['result']; haltedApp?: string }): Promise<TaskRecord | null> {
     return this.serialized(id, async () => {
       const record = await this.store.load(id)
       if (!record) return null
@@ -198,6 +203,7 @@ export class TaskRegistry {
         ...(to === 'completed' || to === 'failed' || to === 'cancelled' || to === 'timed_out' ? { completedAt: now } : {}),
         ...(extra?.error ? { error: extra.error } : {}),
         ...(extra?.result ? { result: extra.result } : {}),
+        ...(extra?.haltedApp ? { haltedApp: extra.haltedApp } : {}),
       }
 
       await this.store.save(updated)
@@ -253,6 +259,7 @@ export class TaskRegistry {
         allowedTools: record.allowedTools,
         scheduledTaskId: record.scheduledTaskId,
         retry,
+        unattended: record.unattended,
         attempt: nextAttempt,
         retryOf: origin,
         force: true,
@@ -423,20 +430,23 @@ export class TaskRegistry {
         ac.signal,
         record.allowedTools,
         (sessionId) => { void this.attachSessionId(record.id, sessionId) },
+        { unattended: record.unattended === true },
       )
 
       await this.transition(record.id, 'completed', { result })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      // 无人值守中止：缺授权的 app 名结构化落库（修复闭环「补授权 → 重跑」）。
+      const haltedApp = err instanceof Error ? (err as Error & { haltedApp?: string }).haltedApp : undefined
       if (ac.signal.aborted) {
         // 如果是被 abort 的，检查是否已经是 timed_out（超时触发）
         // 如果还不是 → cancelled（手动取消）
         const current = await this.getTask(record.id)
         if (current && current.status !== 'timed_out' && current.status !== 'cancelled') {
-          await this.transition(record.id, 'cancelled', { error: message })
+          await this.transition(record.id, 'cancelled', { error: message, ...(haltedApp ? { haltedApp } : {}) })
         }
       } else {
-        await this.transition(record.id, 'failed', { error: message })
+        await this.transition(record.id, 'failed', { error: message, ...(haltedApp ? { haltedApp } : {}) })
       }
     } finally {
       handle?.release()

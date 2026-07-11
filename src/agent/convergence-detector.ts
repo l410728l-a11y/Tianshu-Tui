@@ -48,6 +48,53 @@ export interface ConvergenceInput {
    *  (before the current evaluation). Used by buildInjectedMessage to add a
    *  progressive "第 N 次提醒" prefix — 0 = first time, no prefix. */
   repeatCount?: number
+  /** Hard progress beacons that override the soft stagnation heuristics
+   *  (novelty/entropy/token-efficiency). A session whose todo list is
+   *  advancing, or that is executing an approved plan, is NOT stuck no
+   *  matter what the trajectory-shape signals say — incident 20b9714e:
+   *  32 convergence advisories (0 adopted) fired on a healthy plan run. */
+  progressBeacons?: {
+    /** Completed-todo count increase over the recent signal window.
+     *  > 0 = the task list is demonstrably advancing → cap score-based
+     *  escalation at L1 (no-tool stagnation levels are unaffected). */
+    todoCompletedDelta: number
+    /** An approved plan file is active (plan execution session). Long
+     *  multi-wave turns are the legitimate shape of this work — widen the
+     *  nLow/nMid/nHigh turn thresholds by 1.5×. */
+    activePlan: boolean
+  }
+  /** W3：会话活动模式（classifyActivityMode 的结果，由调用方传入）。
+   *  diagnostic 时收敛文案分流为"先核实断言再收束"。 */
+  activityMode?: ActivityMode
+}
+
+/** W3（incident 20b9714e）：会话活动模式。diagnostic = 近窗口以只读工具为主
+ *  且零改动（日志排查/根因分析类）。此类会话被催收敛时的正确处方是
+ *  "先核实断言再收束"，而不是"输出结论"——后者直接诱发脑补。 */
+export type ActivityMode = 'diagnostic' | 'build'
+
+/** 诊断态判定窗口（近 N 条工具调用） */
+const ACTIVITY_MODE_WINDOW = 8
+/** 诊断态只读占比门槛 */
+const DIAGNOSTIC_READONLY_RATIO = 0.8
+
+/**
+ * W3：从工具轨迹 + 改动数分类会话活动模式。
+ *
+ * diagnostic 判据：窗口内样本 ≥4、只读（非 PRODUCTIVE_TOOLS）占比 ≥0.8、
+ * filesModified = 0。改动一出现即回到 build——改动即应验证，此时催收敛
+ * 走既有的验证锚点文案，不需要诊断分流。
+ */
+export function classifyActivityMode(
+  recentToolHistory: ReadonlyArray<Pick<ToolHistoryEntry, 'tool'>>,
+  filesModifiedCount: number,
+  window = ACTIVITY_MODE_WINDOW,
+): ActivityMode {
+  if (filesModifiedCount > 0) return 'build'
+  const slice = recentToolHistory.slice(-window)
+  if (slice.length < 4) return 'build'
+  const readOnly = slice.filter(h => !PRODUCTIVE_TOOLS.has(h.tool)).length
+  return readOnly / slice.length >= DIAGNOSTIC_READONLY_RATIO ? 'diagnostic' : 'build'
 }
 
 export interface ConvergenceResult {
@@ -165,7 +212,7 @@ const PHASE_WEIGHTS: Record<PhaseClass, PhaseWeights> = {
   plan:    { editRatio: 0.10, targetNovelty: 0.18, toolEntropy: 0.15, errorPenalty: 0.18, tokenEfficiency: 0.18, oscillationPenalty: 0.10, textRepetitionPenalty: 0.11 },
   execute: { editRatio: 0.40, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.18, tokenEfficiency: 0.08, oscillationPenalty: 0.06, textRepetitionPenalty: 0.12 },
   verify:  { editRatio: 0.05, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.35, tokenEfficiency: 0.18, oscillationPenalty: 0.12, textRepetitionPenalty: 0.14 },
-  deliver: { editRatio: 0.36, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.20, tokenEfficiency: 0.08, oscillationPenalty: 0.08, textRepetitionPenalty: 0.12 },
+  deliver: { editRatio: 0.05, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.35, tokenEfficiency: 0.24, oscillationPenalty: 0.08, textRepetitionPenalty: 0.12 },
 }
 
 // ─── Signal Computation ─────────────────────────────────────────────
@@ -546,7 +593,7 @@ function computeConvergenceScore(
   // deliberately excluded — its job is running tests/typechecks and reading
   // diagnostics, NOT editing files. Penalizing verify for low editRatio is
   // the primary false-positive source ("verify 阶段 47 轮未收敛").
-  const editExpectedPhases: PhaseClass[] = ['execute', 'deliver']
+  const editExpectedPhases: PhaseClass[] = ['execute']
   let penalty = 1.0
   if (editExpectedPhases.includes(phaseClass) && signals.editRatio < 0.1) {
     // Severity scales with how far below expectation we are
@@ -640,6 +687,7 @@ function buildInjectedMessage(
   noToolTurnCount?: number,
   productiveStagnation?: boolean,
   repeatCount?: number,
+  activityMode?: ActivityMode,
 ): string {
   const lines: string[] = []
 
@@ -661,6 +709,17 @@ function buildInjectedMessage(
   // (so noToolTurnCount stays 0), but never edits/tests/commits. This catches
   // the alternating read→analyze→read→analyze loop.
   if (productiveStagnation) {
+    // W3 诊断态分流（incident 20b9714e）：排查/根因分析会话被催"输出结论"
+    // 直接诱发脑补——正确处方是先核实将写进结论的断言，再收束。
+    if (activityMode === 'diagnostic') {
+      lines.push('**天枢-感知：最近多轮全部是读取/搜索操作。如果信息已足够，请核实后收束。**')
+      lines.push('')
+      lines.push('收束前先做断言核实：')
+      lines.push('- 把你准备写进结论的每条关键断言，用工具核实一遍（ls/grep/read 实际文件、跑实际命令）——不要凭已读片段推断未读内容')
+      lines.push('- 核实不了的断言，在结论里显式标注"未核实"，不要写成事实')
+      lines.push('- 核实完成后输出结论，交给用户判断——不要为了"做点什么"而去改代码')
+      return lines.join('\n')
+    }
     lines.push('**天枢-感知：最近多轮全部是读取/搜索操作，没有任何编辑、测试或提交。**')
     lines.push('')
     lines.push('信息可能已足够，请收敛：')
@@ -734,6 +793,19 @@ function buildInjectedMessage(
     return lines.join('\n')
   }
 
+  // W3 诊断态分流：通用变体的"换个角度/中断探索"对排查会话同样是错误处方
+  // ——把收束动作定义为断言核实，而非改道或强行下结论。
+  if (activityMode === 'diagnostic') {
+    lines.push(level === 2
+      ? '**天璇-感知：排查进度信号偏弱。请核实已有断言后收束，而不是继续铺开新的读取。**'
+      : '**天枢-感知：排查未能在预期轮次内收敛。请立即核实关键断言并输出带证据的结论。**')
+    lines.push('')
+    lines.push('- 把准备写进结论的关键断言用工具核实（ls/grep/read 实际文件），核实完再收束')
+    lines.push('- 没有工具证据支撑的推断必须标注"未核实"，不要写成事实')
+    lines.push('- 会话自身状态（上下文占用/缓存命中/信号台账）可用 session_vitals 工具取证，不要凭感觉描述')
+    return lines.join('\n')
+  }
+
   if (level === 2) {
     lines.push('**天璇-感知：当前任务可能进入低效循环。换个角度看问题。**')
   } else {
@@ -786,7 +858,18 @@ function buildInjectedMessage(
 // ─── Main Entry Point ───────────────────────────────────────────────
 
 export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult {
-  const tier = selectTier(input.contextWindow)
+  let tier = selectTier(input.contextWindow)
+  // Plan-execution sessions legitimately run long turns (multi-wave edits) —
+  // widen the score-based turn thresholds so the detector doesn't treat an
+  // approved plan run like an unstructured exploration spiral.
+  if (input.progressBeacons?.activePlan) {
+    tier = {
+      ...tier,
+      nLow: Math.round(tier.nLow * 1.5),
+      nMid: Math.round(tier.nMid * 1.5),
+      nHigh: Math.round(tier.nHigh * 1.5),
+    }
+  }
   const weights = PHASE_WEIGHTS[input.phaseClass]
   const windowSize = tier.signalWindow
 
@@ -861,7 +944,14 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     : 1.0
   const distanceToLastProductive = distanceSinceLastProductive(input.recentToolHistory)
   const productiveDistanceThreshold = windowSize * 2
-  const productiveStagnation = stagnationWindow.length >= Math.min(windowSize, 4)
+  // Fix (infinity guard): when there has NEVER been a productive tool call in the
+  // entire session, the session simply hasn't had a chance to be productive yet.
+  // Treating Infinity >= threshold as "far from last productive" would flag every
+  // early-session read burst as stagnation — the wrong heuristic for cold starts.
+  // Skip the productiveStagnation check entirely until at least one productive
+  // call has been made (distance is finite).
+  const productiveStagnation = distanceToLastProductive !== Infinity
+    && stagnationWindow.length >= Math.min(windowSize, 4)
     && productiveRatio === 0
     && !producingReport
     && distanceToLastProductive >= productiveDistanceThreshold
@@ -901,6 +991,16 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     level = 0
   }
 
+  // Progress-beacon veto: the todo list advanced within the recent window —
+  // the hardest possible "not stuck" evidence, strictly stronger than the
+  // trajectory-shape heuristics (novelty/entropy/efficiency). Cap score-based
+  // escalation at L1. No-tool stagnation keeps its levels: completing a todo
+  // requires a tool call, so a genuine no-tool spiral cannot carry this beacon
+  // (noToolCount < 2 guard is belt-and-braces for stale deltas).
+  if ((input.progressBeacons?.todoCompletedDelta ?? 0) > 0 && noToolCount < 2 && level > 1) {
+    level = 1
+  }
+
   // Productive-ratio stagnation: if early-exit was bypassed but no other
   // condition set a level, ensure at least level 1 nudge fires.
   if (productiveStagnation && level === 0 && turn >= (isGlm ? 3 : 4)) {
@@ -921,7 +1021,7 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
   const shouldForceSplit = level >= 3 && !noToolForceAbort
   const shouldKick = level >= 2
   const injectedMessage = (level >= 2)
-    ? buildInjectedMessage(level as 2 | 3, score, signals, input.phaseClass, tier, input.evidenceState.deliveryStatus, noToolCount, productiveStagnation, input.repeatCount)
+    ? buildInjectedMessage(level as 2 | 3, score, signals, input.phaseClass, tier, input.evidenceState.deliveryStatus, noToolCount, productiveStagnation, input.repeatCount, input.activityMode)
     : null
 
   return {

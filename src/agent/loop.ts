@@ -4,6 +4,7 @@ import { SessionPersist, getSessionDir } from './session-persist.js'
 import { attachSessionPersistListener } from './session-persist-listener.js'
 import { PrewarmCache } from './prewarm.js'
 import { invalidateSessionReadDedup } from '../tools/read-file.js'
+import { getTodos } from '../tools/todo.js'
 import { gateToolDefinitions, isExtendedTool } from './tool-tiers.js'
 import type { CompactCircuitBreakerState, ContextAnchor } from '../context/types.js'
 import type { ToolErrorClass } from '../tools/types.js'
@@ -13,7 +14,7 @@ import { TurnHarness } from './turn-harness.js'
 import { TrajectoryRecorder } from './trajectory.js'
 import { createTraceStore, type TraceStore } from './trace-store.js'
 import { getDoomLoopLevel, getClassDoomLoopLevel, combineDoomLoopLevels, getDoomLoopThresholds } from './trace-store.js'
-import { evaluateConvergence, PRODUCTIVE_TOOLS } from './convergence-detector.js'
+import { classifyActivityMode, evaluateConvergence, PRODUCTIVE_TOOLS } from './convergence-detector.js'
 import type { PhaseClass, ConvergenceResult } from './convergence-detector.js'
 import { emitStopReason, stopReasonAbortTag, type StopReason } from './stop-reason.js'
 import type { PlanExecutionTrace, StepResult } from './plan-execution-trace.js'
@@ -83,6 +84,7 @@ import { ResourceSensor, type ResourceSensorSnapshot } from './resource-sensor.j
 import { type PlanMethodology, type TaskContract, type TaskDepthLayer } from '../context/task-contract.js'
 import { StigmergyStore } from '../context/stigmergy.js'
 import { createStanceTally } from './stance-tally.js'
+import { createVirtuePendingLedger, type VirtuePendingLedger, computeVirtueCredit } from './virtue-signals.js'
 import { createFailureJournal, type FailureJournal } from './failure-journal.js'
 import type { Pheromone } from '../context/stigmergy.js'
 import type { PrefixFingerprint } from '../prompt/fingerprint.js'
@@ -161,6 +163,10 @@ export class AgentLoop {
   /** Component C: a real typecheck (tsc/typecheck) has run since the last TS edit.
    *  A new TS edit resets this to false so the reminder re-arms. */
   sawTypecheckThisTask = false
+  /** W5 (render-verify): a UI file was written this session. */
+  touchedUiFiles = false
+  /** W5 (render-verify): a visual verification tool was used this session. */
+  sawVisualVerify = false
   prewarm = new PrewarmCache(60_000, 50)
   private _running = false
   /** Idle compaction: after a run settles, a debounced timer fires a turn-0
@@ -254,6 +260,13 @@ export class AgentLoop {
   private lastConvergenceEmitVerifyFailStreak = 0
   /** 上次发射时的收敛 score — 冷却期内 score 显著下降（>0.15）时打破冷却。 */
   private lastConvergenceEmitScore = 1.0
+  /** W1（20b9714e 复盘）：阶段相对轮数基线。phaseClass 变更时重置，收敛文案
+   *  用 turn - phaseStartTurn 而非会话全局轮数——消灭"连续 90 轮未收敛"这类
+   *  会话越长越吓人的假数字。 */
+  private phaseStartTurn = 0
+  private lastConvergencePhaseClass = ''
+  /** 近 10 次收敛检查时的 todo 完成数采样（进度信标数据源，10 = 最大信号窗口）。 */
+  private todoCompletedSamples: number[] = []
   /** 解耦修复：CCR/kick 的让位判据。旧判据 latestConvergenceResult.shouldKick
    *  在卡住期间恒为 true，而发射被 3 轮冷却节流——冷却静默期 CCR 也被整轮压制
    *  （守护链路静音栈的一环）。新判据只在 convergence **真实发射**过 advisory 的
@@ -381,6 +394,11 @@ export class AgentLoop {
   prevAnchorGraphHash: string | null = null
   /** Previous turn's streamed assistant text for dedup-guard P5. */
   prevStreamedText: string | null = null
+  /** W2 被拦不弃守护：本 turn 被闸门拦截的事件 kind 列表（pipeline onGateBlocked
+   *  累计，gate-block-guard hook postTurn drain 清零）。 */
+  gateBlockedKinds: string[] = []
+  /** P1b: TDD gate 同 target 被拦计数 — session 级累计，≥3 触发 advisory */
+  tddBlockedTargets = new Map<string, number>()
   pressureMonitor: PressureMonitor
   sycophancyTrap: SycophancyTrap = createSycophancyTrap()
   turnBudget: TurnBudget = createTurnBudget(0)
@@ -456,6 +474,7 @@ export class AgentLoop {
   stigmergyStore: StigmergyStore
   loadedPheromones: Pheromone[] = []
   readonly stanceTally = createStanceTally()
+  readonly virtuePendingLedger = createVirtuePendingLedger()
   lastSeenEventId = 0
   gitChangeRate = 0
   telemetryWriter: TelemetryWriter
@@ -503,7 +522,14 @@ export class AgentLoop {
   advisoryReadback = new AdvisoryReadback()
   /** 破坏性命令 pre-execution 闸门(验证失败后 git 清场当轮拦截,首拦重放行)。
    *  tool-pipeline 是唯一写者兼读者,loop 只持有生命周期。 */
-  destructiveGate = createDestructiveGateState()
+  destructiveGate = createDestructiveGateState({
+    getVirtueCredit: () => {
+      // 反证 4：reversal 季冻结——平稳期信任不适用于压力态
+      if (this.currentSeason === 'reversal') return 0.5
+      const signals = this.stanceTally.getAllSignals?.()
+      return signals ? computeVirtueCredit(signals) : 0.5
+    },
+  })
   /** B 跨会话效能信息素 store（构造器内初始化） */
   advisoryEfficacyStore!: AdvisoryEfficacyStore
   /** 上次效能 flush 时的 per-key 计数快照 — mergeAndSave 只收增量,差分在此 */
@@ -560,6 +586,12 @@ export class AgentLoop {
       )
     } catch { /* 先验加载失败不致命——回退冷启动 */ }
     this.advisoryBus.setAdoptionRateProvider(key => this.advisoryReadback.getAdoptionRate(key))
+    // W2 efficacy 负反馈环（20b9714e）：发射前回读会话内 delivered/adopted——
+    // 同 key 零采纳连发 3 次后冷却翻倍、6 次后会话内静默（constitutional 豁免）。
+    this.advisoryBus.setEfficacyStatsProvider(key => {
+      const s = this.advisoryReadback.getStats().get(key)
+      return s ? { delivered: s.delivered, adopted: s.adopted } : null
+    })
     // 星域措辞适配（2026-07-07）：按当前域把 advisory 翻译成该域听得进的
     // 形态（如天权的证据式裁决协议）。惰性读 sessionDomain——域激活/切换自动生效。
     this.advisoryBus.setToneAdapter((content, meta) =>
@@ -1523,6 +1555,50 @@ export class AgentLoop {
 
   getTaskContract(): TaskContract | undefined { return this.taskContract }
 
+  /** W5（incident 20b9714e）：session_vitals 工具的数据源。全部为运行时
+   *  内存态实测，零磁盘 IO；拿不到的维度返回 null，工具层显式标注"无数据"。 */
+  getSessionVitals(): import('../tools/session-vitals.js').SessionVitalsData {
+    const estimatedTokens = this.session.getEstimatedTokens()
+    const contextWindow = this.config.contextWindow
+    const statsMap = this.advisoryReadback.getStats()
+    const top = [...statsMap.entries()]
+      .map(([key, s]) => ({
+        key,
+        delivered: s.delivered,
+        adopted: s.adopted,
+        ignored: s.ignored,
+        silenced: this.advisoryBus.isEfficacySilenced(key),
+      }))
+      .sort((a, b) => b.delivered - a.delivered)
+      .slice(0, 5)
+    const s = this.sensorium
+    return {
+      ctx: {
+        estimatedTokens,
+        contextWindow,
+        ratio: contextWindow > 0 ? estimatedTokens / contextWindow : 1,
+      },
+      cache: this.session.getCacheHistory().slice(-5),
+      sensorium: s ? {
+        momentum: s.momentum, pressure: s.pressure, confidence: s.confidence,
+        complexity: s.complexity, freshness: s.freshness, stability: s.stability,
+      } : null,
+      cvm: {
+        overheadRatio: this.pressureMonitor.getCvmOverheadRatio(),
+        throttled: this.pressureMonitor.isCvmThrottling(),
+        ceiling: this.pressureMonitor.isCvmThrottlingCeiling(),
+      },
+      advisories: {
+        rendered: this.guardianActivity.advisoriesRendered,
+        dropped: this.guardianActivity.advisoriesDropped,
+        adopted: this.guardianActivity.advisoriesAdopted,
+        ignored: this.guardianActivity.advisoriesIgnored,
+        top,
+      },
+      turn: this.session.getTurnCount(),
+    }
+  }
+
   /** 获取持久化的任务列表（从 Assistant 回复中提取），用于 TUI 固定显示和多轮回溯 */
   getTaskList() { return this.sessionStateManager?.getTaskList() ?? [] }
 
@@ -1800,6 +1876,31 @@ export class AgentLoop {
       this.lastUserInputRunTurn = turn
     }
 
+    // W1 — 阶段相对轮数：phase 切换即重置基线，文案与判定引用的是"本阶段"
+    // 的轮数而非会话全局计数。
+    if (phaseClass !== this.lastConvergencePhaseClass) {
+      this.lastConvergencePhaseClass = phaseClass
+      this.phaseStartTurn = turn
+    }
+    const phaseRelativeTurn = Math.max(1, turn - this.phaseStartTurn + 1)
+
+    // W1 — 进度信标：todo 完成数在近窗口内的增量。todo 推进是最硬的
+    // "未停滞"证据，交给 detector 做 L2+ 否决。
+    let todoCompletedNow = 0
+    try {
+      todoCompletedNow = (this.config.getTodos ?? getTodos)().filter(t => t.status === 'completed').length
+    } catch { /* beacon is advisory-only — never break the convergence check */ }
+    this.todoCompletedSamples.push(todoCompletedNow)
+    if (this.todoCompletedSamples.length > 10) this.todoCompletedSamples.shift()
+    const todoCompletedDelta = todoCompletedNow - (this.todoCompletedSamples[0] ?? todoCompletedNow)
+
+    // W3 — 诊断态识别：只读为主 + 零改动的排查会话，收敛文案分流为
+    // "先核实断言再收束"（催"输出结论"是 20b9714e 三次脑补的直接诱因）。
+    const activityMode = classifyActivityMode(
+      this.recentToolHistory,
+      this.evidence.getState().filesModified.size,
+    )
+
     const convergenceCheck = evaluateConvergence({
       turn,
       phaseClass: phaseClass as PhaseClass,
@@ -1812,6 +1913,11 @@ export class AgentLoop {
       providerName: this.config.providerName,
       outputTokens: this.session.getTotalUsage().output_tokens,
       repeatCount: this.convergenceEmitRepeatCount,
+      progressBeacons: {
+        todoCompletedDelta,
+        activePlan: this.activePlanFilePath !== null,
+      },
+      activityMode,
     })
     this.latestConvergenceResult = convergenceCheck
     debugLog(`[convergence] turn=${turn} score=${convergenceCheck.score.toFixed(2)} level=${convergenceCheck.level} phase=${phaseClass}`)
@@ -1839,9 +1945,14 @@ export class AgentLoop {
         this.lastConvergenceEmitVerifyFailStreak = 0
       } else {
         // Fix 1 — cooldown + dedup gate on the visible side-effects. The message
-        // type is keyed by its header line (first line), so same-type nudges with
-        // only changed diagnostic numbers do not count as a new "direction".
-        const msgKey = convergenceCheck.injectedMessage.split('\n', 1)[0] ?? ''
+        // type is keyed by its header line, so same-type nudges with only changed
+        // diagnostic numbers do not count as a new "direction". Skip the
+        // "（第 N 次同类提醒…）" progressive prefix: it varies per emission and
+        // must not make a repeat look like a direction change (that would reset
+        // the cooldown and re-emit every turn — the exact spam this gate exists
+        // to stop).
+        const msgKey = convergenceCheck.injectedMessage.split('\n')
+          .find(l => l.length > 0 && !l.startsWith('（第')) ?? ''
         const cooldownElapsed = turn - this.lastConvergenceEmitTurn >= this.convergenceEmitCooldownTurns
         const scoreDropped = this.lastConvergenceEmitScore - convergenceCheck.score > 0.15
         const cooledDown = cooldownElapsed || scoreDropped
@@ -1870,31 +1981,40 @@ export class AgentLoop {
 
           // Level 2: inject user guidance as a system-visible nudge
           callbacks.onPhaseChange?.('convergence-warning', {
-            reason: `收敛检测 L${convergenceCheck.level}: ${phaseClass} 阶段 ${turn} 轮未收敛 (score=${convergenceCheck.score.toFixed(2)})`,
+            reason: `收敛检测 L${convergenceCheck.level}: ${phaseClass} 阶段近 ${phaseRelativeTurn} 轮进度信号弱 (score=${convergenceCheck.score.toFixed(2)})`,
             suggestion: convergenceCheck.injectedMessage.slice(0, 200),
           })
           // R4 — externalize the convergence nudge as a structured course-correction
           // so the desktop renders a "改道" card; the injected guidance below is what
           // the agent acts on next, making the cause→effect visible to the user.
-          this.recordDecisionShift('convergence')
-          callbacks.onDecisionShift?.({
-            source: 'convergence',
-            reason: `${phaseClass} 阶段连续 ${turn} 轮未收敛，已提示换一种推进方式`,
-            methods: [convergenceCheck.injectedMessage.slice(0, 200)],
-            severity: convergenceCheck.level >= 2 ? 'warn' : 'info',
-          })
+          // W2 — efficacy 环静默的 key 同步抑制改道卡：advisory 都不再送达了，
+          // 还继续弹卡就是纯 UI 噪音（20b9714e：32 张改道卡）。
+          if (!this.advisoryBus.isEfficacySilenced('convergence')) {
+            this.recordDecisionShift('convergence')
+            callbacks.onDecisionShift?.({
+              source: 'convergence',
+              reason: `${phaseClass} 阶段近 ${phaseRelativeTurn} 轮进度信号弱，已提示换一种推进方式`,
+              methods: [convergenceCheck.injectedMessage.slice(0, 200)],
+              severity: convergenceCheck.level >= 2 ? 'warn' : 'info',
+            })
+          }
           this.advisoryBus.submit({
             key: 'convergence',
             priority: 0.65,
             tier: 'operational',
             category: 'discipline',
             content: convergenceCheck.injectedMessage,
-            // 谓词映射表（P1a）：仅无工具僵局变体可客观核销——任意工具调用
-            // 即打破僵局（计划中的 tool_stops 反向谓词）。其余变体（重复循环/
-            // 换推进方式）没有单一行为签名，不设谓词，只计送达。
+            // 谓词映射表（P1a + W3）：
+            // - 无工具僵局变体：任意工具调用即打破僵局。
+            // - 诊断态变体（W3）："核实后收束"的行为签名 = 后续轮出现认知型
+            //   工具调用（read/grep/glob 等）。核实了 → adopted 续命；直接
+            //   无工具脑补结论 → 谓词失败计 ignored，与 efficacy 环双轨咬合。
+            // - 其余 build 变体没有单一行为签名，不设谓词，只计送达。
             expect: this.consecutiveNoToolTurns >= 2
               ? { kind: 'tool_appears', tools: [], withinTurns: 1 }
-              : undefined,
+              : activityMode === 'diagnostic'
+                ? { kind: 'tool_appears', tools: ['read_file', 'grep', 'glob', 'list_dir', 'bash'], withinTurns: 2 }
+                : undefined,
           })
 
           // When convergence is detected, append the delivery gate hint so the
@@ -1930,13 +2050,13 @@ export class AgentLoop {
     }
 
     if (convergenceCheck.shouldAbort) {
-      // Score-abort grace turn: if no L2+ warning was delivered in an earlier
+      // Grace turn for all aborts: if no L2+ warning was delivered in an earlier
       // turn (first escalation straight to L3, or the ladder was reset by a
       // user message), demote this abort to the kick that was just emitted
-      // above and let the model act on it for one turn. The no-tool hard cap
-      // is exempt — 5 consecutive no-tool turns already embodies repeated
-      // chances.
-      if (convergenceCheck.abortCause === 'score' && !warnedInEarlierTurn) {
+      // above and let the model act on it for one turn. This applies to both
+      // score-based and no-tool aborts — a model that went silent without prior
+      // warning deserves one more chance after being nudged.
+      if (!warnedInEarlierTurn) {
         debugLog(`[convergence] turn=${turn} score-abort demoted to kick (no prior-turn warning) score=${convergenceCheck.score.toFixed(2)}`)
         return { action: 'proceed' }
       }

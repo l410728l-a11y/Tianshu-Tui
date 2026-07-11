@@ -74,6 +74,12 @@ export type SessionEventType =
   | 'landing'
   // C3 自治档检查点 — run 在 N 轮后暂停等待用户确认（continue 恢复）。
   | 'autonomy_checkpoint'
+  // 付费版 v1 · T2 — 无人值守运行被审批门禁 fail-closed 中止。
+  | 'unattended_halt'
+  // Phase 3 可靠性 — sidecar 重启打断了在途 run，向 UI 提供一键续跑入口。
+  // data: { model: string|null, domain: string } — 续跑必须沿用原模型/星域
+  // （前缀缓存亲和）；模型不可用时由 POST /resume fail-closed。
+  | 'resume_offer'
 
 export interface SessionEvent {
   seq: number

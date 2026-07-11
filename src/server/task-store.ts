@@ -71,6 +71,10 @@ export interface TaskRecord {
   retryOf?: string
   /** 失败重试策略（从 ScheduledTask 继承，随重试传递）。 */
   retry?: ScheduledTaskRetry
+  /** 无人值守运行（reviewPolicy 解析结果）：审批请求 fail-closed 中止而非挂起。 */
+  unattended?: boolean
+  /** 无人值守中止时缺授权的 app 名（结构化，驱动「去授权/重跑」修复动作）。 */
+  haltedApp?: string
 }
 
 export interface CreateTaskInput {
@@ -91,6 +95,8 @@ export interface CreateTaskInput {
   retryOf?: string
   /** 失败重试策略。 */
   retry?: ScheduledTaskRetry
+  /** 无人值守运行（审批 fail-closed 中止）。 */
+  unattended?: boolean
 }
 
 // ─── TaskStore 接口 ───────────────────────────────────────────
@@ -336,6 +342,7 @@ function isTaskRecord(value: unknown): value is TaskRecord {
     (record.sessionId === undefined || typeof record.sessionId === 'string') &&
     (record.attempt === undefined || (typeof record.attempt === 'number' && Number.isFinite(record.attempt))) &&
     (record.retryOf === undefined || typeof record.retryOf === 'string') &&
+    (record.haltedApp === undefined || typeof record.haltedApp === 'string') &&
     (record.retry === undefined || (typeof record.retry === 'object' && record.retry !== null &&
       typeof (record.retry as ScheduledTaskRetry).maxAttempts === 'number' &&
       typeof (record.retry as ScheduledTaskRetry).backoffMs === 'number'))

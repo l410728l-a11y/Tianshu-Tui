@@ -86,6 +86,7 @@ import { SEMANTIC_SEARCH_TOOL } from './tools/semantic-search.js'
 import { buildSearchBackends } from './tools/web-search.js'
 import { buildFetchOptions } from './tools/web-fetch/build-options.js'
 import { APPLY_PATCH_TOOL } from './tools/apply-patch.js'
+import { createSessionVitalsTool } from './tools/session-vitals.js'
 import { createPlanTaskTool } from './tools/plan-task.js'
 import { createMemoryTool } from './tools/memory.js'
 import { MeridianIndexer } from './repo/meridian-indexer.js'
@@ -145,6 +146,12 @@ export interface RuntimeRefs {
   /** 层3 回归契约：当前主控任务契约 getter（agent 创建后回填）。
    *  deliver_task 用它取 regressionInventory / objective 做重构回归核验。 */
   getTaskContract?: () => import('./context/task-contract.js').TaskContract | undefined
+  /** W1 回归防线：EvidenceTracker.impactedTests getter（agent 创建后回填）。
+   *  deliver_task 用它做改动波及测试的验证归因（module_unverified）。 */
+  getImpactedTests?: () => string[]
+  /** W5 清醒认知闭环：session_vitals 数据源（agent 创建后回填）。
+   *  模型写"系统状态"类结论前的取证入口，全部运行时内存态实测。 */
+  getSessionVitals?: () => import('./tools/session-vitals.js').SessionVitalsData
   /** 多会话隔离：本会话独立的 todo 清单 store。后端所有读/写（todo 工具、plan_task
    *  回灌、turn-end 任务进度注入、todo-reminder 快照）统一走它。TUI 复用全局
    *  defaultStore（保持 setTodoSession/loadTodos 持久化与会话切换语义），server 每会话 new。
@@ -471,7 +478,11 @@ export function createInteractiveToolRegistry(
     // 满载机器 tsc 超时曾被记成 passed 放行（2026-07-07）。
     getTypecheckRunner: () => (cwd: string) => runTypeCheck(cwd, '*', GATE_TSC_TIMEOUT_MS),
   }
-  reg.register(createTeamOrchestrateTool(planExecutorDeps, { defaultMaxParallel: config.agent.maxTeamParallel }))
+  reg.register(createTeamOrchestrateTool(planExecutorDeps, {
+    defaultMaxParallel: config.agent.maxTeamParallel,
+    // Pro gate（双层模式）：桌面端由 Rust 验签后注入 RIVET_PRO=1；CLI 保持软 gate。
+    teamMaxEnabled: isProFeatureEnabled(config, 'teamMax'),
+  }))
 
   // council_convene — 单轮多星域会诊出计划（与 team_orchestrate 解耦，默认绝不派执行；
   // autoExecute 经 executor 走完整 executePlan 闭环，与 team_orchestrate 同路径）。
@@ -484,7 +495,9 @@ export function createInteractiveToolRegistry(
     recordRoutingShadow: event => persistCouncilRoutingShadow(refs.meridianIndexer?.getDb(), event),
     recordCouncilSession: event => recordCouncilSession(refs.meridianIndexer?.getDb(), event),
     executor: planExecutorDeps,
-  }, config.agent.council.seats.length > 0 ? config.agent.council.seats : undefined))
+  }, config.agent.council.seats.length > 0 ? config.agent.council.seats : undefined, {
+    multiRoundEnabled: isProFeatureEnabled(config, 'councilMultiRound'),
+  }))
 
   // recall_capsule
   reg.register(createRecallCapsuleTool(() => cwd))
@@ -512,6 +525,10 @@ export function createInteractiveToolRegistry(
   // APPLY_PATCH: EXTENDED layer — overlap with hash_edit covers >90% of
   // use cases; kept here (interactive) for edge cases (e.g. git-format patches).
   reg.register(APPLY_PATCH_TOOL)
+  // W5 session_vitals: EXTENDED layer（interactive 装配，不占 kernel budget）。
+  // 只读自查工具——模型写"系统状态"类结论前的取证入口（incident 20b9714e）。
+  // 工具定义跟版本发布上车（新定义 = 前缀一次性 miss，绝不热更）。
+  reg.register(createSessionVitalsTool(() => refs.getSessionVitals?.() ?? null))
   // web_search is now in the kernel default-registry (CORE layer).
   // Remove the interactive registration to avoid double-registration.
   // PLAN_MODE_ALLOWED_TOOLS already references web_search alongside recall.
@@ -593,6 +610,7 @@ export function createInteractiveToolRegistry(
     reviewConfig: config.agent.review,
     meridianIndexer: refs.meridianIndexer,
     getTaskContract: () => refs.getTaskContract?.(),
+    getImpactedTests: () => refs.getImpactedTests?.() ?? [],
   })))
 
   // update_goal — model-driven goal lifecycle control (paused/blocked/complete)
@@ -1281,6 +1299,8 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
     ctx.agent = agent
     ctx.refs.promptEngine = agent.config.promptEngine
     ctx.refs.getTaskContract = () => agent.getTaskContract()
+    ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
+    ctx.refs.getSessionVitals = () => agent.getSessionVitals()
     ctx.provider = provider
     ctx.apiKey = apiKey
     ctx.auth = auth
@@ -1380,6 +1400,8 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
   ctx.refs.sessionId = targetId
   ctx.refs.promptEngine = agent.config.promptEngine
   ctx.refs.getTaskContract = () => agent.getTaskContract()
+  ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
+  ctx.refs.getSessionVitals = () => agent.getSessionVitals()
 
   // 同一身份判等防御：装配实际替换 coordinator 才关旧的。
   if (oldCoordinator && oldCoordinator !== ctx.refs.coordinator) {
@@ -1628,6 +1650,8 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   })
   refs.promptEngine = agent.config.promptEngine
   refs.getTaskContract = () => agent.getTaskContract()
+  refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
+  refs.getSessionVitals = () => agent.getSessionVitals()
 
   // 12b. Restore goal tracker from persisted state (if session was resumed).
   // normalizeAfterResume: active → paused (the process that wrote active is gone).

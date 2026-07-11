@@ -4,6 +4,7 @@ import { createKickRuntimeHook } from './hooks/kick-hook.js'
 import { createVigorAfterPerceptionHook, createVigorPostToolHook } from './hooks/vigor-hook.js'
 import { createThetaRuntimeHook } from './hooks/theta-hook.js'
 import { createStigmergyRuntimeHook } from './hooks/stigmergy-hook.js'
+import { createVirtueSettlementHook } from './hooks/virtue-settlement-hook.js'
 import { createSignalConsumerRuntimeHook } from './hooks/signal-consumer-hook.js'
 import { createPlaybookReflectHook } from './hooks/playbook-reflect-hook.js'
 import { createAnchorBreakShadowHook } from './hooks/anchor-break-shadow-hook.js'
@@ -35,6 +36,7 @@ import { createTypecheckReminderHook } from './hooks/typecheck-reminder-hook.js'
 import { createTodoReminderHook } from './hooks/todo-reminder-hook.js'
 import { createBackgroundJobsHook } from './hooks/background-jobs-hook.js'
 import { createEditToolAdvisoryHook } from './hooks/edit-tool-advisory-hook.js'
+import { createEditFailureRecoveryHook } from './hooks/edit-failure-recovery-hook.js'
 import { createLossyObservationHook } from './hooks/lossy-observation-hook.js'
 import { createPointerRegurgitationHook } from './hooks/pointer-regurgitation-hook.js'
 import { createErrorDiagnosisHook } from './hooks/error-diagnosis-hook.js'
@@ -51,7 +53,11 @@ import { createAdvisoryReadbackHooks } from './hooks/advisory-readback-hook.js'
 import { createAsyncCopilotHook, type CopilotContextPack } from './hooks/async-copilot-hook.js'
 import { createLanguageAnchorHook } from './hooks/language-anchor-hook.js'
 import { createContextPressureHook } from './hooks/context-pressure-hook.js'
+import { createGateBlockGuardHook } from './hooks/gate-block-guard-hook.js'
+import { createRenderVerifyHook, type RenderVerifyHookDeps } from './hooks/render-verify-hook.js'
+import { createWrapupAnxietyGuardHook } from './hooks/wrapup-anxiety-guard-hook.js'
 import { createSpecVerifyGateHook } from './hooks/spec-verify-gate-hook.js'
+import { createWalkthroughRecorderHooks, type WalkthroughRecorderDeps } from './hooks/walkthrough-recorder.js'
 import type { AdvisoryBus } from './advisory-bus.js'
 import type { AntiAnchoringConfig } from './anti-anchoring-config.js'
 import type { AnchorGraph } from '../prompt/anchor-graph.js'
@@ -75,6 +81,14 @@ export interface RuntimeHookDeps {
   getEvidenceState: () => EvidenceState
   setLoadedPheromones: (pheromones: any) => void
   recordStance?: (signal: import('./virtue-signals.js').VirtueSignal) => void
+  /** T2: 美德 pending 台账——stigmergy-hook submit, settlement hook drainSettled */
+  virtuePendingLedger?: import('./virtue-signals.js').VirtuePendingLedger
+  /** T2/T0: 当前季节（settlement hook 季节鼓励门用） */
+  getCurrentSeason?: () => import('./cognitive-season.js').CognitiveSeason
+  /** T3: 季节强度 */
+  getCurrentSeasonIntensity?: () => number
+  /** T0: 近 N 轮平均缓存命中率（信复活用） */
+  getRecentCacheHitRate?: () => number | null
   getThetaState: () => any
   setThetaState: (state: any) => void
   getPredictionAccumulator: () => any
@@ -213,6 +227,14 @@ export interface RuntimeHookDeps {
   /** Context window size (used by context-pressure-hook for ratio warning). */
   getContextWindow?: () => number
 
+  // ── W2 被拦不弃守护 ──
+  /** 读取并清零本 turn 的闸门拦截事件 kind 列表（loop.gateBlockedKinds）。 */
+  drainGateBlockedKinds?: () => string[]
+
+  // ── W5 渲染自检 ──
+  /** 检查 browser/computer_use 是否已注册（能力降级分支）。 */
+  getVisualToolsAvailable?: () => boolean
+
   // ── P2 break-anchor scout (preTurn, opt-in real intervention) ──
   /** Present only when antiAnchoring + anchorBreakScout are both enabled and a coordinator exists. */
   anchorBreakScout?: {
@@ -234,6 +256,11 @@ export interface RuntimeHookDeps {
   // ── 轮内防御三层加固（2026-07）──
   /** 注入 system-reminder 到消息流末尾（不经 advisory bus 优先级竞争）。 */
   addSystemReminder?: (content: string) => void
+
+  // ── 运行走查工件（付费版 v1 · T1）──
+  /** computer_use 步骤时间线记录器 + postSession walkthrough 工件组装。
+   *  缺省（无 ArtifactStore 通道）→ 不装 hook。 */
+  walkthrough?: WalkthroughRecorderDeps
 }
 
 export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] {
@@ -247,7 +274,13 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     createPerceptionRuntimeHook(),
     createSignalConsumerRuntimeHook({ advisoryBus: deps.advisoryBus }),
     ...(isStarSoulEnabled() ? [createCourageHook({ cooldownTurns: 5, courageThreshold: 0.5, sycophancyTrap: deps.sycophancyTrap, advisoryBus: deps.advisoryBus })] : []),
-    createKickRuntimeHook({ deposit: deps.stigmergyDeposit, wasConvergenceTriggered: deps.wasConvergenceTriggered, advisoryBus: deps.advisoryBus }),
+    createKickRuntimeHook({
+      deposit: deps.stigmergyDeposit,
+      wasConvergenceTriggered: deps.wasConvergenceTriggered,
+      advisoryBus: deps.advisoryBus,
+      getEstimatedTokens: deps.getEstimatedTokens,
+      getContextWindow: deps.getContextWindow,
+    }),
     createVigorAfterPerceptionHook(),
     createThetaRuntimeHook({
       getThetaState: deps.getThetaState,
@@ -261,6 +294,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       recordStance: deps.recordStance,
       publishEvent: deps.publishEvent,
       sessionId: deps.sessionId,
+      pendingLedger: deps.virtuePendingLedger,
     }),
     ...(deps.getFileObservations
       ? [createConsistencyCheckHook({ getFileObservations: deps.getFileObservations })]
@@ -428,7 +462,10 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // with no ground-truth verification, inject a reminder for the next turn
   // to self-verify before building on the conclusions.
   if (deps.advisoryBus) {
-    hooks.push(createSelfVerifyHook({ advisoryBus: deps.advisoryBus }))
+    hooks.push(createSelfVerifyHook({
+      advisoryBus: deps.advisoryBus,
+      getEvidenceState: deps.getEvidenceState,
+    }))
   }
 
   // Post-Commit Review delivery: preTurn + postTool 双相排水 — deliver_task
@@ -445,6 +482,13 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // Gated by RIVET_EDIT_SMART_ROUTING (default on; set to '0' to disable).
   if (deps.advisoryBus && process.env.RIVET_EDIT_SMART_ROUTING !== '0') {
     hooks.push(createEditToolAdvisoryHook({ advisoryBus: deps.advisoryBus }))
+  }
+
+  // Edit-Failure Recovery: postTool hook — detects consecutive edit failures
+  // on the same file across turns and injects a repair advisory telling the
+  // agent to undo, re-read, and switch to apply_patch/write_file.
+  if (deps.advisoryBus) {
+    hooks.push(createEditFailureRecoveryHook({ advisoryBus: deps.advisoryBus }))
   }
 
   // Lossy Observation: postTool hook — detects collapsed/truncated tool
@@ -568,6 +612,22 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     }))
   }
 
+  // Virtue-Settlement: postTurn 效用核销 — 美德信号两段式
+  // （stigmergy-hook 检测后 submit pending，此处 postTurn 核销效用后转正）。
+  // 不需要 postTool 半边——advisory-readback-observe 已经在喂 readback 观察日志。
+  if (deps.virtuePendingLedger && deps.advisoryReadback && deps.advisoryBus) {
+    hooks.push(createVirtueSettlementHook({
+      ledger: deps.virtuePendingLedger,
+      readback: deps.advisoryReadback,
+      recordStance: deps.recordStance ?? (() => {}),
+      deposit: deps.stigmergyDeposit,
+      advisoryBus: deps.advisoryBus,
+      getSeason: () => deps.getCurrentSeason?.() ?? 'genesis',
+      getSeasonIntensity: () => deps.getCurrentSeasonIntensity?.() ?? 1.0,
+      getRecentCacheHitRate: () => deps.getRecentCacheHitRate?.() ?? null,
+    }))
+  }
+
   // Async-Copilot: postTurn hook — cheap-model 情境合成的中层建议（Phase 3）。
   // 可行性双闸门为运行时数据判定（全局采纳率 >30% 才激活）,自我淘汰降频。
   // Gated by RIVET_ASYNC_COPILOT (default on; set to '0' to disable).
@@ -611,6 +671,42 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       advisoryBus: deps.advisoryBus,
       getEstimatedTokens: deps.getEstimatedTokens,
       getContextWindow: deps.getContextWindow,
+    }))
+  }
+
+  // Gate-Block Guard: postTurn hook — 单 turn 被闸门拦截 ≥2 次时提醒
+  // "被拦不是死路"，引导执行拦截文案里的替代路径而非放弃排查。
+  // per-key 3 轮冷却防连拦 spam。
+  // Gated by RIVET_GATE_BLOCK_GUARD (default on; set to '0' to disable).
+  if (deps.advisoryBus && deps.drainGateBlockedKinds && process.env.RIVET_GATE_BLOCK_GUARD !== '0') {
+    hooks.push(createGateBlockGuardHook({
+      advisoryBus: deps.advisoryBus,
+      drainBlockedKinds: deps.drainGateBlockedKinds,
+    }))
+  }
+
+  // Wrapup-Anxiety Guard: postTurn hook — 收尾/新会话话术 × 实测 ctxRatio
+  // 对照。ratio < 0.5 时注入硬数据反驳（焦虑话术不基于物理事实）；
+  // 0.5-0.7 灰区不注入；≥0.7 不触发（context-pressure 的收束建议合法）。
+  // Gated by RIVET_WRAPUP_ANXIETY_GUARD (default on; set to '0' to disable).
+  if (deps.advisoryBus && deps.getStreamedText && deps.getEstimatedTokens && deps.getContextWindow
+    && process.env.RIVET_WRAPUP_ANXIETY_GUARD !== '0') {
+    hooks.push(createWrapupAnxietyGuardHook({
+      advisoryBus: deps.advisoryBus,
+      getStreamedText: deps.getStreamedText,
+      getEstimatedTokens: deps.getEstimatedTokens,
+      getContextWindow: deps.getContextWindow,
+    }))
+  }
+
+  // Render-Verify: postTurn hook — UI 文件改动后未检查渲染结果时提醒。
+  // 能力降级：browser/computer_use 未注册 → 提示人工过目。
+  // 冷却：每会话 2 次。
+  // Gated by RIVET_RENDER_VERIFY (default on; set to '0' to disable).
+  if (deps.advisoryBus && process.env.RIVET_RENDER_VERIFY !== '0') {
+    hooks.push(createRenderVerifyHook({
+      advisoryBus: deps.advisoryBus,
+      getVisualToolsAvailable: deps.getVisualToolsAvailable,
     }))
   }
 
@@ -659,6 +755,13 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
 
   if (deps.userHooksBridge) {
     hooks.push(...createUserHooksBridge(deps.userHooksBridge))
+  }
+
+  // Walkthrough recorder（付费版 v1 · T1）: postTool 捕获 computer_use 步骤，
+  // postSession 组装走查工件。记录器恒开（无 computer_use 活动时零成本），
+  // 回放查看器在桌面端 Pro gate。
+  if (deps.walkthrough) {
+    hooks.push(...createWalkthroughRecorderHooks(deps.walkthrough))
   }
 
   return hooks

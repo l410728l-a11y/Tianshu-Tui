@@ -122,6 +122,10 @@ export interface ToolExecutionDeps {
   isGoalActive?: () => boolean
   /** 破坏性命令 pre-execution 闸门(会话级状态,loop 持有,pipeline 读写)。 */
   destructiveGate?: import('../tools/destructive-gate.js').DestructiveGateState
+  /** W2 被拦不弃守护：gate/deny 拦截事件上报（loop 持 turn 级计数）。 */
+  onGateBlocked?: (kind: string) => void
+  /** TDD gate 被拦上报：同一 target 反复触发时 advisory 提醒（loop 持会话级计数）。 */
+  onTddBlocked?: (target?: string) => void
   /** 遥测写入(缺口 B 输出裁剪计数等)。 */
   writeTelemetry?: (record: { kind: string } & Record<string, unknown>) => void
 }
@@ -264,6 +268,8 @@ export class ToolExecutionController {
       getLspManager: this.deps.getLspManager,
       abortSignal: state.abortSignal,
       destructiveGate: this.deps.destructiveGate,
+      onGateBlocked: this.deps.onGateBlocked,
+      onTddBlocked: this.deps.onTddBlocked,
     }
   }
 
@@ -598,6 +604,11 @@ export class ToolExecutionController {
           target,
           input: tu.input,
           resultContent: result && 'content' in result && typeof result.content === 'string' ? result.content : undefined,
+          // 发现二修复：礼的真实判定——yolo 模式跳过审批门（approvalRequired=false），
+          // 其他模式下写操作走审批门（true）。非写工具始终 undefined。
+          approvalRequired: (tu.name === 'write_file' || tu.name === 'edit_file' || tu.name === 'hash_edit')
+            ? this.deps.config.approvalMode !== 'dangerously-skip-permissions'
+            : undefined,
           // Classify failure for vigor: environment issues (timeout, api_error)
           // get reduced phasic penalty vs semantic failures (type_error, assertion).
           failureClass: result && 'is_error' in result && result.is_error === true

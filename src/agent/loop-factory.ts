@@ -11,6 +11,7 @@ import { mapQueriedPheromones } from './pheromone-map.js'
 import { setGeneralLedgerTelemetrySink } from './general-ledger.js'
 import { buildPrewarmValue, batchPrewarm } from './prewarm-file.js'
 import { recordToolNamedFingerprint } from './trace-store.js'
+import { classifyActivityMode } from './convergence-detector.js'
 import { join, isAbsolute } from 'node:path'
 import { analyzeImpact } from '../repo/meridian-impact.js'
 import { getSessionDir } from './session-persist.js'
@@ -335,6 +336,21 @@ return new ToolExecutionController({
         }
       },
       destructiveGate: self.destructiveGate,
+      onGateBlocked: kind => { self.gateBlockedKinds.push(kind) },
+      onTddBlocked: (target?: string) => {
+        if (!target) return
+        const count = (self.tddBlockedTargets.get(target) ?? 0) + 1
+        self.tddBlockedTargets.set(target, count)
+        if (count >= 3) {
+          self.advisoryBus.submit({
+            key: `tdd-same-target:${target}`,
+            priority: 0.45,
+            category: 'discipline',
+            content: `同一文件 ${target} 已被 TDD gate 拦截 ${count} 次——确认你是否在反复尝试同一修改而没先跑测试。先运行相关测试定位问题，再回来改。`,
+            ttl: 1,
+          })
+        }
+      },
       writeTelemetry: (record) => { self.telemetryWriter.write(record) },
     })
 }
@@ -354,6 +370,8 @@ return {
       },
       touchedTsFiles: self.touchedTsFiles,
       sawTypecheckThisTask: self.sawTypecheckThisTask,
+      touchedUiFiles: self.touchedUiFiles,
+      sawVisualVerify: self.sawVisualVerify,
       lastThinkingLength: self.lastThinkingContent.length || undefined,
       lastTurnHadTools: self.recentToolHistory.some(h => h.status === 'success') || undefined,
       ...extra,
@@ -406,6 +424,10 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     getEvidenceState: () => self.evidence.getState(),
     setLoadedPheromones: pheromones => { self.loadedPheromones = mapQueriedPheromones(pheromones) },
     recordStance: signal => self.stanceTally.record(signal),
+    virtuePendingLedger: self.virtuePendingLedger,
+    getCurrentSeason: () => self.currentSeason ?? 'genesis',
+    getCurrentSeasonIntensity: () => self.currentSeasonIntensity ?? 1.0,
+    getRecentCacheHitRate: () => self.session.getRecentTurnHitRate(3),
     publishEvent: self.config.sessionRegistry && self.config.sessionId
       ? (input) => self.config.sessionRegistry!.publishEvent(self.config.sessionId!, input)
       : undefined,
@@ -491,6 +513,9 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     getIntentObjective: () => self.taskContract?.objective ?? self.initialUserMessage?.slice(0, 500) ?? null,
     getMaxTurns: () => self.config.maxTurns,
     addSystemReminder: content => { self.session.appendSystemReminder(content) },
+    // W5 (render-verify): check if browser/computer_use are registered for capability degradation.
+    getVisualToolsAvailable: () =>
+      self.config.toolRegistry.has('browser') || self.config.toolRegistry.has('computer_use'),
     hearthObserveEnabled: self.config.hearthObserveEnabled,
     getAnchorGraph: () => self.antiAnchoring.buildAnchorGraph(),
     getPrevAnchorGraphHash: () => self.prevAnchorGraphHash,
@@ -565,8 +590,15 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     sycophancyTrap: self.sycophancyTrap,
     getEstimatedTokens: () => self.session.getEstimatedTokens(),
     getContextWindow: () => self.config.contextWindow ?? 128_000,
+    // W2 被拦不弃守护：drain 语义（读取即清零 turn 级计数）。
+    drainGateBlockedKinds: () => self.gateBlockedKinds.splice(0),
     // 多会话隔离：todo-reminder 经此读本会话 TodoStore（缺省回退全局 getTodos）。
     getTodos: self.config.getTodos,
+    // 运行走查工件（付费版 v1 · T1）：computer_use 步骤时间线 → walkthrough 工件。
+    walkthrough: {
+      getArtifactStore: () => self.artifactStore,
+      sessionId: self.config.sessionId,
+    },
   })
 
   // I4: when any runtime hook throws, run user `onError` hooks and emit the
@@ -786,6 +818,12 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
 
     // === Advisory 总线（action-intent 闸门核销接入）===
     submitAdvisory: (entry) => { self.advisoryBus.submit(entry) },
+
+    // === W3 诊断态识别 ===
+    getActivityMode: () => classifyActivityMode(
+      self.recentToolHistory,
+      self.evidence.getState().filesModified.size,
+    ),
 
     // === Abort signal ===
     getAbortSignal: () => self.abortController?.signal,

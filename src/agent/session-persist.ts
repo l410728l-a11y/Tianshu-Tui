@@ -271,7 +271,9 @@ export class SessionPersist {
             + 'happened either before OR after the file was actually written, so the '
             + 'file may or may not already contain the intended changes. Do NOT blindly '
             + 're-run the write. First verify the file\'s current state with read_file '
-            + 'or grep, then only write what is still missing.</system-reminder>'
+            + 'or grep, then only write what is still missing. This is host-process '
+            + 'interruption recovery, NOT a tool malfunction — the write tools remain '
+            + 'fully functional; keep using them normally instead of bash workarounds.</system-reminder>'
           : '<system-reminder>The previous session was interrupted mid-turn. '
             + 'Some tool calls from the last assistant message were stripped because '
             + 'their results were not recorded. Re-run any read-only/search steps you '
@@ -284,7 +286,7 @@ export class SessionPersist {
   /** Tools whose orphan recovery must be non-destructive: the file may already
    *  hold the intended changes, so the model must verify before re-writing. */
   private static readonly WRITE_TOOL_NAMES = new Set([
-    'write_file', 'edit_file', 'apply_patch', 'multi_edit', 'notebook_edit',
+    'write_file', 'edit_file', 'hash_edit', 'ast_edit', 'apply_patch',
   ])
 
   /** 压#7: Remove orphan tool_use/tool_result pairs left by corrupted/missing lines.
