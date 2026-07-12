@@ -28,6 +28,13 @@ import type { PaletteCommand } from './tui/command-palette.js'
 import { buildCockpitSnapshot } from './tui/cockpit/state.js'
 import { loadTodos, setTodoSession } from './tools/todo.js'
 import { setPlanSession } from './agent/plan-store.js'
+import {
+  nextShiftTabPlanToggle,
+  shiftTabPlanToggleHint,
+} from './agent/plan-mode.js'
+import type { ApprovalMode } from './agent/loop-types.js'
+import { statSync } from 'node:fs'
+import { join as pathJoin } from 'node:path'
 import { formatWelcome } from './tui/format/welcome.js'
 import { color } from './tui/engine/ansi.js'
 import type { RewindMode } from './tui/format/rewind.js'
@@ -59,6 +66,8 @@ import { applyProjectTemplates, recordTemplatesDecision } from './bootstrap/proj
 import { checkForUpdate, formatUpdateBanner, detectInstallRoot, getCurrentVersion } from './tui/updater.js'
 import { detectEnv, formatGitMissingBanner } from './tools/env-check.js'
 import { computeUsageCost, findModelPricing } from './utils/pricing.js'
+import { TuiPerfMonitor, isTuiPerfEnabled } from './tui/engine/perf-monitor.js'
+import { runTuiShutdownSequence } from './tui/engine/shutdown-sequence.js'
 
 // ── CLI args ───────────────────────────────────────────────────
 
@@ -88,6 +97,7 @@ const skipWelcome = args.includes('--skip-welcome')
 let app: TuiApp | null = null
 let ctx: BootstrapContext | null = null
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null
+let perfSummaryFlush: Promise<void> = Promise.resolve()
 
 /** advisory status 通道环形缓冲（最近 N 条,cockpit advisory 面板展示） */
 const ADVISORY_STATUS_BUFFER_MAX = 20
@@ -95,38 +105,52 @@ const advisoryStatusNotices: string[] = []
 
 let isShuttingDown = false
 
-function shutdown(code: number = 0) {
+async function shutdown(code: number = 0): Promise<void> {
   if (isShuttingDown) return
   isShuttingDown = true
 
-  app?.dispose()
-
-  // Delegate core cleanup to bootstrap shutdown handler
-  if (ctx) {
-    try { ctx.shutdown() } catch { /* already handled */ }
-    // Post-teardown resume hint: printed AFTER TUI dispose so it lands on the
-    // normal scrollback and survives the exit — the session id would otherwise
-    // be undiscoverable ("how do I reconnect?").
-    try {
-      const summary = formatExitSummary(ctx.persist.loadMetadata(), ctx.sessionId)
-      if (summary) process.stdout.write(`\n${summary}\n`)
-    } catch { /* best-effort */ }
-  }
-
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval)
-    heartbeatInterval = null
-  }
-
-  if (process.stdin.isTTY && process.stdin.setRawMode) {
-    process.stdin.setRawMode(false)
-  }
-  killAllSync()
-  process.exit(code)
+  await runTuiShutdownSequence({
+    dispose: () => { app?.dispose() },
+    flushTelemetry: () => perfSummaryFlush,
+    cleanup: [
+      () => {
+        // Delegate core cleanup to bootstrap shutdown handler.
+        ctx?.shutdown()
+      },
+      () => {
+        // Post-teardown resume hint: printed AFTER TUI dispose so it lands on the
+        // normal scrollback and survives the exit — the session id would otherwise
+        // be undiscoverable ("how do I reconnect?").
+        if (ctx) {
+          const summary = formatExitSummary(ctx.persist.loadMetadata(), ctx.sessionId)
+          if (summary) process.stdout.write(`\n${summary}\n`)
+        }
+      },
+      () => {
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval)
+          heartbeatInterval = null
+        }
+      },
+      () => {
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(false)
+        }
+      },
+      () => { killAllSync() },
+    ],
+    exit: exitCode => process.exit(exitCode),
+    reportErrors: error => {
+      try {
+        const details = error.errors.map(item => item instanceof Error ? item.message : String(item)).join('; ')
+        process.stderr.write(`[shutdown] ${error.errors.length} cleanup error(s): ${details}\n`)
+      } catch { /* reporting must not block exit */ }
+    },
+  }, code)
 }
 
-process.on('SIGINT', () => shutdown(0))
-process.on('SIGTERM', () => shutdown(0))
+process.on('SIGINT', () => { void shutdown(0) })
+process.on('SIGTERM', () => { void shutdown(0) })
 
 // Last-resort sync hook: even if shutdown() threw or an uncaughtException
 // skipped it, the process-exit event still fires (unless SIGKILL). MCP child
@@ -494,7 +518,7 @@ async function main() {
   if (forceRecoveryCli) {
     const { runRecoveryCli } = await import('./recovery-cli.js')
     await runRecoveryCli(ctx)
-    shutdown(0)
+    await shutdown(0)
     return
   }
 
@@ -520,6 +544,10 @@ async function main() {
     history: loadHistory(),
     contextWindow: currentModel?.contextWindow,
     gitBranch,
+    perfMonitor: new TuiPerfMonitor({ enabled: isTuiPerfEnabled(args) }),
+    onPerfSummary: summary => {
+      perfSummaryFlush = ctx!.flushTuiPerfSummary(summary)
+    },
   })
 
   // Register overlays with real data
@@ -796,7 +824,7 @@ async function main() {
       if (tuiApp.choicePanelKind === 'permission-yolo-confirm') {
         const entries = [
           { id: 'cancel', label: '取消', description: '保持当前权限模式不变。', current: true },
-          { id: 'confirm-yolo', label: '⚠ 确认进入 YOLO', description: '无轮次刹车 · 无进度播报 · 所有工具直接执行（沙箱仍拦项目外写入）。回滚兜底：/rollback + git 检查点。设为默认后重启仍是 YOLO。' },
+          { id: 'confirm-yolo', label: '⚠ 确认进入 YOLO', description: '无轮次刹车 · 无进度播报 · 所有工具直接执行（沙箱仍拦项目外写入）。回滚兜底：/rollback + git 检查点。也可直接输入 /yes。设为默认后重启仍是 YOLO。' },
         ]
         return { title: '确认 YOLO 模式 / Confirm YOLO', choices: entries, selectedIndex: 0 }
       }
@@ -1078,40 +1106,53 @@ async function main() {
   // ── 当前已批准计划指针 provider ─────────────────────────────
   // 读 PromptEngine 中的 activePlanPointer，供右侧面板 lightweight 展示当前计划。
   app.setActivePlanProvider(() => ctx!.agent.config.promptEngine?.getActivePlanPointer())
+  app.setPlanDraftProvider(() => {
+    const agent = ctx!.agent
+    if (agent.planModeState !== 'planning') return null
+    const path = agent.getActivePlanFilePath()
+    if (!path) return null
+    try {
+      const abs = pathJoin(agent.cwd, path)
+      const bytes = statSync(abs).size
+      return { path, bytes }
+    } catch {
+      return { path }
+    }
+  })
 
   // ── Goal / plan-mode / plan-trace providers ──────────────────
   // 把 AgentLoop 的运行时状态暴露给 TUI，用于 GlanceBar 和 side panel。
   app.setGoalTrackerProvider(() => ctx!.refs.goalTrackerRef.current)
   app.setPlanModeProvider(() => ctx!.agent.planModeState === 'planning')
-  // Shift+Tab：CC 式流畅三态环 auto-safe → plan → manual → auto-safe。
-  // 每按一次立即推进，无二次确认、无 picker 劫持（选择器走 /plan-approve）。
-  // plan 退出即环推进——未批准的 draft 保留在 .rivet/plans/，不弹确认。
-  // yolo/auto-accept 不进环：按一次直接退回 auto-safe（快速降险出口）。
-  // 环内切换为会话级（不持久化默认值）。
+  // Shift+Tab：纯 Plan Mode 叠层开关（不兼审批环）。
+  // 进入记住当前审批模式且不改 approval；退出原样恢复（YOLO 不会被冲成 auto-safe/manual）。
+  // 审批切换仍走 /permission 与 /yes；planning 期间改审批会同步更新 stash。未批准 draft 保留在 .rivet/plans/。
   app.setPlanModeToggleHandler(() => {
     const agent = ctx!.agent
-    const setSessionApproval = (mode: import('./agent/loop-types.js').ApprovalMode) => {
+    const setSessionApproval = (mode: ApprovalMode) => {
       agent.setApprovalMode(mode)
       app!.setApprovalMode(mode)
-    }
-    if (agent.planModeState === 'planning') {
-      // plan → manual：draft 保留，随时 /plan-mode 或 Shift+Tab 转回来继续
-      agent.exitPlanMode()
-      setSessionApproval('manual')
-      app!.commitStatic('⏵ manual — 每个高风险工具确认（草稿计划已保留）')
-      return
+      // YOLO 联动无限轮次（与 /yes、权限面板一致）
+      agent.config.maxTurns = mode === 'dangerously-skip-permissions' ? 0 : 200
     }
     const current = agent.config.approvalMode ?? 'auto-safe'
-    if (current === 'auto-safe') {
-      // auto-safe → plan
+    const decision = nextShiftTabPlanToggle({
+      isPlanning: agent.planModeState === 'planning',
+      currentApprovalMode: current,
+      approvalModeBeforePlan: (app!.approvalModeBeforePlan as ApprovalMode | null) ?? null,
+    })
+    if (decision.action === 'enter') {
+      app!.approvalModeBeforePlan = decision.stashMode
       agent.enterPlanMode()
       const path = agent.getActivePlanFilePath()
-      app!.commitStatic(`⏵ plan mode — 写入已锁定，先规划再执行${path ? `（计划文件: \`${path}\`）` : ''}`)
-    } else {
-      // manual / yolo / auto-accept → auto-safe
-      setSessionApproval('auto-safe')
-      app!.commitStatic('⏵ auto-safe — 低风险自动执行，高风险确认')
+      const hint = shiftTabPlanToggleHint('enter', decision.stashMode)
+      app!.commitStatic(path ? `${hint}（计划文件: \`${path}\`）` : hint)
+      return
     }
+    agent.exitPlanMode()
+    setSessionApproval(decision.restoreMode)
+    app!.approvalModeBeforePlan = null
+    app!.commitStatic(shiftTabPlanToggleHint('exit', decision.restoreMode))
   })
   app.setPlanTraceProvider(() => ctx!.agent.planTrace)
 
@@ -1176,7 +1217,7 @@ async function main() {
 
   // ── Wire exit ────────────────────────────────────────────────
   app.onExit(() => {
-    shutdown(0)
+    void shutdown(0)
   })
 
   // ── First-run template prompt (before clearing screen) ───────
@@ -1342,5 +1383,5 @@ main().catch((err) => {
   if ((err as Error).stack) {
     process.stderr.write((err as Error).stack! + '\n')
   }
-  shutdown(1)
+  void shutdown(1)
 })

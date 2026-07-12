@@ -10,6 +10,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { skillRegistry } from '../../skills/skill-loader.js'
+import { EventEmitter } from 'node:events'
+import type { ServerResponse } from 'node:http'
 
 const TOKEN = 'secret-token'
 const AUTH = { authorization: `Bearer ${TOKEN}` }
@@ -22,9 +24,11 @@ class FakeAgent implements ManagedAgent {
   enterPlanModeCalls: Array<{ planFilePath?: string } | undefined> = []
   activePlanFilePath: string | null = null
   enabledTools: string[] = []
+  settleOnAbort = true
   private resolveRun?: () => void
   run(p: string, cb: AgentCallbacks) { this.runPrompts.push(p); this.callbacks = cb; return new Promise<void>((r) => { this.resolveRun = r }) }
-  abort() { this.resolveRun?.() }
+  abort() { if (this.settleOnAbort) this.resolveRun?.() }
+  finish() { this.resolveRun?.() }
   enableTool(name: string) { this.enabledTools.push(name); return { status: 'mounted', cacheImpact: 'none' } as const }
   setActivePlan(plan: { slug: string; title: string; selectedApproach?: string } | null) { this.activePlanCalls.push(plan) }
   enterPlanMode(opts?: { planFilePath?: string }) { this.enterPlanModeCalls.push(opts) }
@@ -95,6 +99,25 @@ test('prompt on a busy session returns 409', async () => {
   const id = (created.body as { id: string }).id
   const again = await router('POST', `/sessions/${id}/prompt`, { prompt: 'more' }, AUTH)
   assert.equal(again.status, 409)
+})
+
+test('prompt remains 409 through archive-abort settlement, then succeeds', async () => {
+  const { router, agents } = setup()
+  const created = await router('POST', '/sessions', { prompt: 'go' }, AUTH)
+  const id = (created.body as { id: string }).id
+  agents[0]!.settleOnAbort = false
+
+  assert.equal((await router('DELETE', `/sessions/${id}`, {}, AUTH)).status, 200)
+  assert.equal((await router('POST', `/sessions/${id}/unarchive`, {}, AUTH)).status, 200)
+  const settling = await router('POST', `/sessions/${id}/prompt`, { prompt: 'too soon' }, AUTH)
+  assert.equal(settling.status, 409)
+  assert.deepEqual(agents[0]!.runPrompts, ['go'])
+
+  agents[0]!.finish()
+  await new Promise((resolve) => setImmediate(resolve))
+  const after = await router('POST', `/sessions/${id}/prompt`, { prompt: 'now safe' }, AUTH)
+  assert.equal(after.status, 200)
+  assert.deepEqual(agents[0]!.runPrompts, ['go', 'now safe'])
 })
 
 test('POST /sessions/:id/resume maps manager results to precise status codes', async () => {
@@ -601,10 +624,9 @@ test('Plan: PUT /plans/:slug refuses non-submitted plans and preserves options o
   assert.match(readFileSync(join(plansDir, 'done.md'), 'utf-8'), /已批准/)
 })
 
-// Wave 2 — plan_draft invalidation signal: while planning, a successful
-// write_file/edit_file (which checkPlanMode restricts to the active draft)
-// emits a throttled metadata-only event so the desktop "起草中" view goes
-// event-driven instead of 2s polling.
+// Wave 2 — plan_draft: while planning, write_file/edit_file emits a throttled
+// event. Persistence/ring store metadata only; SSE listeners get `content` for
+// live PlanPanel paint (≤200KB).
 test('Plan: draft writes emit throttled plan_draft events while planning', async () => {
   const { manager, agents } = setup()
   const dir = mkdtempSync(join(tmpdir(), 'rivet-plans-'))
@@ -617,32 +639,41 @@ test('Plan: draft writes emit throttled plan_draft events while planning', async
   agent.activePlanFilePath = '.rivet/plans/draft-99.md'
   manager.run(s.id, 'plan it')
 
+  const live: Array<Record<string, unknown>> = []
+  const unsub = manager.subscribe(s.id, (e) => {
+    if (e.type === 'plan_draft') live.push(e.data)
+  })
+
   const draftEvents = () =>
     manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'plan_draft')
 
   // Leading edge: first write fires immediately (emit is async — flush microtasks).
   agent.callbacks!.onToolResult('t1', 'write_file', 'ok', false)
-  await new Promise((r) => setTimeout(r, 20))
+  await new Promise((r) => setTimeout(r, 100))
   assert.equal(draftEvents().length, 1)
-  const ev = draftEvents()[0]!.data as { path: string; title: string | null; size: number }
-  assert.equal(ev.path, '.rivet/plans/draft-99.md')
-  assert.equal(ev.title, '草稿')
-  assert.ok(ev.size > 0)
-  assert.ok(!('content' in ev), 'event is an invalidation signal — never carries the body')
+  const stored = draftEvents()[0]!.data as { path: string; title: string | null; size: number }
+  assert.equal(stored.path, '.rivet/plans/draft-99.md')
+  assert.equal(stored.title, '草稿')
+  assert.ok(stored.size > 0)
+  assert.ok(!('content' in stored), 'ring/persist store metadata only')
+  assert.equal(live.length, 1)
+  assert.ok(typeof live[0]!.content === 'string' && (live[0]!.content as string).includes('第一段'), 'SSE live frame carries body')
 
   // Burst inside the window: exactly one trailing event, not one per write.
   agent.callbacks!.onToolResult('t2', 'edit_file', 'ok', false)
   agent.callbacks!.onToolResult('t3', 'write_file', 'ok', false)
-  await new Promise((r) => setTimeout(r, 20))
+  await new Promise((r) => setTimeout(r, 50))
   assert.equal(draftEvents().length, 1, 'writes inside the throttle window do not emit immediately')
-  await new Promise((r) => setTimeout(r, 1100))
+  await new Promise((r) => setTimeout(r, 350))
   assert.equal(draftEvents().length, 2, 'trailing timer lands exactly one event for the burst')
+  assert.equal(live.length, 2)
 
   // Non-write tools and error results never emit.
   agent.callbacks!.onToolResult('t4', 'read_file', 'ok', false)
   agent.callbacks!.onToolResult('t5', 'write_file', 'denied', true)
-  await new Promise((r) => setTimeout(r, 20))
+  await new Promise((r) => setTimeout(r, 50))
   assert.equal(draftEvents().length, 2)
+  unsub?.()
 })
 
 test('Plan: no plan_draft events outside plan mode', async () => {
@@ -1106,4 +1137,33 @@ test('GET /sessions/search returns empty results when transcripts are absent', a
     if (prevDir === undefined) delete process.env.RIVET_SESSION_DIR
     else process.env.RIVET_SESSION_DIR = prevDir
   }
+})
+
+test('GET /sessions/search aborts its scan when the client response closes', async () => {
+  const agents: FakeAgent[] = []
+  const manager = new RuntimeSessionManager({
+    createAgent: () => { const agent = new FakeAgent(); agents.push(agent); return agent },
+    defaultCwd: '/tmp/work',
+  })
+  await createRouter(buildSessionRoutes(manager, TOKEN))('POST', '/sessions', { title: 'Searchable' }, AUTH)
+  let observedSignal: AbortSignal | undefined
+  const routes = buildSessionRoutes(manager, TOKEN, undefined, undefined, {
+    searchSessionTranscripts: async (_sessions, _query, options) => {
+      observedSignal = options?.signal
+      await new Promise<void>((resolve) => options?.signal?.addEventListener('abort', () => resolve(), { once: true }))
+      return {
+        results: [],
+        metadata: { durationMs: 0, scannedFiles: 0 },
+      }
+    },
+  })
+  const router = createRouter(routes)
+  const response = new EventEmitter() as ServerResponse
+  const pending = router('GET', '/sessions/search?q=needle', {}, AUTH, response)
+  await Promise.resolve()
+  response.emit('close')
+  const result = await pending
+
+  assert.equal(observedSignal?.aborted, true)
+  assert.equal(result.status, 200)
 })

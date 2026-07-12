@@ -171,6 +171,8 @@ export class PromptEngine {
   private taskDepthAdvisory: string | null = null
   private planMethodology?: import('../context/task-contract.js').PlanMethodology
   private planMethodologyReason?: string
+  /** Whether the last setPlanMethodology was under Plan Mode (design-doc advisory). */
+  private planMethodologyPlanMode = false
   /** Advisory text — only set when methodology changes, null otherwise to avoid noise. */
   private planMethodologyAdvisory: string | null = null
   private skillAdvisoryBlock?: string | null
@@ -974,14 +976,20 @@ export class PromptEngine {
       : null
   }
 
-  setPlanMethodology(methodology: import('../context/task-contract.js').PlanMethodology | undefined, reason?: string): void {
+  setPlanMethodology(
+    methodology: import('../context/task-contract.js').PlanMethodology | undefined,
+    reason?: string,
+    opts?: { planMode?: boolean },
+  ): void {
     const changed = this.planMethodology !== methodology
+      || this.planMethodologyPlanMode !== !!opts?.planMode
     this.planMethodology = methodology
     this.planMethodologyReason = reason
+    this.planMethodologyPlanMode = !!opts?.planMode
     // Only inject the advisory when methodology changes or is first set.
     // Repeated identical advisory every turn is pure noise (~60 tokens/turn).
     this.planMethodologyAdvisory = changed
-      ? renderPlanMethodologyAdvisory(methodology, reason)
+      ? renderPlanMethodologyAdvisory(methodology, reason, opts)
       : null
   }
 
@@ -1038,14 +1046,17 @@ export class PromptEngine {
   }
 
   /**
-   * Update session-state snapshot. Does NOT invalidate the fresh cache:
-   * within the same user message, all tool-call turns reuse the cached fresh
-   * volatile block — sessionState refreshes only at user-message boundaries.
-   * This is required to preserve DeepSeek prefix cache across tool turns.
+   * Update session-state snapshot. Byte-stable: only stores when the content
+   * actually differs from the previously stored snapshot. This means within an
+   * auto-continuation run where nothing changed (model only read files), the
+   * appendix stays identical → DeepSeek prefix cache preserved. When files are
+   * modified or task step advances, the state updates and the model sees it.
    * See: prompt/volatile.ts VolatileContext.sessionState comment.
    */
   setSessionState(text: string | null): void {
-    this.sessionStateText = text ?? undefined
+    const next = text ?? undefined
+    if (next === this.sessionStateText) return // byte-identical — no churn
+    this.sessionStateText = next
   }
 
   /**

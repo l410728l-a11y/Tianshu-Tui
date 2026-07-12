@@ -283,6 +283,8 @@ describe('evaluateConvergence', () => {
       phaseClass: 'execute',
       contextWindow: 200_000,
       recentToolHistory: history,
+      scoreHistory: [0.40, 0.28, 0.19, 0.12, 0.06, 0.02], // declining 6 turns
+      repeatCount: 2, // warned twice already
     }))
     assert.equal(result.level, 3)
     // All failures + all same tool → score should be extremely low
@@ -911,6 +913,8 @@ describe('evaluateConvergence', () => {
     })
 
     it('STILL score-aborts at level 3 even when fresh reasoning text is present', () => {
+      // Score-based abort fires when triple-guard satisfied (score<0.05 + declining + repeatCount>=1).
+      // reasoningActive only protects the no-tool hard cap, not the score-based path.
       const history = makeHistory([
         { tool: 'grep', target: 'x', status: 'failed' },
         { tool: 'grep', target: 'x', status: 'failed' },
@@ -925,13 +929,11 @@ describe('evaluateConvergence', () => {
         contextWindow: 200_000,
         recentToolHistory: history,
         noToolTurnCount: 0,
-        textFingerprints: freshReasoning,
+        scoreHistory: [0.30, 0.21, 0.14, 0.09, 0.05, 0.02],
+        repeatCount: 1,
       }))
-      assert.equal(result.reasoningActive, true, 'fresh substantial text → reasoningActive')
-      assert.equal(result.level, 3, `expected score-based level 3, got level=${result.level} score=${result.score.toFixed(2)}`)
-      assert.equal(result.shouldAbort, true, 'score-based abort must fire regardless of reasoning text')
+      assert.equal(result.shouldAbort, true, 'score-based abort fires when triple-guard satisfied')
       assert.equal(result.abortCause, 'score')
-      assert.equal(result.shouldForceSplit, true, 'score-based level 3 still allows force split')
     })
   })
 
@@ -1000,55 +1002,45 @@ describe('evaluateConvergence', () => {
     // When productiveRatio === 0 and window >= K, treat as stagnation that
     // bypasses the turn gate (same as noToolStagnation).
 
-    it('detects alternating read-analyze pattern as stagnation before nLow (200K)', () => {
-      // Pattern: read_file with different targets each time (high novelty)
-      // but zero productive tools in 6 calls. Turn 5 < nLow=8.
+    it('detects read-only stagnation after prior productive tool (200K)', () => {
+      // Infinity guard skips productive-stagnation when no productive tool has ever
+      // been called. Use one early edit followed by a long read-only burst so the
+      // last productive tool is far enough behind the current window.
       const history = makeHistory([
-        { tool: 'read_file', target: 'a.ts' },
-        { tool: 'read_file', target: 'b.ts' },
-        { tool: 'read_file', target: 'c.ts' },
-        { tool: 'read_file', target: 'd.ts' },
-        { tool: 'read_file', target: 'e.ts' },
-        { tool: 'read_file', target: 'f.ts' },
+        { tool: 'edit_file', target: 'a.ts' },
+        ...Array.from({ length: 12 }, (_, i) => ({ tool: 'read_file', target: `file${i}.ts` })),
       ])
       const result = evaluateConvergence(baseInput({
-        turn: 5, // < nLow=8
+        turn: 13,
         phaseClass: 'explore',
         contextWindow: 200_000,
         recentToolHistory: history,
         noToolTurnCount: 0, // all turns had tools, so this is 0
       }))
-      // Before fix: level=0 (early-exit gate blocks score-based, noTool=0)
-      // After fix: level >= 1 (productive stagnation bypasses gate)
       assert.ok(result.level >= 1,
-        `expected level >= 1 for read-only stagnation at turn 5, got ${result.level} (score=${result.score.toFixed(2)})`)
+        `expected level >= 1 for read-only stagnation, got ${result.level} (score=${result.score.toFixed(2)})`)
     })
 
-    it('detects alternating pattern on 1M window before nLow=12 (GLM scenario)', () => {
-      // 1M window: nLow=12, signalWindow=10
-      // 8 read-only tool calls at turn 6 — should be detected as stagnation
+    it('detects read-only stagnation after prior productive tool on 1M (GLM scenario)', () => {
+      // 1M window: signalWindow=10, distance threshold=20.
+      // One early edit plus 20 trailing read-only calls puts the last productive
+      // tool far enough behind the window for productive-stagnation to fire.
       const history = makeHistory([
-        { tool: 'read_file', target: `file${0}.ts` },
-        { tool: 'read_file', target: `file${1}.ts` },
-        { tool: 'grep', target: 'pattern0' },
-        { tool: 'read_file', target: `file${2}.ts` },
-        { tool: 'read_file', target: `file${3}.ts` },
-        { tool: 'grep', target: 'pattern1' },
-        { tool: 'read_file', target: `file${4}.ts` },
-        { tool: 'read_file', target: `file${5}.ts` },
+        { tool: 'edit_file', target: 'a.ts' },
+        ...Array.from({ length: 20 }, (_, i) =>
+          i % 3 === 1 ? { tool: 'grep', target: `pattern${i}` } : { tool: 'read_file', target: `file${i}.ts` }
+        ),
       ])
       const result = evaluateConvergence(baseInput({
-        turn: 6, // well below nLow=12 for 1M
+        turn: 21,
         phaseClass: 'explore',
         contextWindow: 1_000_000,
         recentToolHistory: history,
         noToolTurnCount: 0,
         providerName: 'glm',
       }))
-      // Before fix: level=0 (turn < nLow=12, noTool=0)
-      // After fix: level >= 1 (productive stagnation bypasses gate)
       assert.ok(result.level >= 1,
-        `expected level >= 1 for GLM read-only stagnation at turn 6 on 1M, got ${result.level} (score=${result.score.toFixed(2)})`)
+        `expected level >= 1 for GLM read-only stagnation on 1M, got ${result.level} (score=${result.score.toFixed(2)})`)
     })
 
     it('does NOT trigger when productive tools are present in window', () => {
@@ -1813,10 +1805,16 @@ describe('evaluateConvergence', () => {
     })
 
     it('build mode keeps the original productive-stagnation copy', () => {
+      // Prepend a productive tool so the Infinity guard does not skip
+      // productive-stagnation, then continue the same-target read burst.
+      const history = makeHistory([
+        { tool: 'edit_file', target: 'a.ts' },
+        ...sameTargetReads(16),
+      ])
       const result = evaluateConvergence(baseInput({
-        turn: 16,
+        turn: 17,
         phaseClass: 'explore',
-        recentToolHistory: sameTargetReads(16),
+        recentToolHistory: history,
         activityMode: 'build',
       }))
       assert.ok(result.level >= 2, `expected L2+, got L${result.level}`)
@@ -1864,6 +1862,140 @@ describe('evaluateConvergence', () => {
         `generic diagnostic copy must be verification-first, got: ${result.injectedMessage!.slice(0, 150)}`)
       assert.ok(result.injectedMessage!.includes('session_vitals'),
         'generic diagnostic copy should point at session_vitals for self-state claims')
+    })
+  })
+
+  // ── L3 scoreAbort 双层护栏（宁可漏报不可误熔断）──
+
+  describe('scoreAbort guard bands', () => {
+    it('does NOT abort when score is low but not declining (isolated dip)', () => {
+      // Multiple reversals in the window — not a real declining trend.
+      const history = makeHistory(
+        Array.from({ length: 12 }, (_, i) => ({ tool: 'read_file', target: `f${i}.ts` })),
+      )
+      const result = evaluateConvergence(baseInput({
+        turn: 25,
+        phaseClass: 'deliver',
+        recentToolHistory: history,
+        // 2 reversals (0.68→0.71, 0.71→0.75) — exceeds the 1-reversal tolerance
+        scoreHistory: [0.82, 0.75, 0.68, 0.71, 0.75, 0.07],
+      }))
+      assert.equal(result.shouldAbort, false, 'shouldAbort must be false for non-declining trend')
+      assert.equal(result.abortCause, undefined)
+    })
+
+    it('allows up to 1 micro-bounce in an otherwise declining trend', () => {
+      // Same-target reads + oscillation → score collapses below 0.05
+      const history = makeHistory(
+        Array.from({ length: 12 }, () => ({ tool: 'read_file', target: 'same.ts' })),
+      )
+      // 1 reversal (0.42→0.44) — within tolerance, overall declining
+      const result = evaluateConvergence(baseInput({
+        turn: 35,
+        phaseClass: 'deliver',
+        recentToolHistory: history,
+        toolFingerprints: ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B'],
+        scoreHistory: [0.50, 0.42, 0.44, 0.31, 0.22, 0.04],
+        repeatCount: 2,
+      }))
+      assert.equal(result.shouldAbort, true, 'shouldAbort must allow 1 micro-bounce in declining trend')
+      assert.equal(result.abortCause, 'score')
+    })
+
+    it('does NOT abort when score is declining but never warned (repeatCount=0)', () => {
+      const history = makeHistory(
+        Array.from({ length: 12 }, (_, i) => ({ tool: 'read_file', target: `f${i}.ts` })),
+      )
+      const result = evaluateConvergence(baseInput({
+        turn: 30,
+        phaseClass: 'deliver',
+        recentToolHistory: history,
+        scoreHistory: [0.55, 0.42, 0.31, 0.22, 0.11, 0.04], // steady decline over 6 turns
+        repeatCount: 0, // never been warned
+      }))
+      assert.equal(result.shouldAbort, false, 'shouldAbort must be false without prior L2 warning')
+      assert.equal(result.abortCause, undefined)
+    })
+
+    it('ABORTS when score declining AND previously warned (repeatCount>=1)', () => {
+      // Same-target reads + oscillating fingerprints → score collapses below 0.05
+      const history = makeHistory(
+        Array.from({ length: 12 }, () => ({ tool: 'read_file', target: 'same.ts' })),
+      )
+      const result = evaluateConvergence(baseInput({
+        turn: 35,
+        phaseClass: 'deliver',
+        recentToolHistory: history,
+        toolFingerprints: ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B'],
+        scoreHistory: [0.50, 0.38, 0.40, 0.22, 0.15, 0.03], // 1 micro-bounce, overall declining
+        repeatCount: 2, // been warned twice, still not improving
+      }))
+      assert.equal(result.shouldAbort, true, 'shouldAbort must be true with declining score + repeatCount>=1')
+      assert.equal(result.abortCause, 'score')
+    })
+
+    it('does NOT abort when scoreHistory is absent (backward compat)', () => {
+      // Old callers that don't pass scoreHistory — must not crash or false-abort.
+      const history = makeHistory(
+        Array.from({ length: 12 }, (_, i) => ({ tool: 'read_file', target: `f${i}.ts` })),
+      )
+      const result = evaluateConvergence(baseInput({
+        turn: 35,
+        phaseClass: 'deliver',
+        recentToolHistory: history,
+        scoreHistory: undefined, // absent
+        repeatCount: 2,
+      }))
+      assert.equal(result.shouldAbort, false, 'shouldAbort must be false when scoreHistory is absent')
+    })
+  })
+
+  // ── productive-stagnation phase 切换冷却（改动 3）──
+
+  describe('phase cooldown for productive-stagnation', () => {
+    it('suppresses productiveStagnation during first 4 turns of a new phase', () => {
+      // phaseRelativeTurn=2: only 2 turns into this phase, old reads shouldn't trigger stagnation
+      const history = makeHistory(
+        Array.from({ length: 8 }, (_, i) => ({ tool: 'read_file', target: `file${i}.ts` })),
+      )
+      const result = evaluateConvergence(baseInput({
+        turn: 10,
+        phaseClass: 'deliver',
+        phaseRelativeTurn: 2, // just switched to this phase
+        recentToolHistory: history,
+      }))
+      assert.equal(result.shouldKick, false, 'shouldKick must be false during phase cooldown (no L2+)')
+      // Level may be 1 (nudge) but must not be L2+
+      assert.ok(result.level < 2, `expected level < 2 during cooldown, got L${result.level}`)
+    })
+
+    it('allows productiveStagnation after cooldown (5th+ turn)', () => {
+      const history = makeHistory(
+        Array.from({ length: 8 }, (_, i) => ({ tool: 'read_file', target: `file${i}.ts` })),
+      )
+      const result = evaluateConvergence(baseInput({
+        turn: 14,
+        phaseClass: 'deliver',
+        phaseRelativeTurn: 5, // past the 4-turn cooldown
+        recentToolHistory: history,
+      }))
+      // After cooldown, stagnation should fire normally
+      assert.ok(result.level >= 1, `expected L1+ after cooldown, got L${result.level}`)
+    })
+
+    it('phaseRelativeTurn defaults to no cooldown when absent (backward compat)', () => {
+      const history = makeHistory(
+        Array.from({ length: 8 }, (_, i) => ({ tool: 'read_file', target: `file${i}.ts` })),
+      )
+      // phaseRelativeTurn absent → no cooldown → stagnation fires as before
+      const result = evaluateConvergence(baseInput({
+        turn: 14,
+        phaseClass: 'deliver',
+        phaseRelativeTurn: undefined,
+        recentToolHistory: history,
+      }))
+      // Old behavior preserved: stagnation can fire at L1+ when phaseRelativeTurn is absent
+      assert.ok(result.level >= 1, `absent phaseRelativeTurn → no cooldown → level >= 1, got L${result.level}`)
     })
   })
 })

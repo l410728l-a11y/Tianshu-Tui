@@ -12,6 +12,7 @@ import { buildFileDiff, computeChangedLineRanges, type LineRange } from './edit-
 import { detectPointerPlaceholder, pointerPlaceholderError } from './pointer-guard.js'
 import { toPosixPath } from '../path-format.js'
 import { writeMarkdownAsDocx } from './office-writer.js'
+import { formatActivePlanDraftReceipt, canonicalizePathForCompare } from '../agent/plan-mode.js'
 
 const MAX_WRITE_FILE_BYTES = 10 * 1024 * 1024 // 10MB — safety ceiling for single write_file call
 
@@ -92,6 +93,13 @@ Bad: using write_file to change one line in an existing file (use edit_file inst
 
     await mkdir(dir, { recursive: true })
 
+    // The active plan-mode draft is intentionally created as an empty file by
+    // the system. Writing the first content to it is not a blind overwrite of
+    // user content, so skip the read-before-write guard for that exact path.
+    const isActivePlanDraft = params.activePlanFilePath
+      && canonicalizePathForCompare(toPosixPath(relative(params.cwd, filePath)))
+        === canonicalizePathForCompare(params.activePlanFilePath)
+
     // If overwriting an existing file, back it up for recovery
     let fileExists = false
     let existingSize = 0
@@ -124,8 +132,11 @@ Bad: using write_file to change one line in an existing file (use edit_file inst
     // seen. Byte-identical rewrites are exempt (no information loss). After
     // the refusal a single read_file registers the observation and the next
     // write_file goes through — self-correcting, one extra tool call.
+    // Plan-mode drafts are exempt: they start empty and exist only for the
+    // agent to fill in.
     if (
       fileExists
+      && !isActivePlanDraft
       && process.env.RIVET_WRITE_OVERWRITE_GUARD !== '0'
       && getFileReadMtime(filePath, params.sessionId) === null
       && !(haveOldContentForDiff && oldContentForDiff === toLf(content))
@@ -201,8 +212,16 @@ Bad: using write_file to change one line in an existing file (use edit_file inst
       warn = warn ? `${warn}\n(diff skipped: ${(e as Error).message})` : `(diff skipped: ${(e as Error).message})`
     }
     const uiContent = diff ? (warn ? `${diff}\n\n${warn}` : diff) : (warn ? warn : undefined)
+    const draftReceipt = formatActivePlanDraftReceipt(
+      params.cwd,
+      filePath,
+      params.activePlanFilePath,
+      finalContent.length,
+    )
+    const receipt = draftReceipt
+      ?? `Wrote ${finalContent.length} bytes (${lines} lines) to ${toPosixPath(filePath)}`
     return {
-      content: `Wrote ${finalContent.length} bytes (${lines} lines) to ${toPosixPath(filePath)}` + (warn ? '\n\n' + warn : ''),
+      content: receipt + (warn ? '\n\n' + warn : ''),
       uiContent,
       changedRanges,
     }
