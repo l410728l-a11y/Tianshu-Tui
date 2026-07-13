@@ -18,6 +18,7 @@ import { OverlayEngine } from './overlay-engine.js'
 import { InputHandler, type KeyPress } from './input-handler.js'
 import { ResizeHandler } from './resize-handler.js'
 import { InputLine } from './input-line.js'
+import { loadImageAttachment, looksLikeImagePath, MAX_IMAGES } from './image-attach.js'
 import { WriteBatcher } from './write-batcher.js'
 import { StreamRenderer } from './stream-renderer.js'
 import type { TuiPerfMonitor, TuiPerfSummary } from './perf-monitor.js'
@@ -40,7 +41,7 @@ import { formatCollapsedBashGroup, formatCollapsedBashGroupLive, isCollapsibleBa
 import { formatPermissionDiff } from '../format/permission-diff.js'
 import { formatApprovalPrompt } from '../format/approval-renderers.js'
 import { formatThinking } from '../format/thinking.js'
-import { formatGlanceBar, resolveStarDomainDisplay, resolveStarDomainAccent, formatGlanceLeft, formatGlanceRight } from '../format/glance-bar.js'
+import { formatGlanceBar, resolveStarDomainDisplay, resolveStarDomainAccent, formatGlanceLeft, formatGlanceRight, formatPermissionModeLine } from '../format/glance-bar.js'
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
 import { formatTaskList } from '../format/task-list.js'
 import type { TodoItem } from '../../tools/todo-store.js'
@@ -51,6 +52,7 @@ import { buildWorkerDetailContent } from '../worker-detail.js'
 import { renderSidePanel, resolveSidePanelWidth, SIDE_PANEL_MIN_COLUMNS, type SidePanelInput } from '../side-panel.js'
 import { loadWorkerSession } from '../../agent/worker-session-persist.js'
 import type { TasksFilter } from '../format/overlay.js'
+import type { PlanSubmittedInfo, AskUserQuestionInfo } from '../../tools/types.js'
 import {
   delegationObjectiveFromInput,
   delegationProfileFromInput,
@@ -61,6 +63,7 @@ import { formatSpinnerStatus, formatTurnWorkSummary } from '../format/spinner-st
 import { formatSlashHint, slashCompletionTarget, filterSlashCommands, type SlashHintEntry } from '../format/slash-hint.js'
 import { extractAtToken, getCompletions, applyCompletion } from '../file-completer.js'
 import stringWidth from 'string-width'
+import { resolve } from 'node:path'
 import { truncateToDisplayWidth, displayWidth, ambiguousWideEnabled } from '../width.js'
 import { appendHistoryAsync, nextHistoryAfterSubmit } from '../history.js'
 import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, renderTasks, renderDomainPicker, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect } from '../format/overlay.js'
@@ -372,7 +375,7 @@ export class TuiApp {
   readonly callbacks: AgentCallbacks
 
   // External hooks
-  private onSubmitCallback?: (text: string) => void
+  private onSubmitCallback?: (text: string, images?: string[]) => void
   private onAbortCallback?: () => void
   private onExitCallback?: () => void
   /** External slash command handler. If set, it is tried before the registry. */
@@ -383,6 +386,10 @@ export class TuiApp {
   readonly steerBuffer = new SteerBuffer()
   /** agent 是否正在执行（submit → final turn complete 之间） */
   private agentBusy = false
+  /** 主控模型是否原生支持 vision（用于图片附件提示）。 */
+  private supportsVision = false
+  /** 是否配置了独立的 vision bridge 模型（用于图片附件提示）。 */
+  private visionBridgeEnabled = false
   /** 当前会话审批模式（继承自 agent config），供 worker pills badge */
   private _approvalMode: string = 'auto-safe'
   /**
@@ -390,8 +397,18 @@ export class TuiApp {
    * 退出 plan 时原样恢复；`/yes` 等在 planning 期间改审批时同步更新此 stash。
    */
   approvalModeBeforePlan: string | null = null
-  /** choice-panel 当前模式：'effort' (推理强度) / 'permission' (权限选择) / 'permission-yolo-confirm' (YOLO 二次确认) */
-  choicePanelKind: 'effort' | 'permission' | 'permission-yolo-confirm' = 'effort'
+  /** choice-panel 当前模式：'effort' (推理强度) / 'permission' (权限选择) / 'permission-yolo-confirm' (YOLO 二次确认) / 'plan-approval' (计划审批) / 'ask-user-question' (问题选项选择) */
+  choicePanelKind: 'effort' | 'permission' | 'permission-yolo-confirm' | 'plan-approval' | 'ask-user-question' = 'effort'
+  /** 当前待审批计划信息（plan-approval 面板使用）。 */
+  pendingPlanApproval: PlanSubmittedInfo | undefined = undefined
+  /** 当前待回答的可选择问题（ask-user-question 面板使用）。 */
+  pendingAskUserQuestion: AskUserQuestionInfo['questions'][number] | undefined = undefined
+  /** choice-panel 子模式：select（选选项）/ input（在 overlay 内输入文字）。 */
+  choicePanelSubMode: 'select' | 'input' = 'select'
+  /** choice-panel 输入子模式下的实时缓冲。 */
+  choicePanelInputBuffer: string = ''
+  /** 输入子模式提交时的语义目标。 */
+  choicePanelInputFor?: 'plan-reject-comment' | 'ask-other'
   /** GlanceBar 信息密度（Wave 2 减密）：compact 默认四项，`/glance full` 切全量。 */
   glanceDensity: 'compact' | 'full' = 'compact'
   /** 可脚本化 statusline 文本（ui.statusLine.command stdout 首行），渲染在输入框上方。 */
@@ -412,6 +429,10 @@ export class TuiApp {
    *  window and let the user intervene instead. */
   private _lastApprovalDeniedAt = 0
   private static readonly APPROVAL_STALL_GRACE_MS = 5_000
+  /** 是否已经执行过 start()。构造后到 start() 之间的 setter 不应触发渲染，
+   *  否则会在 main.ts 清屏前画出一版输入框；若清屏/flush 出现偏差，旧帧会
+   *  残留在欢迎屏上方形成重影。 */
+  private started = false
   /** Ctrl+X leader key 待处理状态（用于 ctrl+x r 打开右侧面板） */
   private sidePanelLeaderPending = false
   private sidePanelLeaderTimer: ReturnType<typeof setTimeout> | null = null
@@ -470,8 +491,14 @@ export class TuiApp {
       history: options.history,
       placeholder: '询问任何事，或 / 唤起命令',
       onTabComplete: () => this.handleTabComplete(),
-      onSubmit: (text) => {
-        const trimmed = text.trim()
+      onSubmit: (text, images) => {
+        let trimmed = text.trim()
+        const hasImages = images && images.length > 0
+        // 允许只发图片：空文本时补一个占位 prompt，让后端能触发 run。
+        if (!trimmed && hasImages) {
+          text = '📎 图片消息'
+          trimmed = text
+        }
 
         // User-initiated submit is real progress: clear the goal-mode watchdog
         // auto-continue counter so a later legitimate stall gets the full
@@ -491,7 +518,7 @@ export class TuiApp {
         if (this.viewingWorkerId && trimmed && !trimmed.startsWith('/')) {
           const target = this.viewingWorkerId
           const delivered = this.workerSteer?.(target, trimmed) ?? false
-          this.commitUserPrompt(`[→ ${shortOrderLabel(target)}] ${trimmed}`)
+          this.commitUserPrompt(`[→ ${shortOrderLabel(target)}] ${trimmed}`, images)
           if (!delivered) {
             this.commitStatic(color('⚠ 该子代理已结束或不支持直达，消息未送达', this.theme.warning))
           }
@@ -502,7 +529,7 @@ export class TuiApp {
         // W4a: agent 执行中 → 入队（turn 边界 drain 注入）。
         // 同时立即 commit 用户气泡到 scrollback，确保用户始终能看到自己说了什么。
         if (this.agentBusy && trimmed) {
-          this.commitUserPrompt(trimmed)
+          this.commitUserPrompt(trimmed, images)
           this.steerBuffer.push(trimmed)
           this.renderLive()
           return
@@ -534,7 +561,7 @@ export class TuiApp {
         // Commit user message to scrollback（steer 已单独 commit 时跳过）
         if (trimmed) {
           if (!steerMerged) {
-            this.commitUserPrompt(submitText.trim())
+            this.commitUserPrompt(submitText.trim(), images)
           }
           // 新 run 启动前丢弃上一 run 未 finalize 的流式残留：blockWriter 缓冲
           // 与 streamRenderer pending 若不清，会把上一轮文字追加进新轮输出。
@@ -546,7 +573,7 @@ export class TuiApp {
         // Reset turn timer for the new turn
         this.state.turnStartMs = Date.now()
         this.streamRenderController.lastActivityMs = Date.now()
-        this.onSubmitCallback?.(submitText)
+        this.onSubmitCallback?.(submitText, images)
       },
     })
 
@@ -617,7 +644,7 @@ export class TuiApp {
     // Wire bracketed paste: 整段插入光标处，批渲染（避免逐 chunk 全量重写）
     // 审批/意图/overlay 模式下不处理粘贴——粘贴文本会"穿透"到输入框，
     // 退出模式后出现幽灵文本。
-    this.input.onPaste((text) => {
+    this.input.onPaste(async (text) => {
       const mode = this.input.getMode()
       if (mode !== 'input') return
       // Connect overlay active → route paste into connectInput, not the main input box
@@ -632,6 +659,28 @@ export class TuiApp {
       }
       // Other overlays active → don't paste into main input
       if (this.overlay.isActive()) return
+
+      const trimmed = text.trim()
+      // 粘贴内容看起来像图片路径 → 尝试加载为附件；失败则回退为普通文本。
+      if (trimmed && looksLikeImagePath(trimmed) && !trimmed.includes('\n')) {
+        if (this.inputLine.images.length >= MAX_IMAGES) {
+          this.commitStatic(color(`⚠ 最多附加 ${MAX_IMAGES} 张图片`, this.theme.warning))
+          this.renderLive()
+          return
+        }
+        try {
+          const attachment = await loadImageAttachment(resolve(trimmed))
+          this.inputLine.addImage(attachment.dataUrl)
+          this.writeBatcher.schedule()
+          return
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          this.commitStatic(color(`⚠ 图片加载失败: ${message}`, this.theme.warning))
+          this.renderLive()
+          // fallthrough to normal text paste
+        }
+      }
+
       this.inputLine.insertText(text)
       this.inputController.fileCompletion = null
       this.writeBatcher.schedule()
@@ -986,6 +1035,9 @@ export class TuiApp {
    * 无需等待第一次按键。main-ansi 在欢迎块写完后调用。
    */
   start(): void {
+    // 标记已启动：构造后到 start() 之间的 setter 不再触发渲染，
+    // 避免在 main.ts 清屏前画出一版输入框，清屏/flush 偏差时形成顶部重影。
+    this.started = true
     // 启用 bracketed paste（DEC 2004）：粘贴被 200~/201~ 包裹，
     // 避免含 \r 的多行粘贴被逐行当作 Enter 提交、控制字符污染显示。
     this.stdout.write('\x1B[?2004h')
@@ -999,8 +1051,8 @@ export class TuiApp {
     this.renderLive()
   }
 
-  /** 设置提交回调（用户按 Enter 后触发） */
-  onSubmit(callback: (text: string) => void): void {
+  /** 设置提交回调（用户按 Enter 后触发）。images 为当前输入框携带的图片附件 data URL 列表。 */
+  onSubmit(callback: (text: string, images?: string[]) => void): void {
     this.onSubmitCallback = callback
   }
 
@@ -1043,6 +1095,12 @@ export class TuiApp {
   setInput(text: string): void {
     this.inputLine.setValue(text, text.length)
     this.renderLive()
+  }
+
+  /** 设置当前主控模型的 vision 能力与桥接状态（用于图片附件提示）。 */
+  setVisionInfo(supportsVision: boolean, bridgeEnabled: boolean): void {
+    this.supportsVision = supportsVision
+    this.visionBridgeEnabled = bridgeEnabled
   }
 
   /** 构建命令名谓词，供 resolveAppPromptInput 区分路径与命令。
@@ -1193,6 +1251,51 @@ export class TuiApp {
     this.connectError = undefined
     this.input.setMode('input')
     this.activateOverlay('connect')
+  }
+
+  /** 打开计划审批选择面板（plan action=submit 成功后自动调用）。 */
+  openPlanApprovalPanel(info: PlanSubmittedInfo): void {
+    this.choicePanelKind = 'plan-approval'
+    this.pendingPlanApproval = info
+    this.choicePanelSubMode = 'select'
+    this.choicePanelInputBuffer = ''
+    this.choicePanelInputFor = undefined
+    this.activateOverlay('choice-panel')
+  }
+
+  /** 打开用户问题选项选择面板（ask_user_question 含单选选项时自动调用）。 */
+  openAskUserQuestionPanel(info: AskUserQuestionInfo): void {
+    // 目前仅处理第一个非多选的可选择问题；多问题/多选场景保持文本输入。
+    const question = info.questions.find(q => q.options.length > 0 && !q.allowMultiple)
+    if (!question) return
+    this.choicePanelKind = 'ask-user-question'
+    this.pendingAskUserQuestion = question
+    this.choicePanelSubMode = 'select'
+    this.choicePanelInputBuffer = ''
+    this.choicePanelInputFor = undefined
+    this.activateOverlay('choice-panel')
+  }
+
+  /** choice-panel 输入子模式渲染数据（由 renderChoicePanel 读取）。 */
+  getChoicePanelInputState(): ChoicePanelData['inputSubMode'] {
+    if (this.choicePanelSubMode !== 'input') return undefined
+    if (this.choicePanelInputFor === 'plan-reject-comment') {
+      return {
+        active: true,
+        label: '驳回反馈',
+        placeholder: '输入反馈后回车（可留空）',
+        value: this.choicePanelInputBuffer,
+      }
+    }
+    if (this.choicePanelInputFor === 'ask-other') {
+      return {
+        active: true,
+        label: '自定义回答',
+        placeholder: '输入你的回答后回车',
+        value: this.choicePanelInputBuffer,
+      }
+    }
+    return undefined
   }
 
   /** connect overlay 渲染数据（由 registerOverlays 的 render 闭包读取）。 */
@@ -1831,6 +1934,42 @@ export class TuiApp {
     if (id === 'choice-panel') {
       const choices = this.overlayController.getData()?.choicePanelData?.().choices ?? []
       const cur = this.overlayController.nav().choicePanelIndex
+
+      // 输入子模式：在 overlay 内直接输入文字（反馈 / 自定义回答）。
+      if (this.choicePanelSubMode === 'input') {
+        if (key.name === 'escape') {
+          this.choicePanelSubMode = 'select'
+          this.choicePanelInputBuffer = ''
+          this.choicePanelInputFor = undefined
+          this.overlay.rerender()
+          return true
+        }
+        if (key.name === 'return') {
+          const targetId = this.choicePanelInputFor === 'plan-reject-comment' ? '__reject_comment__' : '__other__'
+          const exec = this.overlayController.getChoicePanelExec()
+          if (exec) exec(targetId)
+          this.choicePanelSubMode = 'select'
+          this.choicePanelInputBuffer = ''
+          this.choicePanelInputFor = undefined
+          this.choicePanelKind = 'effort'
+          this.pendingPlanApproval = undefined
+          this.pendingAskUserQuestion = undefined
+          this.deactivateOverlay()
+          return true
+        }
+        if (key.name === 'backspace') {
+          this.choicePanelInputBuffer = this.choicePanelInputBuffer.slice(0, -1)
+          this.overlay.rerender()
+          return true
+        }
+        if (this.isPrintableKey(key)) {
+          this.choicePanelInputBuffer += key.char
+          this.overlay.rerender()
+          return true
+        }
+        return true
+      }
+
       if (key.name === 'down') {
         if (choices.length > 0) { this.overlayController.nav().choicePanelIndex = (cur + 1) % choices.length; this.overlay.rerender() }
         return true
@@ -1841,6 +1980,15 @@ export class TuiApp {
       }
       if (key.name === 'return') {
         const entry = choices[cur]
+        const inputEntryIds = new Set(['__other__', '__reject_comment__'])
+        if (entry && inputEntryIds.has(entry.id)) {
+          // 进入输入子模式，不关闭 overlay。
+          this.choicePanelSubMode = 'input'
+          this.choicePanelInputBuffer = ''
+          this.choicePanelInputFor = entry.id === '__reject_comment__' ? 'plan-reject-comment' : 'ask-other'
+          this.overlay.rerender()
+          return true
+        }
         if (entry && this.overlayController.getChoicePanelExec()) this.overlayController.getChoicePanelExec()?.(entry.id)
         this.deactivateOverlay()
         return true
@@ -1955,15 +2103,15 @@ export class TuiApp {
    * where SlashRouter already has a resolved prompt from resolveAppPromptInput.
    * Commits the user prompt to scrollback and fires onSubmitCallback.
    */
-  submitText(text: string): void {
-    this.commitUserPrompt(text)
+  submitText(text: string, images?: string[]): void {
+    this.commitUserPrompt(text, images)
     this.blockWriter.discard()
     this.streamRenderer.reset()
     this.streamRenderController.assistantHeaderDone = false
     this.agentBusy = true
     this.state.turnStartMs = Date.now()
     this.streamRenderController.lastActivityMs = Date.now()
-    this.onSubmitCallback?.(text)
+    this.onSubmitCallback?.(text, images)
   }
 
   /**
@@ -1991,10 +2139,22 @@ export class TuiApp {
    * 所有 submit 路径（idle / slash passthrough / steer）共用此入口，
    * 确保用户始终能在终端历史中看到自己输入的内容。
    */
-  private commitUserPrompt(content: string): void {
+  private commitUserPrompt(content: string, images?: string[]): void {
     this.commitAbove(() => {
+      const hasImages = images && images.length > 0
+      let imageNote = ''
+      if (hasImages) {
+        imageNote = `\n${color(`📎 ${images.length} image${images.length > 1 ? 's' : ''} attached`, this.theme.muted)}`
+        if (!this.supportsVision) {
+          if (this.visionBridgeEnabled) {
+            imageNote += `\n${color('🖼 将使用配置的 vision 模型生成图片描述后发送', this.theme.muted)}`
+          } else {
+            imageNote += `\n${color('⚠ 当前模型不支持识图，图片未发送。可在 .rivet-config.json 中配置 agent.visionModel 启用识图桥接。', this.theme.warning)}`
+          }
+        }
+      }
       const formatted = formatUserMessage({
-        content: content.trim(),
+        content: content.trim() + imageNote,
         width: this.columns,
       }, this.theme)
       this.commit.write({ text: formatted.join('\n'), trailingNewline: true })
@@ -3072,6 +3232,23 @@ export class TuiApp {
   }
 
   private renderLive(): void {
+    // start() 之前所有 setter / 用户输入回调都不应触发真正的 stdout 输出。
+    // 构造后到 main.ts 清屏写欢迎屏之间若渲染一版输入框，旧帧可能残留在
+    // 欢迎屏上方形成重影；统一在 start() 置 started=true 后才开始绘制。
+    if (!this.started) return
+    // 同步终端实际尺寸：ResizeHandler 的 resize 回调有 150ms debounce，
+    // 在 debounce 窗口内 stdout.columns/rows 已变而 this.columns/rows 仍是旧值。
+    // 若此时触发渲染，renderLiveImpl 按旧宽布局而 LiveEngine 按 stdout 新宽估算
+    // 显示行数，回顶量错误 → 输入框漂移/重影。这里用 stdout 最新值统一口径。
+    const latestCols = this.stdout.columns
+    const latestRows = this.stdout.rows
+    if (latestCols && latestRows) {
+      if (this.columns !== latestCols || this.rows !== latestRows) {
+        this.columns = latestCols
+        this.rows = latestRows
+        this.live.setMaxRows(liveMaxRowsFor(this.rows))
+      }
+    }
     if (this.perfMonitor?.enabled) {
       this.perfMonitor.measure('renderLive', () => this.renderLiveImpl())
     } else {
@@ -3377,8 +3554,7 @@ export class TuiApp {
       const starDomain = activeDomainId ? (STAR_DOMAINS as any)[activeDomainId] : null
       const uiSep = starDomain?.uiPersona?.separator ?? 'thin'
 
-      const W = Math.min(cols - 2, 78)
-      const innerWidth = Math.max(20, W - 4)
+      const innerWidth = Math.max(20, cols - 6)
       // 静态 chrome（线框字符 + 底边框）只依赖 (separator, innerWidth, borderColor)，
       // 缓存复用，避免每帧 repeat(innerWidth) 重建。
       const { leftBar, rightBar, botBorder } = this.getInputChrome(uiSep, innerWidth, borderColor)
@@ -3418,12 +3594,32 @@ export class TuiApp {
       // 渲染宽度会超过 cols → 终端折行成 2 显示行，而 LiveEngine.rowsForLine 按 narrow
       // 数成 1 行 → 回顶欠擦（moveToTop/ERASE 少擦一行）→ 输入框重影/逐帧堆叠重复。
       // 按 wide 定尺后顶边框恒 ≤ cols，任何终端都占 1 显示行，行数估算与实际一致。
-      // 4. 获取边框线字符，构建纯净闭合边框
+      const plainLeft = displayWidth(leftStr, { ambiguousAsWide: true })
+      const plainRight = displayWidth(rightStr, { ambiguousAsWide: true })
+
+      // 4. 计算并拼接一体化顶部边框：╭─ leftStr ─┬─ rightStr ─╮
       const chars = boxCharsFor(uiSep)
-      const topBorder = color(`${chars.tl}${chars.h.repeat(innerWidth + 2)}${chars.tr}`, borderColor)
+      let topBorder = ''
+      if (innerWidth < plainLeft + plainRight + 10) {
+        topBorder = color(`${chars.tl}${chars.h.repeat(innerWidth + 2)}${chars.tr}`, borderColor)
+      } else {
+        const lineRem = innerWidth - plainLeft - plainRight - 4 // 4 = label border paddings
+        const leftFill = Math.max(2, Math.floor(lineRem * 0.4))
+        const rightFill = Math.max(2, lineRem - leftFill)
+        
+        topBorder = color(chars.tl, borderColor) + 
+                    color(chars.h.repeat(2), borderColor) + 
+                    leftStr + 
+                    color(chars.h.repeat(leftFill), borderColor) + 
+                    color(chars.m, borderColor) + 
+                    color(chars.h.repeat(rightFill), borderColor) + 
+                    rightStr + 
+                    color(chars.h.repeat(2), borderColor) + 
+                    color(chars.tr, borderColor)
+      }
 
       const MAX_INPUT_DISPLAY_LINES = 12
-      const arrowColor = this.theme.secondary
+      const arrowColor = this.theme.success
       const inputLines = this.inputLine.value
         ? this.inputLine.displayLines({ maxLines: MAX_INPUT_DISPLAY_LINES, maxWidth: innerWidth })
         : [`${color('〉', arrowColor)} ${color('█', this.theme.primary)}${color(this.inputLine.placeholder, this.theme.dim)}`]
@@ -3448,24 +3644,17 @@ export class TuiApp {
       }
       lines.push({ text: botBorder })
 
-      // 5a. 一体化状态底栏（包含星域、分支、执行模式及实时监控指标）
-      //     当 slash 命令提示打开时让位，避免视觉重叠。
+      // 5a. 图片附件摘要（输入框正下方、权限模式行上方）
+      const imageCount = this.inputLine.images.length
+      if (imageCount > 0) {
+        const imageLabel = `📎 ${imageCount} image${imageCount > 1 ? 's' : ''}`
+        lines.push({ text: this.clampLine(color(imageLabel, this.theme.muted)) })
+      }
+
+      // 5b. 权限模式行（CC parity：输入框正下方常驻，单一事实来源）。
+      //     slash 提示打开时让位，避免与候选列表叠在一起。
       if (!isSlash) {
-        const modeLabel = this._approvalMode === 'dangerously-skip-permissions'
-          ? 'yolo'
-          : this._approvalMode === 'auto-safe'
-          ? '自治'
-          : this._approvalMode === 'manual'
-          ? '监督'
-          : this._approvalMode
-        const planLabel = planModeActive ? ' · Plan' : ''
-        const leftFull = `${leftStr} ${color(`[${modeLabel}${planLabel}]`, this.theme.muted)}`
-        const leftLen = displayWidth(leftFull, { ambiguousAsWide: true })
-        const rightLen = displayWidth(rightStr, { ambiguousAsWide: true })
-        
-        const spaceCount = Math.max(1, cols - leftLen - rightLen - 4) // 4 = 左右侧缩进留白
-        const statusLine = "  " + leftFull + " ".repeat(spaceCount) + rightStr
-        lines.push({ text: this.clampLine(statusLine) })
+        lines.push({ text: this.clampLine(formatPermissionModeLine({ approvalMode: this._approvalMode, planMode: planModeActive }, this.theme)) })
       }
 
       // 5b. slash 命令提示（输入以 / 开头；支持 /skill <name> 等多 token 过滤）
@@ -3836,7 +4025,11 @@ export class TuiApp {
     this.overlay.register('choice-panel', {
       render: (_w, _h) => {
         const data = overlayData?.choicePanelData?.() ?? { title: '', choices: [], selectedIndex: 0 }
-        return renderChoicePanel({ ...data, selectedIndex: this.overlayController.nav().choicePanelIndex }, this.columns, this.rows, this.theme)
+        return renderChoicePanel({
+          ...data,
+          selectedIndex: this.overlayController.nav().choicePanelIndex,
+          inputSubMode: this.getChoicePanelInputState(),
+        }, this.columns, this.rows, this.theme)
       },
     })
 

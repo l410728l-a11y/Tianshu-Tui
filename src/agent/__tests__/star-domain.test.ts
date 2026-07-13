@@ -121,10 +121,10 @@ describe('StarDomain', () => {
     assert.equal(huagai.uiPersona.accent, 'primary')
   })
 
-  it('routes endurance/companion keywords to huagai', () => {
+  it('routes endurance/fidelity keywords to huagai', () => {
     assert.equal(matchDomain('长程任务需要守昼托举'), 'huagai')
     assert.equal(matchDomain('marathon build needs persist and fidelity'), 'huagai')
-    assert.equal(matchDomain('托举建设者，同行不沉默'), 'huagai')
+    assert.equal(matchDomain('托举建设者，最后一英里不停'), 'huagai')
   })
 
   it('huagai does not steal yaoguang/tianquan routes (keyword orthogonality)', () => {
@@ -133,10 +133,13 @@ describe('StarDomain', () => {
     assert.equal(matchDomain('回归测试验证修复是否真的生效'), 'yaoguang')
   })
 
-  it('huagai systemPromptSuffix carries 守昼/双在场/星间接口', () => {
+  it('huagai systemPromptSuffix carries 守昼/追 blocker/基线先行/星间接口', () => {
     const huagai = STAR_DOMAINS.huagai
     assert.match(huagai.systemPromptSuffix, /守昼/)
-    assert.match(huagai.systemPromptSuffix, /双在场/)
+    assert.match(huagai.systemPromptSuffix, /追 blocker/)
+    assert.match(huagai.systemPromptSuffix, /基线先行/)
+    assert.match(huagai.systemPromptSuffix, /不做清单/)
+    assert.match(huagai.systemPromptSuffix, /跨层同步/)
     assert.match(huagai.systemPromptSuffix, /星间接口/)
     assert.match(huagai.systemPromptSuffix, /瑶光/)
     assert.match(huagai.systemPromptSuffix, /天权/)

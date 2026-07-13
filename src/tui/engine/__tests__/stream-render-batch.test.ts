@@ -42,6 +42,7 @@ function makeApp() {
     stdin: stdin as unknown as ReadStream,
     cols: 120, rows: 24, modelName: 'test', contextWindow: 200_000,
   })
+  app.start()
   return { app, out }
 }
 
@@ -73,15 +74,17 @@ test('thinking delta 流经 WriteBatcher：同步批次合并为 1 次渲染', a
 })
 
 test('tool-result streaming chunk 经 WriteBatcher 合并', async () => {
-  const { app, out } = makeApp()
-  out.chunks = []
+  const { app } = makeApp()
+  let renders = 0
+  const internals = app as unknown as { renderLive: () => void }
+  internals.renderLive = () => { renders++ }
 
   // isError === undefined → streaming chunk 路径
   for (let i = 0; i < 8; i++) app.callbacks.onToolResult('t1', 'bash', `line${i}\n`, undefined)
-  assert.equal(out.chunks.length, 0, `streaming chunk 同步阶段不渲染，实际 ${out.chunks.length}`)
+  assert.equal(renders, 0, 'streaming chunk 同步阶段不渲染')
 
   await microtask()
-  assert.ok(out.chunks.length >= 1, 'flush 后渲染 1 次')
+  assert.equal(renders, 1, 'flush 后只渲染 1 次')
 })
 
 test('critical phase flush invalidates a queued streaming render', async () => {
