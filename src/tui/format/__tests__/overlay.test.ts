@@ -186,11 +186,11 @@ describe('renderTasks: per-worker 舰队', () => {
     }
     const lines = renderTasks(data, 60, 12, theme, 1)
     const text = stripAnsi(lines.join('\n'))
-    // 第二个 worker 行应以 ▶ 开头（去 ANSI 后仍是 ▶）
+    // 第二个 worker 行应以 > 开头（去 ANSI 后仍是 >）
     const workerLines = text.split('\n').filter(l => l.includes('A·') || l.includes('B·'))
     assert.equal(workerLines.length, 2)
-    assert.ok(!workerLines[0]!.includes('▶'), 'first worker not selected')
-    assert.ok(workerLines[1]!.includes('▶'), 'second worker selected')
+    assert.ok(!workerLines[0]!.includes('>'), 'first worker not selected')
+    assert.ok(workerLines[1]!.includes('>'), 'second worker selected')
   })
 
   it('纯 ASCII 行严格等宽（padLine 对齐）', () => {
