@@ -52,14 +52,45 @@ test('welcome omits version/mode gracefully when not provided', () => {
   assert.ok(!joined.includes('v undefined') && !joined.includes('vnull'), 'no dangling version text')
 })
 
-test('welcome has bordered card, star logo and no shortcut matrix', () => {
+test('welcome is borderless compact header with no shortcut matrix', () => {
   const lines = formatWelcome({
     modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 120, rows: 40,
     version: '2.15.1',
   }, theme)
   const joined = lines.join('\n')
-  assert.ok(joined.includes('┌'), 'should show border')
+  assert.ok(!joined.includes('┌') && !joined.includes('└') && !joined.includes('─'), 'no border')
   assert.ok(!joined.includes('Ctrl+'), 'no shortcut matrix')
+})
+
+test('welcome shows session prefix and reasoning effort', () => {
+  const lines = formatWelcome({
+    modelName: 'over2',
+    cwd: '/tmp/x/proj',
+    sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24',
+    priorMsgCount: 0,
+    columns: 120,
+    rows: 40,
+    version: '2.18.0',
+    approvalMode: 'yolo',
+    reasoningEffort: 'high',
+  }, theme)
+  const joined = lines.join('\n')
+  assert.ok(joined.includes('8938a88f'), 'should show session prefix')
+  assert.ok(joined.includes('◎high'), 'should show reasoning effort')
+})
+
+test('welcome shows auto reasoning effort', () => {
+  const lines = formatWelcome({
+    modelName: 'over2',
+    cwd: '/tmp/x/proj',
+    sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24',
+    priorMsgCount: 0,
+    columns: 120,
+    rows: 40,
+    reasoningEffort: 'auto',
+  }, theme)
+  const joined = lines.join('\n')
+  assert.ok(joined.includes('◎auto'), 'should show auto reasoning effort')
 })
 
 test('cwd under home is tildified', () => {

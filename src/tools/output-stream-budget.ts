@@ -61,6 +61,7 @@ export class OutputStreamBudget {
     this.maxVisible = Math.max(0, options.maxVisible)
     this.budgetUnit = options.budgetUnit ?? 'bytes'
     this.coalesceMs = options.coalesceMs ?? 40
+    // coalesceBytes is always measured in UTF-8 bytes, even when budgetUnit is 'characters'.
     this.coalesceBytes = options.coalesceBytes ?? 2 * 1024
     this.truncationMarker = options.truncationMarker ?? '\n[stream output truncated]\n'
     this.scheduler = options.scheduler ?? defaultScheduler

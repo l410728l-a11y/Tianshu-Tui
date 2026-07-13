@@ -83,6 +83,7 @@ import { modeForRecoveryTrigger, type ReliabilityDecision } from './reliability-
 import { ResourceSensor, type ResourceSensorSnapshot } from './resource-sensor.js'
 import { type PlanMethodology, type TaskContract, type TaskDepthLayer } from '../context/task-contract.js'
 import { StigmergyStore } from '../context/stigmergy.js'
+import { describeImages } from './vision-service.js'
 import { createStanceTally } from './stance-tally.js'
 import { createVirtuePendingLedger, type VirtuePendingLedger, computeVirtueCredit } from './virtue-signals.js'
 import { createFailureJournal, type FailureJournal } from './failure-journal.js'
@@ -205,6 +206,10 @@ export class AgentLoop {
    *  覆盖模型自主 enter_mode 的场景：session-manager 自己触发的切换它已经知道，
    *  工具触发的切换只能靠这条回调出圈。agent 创建后由外部回填。 */
   onPlanModeChange?: (state: PlanModeState) => void
+  /** TUI 回调：计划提交待审批时弹出审批面板（替代手动输入 /plan-approve）。 */
+  onPlanApprovalRequested?: (info: import('../tools/types.js').PlanSubmittedInfo) => void
+  /** TUI 回调：agent 向用户提问含选项时弹出选择面板（替代手动输入选项编号）。 */
+  onAskUserQuestionRequested?: (info: import('../tools/types.js').AskUserQuestionInfo) => void
   decisions: string[] = []
   trajectory = new TrajectoryRecorder()
   failureJournal: FailureJournal = createFailureJournal()
@@ -271,7 +276,7 @@ export class AgentLoop {
   /** Rolling score history from recent convergence checks (most recent last).
    *  Maintained as a sliding window of at most 20 entries. Passed to
    *  evaluateConvergence for L3 scoreAbort decline-trend detection. */
-  private convergenceScoreHistory: number[] = []
+  convergenceScoreHistory: number[] = []
   /** 解耦修复：CCR/kick 的让位判据。旧判据 latestConvergenceResult.shouldKick
    *  在卡住期间恒为 true，而发射被 3 轮冷却节流——冷却静默期 CCR 也被整轮压制
    *  （守护链路静音栈的一环）。新判据只在 convergence **真实发射**过 advisory 的
@@ -862,9 +867,9 @@ export class AgentLoop {
     }
   }
 
-  /** U6/C1: seed the execution trace from the agent's first todo write.
-   *  withPlanSteps is idempotent — only the first non-empty write populates
-   *  the baseline; later status-update writes are a no-op on the trace. */
+  /** U6/C1: seed or sync the execution trace from todo/plan_task step inputs.
+   *  withPlanSteps is idempotent for first population; once history exists,
+   *  only status is synced (no step insertion/removal/description changes). */
   capturePlanSteps(steps: import('../tools/types.js').PlanStepInput[]): void {
     this.planTraceCoordinator.capturePlanSteps(steps)
   }
@@ -1721,10 +1726,14 @@ export class AgentLoop {
     // Re-entry guard: prevent concurrent agent.run() calls.
     // React strict mode or rapid re-submits could trigger handleSubmit
     // while a previous run is still in-flight, corrupting SessionContext.
+    // Claim the guard synchronously before any await (including the
+    // cancelIdleCompaction drain) so a duplicate run() that arrives during the
+    // drain sees _running=true and no-ops instead of racing _runInner.
     if (this._running) {
       debugLog('[agent] run() called while already running — skipping duplicate')
       return
     }
+    this._running = true
     // Eager abort controller: created synchronously before any await (incl. the
     // cancelIdleCompaction() drain below) so an Esc/Ctrl+C during the init/warmup
     // window aborts a live signal instead of a no-op. Pending latch is cleared
@@ -1741,7 +1750,23 @@ export class AgentLoop {
     // session is always in a consistent state at the await boundary.
     try {
       await this.cancelIdleCompaction()
-      this._running = true
+
+      // Vision bridge: when the primary model is text-only but a dedicated
+      // multimodal model is configured, describe the images and prepend the
+      // description to the user prompt so the primary model still receives
+      // the visual information.
+      if (images && images.length > 0 && !this.config.supportsVision && this.config.visionClient) {
+        const description = await describeImages(this.config.visionClient, images, {
+          prompt: this.config.visionModelPrompt,
+          maxTokens: this.config.visionModelMaxTokens,
+          signal: this.abortController.signal,
+        })
+        if (description) {
+          userInput = `[图片描述]\n${description}\n\n${userInput}`
+        }
+        images = undefined
+      }
+
       await this._runInner(userInput, callbacks, images)
     } finally {
       this._running = false
@@ -1912,6 +1937,14 @@ export class AgentLoop {
       this.evidence.getState().filesModified.size,
     )
 
+    // Grace-turn precondition for the score abort: a convergence warning at L2+
+    // must have been delivered in a strictly earlier turn, so the model had at
+    // least one turn to act on the guidance. Captured before this turn's kick
+    // emission updates the fields and passed into evaluateConvergence so the
+    // detector's scoreAbort decision uses the same signal as loop.ts.
+    const warnedInEarlierTurn = this.lastConvergenceEmitLevel >= 2
+      && this.lastConvergenceEmitTurn < turn
+
     const convergenceCheck = evaluateConvergence({
       turn,
       phaseClass: phaseClass as PhaseClass,
@@ -1926,6 +1959,7 @@ export class AgentLoop {
       providerName: this.config.providerName,
       outputTokens: this.session.getTotalUsage().output_tokens,
       repeatCount: this.convergenceEmitRepeatCount,
+      priorWarningAtL2Plus: warnedInEarlierTurn,
       progressBeacons: {
         todoCompletedDelta,
         activePlan: this.activePlanFilePath !== null,
@@ -1937,15 +1971,6 @@ export class AgentLoop {
     this.convergenceScoreHistory.push(convergenceCheck.score)
     if (this.convergenceScoreHistory.length > 20) this.convergenceScoreHistory.shift()
     debugLog(`[convergence] turn=${turn} score=${convergenceCheck.score.toFixed(2)} level=${convergenceCheck.level} phase=${phaseClass}`)
-
-    // Grace-turn precondition for the score abort (captured BEFORE this turn's
-    // kick emission updates the fields): a convergence warning at L2+ must have
-    // been delivered in a strictly earlier turn, so the model had at least one
-    // turn to act on the guidance. Without this, the L3 abort fires in the very
-    // same evaluation that submits its own advisory — the advisory is consumed
-    // by the NEXT request, which never happens because we just aborted.
-    const warnedInEarlierTurn = this.lastConvergenceEmitLevel >= 2
-      && this.lastConvergenceEmitTurn < turn
 
     if (convergenceCheck.shouldKick && convergenceCheck.injectedMessage) {
       // Fix 3 — user-interaction reset. When the user just spoke/intervened this

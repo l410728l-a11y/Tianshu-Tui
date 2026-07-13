@@ -253,6 +253,11 @@ export interface ManagedAgent {
   /** Model context window size (max tokens). */
   getContextWindow?(): number
   /**
+   * P0-2: 返回本会话 TodoStore 的当前清单。plan_task 成功后发 todo_state SSE 用。
+   * 多会话隔离——每个 session 独立的 TodoStore。Optional 以兼容 lightweight test doubles。
+   */
+  getTodos?(): Array<{ id: string; content: string; status: string }>
+  /**
    * Wave L: 进程退出时释放 session 级资源（典型场景：sidecar runServe.close
    * → shutdownAll）。具体实现负责调 coordinator.shutdown 等清 timer/in-flight
    * worker。与 abort() 严格分离——abort 中止当前 turn 但保留 agent 可继续运行，
@@ -3066,6 +3071,11 @@ export class RuntimeSessionManager {
           && (name === 'write_file' || name === 'edit_file')
         ) {
           this.schedulePlanDraftEvent(session, lifecycleGeneration)
+        }
+        // P0-2: plan_task 成功写入了 todos → 发 todo_state 让桌面 TodoDock 刷新
+        if (name === 'plan_task' && isError === false) {
+          const items = session.agent?.getTodos?.()
+          if (items && items.length > 0) this.append(session, 'todo_state', { items })
         }
         this.scanArtifacts(session)
       },

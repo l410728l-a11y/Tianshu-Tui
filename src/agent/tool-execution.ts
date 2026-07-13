@@ -108,6 +108,10 @@ export interface ToolExecutionDeps {
   onPlanSteps?: (steps: import('../tools/types.js').PlanStepInput[]) => void
   /** Write a constellation milestone when plan_close succeeds with apply=true. */
   onPlanClosed?: (input: import('../tools/types.js').PlanClosedInput) => void
+  /** Notify the UI that a plan was submitted for approval so it can prompt the user. */
+  onPlanSubmitted?: (info: import('../tools/types.js').PlanSubmittedInfo) => void
+  /** Notify the UI that the agent asked the user a question with selectable options. */
+  onAskUserQuestion?: (info: import('../tools/types.js').AskUserQuestionInfo) => void
   /** Evidence-gated plan closure: assess the real delivery gate over owned/dirty files. */
   assessDelivery?: (dirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
   /** 主动 plan mode：plan action=enter_mode → AgentLoop.enterPlanMode（仅主控有）。 */
@@ -242,6 +246,8 @@ export class ToolExecutionController {
       onLeaveMark: this.deps.onLeaveMark,
       onPlanSteps: this.deps.onPlanSteps,
       onPlanClosed: this.deps.onPlanClosed,
+      onPlanSubmitted: this.deps.onPlanSubmitted,
+      onAskUserQuestion: this.deps.onAskUserQuestion,
       assessDelivery: this.deps.assessDelivery,
       enterPlanMode: this.deps.enterPlanMode,
       getVerificationEvidence: this.deps.getVerificationEvidence,
