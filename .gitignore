@@ -1,28 +1,108 @@
 node_modules/
 dist/
-*.js.map
-*.d.ts
-!.rivet/commands/
+*.tsbuildinfo
 
-# Runtime data
-.rivet/
-.test-tmp/
-.tmp_*
-
-# OS
+# TypeScript emitted files alongside sources (tsup outputs to dist/)
+src/**/*.js
+src/**/*.d.ts
+src/**/*.js.map
+src/**/*.d.ts.map
 .DS_Store
-Thumbs.db
+failure-samples/**/transcript.raw.jsonl
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+# Session artifacts
+findings.md
+progress.md
+task_plan.md
+.superpowers/
+docs/sessions/
 
-# Build artifacts
+# Local project reference materials
+其他项目资料/
+
+# Local agent runtime state
+.claude/worktrees/
+.claude/skills/**/*.bak
+.claude/*.lock
+.claude/PRPs/reviews/
+.wolf/
+.omc/
+.github/workflows/
+# 一次性/本地诊断脚本与评估产物
+desktop/scripts/perf-*.ts
+scripts/summarize-*.ts
+scripts/swebench-*.sh
+# 自动生成的计划、研究与设计草稿
+.rivet/plans/*.md
+docs/research/*.md
+docs/superpowers/specs/*.md
+.rivet/sensorium.jsonl
+.rivet/pheromones.json
+.rivet/debug-400.json
+.rivet/artifacts/
+.rivet/sessions/
+.rivet/cache-log.jsonl
+.rivet/tool-stream.jsonl
+.rivet/meridian.db*
+.rivet/playbook.jsonl
+.rivet/knowledge/memory.jsonl
+.rivet/knowledge/advisory-efficacy.jsonl
+.rivet/generals/*.md
+.gitlog_temp.txt
+.rivet/runtime/
+.rivet/tmp/
+.rivet/external/
+.rivet/prefix-diag.jsonl
+.rivet/tool-stream-*.jsonl
+.rivet/test-results.json
+.rivet/checkpoints/
+.rivet/skills/_drafts/
+.rivet/Tianshu/
+.rivet/plans/draft-*.md
+
+# AI agent temp files
+.tmp/
+.tmp_*
+截图/
+.omx/
+.tmp-iso-*
+.tmp-abort-*
+.tmp-test-fixture
+.test-tmp/
+
+# === Agent / tool 运行态（生成物，非源码）===
+# .rivet: 策展子目录(knowledge/skills/plans/agents/...)保持跟踪，仅忽略纯运行态
+.rivet/backups/
+.rivet/vsw/
+.rivet/semantic-index.json
+.rivet/recovery-journal.jsonl
+.rivet/presence.json
+.rivet/constellation.json
+# 其它无策展内容的工具目录，整目录忽略
+.cursor/
+.od-skills/
+# 误产生的空文件
+/js
+# npm pack 产物
 *.tgz
-*.tar.gz
 
-# Logs
-*.log
-npm-debug.log*
+# Release build artifacts（保留 latest.json 作为 manifest 继续跟踪）
+release/*.dmg
+release/*.app.tar.gz
+release/*.sig
+
+# 日志与评估产物
+logs/
+tianshu-agent-v1.*.json
+
+# 运行时插件 / scratch 目录
+.rivet/plugin-*/
+.rivet/scratch/
+
+# macOS 本地应用数据
+Library/
+
+# 一次性临时产物 / 导出的文档产物
+_test-docx.html
+docs/*.html
+docs/*.docx
