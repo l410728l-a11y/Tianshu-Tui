@@ -52,6 +52,7 @@ import type { P3Integration } from './p3-integration.js'
 import { buildCommitNudge } from './commit-nudge.js'
 import { evaluateTddGate, parseTddGateConfig, EDIT_TOOLS, type TddGateConfig } from './tdd-gate.js'
 import { checkPlanMode } from './plan-mode.js'
+import { checkAskMode } from './ask-mode.js'
 import { GIT_CLEAR_RE } from '../tools/destructive-patterns.js'
 import { classifyDeclaredCommand, loadDeclaredVerify } from '../config/verify-config.js'
 import { profileIsPlanModeSafe } from './profile-registry.js'
@@ -183,6 +184,52 @@ async function emitToolInputTrace(input: { cwd: string; sessionId?: string; mess
       : join(getSessionDir(input.cwd), 'unknown')
     await mkdir(sessionDir, { recursive: true })
     await appendFile(join(sessionDir, 'tool-input-trace.jsonl'), `${input.message}\n`, 'utf8')
+  } catch {
+    // Diagnostics must never affect tool execution or pollute model-visible output.
+  }
+}
+
+/**
+ * Unconditional tool-result trace — always writes (no sampling gate). This is the
+ * primary diagnostic log for TUI rendering-loss bugs. Every tool result passing
+ * through the pipeline is recorded BEFORE the onToolResult callback.
+ *
+ * Log path: ~/.rivet/sessions/<project-slug>/<sessionId>/tool-result-trace.jsonl
+ * On Windows: %LOCALAPPDATA%\.rivet\sessions\<project-slug>\<sessionId>\tool-result-trace.jsonl
+ *
+ * Each line is JSON with: { ts, id, name, isError, contentLen, source }
+ *   source: "pipeline" = emitted just before callbacks.onToolResult
+ *           "bridge"   = received by TUI bridge
+ *           "tui"      = processed by TUI handleToolResult
+ *
+ * To find the log file on any platform:
+ *   1. Look at the "Watching" header line printed at TUI startup
+ *   2. Or check %LOCALAPPDATA%\.rivet\sessions\ on Windows
+ *   3. Or run: dir %LOCALAPPDATA%\.rivet\sessions\ /s /b | findstr tool-result-trace
+ */
+async function emitToolResultTrace(input: {
+  cwd: string
+  sessionId?: string
+  id: string
+  name: string
+  isError: boolean | undefined
+  contentLen: number
+  source: 'pipeline' | 'bridge' | 'tui'
+}): Promise<void> {
+  try {
+    const sessionDir = input.sessionId
+      ? join(getSessionDir(input.cwd), input.sessionId)
+      : join(getSessionDir(input.cwd), 'unknown')
+    await mkdir(sessionDir, { recursive: true })
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      id: input.id,
+      name: input.name,
+      isError: input.isError,
+      contentLen: input.contentLen,
+      source: input.source,
+    })
+    await appendFile(join(sessionDir, 'tool-result-trace.jsonl'), `${line}\n`, 'utf8')
   } catch {
     // Diagnostics must never affect tool execution or pollute model-visible output.
   }
@@ -892,7 +939,16 @@ export async function executeToolUse(
       deps.onGateBlocked?.('plan-mode')
       callbacks.onToolResult(tu.id, tu.name, planMsg, true)
       return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? planMsg + starSig : planMsg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
-   }
+    }
+
+    // Ask-mode gate — pure read-only Q&A (no write / execute / plan / delegate)
+    const askModeResult = checkAskMode(deps.config.askModeState ?? 'off', tu.name)
+    if (!askModeResult.allowed) {
+      const askMsg = askModeResult.reason ?? 'Ask Mode: write operations blocked'
+      deps.onGateBlocked?.('ask-mode')
+      callbacks.onToolResult(tu.id, tu.name, askMsg, true)
+      return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? askMsg + starSig : askMsg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+    }
 
     // Sensitive-area preflight — nudge, don't block. The model must read the
     // knowledge manifest before editing prompt/memory/recall/verification/ownership
@@ -1430,7 +1486,13 @@ export async function executeToolUse(
      }
    }
 
-    callbacks.onToolResult(tu.id, tu.name, finalContent, harnessResult.isError, rawToolResult?.rawPath, rawToolResult?.uiContent)
+    // Normalize isError: tools may omit isError on success (undefined),
+    // but the TUI treats undefined as a streaming chunk that never
+    // commits to scrollback. Force false so terminal results render.
+    // DEBUG: unconditional trace for TUI rendering-loss investigation.
+    // Log file: ~/.rivet/sessions/<project-slug>/<sessionId>/tool-result-trace.jsonl
+    void emitToolResultTrace({ cwd: deps.cwd, sessionId: deps.sessionId, id: tu.id, name: tu.name, isError: harnessResult.isError, contentLen: finalContent.length, source: 'pipeline' })
+    callbacks.onToolResult(tu.id, tu.name, finalContent, harnessResult.isError ?? false, rawToolResult?.rawPath, rawToolResult?.uiContent)
 
     deps.recordToolHistory(tu.name, tu.input, harnessResult.isError, harnessResult.content, rawToolResult?.errorClass)
 

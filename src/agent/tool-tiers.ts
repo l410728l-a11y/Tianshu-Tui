@@ -50,6 +50,9 @@ export const CORE_TOOLS = [
   'skill',
   // 换视角方法论：static prompt L80 直接指示使用，必须常驻（与 skill 同源）
   'recall_capsule',
+  // 浏览器联调与 UI 视觉验证（2026-07-15 从 EXTENDED 升入）：改 UI 不看渲染
+  // 是高频失败模式，browser_debug 是渲染验证闭环的主工具，主控必须恒可见。
+  'browser_debug',
 ] as const
 
 /**
@@ -57,8 +60,8 @@ export const CORE_TOOLS = [
  * web/browser/doc/council/team/import/lsp/undo 等低频或重场景工具。
  */
 export const EXTENDED_TOOLS = [
+  // browser（一次性 headless）与 browser_debug 能力重叠且默认未注册——退役候选。
   'browser',
-  'browser_debug',
   'computer_use',
   'repo_graph',
   'council_convene',
@@ -132,7 +135,7 @@ export function resolveMainToolTier(
  *  - deny-list（默认）：只摘 EXTENDED_SET 内的工具，CORE 与一切未分类工具
  *    （MCP / LSP / 自定义注册）原样保留——避免误删用户显式装配的 MCP。
  * 两档都对 exempt（extraCore ∪ mountedExtras）放行。
- */
+ * disabledTools（config 级静态禁用）在最后施加，优先级高于一切豁免。 */
 export interface ToolGatingState {
   /** config.toolGating.enabled。false → 不过滤，返回全集。 */
   enabled: boolean
@@ -144,6 +147,8 @@ export interface ToolGatingState {
   extraCore?: readonly string[]
   /** 运行时经 /tools enable 临时挂回的 EXTENDED 工具。 */
   mountedExtras?: readonly string[]
+  /** config.toolGating.disabledTools — session 启动时生效，运行中不变（缓存约束）。 */
+  disabledTools?: readonly string[]
 }
 
 /**
@@ -175,7 +180,16 @@ export function gateToolDefinitions<T extends { name: string }>(
   }
 
   // deny-list 模式（默认）：只摘 EXTENDED，保留 CORE + 未分类（MCP/LSP/自定义）
-  return allDefs.filter(d => !EXTENDED_SET.has(d.name) || exempt.has(d.name))
+  let filtered = allDefs.filter(d => !EXTENDED_SET.has(d.name) || exempt.has(d.name))
+
+  // config 级静态禁用（最高优先级，即使在 exempt 中也剔除）。
+  // 缓存约束：disabledTools 在 session 启动时读 config，运行中不变。
+  if (state.disabledTools && state.disabledTools.length > 0) {
+    const disabled = new Set(state.disabledTools)
+    filtered = filtered.filter(d => !disabled.has(d.name))
+  }
+
+  return filtered
 }
 
 /** 判断工具是否在 CORE 层 */

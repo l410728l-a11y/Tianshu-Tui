@@ -31,7 +31,7 @@ describe('McpManager', () => {
 
     mgr['_connectServer'] = async () => ({
       client: { listTools: async () => ({ tools: [] }) } as any,
-      transport: { close: async () => {} },
+      transport: { close: async () => {} }, transportType: 'stdio',
       serverId: 'echo',
     })
     mgr['_discoverTools'] = async () => [{
@@ -54,7 +54,7 @@ describe('McpManager', () => {
     let connected = false
     mgr['_connectServer'] = async () => {
       connected = true
-      return { client: {} as any, transport: { close: async () => {} }, serverId: 'off' }
+      return { client: {} as any, transport: { close: async () => {} }, transportType: 'stdio', serverId: 'off' }
     }
 
     await mgr.initialize()
@@ -68,7 +68,7 @@ describe('McpManager', () => {
 
     mgr['_connectServer'] = async () => ({
       client: {} as any,
-      transport: { close: async () => {} },
+      transport: { close: async () => {} }, transportType: 'stdio',
       serverId: 'echo',
     })
     mgr['_discoverTools'] = async () => [{
@@ -104,7 +104,7 @@ describe('McpManager', () => {
       async _connectServer(serverId: string): Promise<any> {
         return {
           serverId,
-          transport: { close: async () => {} },
+          transport: { close: async () => {} }, transportType: 'stdio',
           client: { listTools: () => new Promise(() => {}) },
         }
       }
@@ -133,7 +133,7 @@ describe('McpManager', () => {
 
     mgr['_connectServer'] = async (serverId: string) => ({
       serverId,
-      transport: { close: async () => {} },
+      transport: { close: async () => {} }, transportType: 'stdio',
       client: {
         listTools: async () => ({ tools: [{ name: 'slowTool', description: 'Slow', inputSchema: { type: 'object' as const, properties: {} } }] }),
         callTool: () => new Promise(() => {}),
@@ -164,7 +164,7 @@ describe('McpManager', () => {
     let closed = false
     mgr['_connectServer'] = async () => ({
       client: {} as any,
-      transport: { close: async () => { closed = true } },
+      transport: { close: async () => { closed = true } }, transportType: 'stdio',
       serverId: 'echo',
     })
     mgr['_discoverTools'] = async () => []
@@ -190,7 +190,7 @@ describe('McpManager', () => {
         connectedHeaders = (config as any).headers ?? {}
         return {
           client: {} as any,
-          transport: { close: async () => {} },
+          transport: { close: async () => {} }, transportType: 'stdio',
           serverId,
         }
       }
@@ -219,7 +219,7 @@ describe('McpManager', () => {
     }))
     mgr['_connectServer'] = async () => ({
       client: {} as any,
-      transport: { close: async () => {}, pid: 4242 },
+      transport: { close: async () => {}, pid: 4242 }, transportType: 'stdio',
       serverId: 'echo',
     })
     mgr['_discoverTools'] = async () => []
@@ -242,5 +242,112 @@ describe('McpManager', () => {
     assert.ok(killed.some(k => k.pid === -4242 && k.signal === 'SIGKILL'), 'should SIGKILL the child process group')
     // Connections cleared so a later shutdown() is a no-op.
     assert.deepEqual([...(mgr as any).connections.keys()], [])
+  })
+
+  it('reconcileFromConfig connects servers added after init snapshot', async () => {
+    const mgr = new McpManager(makeConfig())
+    await mgr.initialize()
+    assert.deepEqual(mgr.getStates(), [])
+
+    mgr['_connectServer'] = async (serverId) => ({
+      client: {} as any,
+      transport: { close: async () => {} }, transportType: 'stdio',
+      serverId,
+    })
+    mgr['_discoverTools'] = async () => [{
+      name: 'late',
+      description: 'Late tool',
+      inputSchema: { type: 'object' as const, properties: {} },
+    }]
+
+    const added = await mgr.reconcileFromConfig(makeConfig({
+      late: { command: 'node', args: ['late.js'] },
+    }))
+    assert.equal(added.length, 1)
+    assert.equal(added[0]!.definition.name, 'mcp__late__late')
+    assert.equal(mgr.getStates().find((s) => s.serverId === 'late')?.status, 'connected')
+  })
+
+  it('reconcileFromConfig skips already-connected servers', async () => {
+    const mgr = new McpManager(makeConfig({
+      echo: { command: 'node', args: ['echo.js'] },
+    }))
+    let connects = 0
+    mgr['_connectServer'] = async (serverId) => {
+      connects++
+      return { client: {} as any, transport: { close: async () => {} }, transportType: 'stdio', serverId }
+    }
+    mgr['_discoverTools'] = async () => []
+    await mgr.initialize()
+    const afterInit = connects
+    await mgr.reconcileFromConfig(makeConfig({
+      echo: { command: 'node', args: ['echo.js'] },
+    }))
+    assert.equal(connects, afterInit)
+  })
+
+  it('folds stderr into error state on connect failure', async () => {
+    const mgr = new McpManager(makeConfig({
+      broken: { command: 'node', args: ['broken.js'] },
+    }))
+    mgr['_connectServer'] = async (serverId) => {
+      const err: any = new Error('spawn failed')
+      // Simulate a ConnectedServer that never succeeds — throw after attach
+      throw Object.assign(err, {
+        /* connect fails before return — stderr captured in real path */
+      })
+    }
+    await mgr.initialize()
+    const state = mgr.getStates().find((s) => s.serverId === 'broken')
+    assert.equal(state?.status, 'error')
+    assert.ok(state?.errorHint, 'should carry classifier suggestion')
+    assert.ok(state?.lastErrorClass)
+  })
+
+  it('connectAndDiscover returns newly registered tools', async () => {
+    const mgr = new McpManager(makeConfig())
+    mgr['_connectServer'] = async (serverId) => ({
+      client: {} as any,
+      transport: { close: async () => {} }, transportType: 'stdio',
+      serverId,
+    })
+    mgr['_discoverTools'] = async () => [{
+      name: 't', description: 'T', inputSchema: { type: 'object' as const, properties: {} },
+    }]
+    const tools = await mgr.connectAndDiscover('x', { command: 'node', args: ['x.js'] })
+    assert.equal(tools.length, 1)
+    assert.equal(tools[0]!.definition.name, 'mcp__x__t')
+  })
+
+  it('serializes concurrent connectAndDiscover for the same serverId', async () => {
+    const mgr = new McpManager(makeConfig())
+    let calls = 0
+    mgr['_connectServer'] = async (serverId) => {
+      calls++
+      await new Promise(r => setTimeout(r, 20))
+      return { client: {} as any, transport: { close: async () => {} }, transportType: 'stdio', serverId }
+    }
+    mgr['_discoverTools'] = async () => []
+
+    const [a, b] = await Promise.all([
+      mgr.connectAndDiscover('same', { command: 'node', args: ['same.js'] }),
+      mgr.connectAndDiscover('same', { command: 'node', args: ['same.js'] }),
+    ])
+    assert.equal(calls, 1, 'only one connect attempt should run')
+    assert.equal(a.length, 0)
+    assert.equal(b.length, 0)
+  })
+
+  it('releases connect lock after failure so retry can proceed', async () => {
+    const mgr = new McpManager(makeConfig())
+    let calls = 0
+    mgr['_connectServer'] = async () => {
+      calls++
+      throw new Error('boom')
+    }
+
+    await mgr.connectAndDiscover('same', { command: 'node', args: ['same.js'] })
+    await mgr.connectAndDiscover('same', { command: 'node', args: ['same.js'] })
+    assert.equal(calls, 2)
   })
 })

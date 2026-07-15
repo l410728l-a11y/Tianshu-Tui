@@ -26,10 +26,11 @@ function setup() {
   return { manager, router }
 }
 
-test('GET /health is fail-closed', async () => {
+test('GET /health is intentionally open (desktop monitor probes without token)', async () => {
   const { router } = setup()
   const res = await router('GET', '/health', {}, {})
-  assert.equal(res.status, 401)
+  assert.equal(res.status, 200)
+  assert.equal((res.body as { ok: boolean }).ok, true)
 })
 
 test('GET /health reports version, uptime and counts', async () => {
@@ -51,14 +52,24 @@ test('GET /health reports version, uptime and counts', async () => {
 test('GET /health surfaces registry readiness when a probe is wired', async () => {
   const manager = new RuntimeSessionManager({ createAgent: () => new NoopAgent() })
   let ready = false
+  let configured = false
   const router = createRouter(
-    buildHealthRoute(manager, Date.now(), '9.9.9', TOKEN, () => ready),
+    buildHealthRoute(manager, Date.now(), '9.9.9', TOKEN, () => ready, () => configured),
   )
-  const pending = (await router('GET', '/health', {}, AUTH)).body as { registryOk: boolean }
+  const pending = (await router('GET', '/health', {}, AUTH)).body as { ok: boolean; registryOk: boolean; configured: boolean }
   assert.equal(pending.registryOk, false)
+  assert.equal(pending.configured, false)
+  assert.equal(pending.ok, false)
   ready = true
-  const resolved = (await router('GET', '/health', {}, AUTH)).body as { registryOk: boolean }
+  const configuredReady = (await router('GET', '/health', {}, AUTH)).body as { ok: boolean; registryOk: boolean; configured: boolean }
+  assert.equal(configuredReady.registryOk, true)
+  assert.equal(configuredReady.configured, false)
+  assert.equal(configuredReady.ok, false)
+  configured = true
+  const resolved = (await router('GET', '/health', {}, AUTH)).body as { ok: boolean; registryOk: boolean; configured: boolean }
   assert.equal(resolved.registryOk, true)
+  assert.equal(resolved.configured, true)
+  assert.equal(resolved.ok, true)
 })
 
 test('GET /health includes loop-lag fields when a monitor is wired, omits otherwise', async () => {

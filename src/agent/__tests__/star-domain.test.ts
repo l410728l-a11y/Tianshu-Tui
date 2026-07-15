@@ -133,7 +133,7 @@ describe('StarDomain', () => {
     assert.equal(matchDomain('回归测试验证修复是否真的生效'), 'yaoguang')
   })
 
-  it('huagai systemPromptSuffix carries 守昼/追 blocker/基线先行 + 通用工程 + 假绿手艺', () => {
+  it('huagai systemPromptSuffix carries 守昼/追 blocker/基线先行 + 假绿手艺（通用工程由 baseline 承载）', () => {
     const huagai = STAR_DOMAINS.huagai
     // 守昼专精（长程）
     assert.match(huagai.systemPromptSuffix, /守昼/)
@@ -142,14 +142,14 @@ describe('StarDomain', () => {
     assert.match(huagai.systemPromptSuffix, /不做清单/)
     assert.match(huagai.systemPromptSuffix, /跨层同步/)
     assert.match(huagai.systemPromptSuffix, /托举/)
-    // 通用工程
-    assert.match(huagai.systemPromptSuffix, /事实锚点/)
-    assert.match(huagai.systemPromptSuffix, /消费面穷尽/)
-    assert.match(huagai.systemPromptSuffix, /交付三项/)
     // 假绿手艺
     assert.match(huagai.systemPromptSuffix, /不测复刻/)
     assert.match(huagai.systemPromptSuffix, /环境不可控/)
     assert.match(huagai.systemPromptSuffix, /入口类改动看两面/)
+    // 通用工程纪律已由 baseline <engineering-baseline> 承载，星域不重复
+    assert.doesNotMatch(huagai.systemPromptSuffix, /事实锚点/)
+    assert.doesNotMatch(huagai.systemPromptSuffix, /消费面穷尽/)
+    assert.doesNotMatch(huagai.systemPromptSuffix, /交付三项/)
     // 无星间接口噪音（与天梁同策略）
     assert.doesNotMatch(huagai.systemPromptSuffix, /星间接口/)
     // 无双在场、无本仓专有路径
@@ -194,6 +194,13 @@ describe('StarDomain', () => {
     for (const domain of Object.values(STAR_DOMAINS)) {
       assert.ok(domain.toolWhitelist.includes('delegate_task'), `${domain.name} missing delegate_task`)
       assert.ok(domain.toolWhitelist.includes('delegate_batch'), `${domain.name} missing delegate_batch`)
+    }
+  })
+
+  it('all domains have browser_debug + computer_use (visual verification loop, 2026-07-15)', () => {
+    for (const domain of Object.values(STAR_DOMAINS)) {
+      assert.ok(domain.toolWhitelist.includes('browser_debug'), `${domain.name} missing browser_debug`)
+      assert.ok(domain.toolWhitelist.includes('computer_use'), `${domain.name} missing computer_use`)
     }
   })
 

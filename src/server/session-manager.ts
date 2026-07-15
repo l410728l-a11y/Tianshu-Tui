@@ -18,7 +18,7 @@
  */
 import type { AgentCallbacks, ApprovalMode } from '../agent/loop-types.js'
 import { collectPostBoundaryEditIds } from '../agent/file-history.js'
-import type { DelegationActivity } from '../tools/types.js'
+import type { DelegationActivity, Tool } from '../tools/types.js'
 import type { ApprovalResult } from '../agent/approval-edit.js'
 import type { HookEvent, HookResult } from '../hooks/user-hooks-runner.js'
 import type { IntentPreview } from '../agent/intent-preview.js'
@@ -29,6 +29,7 @@ import type { OaiMessage } from '../api/oai-types.js'
 import type { SessionRegistry } from '../agent/session-registry.js'
 import type { DecisionShift } from '../agent/loop-types.js'
 import type { PlanModeState } from '../agent/plan-mode.js'
+import type { AskModeState } from '../agent/ask-mode.js'
 import {
   listPlans as storeListPlans,
   readPlan as storeReadPlan,
@@ -58,6 +59,7 @@ import { grantApp as grantComputerUseApp } from '../tools/computer-use/app-grant
 import type {
   ApprovalMode as WireApprovalMode,
   PlanModeState as WirePlanModeState,
+  AskModeState as WireAskModeState,
   SessionStatus,
   SessionEvent,
   SessionEventType,
@@ -77,6 +79,7 @@ type Equals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
 type Assert<T extends true> = T
 export type _ApprovalModeInSync = Assert<Equals<ApprovalMode, WireApprovalMode>>
 export type _PlanModeStateInSync = Assert<Equals<PlanModeState, WirePlanModeState>>
+export type _AskModeStateInSync = Assert<Equals<AskModeState, WireAskModeState>>
 
 /** Structured approval outcome — routes surface `reason` instead of a blind 409. */
 export type PlanApprovalOutcome =
@@ -167,12 +170,24 @@ export interface ManagedAgent {
   enterPlanMode?(opts?: { planFilePath?: string }): void
   exitPlanMode?(): void
   /**
+   * Ask mode — restrict the agent to pure read-only Q&A tools (asking) or
+   * release it (off). Mutually exclusive with Plan Mode. Optional so lightweight
+   * test doubles need not implement it.
+   */
+  enterAskMode?(): void
+  exitAskMode?(): void
+  /**
    * Plan mode change notification — assigned by the session layer so agent-side
    * transitions (e.g. the model calling plan action=enter_mode) surface as
    * plan_mode SSE events. Mirrors AgentLoop.onPlanModeChange. Optional so
    * lightweight test doubles need not implement it.
    */
   onPlanModeChange?: (state: PlanModeState) => void
+  /**
+   * Ask mode change notification — assigned by the session layer so agent-side
+   * transitions surface as ask_mode SSE events.
+   */
+  onAskModeChange?: (state: AskModeState) => void
   /**
    * Relative path of the working draft the agent writes while in plan mode
    * (null when not planning). Mirrors AgentLoop.getActivePlanFilePath.
@@ -198,6 +213,13 @@ export interface ManagedAgent {
     status: 'mounted' | 'already-active' | 'not-extended' | 'unknown' | 'gating-off'
     cacheImpact: 'prefix-invalidated' | 'none'
   }
+  /**
+   * Hot-register tools discovered after this agent was built (MCP connect mid-
+   * session). Mirrors LSP attachLspTools: registry.register is Map.set-idempotent;
+   * callers should then rely on updateTools() inside the impl. Optional so
+   * lightweight test doubles need not implement it.
+   */
+  registerExternalTools?(tools: Tool[]): void
   /** Current reasoning effort level (off/low/medium/high/max). */
   getReasoningEffort?(): string | undefined
   /** Set the reasoning effort level (off/low/medium/high/max) or return to auto. */
@@ -306,7 +328,7 @@ export type AgentFactory = (
    * or fall back to the default when the id no longer resolves.
    */
   modelId?: string,
-) => ManagedAgent
+) => ManagedAgent | Promise<ManagedAgent>
 
 export interface CreateSessionInput {
   cwd?: string
@@ -1397,7 +1419,10 @@ export class RuntimeSessionManager {
     // Materialize the on-disk log before appending — otherwise a reconnecting
     // viewer (since=0) would replay only this run's events, not the history.
     this.ensureEvents(session)
-    const agent = this.ensureAgent(session)
+    // Mark running before ensureAgent (may await dynamic serve-agent import) so a
+    // second run() cannot race in while the module is still loading. User/status
+    // events are appended only after the agent exists — warnIfHistoryLost must
+    // see the pre-prompt event log, not this turn's user echo.
     session.running = true
     session.toolResultClosed = false
     // T3 — drop any guidance left from a previous run so it can't leak forward.
@@ -1407,19 +1432,6 @@ export class RuntimeSessionManager {
     // R1 — keep the registry heartbeat fresh while this session is active.
     try { this.getRegistry?.()?.heartbeat(id) } catch { /* non-fatal */ }
     this.touch(session)
-    // Persist each attached image as a standalone file and echo only small
-    // reference ids into the event log — NOT the base64. This keeps events.jsonl
-    // (and its full replay/restore) tiny while the model still receives the data
-    // URLs inline via agent.run below.
-    const imageIds = this.persistImages(id, images)
-    this.append(session, 'user', {
-      text: prompt,
-      ...(images?.length
-        ? { imageCount: images.length, ...(imageIds.length ? { imageIds } : {}) }
-        : {}),
-    })
-    this.append(session, 'status', { status: 'running' })
-    this.persistRecord(session)
 
     const runGeneration = session.lifecycleGeneration
     let resolveRunSettlement!: () => void
@@ -1433,64 +1445,113 @@ export class RuntimeSessionManager {
       resolve: resolveRunSettlement,
     }
     session.activeRunSettlement = runSettlement
-    this.bindPlanModeChange(session, agent, runGeneration)
-    const callbacks = this.buildCallbacks(session)
     const ownsDurability = (): boolean => this.ownsSessionLifecycle(session, runGeneration)
-    void agent
-      .run(prompt, callbacks, images)
-      .then(() => {
-        if (!ownsDurability()) return
-        if (session.record.status === 'running') {
-          session.record.status = 'completed'
-        }
-      })
-      .catch((err: unknown) => {
-        if (!ownsDurability()) return
-        if (session.record.status === 'running') {
-          session.record.status = 'failed'
-          session.record.error = redactText((err as Error)?.message ?? String(err))
-          this.append(session, 'error', { error: session.record.error })
-        }
-      })
-      .finally(() => {
-        if (runSettlement.settled) return
-        runSettlement.settled = true
-        try {
+
+    const startWithAgent = (agent: ManagedAgent) => {
+      // Abort/archive raced a dynamic serve-agent import — never start a turn.
+      if (!ownsDurability() || session.record.status === 'aborted') {
+        if (!runSettlement.settled) {
+          runSettlement.settled = true
           if (session.activeRunSettlement === runSettlement) {
             session.activeRunSettlement = undefined
             session.running = false
           }
           this.releaseRunClaims(id, runSettlement)
-          if (!ownsDurability()) {
-            // Archive owns the durable transition and advances the generation,
-            // but an archived session still needs the deferred heavy-state unload
-            // once its old agent promise releases. Never unload after unarchive.
-            if (this.ownsSessionDurability(session) && session.record.archived) {
-              this.unloadSession(session)
-            }
-            return
-          }
-          // Close out approvals the run left dangling — the promise must settle
-          // (deny) either way, but label honestly: only an aborted run closes as
-          // 'aborted'; a run that ended on its own (completed/failed) leaves the
-          // approval merely 'stale' — the user never denied it and nothing was
-          // interrupted. Mislabeling completed runs as aborted poisoned the
-          // timeline and downstream "was this an interruption?" heuristics.
-          this.rejectAllPending(session, session.record.status === 'aborted' ? 'aborted' : 'stale')
-          this.touch(session)
-          // postSession 产物（如 walkthrough 走查工件）在 run 落定后才入 store —
-          // 这里再扫一遍，让 'artifact' 事件把它公告给桌面端。
-          this.scanArtifacts(session)
-          this.append(session, 'done', { status: session.record.status })
-          this.persistRecord(session)
-          this.maybeWatchdogAutoContinue(session)
-          // Phase 3 #9 — the session was archived while this run was settling
-          // (archive aborts first): finish the unload archiveSession deferred.
-          if (session.record.archived) this.unloadSession(session)
-        } finally {
+          try { agent.abort() } catch { /* best-effort */ }
           runSettlement.resolve()
         }
+        return
+      }
+      // Persist each attached image as a standalone file and echo only small
+      // reference ids into the event log — NOT the base64. This keeps events.jsonl
+      // (and its full replay/restore) tiny while the model still receives the data
+      // URLs inline via agent.run below.
+      const imageIds = this.persistImages(id, images)
+      this.append(session, 'user', {
+        text: prompt,
+        ...(images?.length
+          ? { imageCount: images.length, ...(imageIds.length ? { imageIds } : {}) }
+          : {}),
       })
+      this.append(session, 'status', { status: 'running' })
+      this.persistRecord(session)
+      this.bindPlanModeChange(session, agent, runGeneration)
+      const callbacks = this.buildCallbacks(session)
+      void agent
+        .run(prompt, callbacks, images)
+        .then(() => {
+          if (!ownsDurability()) return
+          if (session.record.status === 'running') {
+            session.record.status = 'completed'
+          }
+        })
+        .catch((err: unknown) => {
+          if (!ownsDurability()) return
+          if (session.record.status === 'running') {
+            session.record.status = 'failed'
+            session.record.error = redactText((err as Error)?.message ?? String(err))
+            this.append(session, 'error', { error: session.record.error })
+          }
+        })
+        .finally(() => {
+          if (runSettlement.settled) return
+          runSettlement.settled = true
+          try {
+            if (session.activeRunSettlement === runSettlement) {
+              session.activeRunSettlement = undefined
+              session.running = false
+            }
+            this.releaseRunClaims(id, runSettlement)
+            if (!ownsDurability()) {
+              if (this.ownsSessionDurability(session) && session.record.archived) {
+                this.unloadSession(session)
+              }
+              return
+            }
+            this.rejectAllPending(session, session.record.status === 'aborted' ? 'aborted' : 'stale')
+            this.touch(session)
+            this.scanArtifacts(session)
+            this.append(session, 'done', { status: session.record.status })
+            this.persistRecord(session)
+            this.maybeWatchdogAutoContinue(session)
+            if (session.record.archived) this.unloadSession(session)
+          } finally {
+            runSettlement.resolve()
+          }
+        })
+    }
+
+    const failEnsure = (err: unknown) => {
+      if (ownsDurability() && session.record.status === 'running') {
+        session.record.status = 'failed'
+        session.record.error = redactText((err as Error)?.message ?? String(err))
+        this.append(session, 'error', { error: session.record.error })
+      }
+      if (!runSettlement.settled) {
+        runSettlement.settled = true
+        if (session.activeRunSettlement === runSettlement) {
+          session.activeRunSettlement = undefined
+          session.running = false
+        }
+        this.releaseRunClaims(id, runSettlement)
+        if (ownsDurability()) {
+          this.append(session, 'done', { status: session.record.status })
+          this.persistRecord(session)
+        }
+        runSettlement.resolve()
+      }
+    }
+
+    try {
+      const agentOrPromise = this.ensureAgent(session)
+      if (agentOrPromise && typeof (agentOrPromise as Promise<ManagedAgent>).then === 'function') {
+        void (agentOrPromise as Promise<ManagedAgent>).then(startWithAgent, failEnsure)
+      } else {
+        startWithAgent(agentOrPromise as ManagedAgent)
+      }
+    } catch (err) {
+      failEnsure(err)
+    }
     return true
   }
 
@@ -1511,7 +1572,7 @@ export class RuntimeSessionManager {
    *    "start a new session" entry. Never silently falls back to the default
    *    model.
    */
-  resumeRun(id: string): ResumeRunResult {
+  async resumeRun(id: string): Promise<ResumeRunResult> {
     const session = this.sessions.get(id)
     if (!session) return { ok: false, code: 'not_found', error: 'Session not found' }
     if (session.running) return { ok: false, code: 'busy', error: 'Session is already running' }
@@ -1540,7 +1601,7 @@ export class RuntimeSessionManager {
     if (switched) {
       if (session.agent) {
         // Live agent on the wrong model — hot-swap it (emits model_switched).
-        if (!this.switchModel(id, target!)) {
+        if (!(await this.switchModel(id, target!))) {
           return { ok: false, code: 'model_unavailable', error: `兜底模型 ${target} 切换失败——请开新会话继续` }
         }
       } else {
@@ -1564,12 +1625,12 @@ export class RuntimeSessionManager {
    * killed by aborting the main conversation. Progress streams through the same
    * 'delegation' SSE channel (origin:'user') the viewer panel already consumes.
    */
-  delegate(id: string, input: DelegateWorkerInput): DelegateResult {
+  async delegate(id: string, input: DelegateWorkerInput): Promise<DelegateResult> {
     const session = this.sessions.get(id)
     if (!session) return { ok: false, reason: 'not_found' }
     const objective = input.objective?.trim()
     if (!objective) return { ok: false, reason: 'invalid' }
-    const agent = this.ensureAgent(session)
+    const agent = await this.ensureAgentAsync(session)
     if (typeof agent.delegateWorker !== 'function') return { ok: false, reason: 'unsupported' }
     const aborts = session.backgroundAborts ?? (session.backgroundAborts = new Map())
     if (aborts.size >= MAX_USER_BACKGROUND_WORKERS) return { ok: false, reason: 'limit' }
@@ -1620,21 +1681,34 @@ export class RuntimeSessionManager {
     return true
   }
 
-  private ensureAgent(session: InternalSession): ManagedAgent {
-    if (!session.agent) {
-      this.ensureJobs(session)
-      // Model affinity: a rehydrated session must come back on the model its
-      // record carries (prefix-cache lives per model) — not the default model.
-      session.agent = this.createAgent(
-        session.record.cwd,
-        session.record.id,
-        session.approvalMode,
-        session.record.model,
-      )
+  private ensureAgent(session: InternalSession): ManagedAgent | Promise<ManagedAgent> {
+    if (session.agent) return session.agent
+    this.ensureJobs(session)
+    // Model affinity: a rehydrated session must come back on the model its
+    // record carries (prefix-cache lives per model) — not the default model.
+    const created = this.createAgent(
+      session.record.cwd,
+      session.record.id,
+      session.approvalMode,
+      session.record.model,
+    )
+    const finish = (agent: ManagedAgent): ManagedAgent => {
+      session.agent = agent
       this.applySelections(session)
       this.warnIfHistoryLost(session)
+      return agent
     }
-    return session.agent
+    // Production serve factory returns a Promise (dynamic serve-agent import).
+    // Test doubles return a ManagedAgent synchronously — keep that path sync so
+    // existing tests don't need a microtask flush after every run().
+    if (created && typeof (created as Promise<ManagedAgent>).then === 'function') {
+      return (created as Promise<ManagedAgent>).then(finish)
+    }
+    return finish(created as ManagedAgent)
+  }
+
+  private async ensureAgentAsync(session: InternalSession): Promise<ManagedAgent> {
+    return await this.ensureAgent(session)
   }
 
   /**
@@ -1710,6 +1784,7 @@ export class RuntimeSessionManager {
       if (session.reasoningEffort !== undefined) agent.setReasoningEffort?.(session.reasoningEffort)
     } catch { /* non-fatal */ }
     this.bindPlanModeChange(session, agent, session.lifecycleGeneration)
+    this.bindAskModeChange(session, agent, session.lifecycleGeneration)
     // Plan mode 是 AgentLoop 的内存态，record.planMode 是持久态。agent 重建
     // （懒构建恢复会话 / switchModel）会丢内存态：工具门禁失效、
     // getActivePlanFilePath 变 null → 桌面「起草中」实时视图断流。record 说
@@ -1717,6 +1792,8 @@ export class RuntimeSessionManager {
     // onPlanModeChange 的同态守卫保证不会重复发 plan_mode SSE。
     if (session.record.planMode === 'planning') {
       try { agent.enterPlanMode?.() } catch { /* non-fatal */ }
+    } else if (session.record.askMode === 'asking') {
+      try { agent.enterAskMode?.() } catch { /* non-fatal */ }
     }
   }
 
@@ -1731,8 +1808,33 @@ export class RuntimeSessionManager {
       if (!this.ownsSessionLifecycle(session, lifecycleGeneration)) return
       if (session.record.planMode === state) return
       session.record.planMode = state
+      // Mutual exclusion: enter plan clears ask on the wire record.
+      if (state === 'planning' && session.record.askMode === 'asking') {
+        session.record.askMode = 'off'
+        this.append(session, 'ask_mode', { state: 'off' })
+      }
       this.touch(session)
       this.append(session, 'plan_mode', { state })
+      this.persistRecord(session)
+    }
+  }
+
+  private bindAskModeChange(
+    session: InternalSession,
+    agent: ManagedAgent,
+    lifecycleGeneration: number,
+  ): void {
+    agent.onAskModeChange = (state: AskModeState) => {
+      if (!this.ownsSessionLifecycle(session, lifecycleGeneration)) return
+      if (session.record.askMode === state) return
+      session.record.askMode = state
+      // Mutual exclusion: enter ask clears plan on the wire record.
+      if (state === 'asking' && session.record.planMode === 'planning') {
+        session.record.planMode = 'off'
+        this.append(session, 'plan_mode', { state: 'off' })
+      }
+      this.touch(session)
+      this.append(session, 'ask_mode', { state })
       this.persistRecord(session)
     }
   }
@@ -1795,10 +1897,10 @@ export class RuntimeSessionManager {
    * selections, persists record.model, and emits model_switched. Returns false
    * when the session is missing/running or the model id is unknown.
    */
-  switchModel(id: string, modelId: string): boolean {
+  async switchModel(id: string, modelId: string): Promise<boolean> {
     const session = this.sessions.get(id)
     if (!session || session.running) return false
-    const agent = this.ensureAgent(session)
+    const agent = await this.ensureAgentAsync(session)
     let resolved: string | null
     try {
       resolved = agent.switchModel?.(modelId) ?? null
@@ -1937,17 +2039,46 @@ export class RuntimeSessionManager {
    * desktop can flip its mode chip / open the plan column. Returns false when the
    * session is missing.
    */
-  setPlanMode(id: string, state: PlanModeState): boolean {
+  async setPlanMode(id: string, state: PlanModeState): Promise<boolean> {
     const session = this.sessions.get(id)
     if (!session) return false
-    const agent = this.ensureAgent(session)
+    const agent = await this.ensureAgentAsync(session)
     session.record.planMode = state
+    // Mutual exclusion with Ask on the wire record.
+    if (state === 'planning' && session.record.askMode === 'asking') {
+      session.record.askMode = 'off'
+      this.append(session, 'ask_mode', { state: 'off' })
+    }
     try {
       if (state === 'planning') agent.enterPlanMode?.()
       else agent.exitPlanMode?.()
     } catch { /* non-fatal */ }
     this.touch(session)
     this.append(session, 'plan_mode', { state })
+    this.persistRecord(session)
+    return true
+  }
+
+  /**
+   * Ask mode — toggle the session between pure read-only Q&A and normal
+   * execution. Mutually exclusive with Plan Mode. Emits `ask_mode` (and clears
+   * plan_mode when entering). Returns false when the session is missing.
+   */
+  async setAskMode(id: string, state: AskModeState): Promise<boolean> {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    const agent = await this.ensureAgentAsync(session)
+    session.record.askMode = state
+    if (state === 'asking' && session.record.planMode === 'planning') {
+      session.record.planMode = 'off'
+      this.append(session, 'plan_mode', { state: 'off' })
+    }
+    try {
+      if (state === 'asking') agent.enterAskMode?.()
+      else agent.exitAskMode?.()
+    } catch { /* non-fatal */ }
+    this.touch(session)
+    this.append(session, 'ask_mode', { state })
     this.persistRecord(session)
     return true
   }
@@ -2082,7 +2213,7 @@ export class RuntimeSessionManager {
       }
     }
     const { approved, kickoff } = result
-    const agent = this.ensureAgent(session)
+    const agent = await this.ensureAgentAsync(session)
     try {
       agent.setActivePlan?.({
         slug,
@@ -2121,7 +2252,7 @@ export class RuntimeSessionManager {
       return false
     }
     if (!rejected) return false
-    const agent = this.ensureAgent(session)
+    const agent = await this.ensureAgentAsync(session)
     try {
       agent.enterPlanMode?.({ planFilePath: `.rivet/plans/${slug}.md` })
     } catch { /* non-fatal */ }
@@ -2520,8 +2651,8 @@ export class RuntimeSessionManager {
   }
 
   /** Working-tree changes relative to HEAD for the desktop "changes" tab. */
-  async getWorkingTreeFiles(cwd?: string): Promise<{ files: WorkingTreeFile[]; isRepo: boolean }> {
-    return getWorkingTreeFiles(cwd ?? this.defaultCwd)
+  async getWorkingTreeFiles(cwd?: string, includeIgnored = false): Promise<{ files: WorkingTreeFile[]; isRepo: boolean }> {
+    return getWorkingTreeFiles(cwd ?? this.defaultCwd, 'HEAD', includeIgnored)
   }
 
   /** Unified diff of a single file relative to HEAD (on-demand). */
@@ -2530,23 +2661,24 @@ export class RuntimeSessionManager {
   }
 
   /**
-   * Resolve the git context of a session: worktree cwd (falls back to the
-   * shared default cwd) and the diff baseline (recorded creation HEAD for
-   * worktree sessions, plain HEAD otherwise).
+   * Resolve the git context of a session: worktree cwd for isolated worktree
+   * sessions, otherwise the session's own cwd (the project directory), falling
+   * back to the shared default cwd only as a last resort. The diff baseline is
+   * the recorded creation HEAD for worktree sessions, plain HEAD otherwise.
    */
   private sessionGitContext(id: string): { cwd: string; baseRef: string } | null {
     const s = this.sessions.get(id)
     if (!s) return null
-    const cwd = s.record.worktreePath ?? this.defaultCwd
+    const cwd = s.record.worktreePath ?? s.record.cwd ?? this.defaultCwd
     const baseRef = s.record.baselineHead ?? 'HEAD'
     return { cwd, baseRef }
   }
 
   /** Session-scoped working-tree changes (worktree cwd + task baseline). */
-  async getSessionWorkingTree(id: string): Promise<{ files: WorkingTreeFile[]; isRepo: boolean } | null> {
+  async getSessionWorkingTree(id: string, includeIgnored = false): Promise<{ files: WorkingTreeFile[]; isRepo: boolean } | null> {
     const ctx = this.sessionGitContext(id)
     if (!ctx) return null
-    const result = await getWorkingTreeFiles(ctx.cwd, ctx.baseRef)
+    const result = await getWorkingTreeFiles(ctx.cwd, ctx.baseRef, includeIgnored)
     // The worktree owner marker is infrastructure, not user work — hide it.
     return { ...result, files: result.files.filter(f => f.path !== '.vsw-owner.json') }
   }
@@ -2642,11 +2774,29 @@ export class RuntimeSessionManager {
    * Returns the mount status, or undefined if the session/agent lacks enableTool
    * (lightweight doubles). No-op if gating is off (tool already visible).
    */
-  enableTool(id: string, name: string): { status: string; cacheImpact: string } | undefined {
+  async enableTool(id: string, name: string): Promise<{ status: string; cacheImpact: string } | undefined> {
     const session = this.sessions.get(id)
     if (!session) return undefined
-    const agent = this.ensureAgent(session)
+    const agent = await this.ensureAgentAsync(session)
     return agent.enableTool?.(name)
+  }
+
+  /**
+   * Hot-inject MCP (or other late-discovered) tools into every session that
+   * already has a live ManagedAgent. Sessions without an agent yet will pick
+   * tools up at ensureAgent → buildSessionStores via getAllTools(). Idempotent:
+   * ToolRegistry.register is Map.set overwrite.
+   */
+  injectMcpTools(tools: Tool[]): void {
+    if (!tools.length) return
+    for (const s of this.sessions.values()) {
+      if (!s.agent || s.record.archived) continue
+      try {
+        s.agent.registerExternalTools?.(tools)
+      } catch {
+        /* best-effort per session — one failure must not block others */
+      }
+    }
   }
 
   /**

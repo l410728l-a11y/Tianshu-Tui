@@ -90,7 +90,7 @@ export function createRouter(routes: Record<string, RouteHandler>) {
   }
 }
 
-export function startServer(port: number, routes: Record<string, RouteHandler>, apiToken?: string): { close: () => void } {
+export async function startServer(port: number, routes: Record<string, RouteHandler>, apiToken?: string): Promise<{ close: () => void }> {
   const router = createRouter(routes)
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -107,7 +107,12 @@ export function startServer(port: number, routes: Record<string, RouteHandler>, 
     }
 
     const reqHeaders = normalizeHeaders(req)
-    if (!isAuthorizedRequest({ headers: reqHeaders }, apiToken)) {
+    // Health endpoint is intentionally not auth-gated — the desktop shell and
+    // Rust monitor probe it from cold-start / token-rotation windows where the
+    // Bearer token may not be available yet. No user data is exposed.
+    // Use startsWith so /health?foo=bar also bypasses auth.
+    const isHealth = req.url?.startsWith('/health') ?? false
+    if (!isHealth && !isAuthorizedRequest({ headers: reqHeaders }, apiToken)) {
       res.writeHead(401, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({ error: 'Unauthorized' }))
       return
@@ -131,7 +136,13 @@ export function startServer(port: number, routes: Record<string, RouteHandler>, 
     res.end(result.body ? JSON.stringify(result.body) : '')
   })
 
-  server.listen(port, '127.0.0.1')
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', () => {
+      server.removeListener('error', reject)
+      resolve()
+    })
+  })
   return { close: () => server.close() }
 }
 

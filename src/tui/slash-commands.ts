@@ -133,6 +133,7 @@ const HELP_TEXT = `Available commands:
 /workflow [list|<name>|replay <id>] — YAML workflow orchestration + trace replay
 /todo [list|add <content>|done <id>|skip <id>|move <id> up|down] — Manage task list
 /plan-template [list|<name>|save <name>] — Reusable plan templates
+/ask — Enter/exit Ask mode (read-only Q&A)
 /team-resume [groupId] — Resume team execution from wave checkpoint
 /goal <objective> [--max N] [--budget M] [--criteria '["..."]'] — Set autonomous goal
 /goal-status — Show current goal state
@@ -578,9 +579,13 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         const { CORE_TOOLS, EXTENDED_TOOLS, isExtendedTool } = await import('../agent/tool-tiers.js')
         const active = new Set(ctx.agent.getActiveToolNames())
         const mountedExtras = [...active].filter(isExtendedTool)
-        const lines: string[] = ['Tool Gating Tiers', '═════════════════════', '', `CORE (${CORE_TOOLS.length}):`, ...CORE_TOOLS.map(t => `  ✓ ${t}`), '', `EXTENDED (${EXTENDED_TOOLS.length}):`, ...EXTENDED_TOOLS.map(t => `  ${active.has(t) ? '✓ (mounted)' : '·'} ${t}`), '']
+        const disabled = new Set(ctx.config.agent?.toolGating?.disabledTools ?? [])
+        const lines: string[] = ['Tool Gating Tiers', '═════════════════════', '', `CORE (${CORE_TOOLS.length}):`, ...CORE_TOOLS.map(t => `  ${disabled.has(t) ? '✗' : '✓'} ${t}`), '', `EXTENDED (${EXTENDED_TOOLS.length}):`, ...EXTENDED_TOOLS.map(t => `  ${disabled.has(t) ? '✗' : active.has(t) ? '✓ (mounted)' : '·'} ${t}`), '']
         if (mountedExtras.length > 0) {
           lines.push(`Runtime-mounted EXTENDED: ${mountedExtras.join(', ')}`, '')
+        }
+        if (disabled.size > 0) {
+          lines.push(`Disabled tools (config-level, restart to apply): ${[...disabled].join(', ')}`, '')
         }
         lines.push('EXTENDED tools are available to workers via delegate_task.', 'Use /tools enable <name> to mount one onto the primary agent.')
         pushStatic(createLogEntry({ type: 'system', content: lines.join('\n') }))
@@ -1627,6 +1632,28 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     },
   },
   {
+    name: '/ask',
+    immediate: true,
+    handler(ctx) {
+      const { pushStatic, setIsStreaming } = ctx
+      if (ctx.agent.getAskModeState?.() === 'asking' || ctx.agent.askModeState === 'asking') {
+        ctx.agent.exitAskMode()
+        pushStatic(createLogEntry({ type: 'system', content: 'Ask Mode 已关闭 — 写入与执行操作已解锁。' }))
+        setIsStreaming(false)
+        return true
+      }
+      ctx.agent.enterAskMode()
+      pushStatic(createLogEntry({
+        type: 'system',
+        content:
+          '? Ask Mode activated. Only read / search / ask_user_question are allowed.\n\n' +
+          'Ask Mode 适合：代码问答、对照阅读、澄清需求。需要写改或跑命令时执行 /ask 退出。',
+      }))
+      setIsStreaming(false)
+      return true
+    },
+  },
+  {
     name: '/plan-list',
     immediate: true,
     async handler(ctx) {
@@ -2387,10 +2414,80 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
   {
     name: '/mcp',
     immediate: true,
-    handler(ctx) {
+    async handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
-      const cmd = parts[0]!.toLowerCase()
-      pushStatic(createLogEntry({ type: 'system', content: 'MCP status: use /debug mcp for detailed connection info, or check startup logs.' }))
+      const subcmd = parts[0]?.toLowerCase() ?? 'status'
+      const serverId = parts[1]
+
+      if (subcmd === 'auth' && serverId) {
+        try {
+          const { startMcpOAuth } = await import('../mcp/oauth/connector.js')
+          const { findMcpOAuthProvider } = await import('../mcp/oauth/providers.js')
+          const { loadConfig } = await import('../config/manager.js')
+          const cfg = loadConfig().mcp?.servers[serverId]
+          if (!cfg) {
+            pushStatic(createLogEntry({ type: 'system', content: `MCP server "${serverId}" not found in config.`, isError: true }))
+            setIsStreaming(false)
+            return true
+          }
+          const auth = cfg.auth
+          if (!auth || auth.type !== 'oauth') {
+            pushStatic(createLogEntry({ type: 'system', content: `Server "${serverId}" does not support OAuth.`, isError: true }))
+            setIsStreaming(false)
+            return true
+          }
+          const provider = findMcpOAuthProvider(auth.provider)
+          if (!provider) {
+            pushStatic(createLogEntry({ type: 'system', content: `Unknown OAuth provider: ${auth.provider}`, isError: true }))
+            setIsStreaming(false)
+            return true
+          }
+          const clientId = process.env.RIVET_MCP_OAUTH_CLIENT_ID ?? ''
+          if (!clientId) {
+            pushStatic(createLogEntry({ type: 'system', content: 'Set RIVET_MCP_OAUTH_CLIENT_ID env var with your OAuth app client ID, then retry.', isError: true }))
+            setIsStreaming(false)
+            return true
+          }
+          pushStatic(createLogEntry({ type: 'system', content: `Starting OAuth for ${serverId} (${provider.name})...\nA browser window should open shortly.` }))
+          try {
+            const scopes = [...provider.defaultScopes, ...(auth.scopes ?? [])]
+            await startMcpOAuth(serverId, provider, clientId, scopes)
+            pushStatic(createLogEntry({ type: 'system', content: `✓ OAuth connected for ${serverId} (${provider.name})` }))
+          } catch (err) {
+            pushStatic(createLogEntry({ type: 'system', content: `OAuth failed: ${(err as Error).message}`, isError: true }))
+          }
+        } catch (err) {
+          pushStatic(createLogEntry({ type: 'system', content: `OAuth failed: ${(err as Error).message}`, isError: true }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+
+      if (subcmd === 'logs' && serverId) {
+        try {
+          const mgr = ctx.mcpManagerRef?.current
+          if (!mgr) {
+            pushStatic(createLogEntry({ type: 'system', content: 'MCP manager not initialized.', isError: true }))
+            setIsStreaming(false)
+            return true
+          }
+          const tail = Number.parseInt(parts[2] ?? '100', 10) || 100
+          const entries = mgr.getLogs(serverId, tail)
+          if (entries.length === 0) {
+            pushStatic(createLogEntry({ type: 'system', content: `No log entries for server "${serverId}".` }))
+          } else {
+            const lines = entries.map((entry) => `[${new Date(entry.ts).toISOString()}] ${entry.stream === 'stderr' ? 'stderr' : 'event'}: ${entry.text.trimEnd()}`)
+            pushStatic(createLogEntry({ type: 'system', content: `Logs for ${serverId} (last ${entries.length} entries):\n${lines.join('\n')}` }))
+          }
+        } catch (err) {
+          pushStatic(createLogEntry({ type: 'system', content: `Logs failed: ${(err as Error).message}`, isError: true }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+
+      // Default: show status
+      pushStatic(createLogEntry({ type: 'system', content: 'Usage:\n  /mcp — show status\n  /mcp auth <serverId> — start OAuth flow\n  /mcp logs <serverId> [tail] — view stderr log buffer' }))
       setIsStreaming(false)
       return true
     },
