@@ -1,4 +1,6 @@
 import type { ToolHistoryEntry } from '../prompt/volatile.js'
+import type { KnowledgeCandidate } from '../memory/essence-gate.js'
+import { ControlPlaneController } from './control-plane-adapters.js'
 import { SessionContext } from './context.js'
 import { SessionPersist, getSessionDir } from './session-persist.js'
 import { attachSessionPersistListener } from './session-persist-listener.js'
@@ -9,7 +11,8 @@ import { gateToolDefinitions, isExtendedTool } from './tool-tiers.js'
 import type { CompactCircuitBreakerState, ContextAnchor } from '../context/types.js'
 import type { ToolErrorClass } from '../tools/types.js'
 import { EvidenceTracker } from './evidence.js'
-import { computeVerifyFailStreak } from './hooks/cognitive-capsule-router.js'
+import { ObligationTracker } from './obligation-tracker.js'
+import { computeVerifyFailStreak, createCvmVectorEvaluator, cvmVectorMode, type CvmVectorMode } from './hooks/cognitive-capsule-router.js'
 import { TurnHarness } from './turn-harness.js'
 import { TrajectoryRecorder } from './trajectory.js'
 import { createTraceStore, type TraceStore } from './trace-store.js'
@@ -99,7 +102,7 @@ import type { PermissionAllowRule, PermissionOverlay } from './permissions.js'
 import { createPermissionOverlay } from './permissions.js'
 import { recordToolHistory } from "./tool-history-recorder.js";
 import { requestThetaCheck } from "./theta-controller.js";
-import { createTurnStreamController, createTurnCompletionController, createToolExecutionController, createPlanTraceCoordinator, createCompactBoundaryCoordinator, createTurnOrchestrator, createTurnStepProducer, createReasoningEffortController, createIntentRetrievalRouteController, createAntiAnchoringController, createModelRoutingShadowController, createPrewarmController, createRuntimeHooksPipeline, buildRuntimeSnapshot, createSidePathUsageRecorder } from "./loop-factory.js";
+import { createTurnStreamController, createTurnCompletionController, createToolExecutionController, createPlanTraceCoordinator, createCompactBoundaryCoordinator, createTurnOrchestrator, createTurnStepProducer, createReasoningEffortController, createIntentRetrievalRouteController, createAntiAnchoringController, createModelRoutingShadowController, createPrewarmController, createRuntimeHooksPipeline, buildRuntimeSnapshot, createSidePathUsageRecorder, createReclaimDecisionRecorder } from "./loop-factory.js";
 import type { TurnStepProducer } from './turn-step-producer.js'
 import { ReasoningEffortController } from './reasoning-effort-controller.js'
 import { IntentRetrievalRouteController } from './intent-retrieval-route-controller.js'
@@ -159,6 +162,10 @@ export class AgentLoop {
   _pendingAbort = false
   cwd: string
   evidence: EvidenceTracker
+  /** 证据义务状态机（evidence-driven reasoning loop）——与 evidence 同寿命。 */
+  obligations: ObligationTracker
+  /** Obligation final gate 遥测（auto-continue 触发/误触发/诚实受阻计数，postSession 落 meta）。 */
+  obligationGateStats = { continued: 0, misfires: 0, honestBlocked: 0 }
   compactFailures: CompactCircuitBreakerState = { consecutiveFailures: 0 }
   recentToolHistory: ToolHistoryEntry[] = []
   /** Component C (typecheck-reminder): a .ts/.tsx file was written this session. */
@@ -289,6 +296,21 @@ export class AgentLoop {
   wasConvergenceEmittedRecently(): boolean {
     return this.session.getTurnCount() - this.lastConvergenceEmitTurn <= 1
   }
+  /** CVM-vector（v3.1 计划）：最近一次 convergence 检查的 phaseClass。
+   *  '' = 本会话尚未跑过 convergence 检查（未到 perception 不分类）。 */
+  getConvergencePhaseClass(): string {
+    return this.lastConvergencePhaseClass
+  }
+  /** CVM-vector 干预路由：mode 闸门（RIVET_CVM_VECTOR，缺省 shadow）+
+   *  session 级 evaluator（冷却状态内聚）。shadow 只落 telemetry 绝不 submit——
+   *  该纪律由 turn-step-producer 的唯一接线点执行。 */
+  readonly cvmVector: { mode: CvmVectorMode; evaluator: ReturnType<typeof createCvmVectorEvaluator> } = {
+    mode: cvmVectorMode(),
+    evaluator: createCvmVectorEvaluator(),
+  }
+  /** anchor-break-scout 已在本 session 派发过视角侦察（CV2 让位判据）。
+   *  scout 是 opt-in（antiAnchoring），默认会话恒 false。 */
+  anchorScoutOwned = false
   /** Phase 0 观测 — guardian（CCR / 改道 / kick）触发计数。会话内累计，
    *  随遥测与 session meta 落盘，让"守护链路被静音"从体感问题变成数据问题。 */
   readonly guardianActivity: {
@@ -353,6 +375,13 @@ export class AgentLoop {
    * 中断 / 流错误 / 自然收尾不可区分）。现在同步写进 session meta，
    * 每次 run 结束覆盖上一条。写失败不致命（观测辅助，永不阻断）。
    */
+  /** Obligation final gate 遥测计数（turn-orchestrator 回调；postSession 落 meta）。 */
+  recordObligationGateEvent(event: 'continued' | 'misfire' | 'honest_blocked'): void {
+    if (event === 'continued') this.obligationGateStats.continued += 1
+    else if (event === 'misfire') this.obligationGateStats.misfires += 1
+    else this.obligationGateStats.honestBlocked += 1
+  }
+
   recordStopReason(r: StopReason): void {
     this.latestStopReason = r
     if (!this.persist) return
@@ -537,6 +566,9 @@ export class AgentLoop {
   advisoryBus = new AdvisoryBus()
   /** P1a 核销闭环：advisory 送达后按 expect 谓词核销 adopted/ignored */
   advisoryReadback = new AdvisoryReadback()
+  /** 主控心流控制面（RIVET_CONTROL_PLANE: off|shadow|active，默认 shadow）。
+   *  shadow 只归并/记账（K0），不改 prompt；active 才允许 appendix 出口（Wave 4）。 */
+  controlPlane = new ControlPlaneController()
   /** 破坏性命令 pre-execution 闸门(验证失败后 git 清场当轮拦截,首拦重放行)。
    *  tool-pipeline 是唯一写者兼读者,loop 只持有生命周期。 */
   destructiveGate = createDestructiveGateState({
@@ -557,6 +589,9 @@ export class AgentLoop {
   turnsSinceLastObjection = 0
   lastToolCompleteTime = 0
   initialUserMessage: string | null = null
+  /** 知识重构（Wave 1/2）：候选知识缓冲——正则观察 + 手动 remember 队列，
+   *  不直写存储，由 postSession essence-gate 统一裁决准入。会话级，上限 60 条 FIFO。 */
+  knowledgeCandidates: KnowledgeCandidate[] = []
   /** 当前 run 的 orchestrator 循环轮数(每 run 从 0 重计)——缺口 C/D hook 消费 */
   runLoopTurn = 0
   /** 最近一次用户输入(run 启动 = 0,steer 注入时更新)的 run 轮数 */
@@ -579,6 +614,10 @@ export class AgentLoop {
     }
     this.cwd = cwd ?? process.cwd()
     this.evidence = new EvidenceTracker()
+    // 证据义务状态机：与 EvidenceTracker 同寿命。验证事件单向流入——
+    // blocked 只记 attempted、目标不匹配的失败不满足 RED（Wave 1 语义）。
+    this.obligations = new ObligationTracker()
+    this.evidence.setVerificationListener(meta => this.obligations.applyVerification(meta))
     this.traceStore = createTraceStore()
     // P1b 习惯化对抗：核销账本的 ignoredStreak 驱动升级措辞/有界静音
     this.advisoryBus.setHabituationPolicy(this.advisoryReadback)
@@ -654,6 +693,22 @@ export class AgentLoop {
       providerProfile: this.config.providerProfile ?? { cacheType: 'none', persistent: false },
       contextWindow: this.config.contextWindow,
     })
+    // W3-C3: observe-only delay-compact decision ledger → cache-log.jsonl
+    // (event:'compact_delay_decision'), same channel as per-request cache rows
+    // so offline analysis joins decisions with the actual cache outcome.
+    if (this.config.sessionId) {
+      const sid = this.config.sessionId
+      this.cacheAdvisor.setDelayDecisionListener(decision => {
+        try {
+          const line = JSON.stringify({ ts: Date.now(), ...decision })
+          import('node:fs/promises').then(fs => {
+            const dir = join(getSessionDir(this.cwd), sid)
+            return fs.mkdir(dir, { recursive: true })
+              .then(() => fs.appendFile(join(dir, 'cache-log.jsonl'), line + '\n'))
+          }).catch(() => {})
+        } catch { /* ledger is best-effort */ }
+      })
+    }
     // Speculative pre-execution chain SEALED (2026-07-07): no execute callback
     // and speculativeEnabled unset → miner still records patterns, but nothing
     // is pre-executed or cached. Serving was cut 2026-07-06 (ShadowQueue had no
@@ -680,10 +735,17 @@ export class AgentLoop {
       getProviderDegradationRatio: () => this.config.providerHealth?.getDegradationRatio() ?? 0,
       // Hook injections are pseudo-user messages: append as SR to the last
       // user message (not a new message entry) to preserve prefix cache.
-      addUserMessage: message => { this.session.appendSystemReminder(message) },
+      // W2-B1: K1 append-only egress — runtime hook payloads (MCTS seeds,
+      // scout packets, fallback advisories) charge their bytes exactly once
+      // at commit, under the 'runtime-payload' tag.
+      addUserMessage: message => {
+        this.session.appendSystemReminder(message)
+        this.pressureMonitor.recordCvmInjection(Math.ceil(message.length / 4), 'runtime-payload')
+      },
       requestThetaCheck: reason => { this.requestThetaCheck(reason) },
       setReasoningEffort: effort => { this.setReasoningEffort(effort) },
       getFingerprint: () => this.config.promptEngine.getFingerprint(),
+      submitControlSignal: signal => { this.controlPlane.submit(signal) },
     })
     this.intent = new TurnIntentController()
     this.contextInjection = new ContextInjectionController({
@@ -709,6 +771,7 @@ export class AgentLoop {
       promptEngine: this.config.promptEngine,
       contextWindow: this.config.contextWindow,
       providerProfile: this.config.providerProfile,
+      compactionProfile: this.config.compactionProfile,
       primaryClient: this.config.primaryClient,
       compactClient: this.config.compactClient,
       compactEnabled: this.config.compact.enabled,
@@ -786,6 +849,7 @@ export class AgentLoop {
       recordSummaryUsage: (usage, model) => {
         createSidePathUsageRecorder(this)('compact-summary', usage, model)
       },
+      onReclaimDecision: createReclaimDecisionRecorder(this),
       writeProbe: createWriteEvidenceProbe(this.cwd),
     })
     // 在 AgentLoop 构造时立即设置 prefixOverhead，关闭 UI 启动到 maybeCompact 之间的窗口。
@@ -1740,6 +1804,15 @@ export class AgentLoop {
       const engineStats = this.llmSpeculationEngine?.stats()
       if (engineStats && engineStats.fired > 0) {
         this.persist?.updateMetadata({ llmSpeculationEngine: engineStats })
+      }
+    } catch { /* meta 摘要是观测辅助 — 永不阻断 */ }
+    // Obligation final gate 遥测（Wave 3 心流保护）：auto-continue 触发率与
+    // 误触发率的原始计数。误触发率 >20% 时优先怀疑 task kind 分类而非调低
+    // 风险阈值（计划纪律）。有活动才写，闲置会话不长 meta。
+    try {
+      const og = this.obligationGateStats
+      if (og.continued > 0 || og.misfires > 0 || og.honestBlocked > 0) {
+        this.persist?.updateMetadata({ obligationGate: og })
       }
     } catch { /* meta 摘要是观测辅助 — 永不阻断 */ }
   }

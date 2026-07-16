@@ -13,10 +13,8 @@
 
 import { PromptEngine } from '../src/prompt/engine.js'
 import { createVolatileSnapshot } from '../src/prompt/volatile-snapshot.js'
-import { canonicalizeRequest } from '../src/api/request-freezer.js'
-import { getProviderProfile } from '../src/api/provider-profile.js'
 import { stableStringify } from '../src/api/stable-json.js'
-import type { Message, Usage } from '../src/api/types.js'
+import type { OaiMessage } from '../src/api/oai-types.js'
 
 const API_KEY = process.env.DEEPSEEK_API_KEY
 const BASE_URL = process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com'
@@ -67,7 +65,7 @@ interface TurnResult {
 }
 
 const results: TurnResult[] = []
-const conversationMessages: Message[] = []
+const conversationMessages: OaiMessage[] = []
 
 const PROMPTS = [
   '你好，介绍一下你自己',
@@ -77,33 +75,28 @@ const PROMPTS = [
   '总结一下我们刚才的对话',
 ]
 
-const profile = getProviderProfile('deepseek', 128_000)
+const CONTEXT_WINDOW = 128_000
+
+// 上一轮请求各消息的规范化字节（前缀稳定性 = 上一轮消息序列是本轮的字节前缀）
+let prevMessageBytes: string[] = []
 
 async function sendTurn(turn: number, userText: string): Promise<TurnResult> {
   // 添加 user 消息
   conversationMessages.push({ role: 'user', content: userText })
 
-  // 构建请求
-  const request = engine.buildRequest(conversationMessages)
+  // 构建请求（走生产同一条路径：frozen base + appendixDelta + 边界合并）。
+  // DeepSeek 是 OpenAI 兼容端点：system prompt 就在 messages[0]，不做顶层剥离。
+  const request = engine.buildOaiRequest(conversationMessages, undefined, CONTEXT_WINDOW)
 
-  // 检查前缀稳定性：第一个 volatile block 是否和上一轮一样
+  // 前缀稳定性：上一轮发出的消息序列必须是本轮的逐字节前缀
+  // （前缀缓存命中的充要条件——比对规范化后的每条消息字节）
+  const messageBytes = request.messages.map(m => stableStringify(m))
   let prefixStable = true
   if (turn > 1) {
-    const prevReq = engine.buildRequest(conversationMessages.slice(0, -1))
-    const vol0Current = (request.messages[0] as { content: string }).content
-    const vol0Prev = (prevReq.messages[0] as { content: string }).content
-    prefixStable = vol0Current === vol0Prev
+    prefixStable = prevMessageBytes.length < messageBytes.length
+      && prevMessageBytes.every((bytes, i) => bytes === messageBytes[i])
   }
-
-  // Canonicalize（strip cache_control, stable JSON）
-  const canonical = canonicalizeRequest(
-    { ...request, stream: true },
-    profile,
-    ['cache_control'],
-  )
-
-  // 发送 API 请求（非流式，简化解析）
-  const body = stableStringify(canonical)
+  prevMessageBytes = messageBytes
 
   const response = await fetch(`${BASE_URL}/v1/chat/completions`, {
     method: 'POST',
@@ -113,10 +106,7 @@ async function sendTurn(turn: number, userText: string): Promise<TurnResult> {
     },
     body: stableStringify({
       model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: canonical.system },
-        ...canonical.messages,
-      ],
+      messages: request.messages,
       max_tokens: 256,
       stream: false,
     }),

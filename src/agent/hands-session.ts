@@ -5,10 +5,20 @@ import { collectDiff, formatDiffArtifact } from './diff-collector.js'
 import {
   buildBlockedWorkerResult,
   parseWorkerResult,
+  salvageWorkerResult,
   type WorkOrder,
   type WorkerResult,
 } from './work-order.js'
 import { buildWorkerPrompt, buildWorkerRepairPrompt } from './worker-prompts.js'
+import {
+  applyWriteGateToResult,
+  buildWorkerVerifyRepairPrompt,
+  evaluateWorkerWriteGate,
+  workerWriteGateEnabled,
+  type EvaluateWorkerWriteGateInput,
+  type WorkerWriteGateReport,
+} from './worker-write-gate.js'
+import { provisionSnapshotDeps } from './snapshot-deps.js'
 import { buildWorkerKnowledgeBlock } from './worker-knowledge.js'
 import { buildDomainKnowledgeBlock } from './domain-knowledge-block.js'
 import type { DomainKnowledgeStore } from './domain-knowledge-store.js'
@@ -64,11 +74,17 @@ export interface HandsSessionConfig {
    * which must contain a schema-valid WorkerResult JSON.
    */
   runAgent: (prompt: string, callbacks: AgentCallbacks, workerCwd: string) => Promise<string>
+  /** W4-D1: injectable write-gate evaluator (tests). Defaults to the real wave-gate wrapper. */
+  evaluateWriteGate?: (input: EvaluateWorkerWriteGateInput) => Promise<WorkerWriteGateReport>
+  /** W4-D1: override gate enablement (tests). Defaults to the env kill switch. */
+  writeGateEnabled?: boolean
 }
 
 export interface HandsSessionRun {
   result: WorkerResult
   usage: Partial<Usage>
+  /** W4-D1: main-side write-gate outcome, when the gate ran (write workers only). */
+  writeGate?: { report: WorkerWriteGateReport; repairCount: number }
 }
 
 /**
@@ -139,20 +155,16 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
      }
    }
 
-    // Collect diff only when running in a real worktree (in-place mode has no
-    // isolated worktree and no base ref, so diff is meaningless).
-    const baseRef = inPlace ? undefined : (config.baseRef ?? getCurrentGitRef(config.cwd))
-    // Materialized scope files are inputs copied from the base repo, not worker
-    // output — exclude them so the patch applies back onto the base repo.
-    const diff = baseRef ? collectDiff(config.cwd, wt.path, baseRef, scopeResult.materialized) : ''
-
     let result: WorkerResult
     try {
       result = parseWorkerResult(text, config.order.id)
    } catch (parseError) {
       const message = parseError instanceof Error ? parseError.message : String(parseError)
       // Retry: send repair prompt and re-parse (mirrors worker-session.ts retry loop)
-      result = buildBlockedWorkerResult(config.order, message) // default — overwritten on success
+      // Terminal default: field-level salvage first (recover parseable findings
+      // from the malformed report), empty blocked only when nothing salvages.
+      result = salvageWorkerResult(text, config.order.id)
+        ?? buildBlockedWorkerResult(config.order, message, 'json_parse') // default — overwritten on success
       for (let attempt = 0; attempt < config.maxTurns && attempt < 2; attempt++) {
         try {
           const repairPrompt = buildWorkerRepairPrompt(config.order, text, message)
@@ -178,6 +190,57 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
      }
    }
 
+    // ── W4-D1: main-side write gate ──────────────────────────────────────
+    // Workers self-report verification, but the main controller re-runs it
+    // against the worker's actual tree (reusing wave-gate: scoped typecheck +
+    // whitelisted declared command). Gate failure gives the SAME worker one
+    // bounded repair round; a second failure returns 'failed' to the primary.
+    // Blocked (env) is environment-neutral: no repair, no capability penalty.
+    let writeGate: HandsSessionRun['writeGate']
+    const gateOn = config.writeGateEnabled ?? workerWriteGateEnabled()
+    if (gateOn && result.changedFiles.length > 0 && result.status !== 'blocked' && !apiError) {
+      const evaluate = config.evaluateWriteGate ?? evaluateWorkerWriteGate
+      // Isolated worktrees lack node_modules/tsconfig links — provision them so
+      // the scoped typecheck is runnable (best-effort; failure → gate blocked).
+      if (!inPlace) {
+        try { provisionSnapshotDeps(config.cwd, wt.path) } catch { /* gate will report unverifiable */ }
+      }
+      let report = await evaluate({ cwd: wt.path, result })
+      let repairCount = 0
+      if (report.outcome === 'failed') {
+        repairCount = 1
+        try {
+          const repairText = await config.runAgent(buildWorkerVerifyRepairPrompt(config.order, report), {
+            onTextDelta: () => {},
+            onThinkingDelta: () => {},
+            onToolUse: () => {},
+            onToolResult: () => {},
+            onTurnComplete: (usage) => { turnUsage = usage },
+            onError: (err) => { apiError = err.message },
+            onAbort: () => { apiError = 'aborted' },
+            onApprovalRequired: async () => false,
+          }, wt.path)
+          if (!apiError) {
+            result = parseWorkerResult(repairText, config.order.id)
+            report = await evaluate({ cwd: wt.path, result })
+          }
+        } catch {
+          // Repair output unparseable — keep the failing report; result is
+          // marked failed below and adjudication returns to the primary.
+        }
+      }
+      result = applyWriteGateToResult(result, report, repairCount)
+      writeGate = { report, repairCount }
+    }
+
+    // Collect diff only when running in a real worktree (in-place mode has no
+    // isolated worktree and no base ref, so diff is meaningless). Collected
+    // AFTER the write gate so bounded-repair changes are included.
+    const baseRef = inPlace ? undefined : (config.baseRef ?? getCurrentGitRef(config.cwd))
+    // Materialized scope files are inputs copied from the base repo, not worker
+    // output — exclude them so the patch applies back onto the base repo.
+    const diff = baseRef ? collectDiff(config.cwd, wt.path, baseRef, scopeResult.materialized) : ''
+
     if (diff) {
       result.artifacts.push(formatDiffArtifact(diff, config.order.profile))
       // Persist the diff so the UI can review it independently. Saved into the
@@ -197,7 +260,7 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
       }
     }
 
-    return { result, usage: turnUsage }
+    return { result, usage: turnUsage, writeGate }
  } finally {
     config.wtCoordinator.remove(config.order.id)
  }

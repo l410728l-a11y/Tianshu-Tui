@@ -256,6 +256,11 @@ export interface VolatileContext {
    *  Cache-safe: rendered ONLY into the dynamic appendix.
    *  Max 3 advisories per turn. */
   harnessAdvisoryBlock?: string | null
+  /** 主控心流控制面 appendix（Wave 4，仅 RIVET_CONTROL_PLANE=active 时非空）。
+   *  Cache-safe: dynamic appendix only；状态变化才更新（revision 驱动），
+   *  稳定排序。禁止 timestamp / random ID / 累计计数 / 无序序列化 /
+   *  模型自由生成文本——任何此类内容都会把 earliest divergence 提前。 */
+  controlPlaneBlock?: string | null
   /** Cross-session events formatted for injection (cache-safe: only in dynamic appendix) */
   crossSessionEvents?: string
   /** Companion presence block — other active sessions working on the same project. */
@@ -285,6 +290,9 @@ export interface VolatileContext {
   planExitReminderPending?: boolean
   /** Project memory loaded from .rivet/knowledge/memory.jsonl (frozen: changes only on file update) */
   projectMemoryBlock?: string
+  /** Knowledge manifest routing index（Wave 4b）——"改 X 前先召回 Y"的地图，
+   *  会话启动快照一次进 frozen base，只留索引不留知识本文。 */
+  knowledgeManifestBlock?: string
   /** Codebase index — module summaries + CLI entries from MeridianDB.
    *  Rendered into frozen base after projectMemoryBlock for prefix cache stability.
    *  Generated at snapshot time from DB, not stored as flat file. */
@@ -411,6 +419,8 @@ export function buildStableVolatileBlock(ctx: VolatileContext): string {
     intentRetrievalRoute: undefined,
     // Harness advisory — per-turn dynamic, stripped from FROZEN
     harnessAdvisoryBlock: undefined,
+    // Control-plane appendix — per-turn dynamic, stripped from FROZEN
+    controlPlaneBlock: undefined,
     // gitStatus moved to dynamic appendix — changes every turn, breaks prefix cache
     gitStatus: undefined,
     // planModeState and worktreeReality rendered in buildVolatileBlockInternal
@@ -629,6 +639,12 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // Harness advisory: unified corrective guidance (A1 bus, max 3 entries)
   if (ctx.harnessAdvisoryBlock) {
     parts.push(ctx.harnessAdvisoryBlock)
+  }
+
+  // Control-plane appendix (Wave 4): active-mode only, revision-driven —
+  // byte-stable while the frame's model-visible state is unchanged.
+  if (ctx.controlPlaneBlock) {
+    parts.push(ctx.controlPlaneBlock)
   }
 
   // Worktree warning: cache-safe — rendered ONLY into dynamic appendix
@@ -974,6 +990,12 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
   // A3: budget cap at 3K chars — beyond that it's stale noise.
   if (ctx.projectMemoryBlock) {
     parts.push(truncateBlock(ctx.projectMemoryBlock, 3_000, 'project-memory'))
+  }
+
+  // Knowledge manifest routing map（Wave 4b）——字节稳定索引，snapshot 时生成。
+  // 只告诉模型"何时召回什么"，知识本文经 memory recall 按需取。
+  if (ctx.knowledgeManifestBlock) {
+    parts.push(truncateBlock(ctx.knowledgeManifestBlock, 2_200, 'knowledge-manifest'))
   }
 
   // Seed capsule — 前辈星域封存的经验方法（天璇胶囊等）。

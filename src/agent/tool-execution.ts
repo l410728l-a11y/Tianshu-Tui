@@ -49,6 +49,8 @@ export interface ToolExecutionDeps {
   harness: TurnHarness
   prewarm: PrewarmCache
   evidence: EvidenceTracker
+  /** 证据义务状态机——tool pipeline 把 probe/失败/RED 编辑门接进义务状态。 */
+  obligations?: import('./obligation-tracker.js').ObligationTracker
   repairHintTracker: RepairHintTracker
   repairPipeline: RepairPipeline
   runtimeHooks: RuntimeHookPipeline
@@ -71,6 +73,8 @@ export interface ToolExecutionDeps {
   recordToolHistory: (name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass) => void
   buildRuntimeSnapshot: (extra?: Partial<RuntimeHookSnapshot>) => RuntimeHookSnapshot
   requestThetaCheck: (reason: string) => void
+  /** Wave 2 控制面：postTool hook 结构化事实上报出口（shadow 记账，不改 prompt）。 */
+  submitControlSignal?: (signal: import('./control-plane.js').ControlSignal) => void
   getAutoReasoning: () => boolean
   getReasoningEffort: () => ReasoningEffort | undefined
   setClientReasoningEffort: (effort: ReasoningEffort) => void
@@ -229,6 +233,7 @@ export class ToolExecutionController {
       harness: this.deps.harness,
       prewarm: this.deps.prewarm,
       evidence: this.deps.evidence,
+      obligations: this.deps.obligations,
       traceStore: state.traceStore,
       repairHintTracker: this.deps.repairHintTracker,
       repairPipeline: this.deps.repairPipeline,
@@ -610,6 +615,7 @@ export class ToolExecutionController {
           {
             setVigor: (vigor) => { this.deps.setVigorState(vigor) },
             requestThetaCheck: (reason) => { this.deps.requestThetaCheck(reason) },
+            emitControlSignal: signal => { this.deps.submitControlSignal?.(signal) },
             markClaimStale: claimId => {
               this.deps.config.contextClaimStore?.updateClaimStatus(
                 claimId,

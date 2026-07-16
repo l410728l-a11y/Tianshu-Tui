@@ -92,7 +92,7 @@ export const DEFAULT_CONFIG: Config = {
     maxTurns: 200,
     mode: 'code',
     autoReasoning: true,
-    defaultDomain: 'auto',
+    defaultDomain: 'tianquan',
     verificationSnapshot: 'auto',
     songlineEnabled: false,
     desktopTools: false,
@@ -198,6 +198,7 @@ export const DEFAULT_CONFIG: Config = {
     userAgent: 'Tianshu/1.0 (terminal coding agent)',
     extractMainContent: true,
   },
+  network: {},
   mcp: {
     enabled: true,
     servers: {},

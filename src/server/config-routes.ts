@@ -38,6 +38,8 @@ import {
   setShellConfig,
   getCheckpointConfig,
   setCheckpointConfig,
+  getNetworkConfig,
+  setNetworkConfig,
   getPermissionDirs,
   setPermissionDirs,
   getVisionModelConfig,
@@ -50,6 +52,7 @@ import { existsSync } from 'node:fs'
 import { PROVIDER_PRESETS, providerPresetKeys, type ProviderPresetKey } from '../config/provider-presets.js'
 import { modelConfigSchema, type ModelConfig } from '../config/schema.js'
 import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.js'
+import { getDeepSeekUserSummary, getDeepSeekCostReport } from '../api/deepseek-platform-client.js'
 import { listGrantedApps, revokeApp } from '../tools/computer-use/app-grants.js'
 import { createPlatformDriver, isComputerUsePlatform } from '../tools/computer-use/platform-driver.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
@@ -324,6 +327,23 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
     }, apiToken),
 
+    // HTTP proxy for web_fetch / import_resource (Clash etc.). Empty = follow env.
+    'GET /config/network': withAuth(() => {
+      return { status: 200, body: getNetworkConfig() }
+    }, apiToken),
+
+    'PUT /config/network': withAuth((body) => {
+      const { proxy, noProxy } = (body ?? {}) as { proxy?: unknown; noProxy?: unknown }
+      if (proxy === undefined && noProxy === undefined) {
+        return { status: 400, body: { error: 'proxy or noProxy is required' } }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setNetworkConfig({ proxy, noProxy }) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
     // Computer Use (desktop GUI automation) status for the desktop settings UI:
     // platform availability, Pro gating, system permission probe, and per-app grants.
     'GET /config/computer-use': withAuth(async () => {
@@ -429,6 +449,29 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
       const balance = await queryDeepSeekBalance(apiKey, provider.baseUrl)
       return { status: 200, body: { balance } }
+    }, apiToken),
+
+    // DeepSeek 平台账户摘要：当天/当月花费、余额、Flash/Pro 用量。
+    'GET /config/deepseek/summary': withAuth(async () => {
+      const cfg = loadConfig()
+      const provider = cfg.provider.providers[cfg.provider.default]
+      if (!provider) return { status: 200, body: { summary: null } }
+      const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+      const summary = await getDeepSeekUserSummary(apiKey, provider.baseUrl)
+      return { status: 200, body: { summary } }
+    }, apiToken),
+
+    // DeepSeek 平台成本明细：按模型按天的 token/cost。month=1-12, year=YYYY。
+    'GET /config/deepseek/cost': withAuth(async (_body, params) => {
+      const cfg = loadConfig()
+      const provider = cfg.provider.providers[cfg.provider.default]
+      if (!provider) return { status: 200, body: { cost: null } }
+      const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+      const now = new Date()
+      const month = Number(params?.month ?? now.getMonth() + 1)
+      const year = Number(params?.year ?? now.getFullYear())
+      const cost = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
+      return { status: 200, body: { cost } }
     }, apiToken),
   }
 }

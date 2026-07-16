@@ -3,11 +3,13 @@ import type { Usage } from '../api/types.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import { CACHE_ANCHOR_MESSAGES, summaryOutputBudgetChars } from '../compact/constants.js'
 import { microCompactOai, estimateOaiTokens } from '../compact/micro.js'
+import { deriveCompactionProfile, cacheKindFromProviderProfile, type CompactionProfile, type CompactionAction } from '../compact/compaction-profile.js'
+import { estimateReclaim, buildReclaimDecision, type ReclaimDecisionRecord } from '../compact/reclaim-estimate.js'
 
 import { debugLog } from '../utils/debug.js'
 import { runResumePreflightOai } from '../context/resume-preflight.js'
 import type { WriteProbe } from '../context/write-evidence-probe.js'
-import { decideCompactTier, recordCompactFailure, recordCompactSuccess } from '../context/compact-policy.js'
+import { decideCompactAction, recordCompactFailure, recordCompactSuccess } from '../context/compact-policy.js'
 import type { CompactCircuitBreakerState, CompactTier } from '../context/types.js'
 import type { ProviderProfile } from '../api/provider-profile.js'
 import { diagnoseCacheMiss } from '../prompt/cache-diagnostic.js'
@@ -389,6 +391,14 @@ export interface CompactionControllerDeps {
   recordSummaryUsage?: (usage: Partial<Usage>, model: string) => void
   /** Disk evidence probe for write-tool orphan synthesis during compaction repair. */
   writeProbe?: WriteProbe
+  /**
+   * Cost-aware reclaim profile (2026-07-16 plan). When absent, a conservative
+   * per-token profile is derived from providerProfile + contextWindow — an
+   * unknown provider must never get looser cache protection than DeepSeek.
+   */
+  compactionProfile?: CompactionProfile
+  /** Structured sink for reclaim-gate decisions (committed AND rejected). */
+  onReclaimDecision?: (record: ReclaimDecisionRecord) => void
 }
 
 export interface ArchiveHistoryInput {
@@ -506,122 +516,129 @@ export class CompactionController {
     const ratio = contextWindow > 0 ? estimatedTokens / contextWindow : 0
     debugLog(`[compaction-check] contextWindow=${contextWindow} estimatedTokens=${estimatedTokens} ratio=${(ratio * 100).toFixed(1)}% turn=${this.deps.session.getTurnCount()}`)
 
-    // Phase 2: On 1M+ context windows, skip micro compact but allow LLM
-    // compact at 75% as a graceful degradation before the 86% session split.
-    // This preserves key context via model-generated summary rather than the
-    // abrupt "nuke everything" of trySessionSplit.
-    //
-    // Circuit breaker: consecutive LLM compact failures are tracked via
-    // CompactCircuitBreakerState. After 3 consecutive failures, the breaker
-    // opens and skips LLM compact for the next 3 turns, preventing repeated
-    // 750K-860K token requests from being wasted on a failing pipeline.
-    if (this.deps.contextWindow >= 1_000_000) {
-      // Check circuit breaker before attempting any expensive compact
-      const breakerOpen = input.failures.disabledUntilTurn !== undefined
-        && this.deps.session.getTurnCount() < input.failures.disabledUntilTurn
-      if (breakerOpen) {
-        debugLog(`[llm-compact] circuit breaker open until turn ${input.failures.disabledUntilTurn} — skipping`)
-        return { failures: input.failures, compacted: false }
-      }
-
-      // P2: on exact-prefix providers (DeepSeek), the 1M LLM-compact paths used
-      // to bypass shouldDelayCompact entirely — breaking the prefix cache even
-      // when it was hot. Gate them through the same cache-protection check the
-      // non-1M tier path already uses (L430), so we only pay the cache-miss
-      // rebuild when the headroom is genuinely worth more than cache warmth.
-      const cachePreserving = this.isCachePreservingProvider()
-
-      // T8: Partial Compact at 60% — earlier, lighter, preserves recent context.
-      if (ratio >= 0.60 && ratio < 0.75 && this.summaryClient()) {
-        if (cachePreserving && this.deps.cacheAdvisor?.shouldDelayCompact(1, { estimatedTokens, contextWindow })) {
-          debugLog(`[partial-compact] 1M at ${(ratio * 100).toFixed(0)}% — cache healthy, delaying`)
-          return { failures: input.failures, compacted: false }
-        }
-        debugLog(`[partial-compact] 1M window at ${(ratio * 100).toFixed(0)}% — trying partial compact`)
-        const partialResult = await this.tryPartialCompact(60)
-        if (partialResult) {
-          return { failures: recordCompactSuccess(input.failures), compacted: true }
-        }
-        debugLog('[partial-compact] partial compact failed — will wait for 75% full compact')
-        return { failures: input.failures, compacted: false }
-      }
-
-      // Full LLM compact at 75% — fallback when partial was insufficient
-      if (ratio >= 0.75 && this.summaryClient()) {
-        // P2: tier-2 delay check. At 75%+ pressure shouldDelayCompact rarely
-        // holds (protection = hitRate × (1 − pressure) ≤ 0.25 < 0.45), so this
-        // mainly defers the 75-80% band when the cache is exceptionally hot.
-        if (cachePreserving && this.deps.cacheAdvisor?.shouldDelayCompact(2, { estimatedTokens, contextWindow })) {
-          debugLog(`[llm-compact] 1M at ${(ratio * 100).toFixed(0)}% — cache healthy, delaying`)
-          return { failures: input.failures, compacted: false }
-        }
-        // Try partial compact first (lighter)
-        debugLog(`[llm-compact] 1M window at ${(ratio * 100).toFixed(0)}% — trying partial compact before full`)
-        const partialResult = await this.tryPartialCompact(60)
-        if (partialResult) {
-          return { failures: recordCompactSuccess(input.failures), compacted: true }
-        }
-
-        debugLog(`[llm-compact] partial compact insufficient — triggering full LLM compact`)
-        const summary = await this.llmCompact(undefined, this.deps.getAbortSignal?.())
-        if (this.isAbortRequested()) {
-          debugLog('[llm-compact] turn aborted after compact returned — skipping checkpoint replacement')
-          return { failures: input.failures, compacted: false }
-        }
-        if (summary) {
-          // P3: persist heuristic session memories BEFORE replaceWithCheckpoint
-          // wipes history (extractSessionMemories reads the live message list).
-          // Placed AFTER llmCompact so the compaction request itself still reuses
-          // the prefix cache with the pre-refresh frozen base — the persist
-          // callback hot-refreshes session memory, which rebuilds the frozen base.
-          this.persistExtractedMemories(this.deps.getTrajectoryEntries())
-          await this.replaceWithCheckpoint({
-            tier: 2,
-            reason: `LLM compact at ${(ratio * 100).toFixed(0)}% context (1M window graceful degradation)`,
-            summary,
-            maxFallback: this.deps.contextWindow * 0.3,
-            fallbackText: '<compact-summary>LLM compact failed to fit; session continues with cache anchors.</compact-summary>',
-          })
-          return { failures: recordCompactSuccess(input.failures), compacted: true }
-        }
-        debugLog(`[llm-compact] LLM compact failed (null summary)`)
-        return {
-          failures: recordCompactFailure(input.failures, this.deps.session.getTurnCount()),
-          compacted: false,
-        }
-      }
-      return { failures: input.failures, compacted: false }
-    }
-
-    const compactDecision = decideCompactTier({
+    // Unified window-aware action decision (2026-07-16 reclaim gate plan
+    // task 4). The old dedicated 1M branch early-returned past
+    // decideCompactTier, silently bypassing the precision ceiling; windows now
+    // share one action vocabulary and only thresholds differ. The 60%/75% LLM
+    // ladder and circuit-breaker semantics live inside decideCompactAction.
+    const actionDecision = decideCompactAction({
       estimatedTokens,
       maxTokens: contextWindow,
       turn: this.deps.session.getTurnCount(),
       failures: input.failures,
       providerProfile: this.deps.providerProfile,
       recentHitRate: this.deps.cacheAdvisor?.getRecentHitRate() ?? null,
+      profile: this.reclaimProfile(),
     })
+    debugLog(`[compaction-decision] action=${actionDecision.action} tier=${actionDecision.tier} force=${actionDecision.force} precisionRisk=${actionDecision.precisionRisk} reason="${actionDecision.reason}"`)
 
-    debugLog(`[compaction-decision] tier=${compactDecision.tier} shouldCompact=${compactDecision.shouldCompact} reason="${compactDecision.reason}"`)
+    if (actionDecision.action === 'none') {
+      return { failures: input.failures, compacted: false }
+    }
 
-    if (!compactDecision.shouldCompact) {
+    if (actionDecision.action === 'partial-llm' || actionDecision.action === 'full-llm' || actionDecision.action === 'checkpoint') {
+      if (!this.summaryClient()) {
+        return { failures: input.failures, compacted: false }
+      }
+      // P2: on exact-prefix providers (DeepSeek), the LLM-compact paths used
+      // to bypass shouldDelayCompact entirely — breaking the prefix cache even
+      // when it was hot. Non-force actions defer to cache warmth; the forced
+      // ceiling checkpoint must stay reachable (an over-window request is a
+      // hard API failure, so "cache healthy, delay" cannot stall it forever).
+      const cachePreserving = this.isCachePreservingProvider()
+      const delayTier = actionDecision.action === 'partial-llm' ? 1 : 2
+      if (!actionDecision.force && cachePreserving && this.deps.cacheAdvisor?.shouldDelayCompact(delayTier, { estimatedTokens, contextWindow })) {
+        debugLog(`[llm-compact] ${actionDecision.action} at ${(ratio * 100).toFixed(0)}% — cache healthy, delaying`)
+        return { failures: input.failures, compacted: false }
+      }
+
+      // Try partial compact first for every LLM action (lighter, preserves
+      // the recent zone) — unchanged ladder order.
+      debugLog(`[llm-compact] ${actionDecision.action} at ${(ratio * 100).toFixed(0)}% — trying partial compact first`)
+      const partialResult = await this.tryPartialCompact(60)
+      if (partialResult) {
+        return { failures: recordCompactSuccess(input.failures), compacted: true }
+      }
+      if (actionDecision.action === 'partial-llm') {
+        debugLog('[partial-compact] partial compact failed — will wait for the full-compact rung')
+        return { failures: input.failures, compacted: false }
+      }
+
+      debugLog(`[llm-compact] partial compact insufficient — triggering full LLM compact`)
+      const summary = await this.llmCompact(undefined, this.deps.getAbortSignal?.())
+      if (this.isAbortRequested()) {
+        debugLog('[llm-compact] turn aborted after compact returned — skipping checkpoint replacement')
+        return { failures: input.failures, compacted: false }
+      }
+      if (summary) {
+        // P3: persist heuristic session memories BEFORE replaceWithCheckpoint
+        // wipes history (extractSessionMemories reads the live message list).
+        // Placed AFTER llmCompact so the compaction request itself still reuses
+        // the prefix cache with the pre-refresh frozen base — the persist
+        // callback hot-refreshes session memory, which rebuilds the frozen base.
+        this.persistExtractedMemories(this.deps.getTrajectoryEntries())
+        const committed = await this.replaceWithCheckpoint({
+          tier: 2,
+          reason: `LLM compact at ${(ratio * 100).toFixed(0)}% context (${actionDecision.action})`,
+          summary,
+          maxFallback: this.deps.contextWindow * 0.3,
+          fallbackText: '<compact-summary>LLM compact failed to fit; session continues with cache anchors.</compact-summary>',
+          action: actionDecision.action,
+          force: actionDecision.force,
+        })
+        if (!committed) {
+          // Gate veto is an economic decision, not a pipeline error.
+          return { failures: input.failures, compacted: false }
+        }
+        return { failures: recordCompactSuccess(input.failures), compacted: true }
+      }
+      debugLog(`[llm-compact] LLM compact failed (null summary)`)
+      return {
+        failures: recordCompactFailure(input.failures, this.deps.session.getTurnCount()),
+        compacted: false,
+      }
+    }
+
+    // Deterministic actions ('micro' / 'stale-round') from here on.
+    // 1M windows never ran a deterministic rewrite in maybeCompact before the
+    // precision band was surfaced — introduce it strictly at user boundaries
+    // (turn 0) so this new path can never shatter a mid-turn prefix.
+    if (contextWindow >= 1_000_000 && input.loopTurn !== 0) {
       return { failures: input.failures, compacted: false }
     }
 
     // Track 4: 显式 cache-miss 成本 vs 压缩收益权衡 — 传入压力上下文，
     // 热缓存只在低压力时挡住压缩，高压力时放行（1M 余量 > 前缀重建成本）。
-    if (this.deps.cacheAdvisor?.shouldDelayCompact(compactDecision.tier, { estimatedTokens, contextWindow })) {
+    if (!actionDecision.force && this.deps.cacheAdvisor?.shouldDelayCompact(actionDecision.tier, { estimatedTokens, contextWindow })) {
       return { failures: input.failures, compacted: false }
     }
 
     try {
       const { messages: compacted } = this.compactMessages(messages, estimatedTokens)
 
+      // Reclaim gate (2026-07-16 plan task 2): the candidate must prove it
+      // reclaims enough context to be worth the prefix-cache rebuild before
+      // any history replacement. Rejected candidates leave the session
+      // untouched — the next boundary re-evaluates with fresh pressure. A
+      // gate skip is NOT a compaction failure (the circuit breaker tracks
+      // pipeline errors, not economic vetoes).
+      const decision = buildReclaimDecision(
+        'micro',
+        estimateReclaim(messages, compacted),
+        this.reclaimProfile(),
+        actionDecision.force,
+      )
+      this.deps.onReclaimDecision?.(decision)
+      if (!decision.commit) {
+        debugLog(`[compaction-gate] micro candidate rejected (${decision.reason}): reclaimed=${decision.reclaimedTokens} floor=${this.reclaimProfile().minReclaimTokens}`)
+        return { failures: input.failures, compacted: false }
+      }
+
       // Tier 2+: inject a deterministic 4-field summary so the model retains
       // goals/progress/active-files/errors across compaction boundaries.
       // Only inject when compaction actually reduced message count (otherwise
       // the summary adds noise without reclaiming context).
-      if (compactDecision.tier >= 2 && compacted.length < messages.length) {
+      if (actionDecision.tier >= 2 && compacted.length < messages.length) {
         const taskState = extractTaskState(
           this.deps.getTrajectoryEntries(),
           this.deps.getStreamedText(),
@@ -676,7 +693,7 @@ export class CompactionController {
       this.deps.session.recordCompactEvent({
         turn: this.deps.session.getTurnCount(),
         tier: 1,
-        reason: `auto compact: ${compactDecision.reason}`,
+        reason: `auto compact: ${actionDecision.reason}`,
         beforeTokens: estimatedTokens,
         afterTokens,
         createdAt: Date.now(),
@@ -716,6 +733,8 @@ export class CompactionController {
           summary,
           maxFallback: ceiling,
           fallbackText: '<checkpoint-resume>Context ceiling exceeded. Continue from preserved cache anchors.</checkpoint-resume>',
+          action: 'checkpoint',
+          force: true,
         })
         return
       }
@@ -751,6 +770,8 @@ export class CompactionController {
       summary: resumeContent,
       maxFallback: ceiling,
       fallbackText: '<checkpoint-resume>Context ceiling exceeded. Continue from preserved cache anchors and ask for missing details if needed.</checkpoint-resume>',
+      action: 'checkpoint',
+      force: true,
     })
   }
 
@@ -781,6 +802,8 @@ export class CompactionController {
           summary,
           maxFallback: this.deps.contextWindow * 0.3,
           fallbackText: `<session-handoff>Session split at ${(ratio * 100).toFixed(0)}% context.</session-handoff>`,
+          action: 'session-split',
+          force: true,
         })
         debugLog(`[session-split] LLM compact ratio=${ratio.toFixed(2)} tokens=${this.deps.session.getEstimatedTokens()}`)
         return true
@@ -797,6 +820,8 @@ export class CompactionController {
       summary: handoffContent,
       maxFallback: this.deps.contextWindow * 0.3,
       fallbackText: `<session-handoff>Session split at ${(ratio * 100).toFixed(0)}% context. ${taskState.current}</session-handoff>`,
+      action: 'session-split',
+      force: true,
     })
 
     debugLog(`[session-split] structured handoff ratio=${ratio.toFixed(2)} tokens=${this.deps.session.getEstimatedTokens()}`)
@@ -929,6 +954,16 @@ export class CompactionController {
     return this.deps.providerProfile?.cacheType === 'exact-prefix' && (this.deps.providerProfile?.persistent ?? false)
   }
 
+  /** Reclaim-gate profile: injected model-aware profile, else a conservative
+   *  per-token derivation from the provider cache profile (never looser). */
+  private reclaimProfile(): CompactionProfile {
+    return this.deps.compactionProfile ?? deriveCompactionProfile({
+      contextWindow: this.deps.contextWindow,
+      billing: 'per-token',
+      cache: cacheKindFromProviderProfile(this.deps.providerProfile),
+    })
+  }
+
   /**
    * Replace session messages after running OAI orphan-tool_call preflight.
    *
@@ -1036,8 +1071,15 @@ export class CompactionController {
 
   /**
    * Replace message history with cache anchors + checkpoint summary.
-   * Called by both trySessionSplit (86% threshold, richer handoff) and
-   * enforceContextCeiling (95% threshold, emergency fallback).
+   * Called by trySessionSplit (86% threshold, richer handoff),
+   * enforceContextCeiling (95% threshold, emergency fallback), and the
+   * maybeCompact LLM ladder.
+   *
+   * Task 6 force semantics: every checkpoint-style rewrite passes through the
+   * reclaim gate and emits a decision record. Forced callers (ceiling /
+   * session split — the alternative is an over-window API failure) always
+   * commit; discretionary LLM commits must clear the profile floors.
+   * Returns whether the rewrite was committed.
    */
   private async replaceWithCheckpoint(params: {
     tier: CompactTier
@@ -1045,7 +1087,9 @@ export class CompactionController {
     summary: string
     maxFallback: number
     fallbackText: string
-  }): Promise<void> {
+    action: CompactionAction
+    force: boolean
+  }): Promise<boolean> {
     const messages = this.deps.session.getMessages()
     const anchorMessages = messages.slice(0, CACHE_ANCHOR_MESSAGES)
 
@@ -1072,7 +1116,19 @@ export class CompactionController {
       candidate.push({ role: 'user', content: anchorAppendix })
     }
 
-    const beforeTokens = estimateOaiTokens(messages)
+    const decision = buildReclaimDecision(
+      params.action,
+      estimateReclaim(messages, candidate),
+      this.reclaimProfile(),
+      params.force,
+    )
+    this.deps.onReclaimDecision?.(decision)
+    if (!decision.commit) {
+      debugLog(`[compaction-gate] ${params.action} checkpoint rejected (${decision.reason}): reclaimed=${decision.reclaimedTokens}`)
+      return false
+    }
+
+    const beforeTokens = decision.beforeTokens
     this.safeReplaceMessages(candidate)
     this.deps.promptEngine.resetAppendixBaseline()
     this.deps.session.recordCompactEvent({
@@ -1084,6 +1140,7 @@ export class CompactionController {
       createdAt: Date.now(),
     })
     this.deps.refreshLedger()
+    return true
   }
 
   /**
@@ -1199,6 +1256,18 @@ export class CompactionController {
       // prefix — so this stays prefix-cache safe. Fail-soft: a null archive
       // simply means the summary ships without a recall pointer.
       const archive = await this.archiveDiscardedHistory(oldZone, 'partial-compact')
+
+      // W3-C1: same state-coverage post-check as llmCompact (line ~1344).
+      // Partial compact has two deterministic backstops — the verbatim archive
+      // (recall ref) and the task-anchor appendix. Only when BOTH are absent
+      // would this lossy summary be the sole carrier of the discarded history;
+      // in that case a summary reflecting none of the material state must not
+      // commit the rewrite (fail-open to context occupancy).
+      if (!archive && !this.buildTaskAnchorAppendix() && !this.summaryCoversState(summary)) {
+        debugLog('[partial-compact] summary failed state-coverage post-check with no archive/anchor backstop — skipping rewrite')
+        return false
+      }
+
       const summaryBody = archive ? `${summary}${archive.ref}` : summary
 
       const summaryMessage: OaiMessage = {
@@ -1228,6 +1297,17 @@ export class CompactionController {
       const anchorAppendix = this.buildTaskAnchorAppendix()
       if (anchorAppendix) {
         newMessages.push({ role: 'user', content: anchorAppendix })
+      }
+
+      // Reclaim gate: a partial compact that fails to reclaim the profile
+      // floor (e.g. tiny oldZone vs a large recall-laden summary) must not
+      // shatter the prefix for nothing. The side-path summary cost is already
+      // booked either way; skipping the rewrite keeps the cache intact.
+      const decision = buildReclaimDecision('partial-llm', estimateReclaim(messages, newMessages), this.reclaimProfile(), false)
+      this.deps.onReclaimDecision?.(decision)
+      if (!decision.commit) {
+        debugLog(`[compaction-gate] partial-llm candidate rejected (${decision.reason}): reclaimed=${decision.reclaimedTokens}`)
+        return false
       }
       this.safeReplaceMessages(newMessages)
       this.deps.promptEngine.resetAppendixBaseline()

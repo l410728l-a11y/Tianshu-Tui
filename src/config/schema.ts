@@ -232,7 +232,7 @@ export const agentSchema = z.object({
   mode: z.enum(['code', 'ask', 'plan']).default('code'),
   autoReasoning: z.boolean().default(true),
   /** 默认星域（auto | tianshu | pojun ...）。新会话的初始星域将由此配置项决定。 */
-  defaultDomain: z.string().default('auto'),
+  defaultDomain: z.string().default('tianquan'),
   /**
    * 重启后一键续跑的兜底模型（可选）。续跑严格沿用会话原模型（前缀缓存亲和）；
    * 仅当原模型不可用且此项配置了可用模型时才切换续跑（UI 明示缓存将重建）。
@@ -401,6 +401,15 @@ export const fetchSchema = z.object({
 
 export type FetchConfig = z.infer<typeof fetchSchema>
 
+export const networkSchema = z.object({
+  /** HTTP/HTTPS 代理地址（如 http://127.0.0.1:7890）。
+   *  优先于环境变量 HTTPS_PROXY/HTTP_PROXY。留空则跟随系统环境变量。 */
+  proxy: z.string().optional(),
+  /** 不走代理的域名列表（逗号分隔，支持 * 通配和 . 前缀）。
+   *  匹配语义对齐 curl/wget 的 NO_PROXY。留空则跟随 NO_PROXY 环境变量。 */
+  noProxy: z.string().optional(),
+}).default({})
+export type NetworkConfig = z.infer<typeof networkSchema>
 export const editorSchema = z.object({
   /**
    * Target-OS conventions for file artifacts and the system-prompt OS hint.
@@ -589,6 +598,7 @@ export const configSchema = z.object({
   cache: cacheSchema.default({}),
   search: searchSchema,
   fetch: fetchSchema,
+  network: networkSchema,
   editor: editorSchema.default({}),
   mcp: mcpConfigSchema.default({}),
   workers: workersSchema,
@@ -610,6 +620,7 @@ export type Config = {
   cache: CacheConfig
   search: SearchConfig
   fetch: FetchConfig
+  network: NetworkConfig
   editor: EditorConfig
   mcp: McpConfig
   workers: WorkersConfig

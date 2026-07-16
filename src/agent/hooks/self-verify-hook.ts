@@ -109,6 +109,14 @@ export interface SelfVerifyHookDeps {
   /** W5: EvidenceTracker state getter for scope-mismatch detection.
    *  Absent → mismatch check disabled (unchanged behavior). */
   getEvidenceState?: () => { filesModified: Set<string>; verifications: VerificationMetadata[] }
+  /** 结构化 verification_required 信号出口（control plane）。与 advisory
+   *  并行：advisory 服务下一轮措辞（可核销/自愈），信号让 focus 立即转
+   *  verify——不再只是 postTurn 软文。 */
+  submitControlSignal?: (signal: import('../control-plane.js').ControlSignal) => void
+  /** 证据义务状态机（同义 advisory supersede，Wave 3）：存在未决高风险
+   *  delivery/bugfix 义务时，义务块已是"改了没验证"事实的模型可见声音——
+   *  跳过泛化 self-verify advisory，避免同一事实两份文案同轮出现。 */
+  obligations?: Pick<import('../obligation-tracker.js').ObligationTracker, 'unresolvedHigh'>
 }
 
 export function createSelfVerifyHook(deps: SelfVerifyHookDeps): PostTurnRuntimeHook {
@@ -148,6 +156,26 @@ export function createSelfVerifyHook(deps: SelfVerifyHookDeps): PostTurnRuntimeH
       // are not classified → stay conservative and don't fire.
       const allReadOrWrite = recentToolHistory.every(isReadOrWriteCall)
       if (!allReadOrWrite) return
+
+      // 结构化信号：kind='verification' + attention → control plane focus 转
+      // 'verify'。key 稳定、无自由文本——同一事实反复触发不会抖动 revision。
+      deps.submitControlSignal?.({
+        key: 'self-verify:verification-required',
+        kind: 'verification',
+        severity: 'attention',
+        summary: 'recent conclusions built on reads/edits without ground-truth verification',
+        routeHint: 'status',
+        requiresDecision: false,
+        ttlTurns: 2,
+        cacheImpact: 'none',
+      })
+
+      // 同义 supersede：未决高风险 delivery/bugfix 义务在场时，义务块
+      // （evidence-obligation projection + control plane）已承载同一事实与
+      // 更具体的下一动作——不再叠发泛化 advisory。
+      const obligationVoice = (deps.obligations?.unresolvedHigh() ?? [])
+        .some(o => o.family === 'delivery' || o.family === 'bugfix')
+      if (obligationVoice) return
 
       deps.advisoryBus.submit({
         key: 'self-verify',

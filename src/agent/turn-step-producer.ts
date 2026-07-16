@@ -32,6 +32,9 @@ import { buildCognitiveProjectionParts, createCognitiveLedger, getCognitivePhase
 import { formatImmuneContext } from './immune-context.js'
 import { VITALS_LITE_KIND } from './telemetry-writer.js'
 import { getCapsuleByStar } from './seed-capsule-store.js'
+import { BlockChargeTracker } from './injection-meter.js'
+import { signalFromLedgerDelta, signalsFromDelivered, signalsFromObligations } from './control-plane-adapters.js'
+import { renderControlPlaneAppendix } from './control-plane.js'
 
 /**
  * Resolve the turn-level hard-stall watchdog ceiling (ms) from provider +
@@ -71,6 +74,22 @@ export function crossSessionDisabled(configEnabled?: boolean): boolean {
   if (v === '0' || v === 'false') return false
   if (configEnabled !== undefined) return !configEnabled
   return true
+}
+
+/**
+ * Wave 1（知识重构）：`<cross-session-memory>` 每轮推送注入**默认退位**。
+ *
+ * Store B（unified-memory）的正则观察噪声曾经此通道每个用户边界推给模型；
+ * 按"召回是主通道"原则，跨会话知识只经 memory recall 工具按需取。
+ * 显式回退口：env RIVET_CROSS_SESSION_INJECT=1 恢复推送（对照实验用）。
+ *
+ * 注意与 crossSessionDisabled 的分工：后者门控另外三个点位
+ * （warmup / 跨会话事件 / 伙伴 presence——多会话协作功能，不是知识推送），
+ * 本开关只管记忆块推送，默认关。
+ */
+export function crossSessionMemoryPushEnabled(): boolean {
+  const v = process.env.RIVET_CROSS_SESSION_INJECT
+  return v === '1' || v === 'true'
 }
 
 /**
@@ -125,6 +144,14 @@ export class TurnStepProducer {
   /** 计费基线对应的 compact 轮 — compact 重置 appendix baseline 后块全量
    *  重新入场，计费基线必须同步作废（否则重发字节被漏计）。 */
   private chargeBaselineCompactTurn: number | null = null
+  /** W2-B1: advisory appendix block 的增量计费基线（appendixDelta 对齐） */
+  private readonly advisoryBlockCharge = new BlockChargeTracker()
+  /** advisory 计费基线对应的 compact 轮（与 chargeBaselineCompactTurn 同语义） */
+  private advisoryChargeBaselineCompactTurn: number | null = null
+  /** Wave 4: control-plane appendix 独立计费 tracker——同一字节绝不同时记在
+   *  advisory-appendix 与 control-appendix（两个 block 互斥，各自持有 tracker）。 */
+  private readonly controlBlockCharge = new BlockChargeTracker()
+  private controlChargeBaselineCompactTurn: number | null = null
 
   /**
    * Step 6a: Per-run initialization — warmup, heartbeat, state resets,
@@ -262,6 +289,9 @@ export class TurnStepProducer {
 
     if (turnMode === 'task') {
       this.self.taskContract = extractTaskContract(userInput, this.self.session.getTurnCount())
+      // 证据义务任务边界：上一个用户任务的未决义务全部作废（satisfied 历史
+      // 保留），latch 清空——新任务从干净的义务面开始。
+      this.self.obligations.supersedeOpen()
     } else if (turnMode === 'followUp') {
       // P5: inherit the active contract, but fold in any new constraints/files
       // from this follow-up (multi-line corrections whose constraint sits past
@@ -302,6 +332,44 @@ export class TurnStepProducer {
     // Classify task dependency depth for TDD strategy / verifier selection
     if (this.self.taskContract && actionable) {
       const routeKinds = this.self._lastRetrievalRoute?.taskKinds
+      // 初始证据义务（evidence-driven reasoning loop Wave 3）：由结构化来源
+      // （task kind + contract）创建，不做自由文本 claim 抽取（计划「待验证假设」
+      // 明确第一版不上正则 claim detector）。只在新任务边界创建一次——upsert
+      // 幂等（稳定 ID），followUp 轮重复调用不改变状态。
+      if (turnMode === 'task') {
+        const targets = this.self.taskContract.scope.mentionedFiles
+        if (routeKinds?.includes('bug_fix')) {
+          // bugfix → RED 复现优先（动作矩阵第一列）。high：final gate 参与方。
+          this.self.obligations.upsert({
+            family: 'bugfix',
+            claim: `缺陷已被 RED 复现并修复：${this.self.taskContract.objective}`,
+            targets,
+            risk: 'high',
+          })
+        }
+        if (routeKinds?.includes('refactor')) {
+          // 重构的风险形态是回归。medium：提供 baseline_diff 升级阶梯与
+          // 状态可见性，但不拦 natural-finish（回归权威仍是 B1 delivery gate
+          // + regressionInventory 核验）。
+          this.self.obligations.upsert({
+            family: 'regression',
+            claim: `重构未破坏既有行为：${this.self.taskContract.objective}`,
+            targets,
+            risk: 'medium',
+          })
+        }
+        if (routeKinds?.includes('review_audit') || routeKinds?.includes('performance_diagnosis')) {
+          // 审查/诊断结论需要交叉验证（计划：review/diagnosis→交叉验证）。
+          // medium：诊断是排查不是交付，不制造 final gate 仪式。
+          this.self.obligations.upsert({
+            family: 'behavior',
+            claim: `诊断/审查结论有独立证据支撑：${this.self.taskContract.objective}`,
+            targets,
+            risk: 'medium',
+            requiredAction: 'cross_check',
+          })
+        }
+      }
       this.self._taskDepthLayer = classifyTaskDepth(this.self.taskContract, undefined, routeKinds)
       this.self.config.promptEngine.setTaskDepthLayer(this.self._taskDepthLayer)
       // Plan mode always uses design-doc advisory (not executable Superpowers bash template);
@@ -356,7 +424,9 @@ export class TurnStepProducer {
       skillRegistry.renderDiscoveryBlock(userInput, { exclude: this.self.getDisabledSkills() }),
     )
     this.self.config.promptEngine.setCrossSessionMemoryBlock(
-      crossSessionDisabled(this.self.config.crossSessionEnabled) ? null : renderMemoryBlock(this.self.cwd, userInput),
+      crossSessionMemoryPushEnabled() && !crossSessionDisabled(this.self.config.crossSessionEnabled)
+        ? renderMemoryBlock(this.self.cwd, userInput)
+        : null,
     )
     this.self.config.promptEngine.setMentionContextBlock(renderMentionContext(parseMentions(userInput)))
 
@@ -421,21 +491,97 @@ export class TurnStepProducer {
     // Anti-habituation: staleness / vigor-low advisories are now routed by
     // CognitiveCapsuleRouter (preTurn hook) via advisory bus. Manual injection removed.
 
+    // CVM-vector 干预路由（v3.1 计划）：render 前的唯一评估点——此时本轮
+    // convergence/pressure/obligation 事实与各 preTurn hook 的 pending advisory
+    // 全部就绪。纪律：off 不评估；shadow 只落 telemetry，绝不 submit（“名义
+    // shadow、实际影响模型”是计划的反证测试项）；active 至多 submit 一条。
+    // evaluator 抛错吞掉——干预路由永不阻断主 turn。
+    if (this.self.cvmVector.mode !== 'off') {
+      try {
+        const conv = this.self.latestConvergenceResult
+        const evidenceState = this.self.evidence.getState()
+        const decision = this.self.cvmVector.evaluator.evaluate({
+          turn,
+          phaseClass: this.self.getConvergencePhaseClass(),
+          convergence: conv
+            ? {
+                score: conv.score,
+                level: conv.level,
+                textRepetitionPenalty: conv.signals.textRepetitionPenalty,
+                oscillationPenalty: conv.signals.oscillationPenalty,
+              }
+            : null,
+          pressure: {
+            ratio: pressureResult.ratio,
+            cvmOverheadRatio: pressureResult.cvmOverheadRatio,
+            thrashing: pressureResult.thrashing,
+            shouldThrottleCvm: pressureResult.shouldThrottleCvm,
+            hardCeiling: this.self.pressureMonitor.isCvmThrottlingCeiling(),
+          },
+          obligations: this.self.obligations.getStore(),
+          evidence: {
+            filesModified: evidenceState.filesModified.size,
+            deliveryStatus: evidenceState.deliveryStatus,
+          },
+          pendingAdvisoryKeys: this.self.advisoryBus.peekPendingKeys(),
+          convergenceEmittedRecently: this.self.wasConvergenceEmittedRecently(),
+          scoutOwned: this.self.anchorScoutOwned,
+          hasDecisionGates: this.self.controlPlane.getFrame().decisionGates.length > 0,
+        })
+        if (decision.classification || decision.candidate || decision.yielded) {
+          this.self.telemetryWriter.write({
+            kind: 'cvm-vector-decision',
+            turn,
+            mode: this.self.cvmVector.mode,
+            classification: decision.classification?.kind ?? null,
+            ruleId: decision.classification?.ruleId ?? decision.candidate?.ruleId ?? null,
+            facts: decision.classification?.facts ?? null,
+            candidateKey: decision.candidate?.entry.key ?? null,
+            yielded: decision.yielded,
+          })
+        }
+        if (this.self.cvmVector.mode === 'active' && decision.candidate) {
+          this.self.advisoryBus.submit(decision.candidate.entry)
+        }
+      } catch {
+        // CVM-vector 评估失败不影响 turn 主路径
+      }
+    }
+
     // A1: flush advisory bus into prompt engine (unified corrective guidance)
     // Pass active star domain name for dedup — suppress entries whose 【星名】 tag
     // matches the domain already rendered in the frozen base.
     const activeStarName = this.self.sessionDomain?.name
-    this.self.config.promptEngine.setHarnessAdvisoryBlock(this.self.advisoryBus.render(activeStarName, turn))
+    const advisoryBlock = this.self.advisoryBus.render(activeStarName, turn)
+    this.self.config.promptEngine.setHarnessAdvisoryBlock(advisoryBlock)
+    // W2-B1 egress metering: advisory appendix block, appendixDelta semantics —
+    // pays full bytes on change, zero at steady state. Compact resets the
+    // appendix baseline → tracker baseline must reset too (bytes re-enter).
+    if (this.self.lastCompactTurn !== this.advisoryChargeBaselineCompactTurn) {
+      this.advisoryChargeBaselineCompactTurn = this.self.lastCompactTurn
+      this.advisoryBlockCharge.reset()
+    }
+    const advisoryChargedChars = this.advisoryBlockCharge.charge(advisoryBlock ?? '')
+    if (advisoryChargedChars > 0) {
+      this.self.pressureMonitor.recordCvmInjection(Math.ceil(advisoryChargedChars / 4), 'advisory-appendix')
+    }
 
     // Phase 2 通道分级：system-reminder 通道条目走消息流细断点（必读通道,
     // 缓存安全:只追加尾部）。目前仅 git-clear 等 immediate 守护使用。
+    // W2-B1: K1 append-only — each drained SR charges its bytes exactly once
+    // at the moment it is committed to the session tail.
     for (const sr of this.self.advisoryBus.drainSystemReminders()) {
       this.self.session.appendSystemReminder(sr)
+      this.self.pressureMonitor.recordCvmInjection(Math.ceil(sr.length / 4), 'system-reminder')
     }
 
     // P1a 核销闭环：把本轮实际送达的条目（含 expect 谓词）交给 readback 跟踪。
     // 送达轮 = 当前 turn；postTurn 的 advisory-readback-evaluate 按窗口核销。
-    this.self.advisoryReadback.track(this.self.advisoryBus.drainDelivered(), turn)
+    // 控制面 tee（Wave 2）：单次 drain → 不可变快照 → 多路分发。readback 与
+    // control adapter 消费同一快照；adapter 绝不自行 drain（一次性消费边界）。
+    const deliveredSnapshot = this.self.advisoryBus.drainDelivered()
+    this.self.advisoryReadback.track(deliveredSnapshot, turn)
+    this.self.controlPlane.submitAll(signalsFromDelivered(deliveredSnapshot))
 
     // Phase 0 观测：advisory 投递账本落盘（仅有活动时写，避免遥测噪音），
     // 并把 guardian 活动摘要（CCR/改道/丢弃计数）同步进 session meta。
@@ -445,6 +591,49 @@ export class TurnStepProducer {
     }
     this.self.recordAdvisoryLedger(advisoryLedger)
     this.self.flushGuardianMeta()
+    const ledgerSignal = signalFromLedgerDelta(advisoryLedger)
+    if (ledgerSignal) this.self.controlPlane.submit(ledgerSignal)
+
+    // 证据义务 → 控制面（Wave 3）：high open/attempted → decision-gate
+    // （kind='obligation'，focus 分流到 inspect/verify 而非 await-user）；
+    // medium/blocked → appendix。信号键/摘要由稳定义务 ID 和归一化 claim
+    // 派生——状态不变则字节不变，revision 静默。
+    this.self.controlPlane.submitAll(signalsFromObligations(this.self.obligations.getStore()))
+
+    // 控制面归并：一轮一次（统一 TTL tick 点）。shadow/active 都在此归并；
+    // shadow 只落 K0 遥测（有活动信号才写行，避免噪音），不触碰 prompt。
+    {
+      const prevRevision = this.self.controlPlane.getFrame().revision
+      const frame = this.self.controlPlane.reduceTurn()
+      if (frame.signals.length > 0 || frame.revision !== prevRevision) {
+        this.self.telemetryWriter.write({
+          kind: 'control-plane-frame',
+          turn,
+          focus: frame.focus,
+          revision: frame.revision,
+          signals: frame.signals.length,
+          gates: frame.decisionGates.map(s => s.key),
+          appendix: frame.appendix.map(s => s.key),
+          status: frame.status.length,
+        })
+      }
+      // Wave 4：仅 active 模式把 appendix lane 交给 dynamic appendix setter。
+      // 渲染是 frame 的纯函数（无时间戳/随机值/计数）——revision 不变则字节
+      // 不变，appendixDelta 稳态零重发。off/shadow 下绝不调用 setter，
+      // PromptEngine 输出与无控制面时逐字节一致（cache-prefix-replay 锁定）。
+      if (this.self.controlPlane.mode === 'active') {
+        const controlBlock = renderControlPlaneAppendix(frame)
+        this.self.config.promptEngine.setControlPlaneAppendix(controlBlock)
+        if (this.self.lastCompactTurn !== this.controlChargeBaselineCompactTurn) {
+          this.controlChargeBaselineCompactTurn = this.self.lastCompactTurn
+          this.controlBlockCharge.reset()
+        }
+        const controlChargedChars = this.controlBlockCharge.charge(controlBlock ?? '')
+        if (controlChargedChars > 0) {
+          this.self.pressureMonitor.recordCvmInjection(Math.ceil(controlChargedChars / 4), 'control-appendix')
+        }
+      }
+    }
 
     // W5 轻量生命体征快照（通道 C，默认落盘）：单行 <200B，百轮 <20KB。
     // 事后复盘的最小数据面——节流何时触发、镜面是否存活、advisory 台账走势。
@@ -462,6 +651,9 @@ export class TurnStepProducer {
         ctxRatio: r2(pressureResult.ratio),
         cvmOverheadRatio: Math.round(pressureResult.cvmOverheadRatio * 10_000) / 10_000,
         throttled: pressureResult.shouldThrottleCvm,
+        // W2-B1 出口计量拆分（量纲：会话累计 token 估算，compact 时随
+        // resetCvmOverhead 清零）。恒等式：各 source 之和 == cvmTokenAccumulator。
+        cvmBySource: this.self.pressureMonitor.getCvmInjectionBySource(),
         advisories: {
           rendered: this.self.guardianActivity.advisoriesRendered,
           dropped: this.self.guardianActivity.advisoriesDropped,
@@ -560,6 +752,23 @@ export class TurnStepProducer {
     actionable: boolean,
     pressureResult: import('../context/pressure-monitor.js').PressureResult,
   ): void {
+    // Delivery 义务（动态）：任务型会话里代码文件被改且尚未验证 → 登记
+    // high 义务（self-verify 从 postTurn 软文升格为 final 前门禁的状态载体）。
+    // targets=[] → 任意 passed 验证即关闭（B1 delivery gate 仍是交付权威，
+    // 义务只负责 natural-finish 前的注意力）。doc/config-only 编辑不创建
+    // （low_risk_small_edit_never_gates_final）。upsert 幂等，每轮调用安全。
+    {
+      const ev = this.self.evidence.getState()
+      const gate = this.self.evidence.getGateState()
+      if (actionable && this.self.taskContract && gate.hasCodeEdits && ev.deliveryStatus === 'unverified') {
+        this.self.obligations.upsert({
+          family: 'delivery',
+          claim: '本任务修改的代码已通过相关验证',
+          targets: [],
+          risk: 'high',
+        })
+      }
+    }
     const cognitiveLedger = createCognitiveLedger({
       contract: this.self.taskContract,
       evidence: this.self.evidence.getState(),
@@ -583,6 +792,8 @@ export class TurnStepProducer {
       ctxWindow: this.self.config.contextWindow,
       // T5: 美德 mirror — Fibonacci 桶字节稳定，无条件传入
       virtue: this.self.stanceTally.renderMirror(),
+      // 证据义务结构化摘要：非空时替代 verification-gap（同一事实单一声音）。
+      obligationBlock: this.self.obligations.renderBlock(),
     })
     this.self.latestCognitiveSnapshot = getCognitivePhaseSnapshot(cognitiveLedger)
 
@@ -625,13 +836,19 @@ export class TurnStepProducer {
         this.lastChargedProjectionStable = ''
         this.lastChargedToolCtx = ''
       }
+      // W2-B1: per-source tagging — same charge decisions as before, but each
+      // egress books under its own enum tag so telemetry can split
+      // projection/ephemeral/tool-context (sum semantics unchanged).
       const stableChanged = projectionStable !== this.lastChargedProjectionStable
       const toolCtxChanged = this.lastRenderedToolCtx !== this.lastChargedToolCtx
-      const chargedChars = (stableChanged ? projectionStable.length : 0)
-        + projectionEphemeral.length
-        + (toolCtxChanged ? this.lastRenderedToolCtx.length : 0)
-      if (chargedChars > 0) {
-        this.self.pressureMonitor.recordCvmInjection(Math.ceil(chargedChars / 4))
+      if (stableChanged && projectionStable.length > 0) {
+        this.self.pressureMonitor.recordCvmInjection(Math.ceil(projectionStable.length / 4), 'projection')
+      }
+      if (projectionEphemeral.length > 0) {
+        this.self.pressureMonitor.recordCvmInjection(Math.ceil(projectionEphemeral.length / 4), 'ephemeral')
+      }
+      if (toolCtxChanged && this.lastRenderedToolCtx.length > 0) {
+        this.self.pressureMonitor.recordCvmInjection(Math.ceil(this.lastRenderedToolCtx.length / 4), 'tool-context')
       }
       this.lastChargedProjectionStable = projectionStable
       this.lastChargedToolCtx = this.lastRenderedToolCtx

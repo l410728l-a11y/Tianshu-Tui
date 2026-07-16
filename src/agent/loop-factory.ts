@@ -18,6 +18,7 @@ import { getSessionDir } from './session-persist.js'
 import type { AgentCallbacks } from './loop-types.js'
 import { diagnoseCacheMiss } from '../prompt/cache-diagnostic.js'
 import { computeCompactAttribution } from './compact-attribution.js'
+import type { ReclaimDecisionRecord } from '../compact/reclaim-estimate.js'
 import { isCostInsensitiveProvider } from '../api/cost-model.js'
 import { isSystemReminder } from '../prompt/system-reminder.js'
 import { getReadRefStats, invalidateSessionReadDedup } from '../tools/read-file.js'
@@ -28,7 +29,6 @@ import { GoalContinuationController } from './goal-continuation.js'
 import { PostTurnDecisionController } from './post-turn-decision.js'
 import { ReasoningEffortController } from './reasoning-effort-controller.js'
 import { buildGatedInfluenceAuditEvent, persistGatedInfluenceAudit } from './gated-influence-audit.js'
-import { loadProjectRules } from '../context/rules-loader.js'
 import { IntentRetrievalRouteController } from './intent-retrieval-route-controller.js'
 import { AntiAnchoringController } from './anti-anchoring-controller.js'
 import { ModelRoutingShadowController } from './model-routing-shadow-controller.js'
@@ -76,6 +76,44 @@ export function createSidePathUsageRecorder(self: AgentLoop): (kind: string, usa
           .then(() => fs.appendFile(join(dir, 'cache-log.jsonl'), line + '\n'))
       }).catch(() => {})
     } catch { /* accounting is best-effort — never break the side path */ }
+  }
+}
+
+/**
+ * Reclaim-decision telemetry sink (plan task 7). Every deterministic candidate
+ * that passes through the reclaim gate — committed or rejected — emits a
+ * structured `event:'reclaim_decision'` line to the cache-log. This makes
+ * "compressed but reclaimed nothing" visible offline instead of masquerading
+ * as a successful compact.
+ *
+ * Best-effort fire-and-forget: observability must never break compaction.
+ */
+export function createReclaimDecisionRecorder(self: AgentLoop): (record: ReclaimDecisionRecord) => void {
+  return (record) => {
+    try {
+      const line = JSON.stringify({
+        event: 'reclaim_decision',
+        t: Date.now(),
+        turn: self.session.getTurnCount(),
+        action: record.action,
+        commit: record.commit,
+        reason: record.reason,
+        force: record.force,
+        windowBand: record.windowBand,
+        billing: record.billing,
+        cache: record.cache,
+        beforeTokens: record.beforeTokens,
+        afterTokens: record.afterTokens,
+        reclaimedTokens: record.reclaimedTokens,
+        reclaimRatio: Number(record.reclaimRatio.toFixed(4)),
+      })
+      const sid = self.config.sessionId ?? 'anon'
+      void import('node:fs/promises').then(fs => {
+        const dir = join(getSessionDir(self.cwd), sid)
+        return fs.mkdir(dir, { recursive: true })
+          .then(() => fs.appendFile(join(dir, 'cache-log.jsonl'), line + '\n'))
+      }).catch(() => {})
+    } catch { /* telemetry is best-effort — never break compaction */ }
   }
 }
 
@@ -278,6 +316,7 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
       harness: self.harness,
       prewarm: self.prewarm,
       evidence: self.evidence,
+      obligations: self.obligations,
       repairHintTracker: self.repairHintTracker,
       repairPipeline: self.repairPipeline,
       immuneHook: self.immuneHook,
@@ -318,6 +357,7 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
       onSkillInvoked: name => self.config.promptEngine.markSkillInvoked(name),
       onSkillCompleted: name => self.config.promptEngine.markSkillCompleted(name),
       buildRuntimeSnapshot: extra => self.buildRuntimeSnapshot(extra),
+      submitControlSignal: signal => { self.controlPlane.submit(signal) },
       requestThetaCheck: reason => { self.requestThetaCheck(reason) },
       getAutoReasoning: () => self.config.autoReasoning ?? false,
       getReasoningEffort: () => self.config.reasoningEffort,
@@ -432,6 +472,8 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     stigmergyDeposit: deposit => self.stigmergyStore.deposit(deposit),
     stigmergyQuery: () => self.stigmergyStore.query(),
     getEvidenceState: () => self.evidence.getState(),
+    obligations: self.obligations,
+    submitControlSignal: signal => { self.controlPlane.submit(signal) },
     setLoadedPheromones: pheromones => { self.loadedPheromones = mapQueriedPheromones(pheromones) },
     recordStance: signal => self.stanceTally.record(signal),
     virtuePendingLedger: self.virtuePendingLedger,
@@ -555,6 +597,15 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
         getDecisions: () => self.decisions,
         getTrajectory: () => self.trajectory.getEntries(),
         getFailureJournal: () => self.failureJournal,
+        // Wave 5（反馈闭环）：dream 候选推入 essence-gate 素材缓冲。
+        // create-runtime-hooks 只在 gate 真实装配时转发此回调；gate 缺席时
+        // dream-hook 走直写分支，缓冲不会积压无消费者的候选。
+        onKnowledgeCandidates: candidates => {
+          self.knowledgeCandidates.push(...candidates)
+          if (self.knowledgeCandidates.length > 60) {
+            self.knowledgeCandidates.splice(0, self.knowledgeCandidates.length - 60)
+          }
+        },
       },
       getRegisteredSkills: () => skillRegistry.list().map(s => ({ name: s.name, triggers: s.triggers })),
     } : {}),
@@ -583,6 +634,7 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
             config: aa.anchorBreakScout,
             getCoordinator: () => self.config.coordinatorRef?.() ?? null,
             getAbortSignal: () => self.abortController?.signal,
+            onScoutDispatched: () => { self.anchorScoutOwned = true },
           }
         : undefined
     })(),
@@ -591,18 +643,88 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
       sessionId: self.config.sessionId,
       getUserMessage: () => self.initialUserMessage,
       getStreamedText: () => self.streamedText,
-      // Mid-session rules reload: newly generated .rivet/rules/*.md enter the
-      // claim store immediately (propose is idempotent by claim id) instead of
-      // waiting for the next bootstrap. Claims flow into the prompt via the
-      // refreshActiveClaims → updateActiveClaims channel, not frozenBase.
-      onRuleGenerated: () => {
-        const store = self.config.contextClaimStore
-        if (!store) return
-        try {
-          for (const rule of loadProjectRules(self.cwd)) store.propose(rule)
-        } catch { /* rules reload is best-effort */ }
+      // Wave 1（知识重构）：提取结果只进内存缓冲，postSession essence-gate
+      // 统一裁决准入。不再直写 unified-memory、不再自动生成 .rivet/rules。
+      onObservationCandidates: candidates => {
+        self.knowledgeCandidates.push(...candidates.map(c => ({
+          text: c.text,
+          kind: c.kind,
+          confidence: c.confidence,
+          origin: 'observation' as const,
+          tags: c.tags,
+          sessionId: c.sessionId,
+        })))
+        if (self.knowledgeCandidates.length > 60) {
+          self.knowledgeCandidates.splice(0, self.knowledgeCandidates.length - 60)
+        }
       },
     },
+    // Essence-gate（Wave 2 知识重构）：postSession 知识准入闸。廉价路由优先
+    // compactClient；无任何 client 时不装配（fail-closed：无闸即无写入）。
+    essenceGate: (() => {
+      const gateClient = self.config.compactClient ?? self.config.primaryClient ?? self.config.client
+      if (!gateClient || !self.config.sessionId) return undefined
+      const recordSidePath = createSidePathUsageRecorder(self)
+      return {
+        cwd: self.cwd,
+        sessionId: self.config.sessionId,
+        // 三路素材收口：① 正则观察缓冲 ② agent 手动 remember（scope=project 的
+        // 本会话 claims——memory 工具已停直写，项目级持久化由闸门裁决）③ 失败模式
+        getCandidates: () => {
+          const manualRemembers = (self.config.contextClaimStore?.listClaims({ scope: ['project'] }) ?? [])
+            .filter(c => c.source.sessionId === self.config.sessionId && c.source.eventId.startsWith('memory:'))
+            .map(c => ({
+              text: c.text,
+              kind: c.kind,
+              confidence: c.confidence,
+              origin: 'manual' as const,
+              tags: c.tags,
+              sessionId: self.config.sessionId,
+            }))
+          return [...self.knowledgeCandidates, ...manualRemembers]
+        },
+        getFailureJournal: () => self.failureJournal,
+        complete: async (prompt: string, timeoutMs: number) => {
+          // 独立新建 request（不复用主请求对象）——无 prefixProbe、无 mutation 风险
+          const request = {
+            model: '', // client already binds the model
+            messages: [{ role: 'user' as const, content: prompt }],
+            max_tokens: 2048,
+            stream: true,
+          }
+          const chunks: string[] = []
+          let streamError: Error | undefined
+          const abort = new AbortController()
+          const timer = setTimeout(() => abort.abort(), timeoutMs)
+          try {
+            await gateClient.stream(request, {
+              onTextDelta: text => { chunks.push(text) },
+              onThinkingDelta: () => {},
+              onContentBlock: () => {},
+              onStopReason: (_reason, usage) => {
+                recordSidePath('essence_gate', usage ?? {})
+              },
+              onError: err => { streamError = err },
+            }, abort.signal)
+          } finally {
+            clearTimeout(timer)
+          }
+          if (streamError) throw streamError
+          if (abort.signal.aborted) throw new Error('essence-gate LLM timeout')
+          return chunks.join('')
+        },
+      }
+    })(),
+    // 召回健康账本（Wave 3 知识重构）：memory recall 工具经模块级 tracker 记录，
+    // postSession 聚合落盘 + 连续空召回告警。
+    recallEfficacy: self.config.sessionId ? {
+      cwd: self.cwd,
+      sessionId: self.config.sessionId,
+      getAssistantText: () => self.session.getMessages()
+        .filter(m => m.role === 'assistant' && typeof m.content === 'string')
+        .map(m => m.content as string)
+        .join('\n'),
+    } : undefined,
     userHooksBridge: userBridgeDeps,
     advisoryBus: self.advisoryBus,
     getJobs: () => self.jobs,
@@ -617,6 +739,22 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     walkthrough: {
       getArtifactStore: () => self.artifactStore,
       sessionId: self.config.sessionId,
+    },
+    // W3-C1 压缩失忆 shadow 账本：行落 cache-log.jsonl（event:'amnesia_shadow'），
+    // 与既有缓存指标同通道，离线分析共用一个读取面。
+    compactionAmnesia: {
+      getCompactEvents: () => self.session.getCompactEvents(),
+      record: row => {
+        try {
+          const sid = self.config.sessionId ?? 'anon'
+          const line = JSON.stringify({ ts: Date.now(), ...row })
+          import('node:fs/promises').then(fs => {
+            const dir = join(getSessionDir(self.cwd), sid)
+            return fs.mkdir(dir, { recursive: true })
+              .then(() => fs.appendFile(join(dir, 'cache-log.jsonl'), line + '\n'))
+          }).catch(() => {})
+        } catch { /* shadow accounting is best-effort */ }
+      },
     },
   })
 
@@ -677,9 +815,46 @@ export function createCompactBoundaryCoordinator(self: AgentLoop): CompactBounda
     shouldOpportunisticCompact: () => self.cacheAdvisor.shouldOpportunisticCompact(),
     isCachePreservingProvider: () => self.compaction.isCachePreservingProvider(),
     isCostInsensitiveProvider: () => isCostInsensitiveProvider(self.config.providerName),
+    getCompactionProfile: () => self.config.compactionProfile,
     getProviderName: () => self.config.providerName,
     getQualityThresholds: () => self.config.compact.qualityCompact ?? DEFAULT_QUALITY_COMPACT_THRESHOLDS,
+    onReclaimDecision: createReclaimDecisionRecorder(self),
     injectImmuneSignal: signal => { self.immuneHook.injectSignal(signal) },
+    // W1-A3: boundary archive adapter — pure transforms receive only the
+    // resulting index→artifactId map; ArtifactStore stays out of micro/stale.
+    archiveForRecovery: async candidates => {
+      const out = new Map<number, string>()
+      const store = self.artifactStore
+      if (!store) return out
+      for (const c of candidates) {
+        try {
+          const id = await store.save({
+            tool: 'compact-archive',
+            target: c.toolCallId ?? `message-${c.index}`,
+            rawContent: c.content,
+            summary: c.content.slice(0, 160),
+            sections: [],
+          })
+          out.set(c.index, id)
+        } catch {
+          // fail-open: absent from the map → transform keeps the original
+        }
+      }
+      // Wave 4 控制面：归档事实只进 silent（recovery ref 已在消息尾部留痕，
+      // 主控无需被打断）。
+      if (out.size > 0) {
+        self.controlPlane.submit({
+          key: 'compaction:boundary-archive',
+          kind: 'compaction',
+          severity: 'info',
+          summary: `compact boundary archived ${out.size} marker-less tool message(s) for recovery`,
+          requiresDecision: false,
+          ttlTurns: 1,
+          cacheImpact: 'none',
+        })
+      }
+      return out
+    },
   })
 }
 
@@ -831,6 +1006,12 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     // === Telemetry ===
     writeTelemetry: (entry) => { self.telemetryWriter.write(entry) },
     resetEvidence: () => { self.evidence.reset() },
+
+    // === Obligation final gate（evidence-driven reasoning loop Wave 3）===
+    evaluateObligationFinal: () => self.obligations.evaluateFinal(),
+    markObligationContinued: id => { self.obligations.markContinued(id) },
+    getObligationVersion: () => self.obligations.getVersion(),
+    recordObligationGateEvent: event => { self.recordObligationGateEvent(event) },
 
     // === Stop-reason 落盘（2026-07-07 观测缺口修复）===
     recordStopReason: (r) => { self.recordStopReason(r) },
@@ -1021,6 +1202,8 @@ export function createModelRoutingShadowController(self: AgentLoop): ModelRoutin
     getCurrentModel: () => self.config.getCurrentModel?.(),
     hasCurrentModelOverride: () => !!self.config.getCurrentModel,
     getFallbackModel: () => self.config.promptEngine.getModel(),
+    // W4-D2 producer: latest run_tests verification recorded by EvidenceTracker.
+    getLatestVerificationOutcome: () => self.evidence.getState().verifications.at(-1)?.status,
   })
 }
 

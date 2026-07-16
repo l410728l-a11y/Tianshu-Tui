@@ -27,6 +27,8 @@ import { createBlindExplorationHook } from './hooks/blind-exploration-hook.js'
 import { createMCTSPlanningHook } from './hooks/mcts-planning-hook.js'
 import { createDispatcherHook, type DispatcherHookDeps } from './hooks/dispatcher-hook.js'
 import { createMemoryLearningPostTurnHook, type MemoryLearningHookDeps } from './hooks/memory-learning-hook.js'
+import { createEssenceGateHook, type EssenceGateHookDeps } from './hooks/essence-gate-hook.js'
+import { createRecallEfficacyHook, type RecallEfficacyHookDeps } from './hooks/recall-efficacy-hook.js'
 import { createUserHooksBridge, type UserHooksBridgeDeps } from './hooks/user-hooks-bridge.js'
 import { createCompanionHeartbeatHook } from './hooks/companion-heartbeat-hook.js'
 import { createCcrHook, type CcrTriggerEvent } from './hooks/cognitive-capsule-router.js'
@@ -38,6 +40,7 @@ import { createBackgroundJobsHook } from './hooks/background-jobs-hook.js'
 import { createEditToolAdvisoryHook } from './hooks/edit-tool-advisory-hook.js'
 import { createEditFailureRecoveryHook } from './hooks/edit-failure-recovery-hook.js'
 import { createLossyObservationHook } from './hooks/lossy-observation-hook.js'
+import { createCompactionAmnesiaHook, type CompactionAmnesiaHookDeps } from './hooks/compaction-amnesia-hook.js'
 import { createPointerRegurgitationHook } from './hooks/pointer-regurgitation-hook.js'
 import { createErrorDiagnosisHook } from './hooks/error-diagnosis-hook.js'
 import { createProbeTrackingHook } from './hooks/probe-tracking-hook.js'
@@ -81,6 +84,11 @@ export interface RuntimeHookDeps {
   stigmergyDeposit: (deposit: any) => Promise<void>
   stigmergyQuery: () => Promise<any>
   getEvidenceState: () => EvidenceState
+  /** 证据义务状态机（evidence-driven reasoning loop）。缺省 → hooks 只发
+   *  advisory 不做义务归账（行为与旧版一致）。 */
+  obligations?: import('./obligation-tracker.js').ObligationTracker
+  /** control plane 信号出口（self-verify 的结构化 verification_required 用）。 */
+  submitControlSignal?: (signal: import('./control-plane.js').ControlSignal) => void
   setLoadedPheromones: (pheromones: any) => void
   recordStance?: (signal: import('./virtue-signals.js').VirtueSignal) => void
   /** T2: 美德 pending 台账——stigmergy-hook submit, settlement hook drainSettled */
@@ -107,7 +115,13 @@ export interface RuntimeHookDeps {
     getDecisions: () => string[]
     getTrajectory: () => TrajectoryEntry[]
     getFailureJournal?: () => import('./failure-journal.js').FailureJournal
+    /** Wave 5（反馈闭环）：dream 蒸馏候选交 essence-gate 统一裁决（见 dream-hook）。 */
+    onKnowledgeCandidates?: (candidates: import('../memory/essence-gate.js').KnowledgeCandidate[]) => void
   }
+  /** Essence-gate（postSession 知识准入闸）。缺省不装配 = fail-closed 无写入。 */
+  essenceGate?: EssenceGateHookDeps
+  /** 召回健康账本（postSession 聚合落盘）。 */
+  recallEfficacy?: RecallEfficacyHookDeps
   playbookStore?: PlaybookStore
   /** Live registry skills (name+triggers) for skill-distill dedup. */
   getRegisteredSkills?: () => Array<{ name: string; triggers: RegExp[] }>
@@ -250,6 +264,8 @@ export interface RuntimeHookDeps {
     config: AnchorBreakScoutConfig
     getCoordinator: () => DelegationCoordinator | null
     getAbortSignal?: () => AbortSignal | undefined
+    /** CVM-vector 让位判据：scout 派发时回调（loop.anchorScoutOwned 置位）。 */
+    onScoutDispatched?: () => void
   }
 
   // ── 主控工作流缺口 C/D(intent-anchor / turn-budget,2026-07-04) ──
@@ -270,6 +286,10 @@ export interface RuntimeHookDeps {
   /** computer_use 步骤时间线记录器 + postSession walkthrough 工件组装。
    *  缺省（无 ArtifactStore 通道）→ 不装 hook。 */
   walkthrough?: WalkthroughRecorderDeps
+
+  // ── W3-C1 压缩失忆 shadow 账本 ──
+  /** Shadow-only：不注入 prompt、不改行为，仅落行供离线分析。缺省不装 hook。 */
+  compactionAmnesia?: CompactionAmnesiaHookDeps
 }
 
 export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] {
@@ -363,6 +383,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       getDoomLoopLevel: deps.getDoomLoopLevel,
       getAbortSignal: deps.anchorBreakScout.getAbortSignal,
       store: deps.meridianIndexer?.getDb() ?? null,
+      onScoutDispatched: deps.anchorBreakScout.onScoutDispatched,
     }))
   }
 
@@ -375,6 +396,9 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       getTrajectory: deps.dream.getTrajectory,
       getFailureJournal: deps.dream.getFailureJournal,
       getPlaybookStore: deps.playbookStore ? () => deps.playbookStore : undefined,
+      // 只有 essence-gate 真的装配时才转发回调——gate 缺席时 dream 保留直写通道，
+      // 否则候选推进缓冲后没有任何消费者，dream 知识凭空丢失。
+      onKnowledgeCandidates: deps.essenceGate ? deps.dream.onKnowledgeCandidates : undefined,
     }))
 
     // Skill-distill: same postSession source as dream — verified, repeatable
@@ -390,6 +414,17 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
         getObjective: deps.getObjective,
       }))
     }
+  }
+
+  // Essence-gate（Wave 2 知识重构）：postSession 知识准入闸。
+  // deps-gated——没有廉价 LLM complete 通道就不装配（fail-closed：无闸即无写入）。
+  if (deps.essenceGate) {
+    hooks.push(createEssenceGateHook(deps.essenceGate))
+  }
+
+  // 召回健康账本（Wave 3 知识重构）：postSession 聚合空召回率/引用率落盘。
+  if (deps.recallEfficacy) {
+    hooks.push(createRecallEfficacyHook(deps.recallEfficacy))
   }
 
   if (deps.telemetryWriter && deps.getPhysarumShadowStats) {
@@ -474,6 +509,10 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     hooks.push(createSelfVerifyHook({
       advisoryBus: deps.advisoryBus,
       getEvidenceState: deps.getEvidenceState,
+      // 结构化 verification 信号 + 同义 advisory supersede（义务在场时义务块
+      // 是唯一声音，泛化 self-verify advisory 不再叠发）。
+      submitControlSignal: deps.submitControlSignal,
+      obligations: deps.obligations,
     }))
   }
 
@@ -508,6 +547,14 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     hooks.push(createLossyObservationHook({ advisoryBus: deps.advisoryBus }))
   }
 
+  // W3-C1 Compaction Amnesia (shadow): postTool hook — records unchanged-hash
+  // full re-reads within 10 turns after a compact. Never injects into the
+  // prompt; rows feed offline precision analysis only.
+  // Gated by RIVET_AMNESIA_SHADOW (default on; set to '0' to disable).
+  if (deps.compactionAmnesia && process.env.RIVET_AMNESIA_SHADOW !== '0') {
+    hooks.push(createCompactionAmnesiaHook(deps.compactionAmnesia))
+  }
+
   // Pointer-Regurgitation: postTool hook — counts pointer-guard rejections
   // (model echoing "[file written to …]"-style placeholders as real content)
   // session-wide and escalates to a constitutional advisory from the 2nd
@@ -524,7 +571,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // translation table in the system prompt — knowledge is injected
   // on-demand instead of occupying prompt space permanently.
   if (deps.advisoryBus) {
-    hooks.push(createErrorDiagnosisHook({ advisoryBus: deps.advisoryBus }))
+    hooks.push(createErrorDiagnosisHook({ advisoryBus: deps.advisoryBus, obligations: deps.obligations }))
   }
 
   // Probe-Tracking: postTool hook — detects debug probes (console.log,
@@ -570,6 +617,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     hooks.push(createDeadEndDetectorHook({
       advisoryBus: deps.advisoryBus,
       deposit: deps.stigmergyDeposit,
+      obligations: deps.obligations,
     }))
   }
 
@@ -666,7 +714,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // and exploration-stall don't cover: pure thinking length without tools.
   // Gated by RIVET_REASONING_SPIRAL_GUARD (default on; set to '0' to disable).
   if (deps.advisoryBus && process.env.RIVET_REASONING_SPIRAL_GUARD !== '0') {
-    hooks.push(createReasoningSpiralHook({ advisoryBus: deps.advisoryBus }))
+    hooks.push(createReasoningSpiralHook({ advisoryBus: deps.advisoryBus, obligations: deps.obligations }))
   }
 
   // Language Anchor: postTool hook — when a turn's cumulative tool output is a
@@ -740,7 +788,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // Spec-Verify Gate: preTurn hook — detects "read spec → implement
   // without verification" jumps and injects a constitutional advisory.
   if (deps.advisoryBus) {
-    hooks.push(createSpecVerifyGateHook({ advisoryBus: deps.advisoryBus }))
+    hooks.push(createSpecVerifyGateHook({ advisoryBus: deps.advisoryBus, obligations: deps.obligations }))
   }
 
   // Typecheck-Reminder: postTurn hook — fills self-verify's blind spot. tsx
