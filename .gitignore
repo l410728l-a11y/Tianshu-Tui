@@ -107,3 +107,4 @@ Library/
 _test-docx.html
 docs/*.html
 docs/*.docx
+.rivet/
