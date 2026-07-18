@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { DEFAULT_TDD_GATE_CONFIG, evaluateTddGate, parseTddGateConfig, checkTddGate } from '../tdd-gate.js'
+import { DEFAULT_TDD_GATE_CONFIG, evaluateTddGate, parseTddGateConfig, checkTddGate, buildTddGateHint } from '../tdd-gate.js'
 import type { TddGateState } from '../evidence.js'
 
 // ---------------------------------------------------------------------------
@@ -262,6 +262,70 @@ describe('evaluateTddGate', () => {
 // ---------------------------------------------------------------------------
 // parseTddGateConfig — env-driven config
 // ---------------------------------------------------------------------------
+
+// ─── P2 阴阳调度：buildTddGateHint 的 advisory projection ─────────────
+
+describe('buildTddGateHint — P2 structure-flow projection', () => {
+  const state = (overrides: Partial<TddGateState> = {}): TddGateState => ({
+    filesModified: 1,
+    verifications: 0,
+    editsSinceLastTest: 1,
+    hasFailedTests: false,
+    hasCodeEdits: true,
+    hasReadTestFiles: true,
+    ...overrides,
+  })
+  const config = { enabled: true, mode: 'suggest' as const, threshold: 3, skipIfNoTests: true }
+  const flowNeutral = { mode: 'flow' as const, tddRecommendation: 'neutral' as const }
+  const flowSuggest = { mode: 'flow' as const, tddRecommendation: 'suggest' as const }
+
+  it('flow + neutral + 编辑数在探索窗口内 → 提示降噪（返回 null）', () => {
+    assert.equal(buildTddGateHint(state({ editsSinceLastTest: 2 }), config, flowNeutral), null)
+  })
+
+  it('flow + neutral 但编辑数达到阈值 → 提示照常（降噪只作用于探索窗口）', () => {
+    const hint = buildTddGateHint(state({ editsSinceLastTest: 3 }), config, flowNeutral)
+    assert.ok(hint, '阈值达到后 flow 不再降噪')
+  })
+
+  it('flow 但 tddRecommendation=suggest（验证债务）→ 提示保持', () => {
+    const hint = buildTddGateHint(state({ editsSinceLastTest: 1 }), config, flowSuggest)
+    assert.ok(hint, '债务信号恒不降噪')
+  })
+
+  it('flow + failed tests → 提示保持（失败测试恒不降噪）', () => {
+    const hint = buildTddGateHint(
+      state({ verifications: 1, editsSinceLastTest: 0, hasFailedTests: true }),
+      config,
+      flowNeutral,
+    )
+    assert.ok(hint)
+    assert.ok(hint.suggestion.includes('failing'))
+  })
+
+  it('tighten / balanced / 缺省快照 → 与旧行为一致（有编辑无验证就提示）', () => {
+    const base = buildTddGateHint(state(), config)
+    assert.ok(base, '旧行为基线：有提示')
+    for (const mode of ['tighten', 'balanced'] as const) {
+      const hint = buildTddGateHint(state(), config, { mode, tddRecommendation: 'neutral' })
+      assert.deepEqual(hint, base, `${mode} 不降噪`)
+    }
+    assert.deepEqual(buildTddGateHint(state(), config, null), base, 'null 快照 = 旧行为')
+  })
+
+  it('doc-only 编辑仍然无提示（降噪逻辑不改变既有跳过规则）', () => {
+    assert.equal(buildTddGateHint(state({ hasCodeEdits: false }), config, flowNeutral), null)
+  })
+
+  it('P2 不修改 evaluateTddGate：enforce 模式高 flow 场景下 block 语义不变', () => {
+    // evaluateTddGate 没有 structure-flow 参数——本测试锁定其签名行为：
+    // 阈值达到 + enforce + 非测试文件 → block，无论外部 flow 状态如何。
+    const enforce = { enabled: true, mode: 'enforce' as const, threshold: 3, skipIfNoTests: true }
+    const hot = state({ filesModified: 3, editsSinceLastTest: 3 })
+    const decision = evaluateTddGate(hot, 'edit_file', enforce, 'src/x.ts')
+    assert.equal(decision.action, 'block')
+  })
+})
 
 describe('parseTddGateConfig', () => {
   const withEnv = (value: string | undefined, fn: () => void) => {

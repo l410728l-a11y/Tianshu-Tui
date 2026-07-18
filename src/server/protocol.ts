@@ -88,6 +88,11 @@ export type SessionEventType =
   // data: { model: string|null, domain: string } — 续跑必须沿用原模型/星域
   // （前缀缓存亲和）；模型不可用时由 POST /resume fail-closed。
   | 'resume_offer'
+  // Goal mode — autonomous cross-turn goal tracker state change (created /
+  // paused / resumed / cancelled / criteria-extracted / verdict-updated).
+  // data: GoalSnapshot (see session-manager). The desktop GoalBar polls or
+  // consumes this via SSE to render 🎯 goal + iteration + controls.
+  | 'goal_state'
 
 export interface SessionEvent {
   seq: number

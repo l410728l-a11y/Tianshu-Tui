@@ -408,6 +408,26 @@ describe('renderAllCapsulesBlock', () => {
     clearCapsuleCache()
   })
 
+  // 开阳第十二域：星域名胶囊可索引 + recall，原则池 K0–K6。
+  it('repo docs/ ships a 开阳 capsule with K0-K6 principles', () => {
+    clearCapsuleCache()
+    const repoRoot = process.cwd()
+    const capsule = getCapsuleByStar(repoRoot, '开阳')
+    assert.ok(capsule, 'docs/seed-capsule-kaiyang.md 必须存在且可解析')
+    assert.ok(capsule!.gist, '开阳胶囊必须带 gist 一行索引')
+    assert.match(capsule!.gist!, /对账/)
+    const principles = extractPrinciples(repoRoot, '开阳')
+    assert.ok(principles, '开阳胶囊应含 <principle> 标签')
+    assert.deepEqual(principles!.map(p => p.key), ['K0', 'K1', 'K2', 'K3', 'K4', 'K5', 'K6'])
+    for (const p of principles!) {
+      assert.ok(p.maxim.length > 0)
+      assert.ok(p.actionPrompt.length > 0)
+    }
+    // 主题别名仍可召回，不抢星域名
+    assert.ok(getCapsuleByStar(repoRoot, '攻坚方法论'), '攻坚方法论 topic 胶囊仍在')
+    clearCapsuleCache()
+  })
+
   it('getCapsuleByStar fetches one capsule by name (trim + case insensitive)', () => {
     const docsDir = join(tmpDir, 'docs')
     mkdirSync(docsDir)

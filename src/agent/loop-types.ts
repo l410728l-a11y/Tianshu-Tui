@@ -76,6 +76,13 @@ export interface AgentConfig {
   runtimeHooks?: RuntimeHookPipeline
   /** I4: emit user hook results to the desktop event stream. */
   emitHookResult?: (results: HookResult[], meta: { event: HookEvent; turn?: number; toolName?: string; error?: string }) => void
+  /** Lazy-binding getter for plugin-contributed hooks (absolute script paths).
+   *  Plugins load after agent assembly; this getter lets the user-hooks bridge
+   *  read the current set at fire time. Returns [] when no plugins loaded. */
+  getPluginHooks?: () => import('../plugins/plugin-loader.js').PluginHookEntry[]
+  /** Lazy-binding getter for plugin-contributed slash commands (absolute .md
+   *  paths). Read by the slash-command resolver at input time. */
+  getPluginCommands?: () => import('../plugins/plugin-loader.js').PluginCommandEntry[]
   fileHistory?: import('./file-history.js').FileHistory
   modelCards?: ModelCapabilityCard[]
   /** Shadow-only model routing telemetry cards. Does not enable model switching. */
@@ -131,6 +138,11 @@ export interface AgentConfig {
   /** Track 3: 权威交付门禁（v2 GREEN/YELLOW/RED）。接入后 evidence badge 与
    *  收敛检测以 v2 状态为准；缺省回退 v1（EvidenceState 推导）。 */
   deliveryGateV2?: (currentDirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
+  /**
+   * 会话 Auto 是否按消息关键词匹配换域。默认 false（发版）：Auto 固定开阳。
+   * 显式 true 恢复 per-message matchDomain。
+   */
+  domainKeywordRouting?: boolean
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. Disabled by default. */
   songlineEnabled?: boolean
   /** Explicit opt-in for HEARTH anchor invariant observation (postTurn, diagnostic only). Disabled by default. */

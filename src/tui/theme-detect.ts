@@ -97,7 +97,7 @@ export async function detectTerminalBackground(opts: DetectBackgroundOptions = {
   }
 }
 
-/** auto 主题的默认落点：dark → cobalt，light → paper。 */
-export function autoThemeFor(background: TerminalBackground): 'cobalt' | 'paper' {
-  return background === 'light' ? 'paper' : 'cobalt'
+/** auto 主题的默认落点：dark → graphite，light → paper。 */
+export function autoThemeFor(background: TerminalBackground): 'graphite' | 'paper' {
+  return background === 'light' ? 'paper' : 'graphite'
 }

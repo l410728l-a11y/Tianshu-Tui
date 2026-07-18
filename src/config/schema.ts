@@ -231,8 +231,14 @@ export const agentSchema = z.object({
   maxTurns: z.number().int().nonnegative().default(200),
   mode: z.enum(['code', 'ask', 'plan']).default('code'),
   autoReasoning: z.boolean().default(true),
-  /** 默认星域（auto | tianshu | pojun ...）。新会话的初始星域将由此配置项决定。 */
-  defaultDomain: z.string().default('tianquan'),
+  /** 默认星域（auto | kaiyang | tianshu | …）。新会话的初始星域将由此配置项决定。 */
+  defaultDomain: z.string().default('kaiyang'),
+  /**
+   * 会话 Auto 星域是否按消息关键词匹配换域。
+   * 默认 false：Auto 固定落到 DEFAULT_DOMAIN（开阳），其它域仅手动切换。
+   * 显式 true 可恢复旧的 per-message matchDomain 行为。
+   */
+  domainKeywordRouting: z.boolean().default(false),
   /**
    * 重启后一键续跑的兜底模型（可选）。续跑严格沿用会话原模型（前缀缓存亲和）；
    * 仅当原模型不可用且此项配置了可用模型时才切换续跑（UI 明示缓存将重建）。
@@ -520,7 +526,7 @@ export const envSchema = z.object({
 export const uiSchema = z.object({
   /** Default TUI color theme used on startup. Runtime /theme switches are not persisted.
    *  Accepts: builtin theme name | 'auto' (detect terminal background via OSC 11 /
-   *  COLORFGBG, pick cobalt/paper) | 'custom:<name>' (~/.rivet/themes/<name>.json). */
+   *  COLORFGBG, pick graphite/paper) | 'custom:<name>' (~/.rivet/themes/<name>.json). */
   theme: z.union([
     z.enum(THEME_NAMES),
     z.literal('auto'),

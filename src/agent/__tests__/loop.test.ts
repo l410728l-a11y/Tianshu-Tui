@@ -14,6 +14,7 @@ import { PlaybookStore } from '../playbook-store.js'
 import type { StreamCallbacks } from '../../api/stream-client.js'
 import type { StreamClient } from '../../api/stream-client.js'
 import type { ContentBlock, Message } from '../../api/types.js'
+import type { OaiMessage } from '../../api/oai-types.js'
 import type { Tool } from '../../tools/types.js'
 
 // Writable cwd for AgentLoop: turn-cache telemetry does a fire-and-forget
@@ -247,7 +248,9 @@ describe('AgentLoop — multi-turn tool_use', () => {
       }),
     } as unknown as StreamClient
 
-    const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: registry, maxTurns: 2, contextWindow: 1_000_000, compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' } }, session, TEST_CWD)
+    // 关键词路由是被测特性——0d557061 起会话默认钉开阳、Auto 路由默认关
+    // （loop.ts `domainKeywordRouting === true` 才启用），本测试必须显式打开。
+    const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: registry, maxTurns: 2, contextWindow: 1_000_000, domainKeywordRouting: true, compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' } }, session, TEST_CWD)
 
     await agent.run('探索一个新的实验性 POC', makeCallbacks())
     await agent.run('修复内存泄漏', makeCallbacks())
@@ -785,16 +788,14 @@ describe('AgentLoop — compact policy', () => {
     const registry = new ToolRegistry()
     const session = new SessionContext()
     const historyMessage = 'x'.repeat(12_000 * 4)
-    session.replaceMessages([
-      { role: 'user', content: historyMessage },
-      { role: 'assistant', content: historyMessage },
-      { role: 'user', content: historyMessage },
-      { role: 'assistant', content: historyMessage },
-      { role: 'user', content: historyMessage },
-      { role: 'assistant', content: historyMessage },
-      { role: 'user', content: historyMessage },
-      { role: 'assistant', content: historyMessage },
-    ])
+    // Reclaim-gate era (8582c7df): the fixture must contain genuinely
+    // compactable content — micro compact only truncates oversized tool
+    // results, and an all-text history produces an unchanged candidate that
+    // the gate correctly refuses to commit. Mirrors the fixture shape in
+    // compaction-controller.test.ts.
+    session.replaceMessages(Array.from({ length: 8 }, (_, i) => (
+      { role: 'tool', tool_call_id: `read_file_${i}`, content: historyMessage } as OaiMessage
+    )))
     const agent = new AgentLoop({
       client,
       promptEngine: makeEngine(),
@@ -1608,6 +1609,226 @@ describe('AgentLoop — convergence emission cooldown', () => {
 
     await agent.runConvergenceCheck(16, 'plan', true, false, cb) // reset → emit despite <3 turns since last
     assert.equal(shifts, 2, 'cooldown should have been reset by user intervention, allowing an immediate re-emit')
+  })
+})
+
+// ── P1 心流保护 Wave 3：真实 AgentLoop 接线（sensorium → flowInputs →
+// evaluateConvergence）。不 mock computeFlowBeacon——走 runConvergenceCheck
+// 完整路径，断言 latestConvergenceResult。
+describe('AgentLoop — P1 flow beacon wiring (Wave 3)', () => {
+  function flowAgent(sensorium: import('../sensorium.js').Sensorium | null) {
+    const registry = new ToolRegistry()
+    registry.register(READ_FILE_TOOL)
+    const agent = new AgentLoop(
+      {
+        client: mockClient([makeTextBlock('x')]), promptEngine: makeEngine(), toolRegistry: registry,
+        maxTurns: 40, contextWindow: 200_000,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      },
+      new SessionContext(),
+      TEST_CWD,
+    )
+    // 同目标全 success 读 ×6 → score-based 低分形状（turn 8 = nLow 基线 L1），
+    // 且 distanceToLastProductive = Infinity → productive stagnation 不参与。
+    agent.recentToolHistory = Array.from({ length: 6 }, () => ({
+      tool: 'read_file', status: 'success', target: 'a.ts',
+    })) as unknown as typeof agent.recentToolHistory
+    agent.sensorium = sensorium
+    return agent
+  }
+
+  const healthySensorium = {
+    momentum: 1, pressure: 0.1, confidence: 0.8, complexity: 0.2, freshness: 0.7, stability: 1,
+    quality: { confidence: 'measured', momentum: 'measured', stability: 'measured' },
+  } as import('../sensorium.js').Sensorium
+
+  it('健康 sensorium 经真实路径延后 score-based L1（turn 8 L0，turn 10 仍到达）', async () => {
+    const baseline = flowAgent(null)
+    await baseline.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(baseline.latestConvergenceResult?.level, 1, 'sensorium 缺失 → 旧行为基线 L1')
+
+    const flowed = flowAgent(healthySensorium)
+    await flowed.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(flowed.latestConvergenceResult?.level, 0, '高 flow → turn 8 延后为 L0')
+
+    const delayed = flowAgent(healthySensorium)
+    await delayed.runConvergenceCheck(10, 'explore', true, false, makeCallbacks())
+    assert.equal(delayed.latestConvergenceResult?.level, 1, '延后有界：turn 10 仍到达 L1')
+  })
+
+  it('反例：高 flow + 连续 no-tool 仍保持 no-tool 硬熔断语义', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.consecutiveNoToolTurns = 5
+    await agent.runConvergenceCheck(12, 'execute', true, false, makeCallbacks())
+    assert.equal(agent.latestConvergenceResult?.shouldAbort, true, '高 flow 不能救 no-tool 熔断')
+    assert.equal(agent.latestConvergenceResult?.abortCause, 'no-tool')
+  })
+
+  it('反例：momentum no-data 的 sensorium 不进入保护态（资格门经真实路径生效）', async () => {
+    const noData = {
+      ...healthySensorium,
+      quality: { confidence: 'measured', momentum: 'no-data', stability: 'measured' },
+    } as import('../sensorium.js').Sensorium
+    const agent = flowAgent(noData)
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(agent.latestConvergenceResult?.level, 1, 'no-data → 基线 L1 不变')
+  })
+
+  // ── P2 阴阳调度：structure-flow 快照经真实 runConvergenceCheck 接线 ──
+
+  const healthyEfe = { epistemicValue: 0.15, pragmaticValue: 0.9, noveltyBonus: 0.2, precision: 0.9 }
+
+  it('P2：EFE 缺失 → latestStructureFlow=null，P1 路径字节级不变', async () => {
+    const agent = flowAgent(healthySensorium)
+    assert.equal(agent.latestPolicySignals, undefined, '前置：EFE 未写入')
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(agent.latestStructureFlow, null, 'EFE 缺失 → 快照为 null')
+    assert.equal(agent.latestConvergenceResult?.level, 0, 'P1 flow 路径继续生效（turn 8 延后 L0）')
+  })
+
+  it('P2：EFE 就绪 + 健康执行 → 快照 mode=flow，relaxation 经真实路径延后 L1', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(agent.latestStructureFlow?.mode, 'flow')
+    assert.ok(Math.abs((agent.latestStructureFlow?.relaxation ?? 0) - 0.25) < 1e-9)
+    assert.equal(agent.latestConvergenceResult?.level, 0, 'P2 relaxation=0.25 → nLow 8→10 → L0')
+
+    const delayed = flowAgent(healthySensorium)
+    delayed.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await delayed.runConvergenceCheck(10, 'explore', true, false, makeCallbacks())
+    assert.equal(delayed.latestConvergenceResult?.level, 1, '延后有界：turn 10 仍到达 L1')
+  })
+
+  it('P2 hardTighten（连续失败≥2）压过 P1 放宽：同一形状下 P1 放行、P2 收紧', async () => {
+    const failTailHistory = [
+      ...Array.from({ length: 4 }, () => ({ tool: 'read_file', status: 'success', target: 'a.ts' })),
+      { tool: 'read_file', status: 'failed', target: 'a.ts' },
+      { tool: 'read_file', status: 'failed', target: 'a.ts' },
+    ]
+    // 对照组：EFE 缺失 → P1 flow（成功率 4/6 → score≈0.77 → 1.23× → nLow 10）→ L0
+    const p1 = flowAgent(healthySensorium)
+    p1.recentToolHistory = failTailHistory as unknown as typeof p1.recentToolHistory
+    await p1.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(p1.latestConvergenceResult?.level, 0, '前置：P1 路径下该形状放行 L0')
+
+    // 实验组：EFE 就绪 → 尾部连续 2 failed → hardTighten → relaxation=0 且屏蔽 P1 → L1
+    const p2 = flowAgent(healthySensorium)
+    p2.recentToolHistory = failTailHistory as unknown as typeof p2.recentToolHistory
+    p2.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await p2.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(p2.latestStructureFlow?.mode, 'tighten')
+    assert.equal(p2.latestStructureFlow?.relaxation, 0)
+    assert.equal(p2.latestConvergenceResult?.level, 1, 'hardTighten → 放松归零 → 基线 L1')
+  })
+
+  it('P2 反例：mode=flow 也不能救 no-tool 硬熔断', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    agent.consecutiveNoToolTurns = 5
+    await agent.runConvergenceCheck(12, 'execute', true, false, makeCallbacks())
+    assert.equal(agent.latestConvergenceResult?.shouldAbort, true)
+    assert.equal(agent.latestConvergenceResult?.abortCause, 'no-tool')
+  })
+
+  it('P2：用户干预（userMessageConsumed）→ 快照 hardTighten 且 reason=user-intervened', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await agent.runConvergenceCheck(8, 'explore', true, true, makeCallbacks())
+    assert.equal(agent.latestStructureFlow?.mode, 'tighten')
+    assert.ok(agent.latestStructureFlow?.reasons.includes('user-intervened'))
+  })
+
+  it('P2 plan advisory 去重键：用户干预与 plan 生命周期都清空（允许新语境重新建议）', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.structureFlowPlanAdvisoryKeys.add('structure-flow-plan:enter:unknown-domain')
+
+    // 用户干预 → 清空
+    await agent.runConvergenceCheck(8, 'explore', true, true, makeCallbacks())
+    assert.equal(agent.structureFlowPlanAdvisoryKeys.size, 0, '用户干预清空去重键')
+
+    // enterPlanMode → 清空
+    agent.structureFlowPlanAdvisoryKeys.add('structure-flow-plan:exit')
+    agent.enterPlanMode()
+    assert.equal(agent.structureFlowPlanAdvisoryKeys.size, 0, 'enterPlanMode 清空去重键')
+
+    // exitPlanMode → 清空
+    agent.structureFlowPlanAdvisoryKeys.add('structure-flow-plan:enter:mixed-signals')
+    agent.exitPlanMode()
+    assert.equal(agent.structureFlowPlanAdvisoryKeys.size, 0, 'exitPlanMode 清空去重键')
+  })
+
+  // ── P3 认知帧：单一装配点经真实 runConvergenceCheck 接线（Wave 2）──
+
+  it('P3：frame 恒产出且与 latestStructureFlow 同 turn 对应', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.ok(agent.latestCognitiveFrame, 'frame 恒产出')
+    assert.equal(agent.latestCognitiveFrame.turn, 8)
+    assert.equal(agent.latestCognitiveFrame.phaseClass, 'explore')
+    assert.equal(agent.latestCognitiveFrame.quality.efe, 'measured')
+    assert.equal(agent.latestStructureFlow?.mode, 'flow', '投影→控制器输出与 P2 一致')
+  })
+
+  it('P3：EFE 缺失 → frame 仍产出（quality=missing）但 latestStructureFlow=null', async () => {
+    const agent = flowAgent(healthySensorium)
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.ok(agent.latestCognitiveFrame, 'EFE 缺失时 frame 也要产出（可观测性）')
+    assert.equal(agent.latestCognitiveFrame.quality.efe, 'missing')
+    assert.equal(agent.latestStructureFlow, null, '投影 fail-closed → P2 旧行为路径')
+    assert.equal(agent.latestConvergenceResult?.level, 0, 'P1 flow 路径继续生效')
+  })
+
+  it('P3：no-data sensorium 的质量标记经真实路径生效（partial，不伪装 measured）', async () => {
+    const noData = {
+      ...healthySensorium,
+      quality: { confidence: 'measured', momentum: 'no-data', stability: 'measured' },
+    } as import('../sensorium.js').Sensorium
+    const agent = flowAgent(noData)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: noData }
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.equal(agent.latestCognitiveFrame?.quality.sensorium, 'partial')
+    assert.equal(agent.latestCognitiveFrame?.quality.flow, 'missing', 'no-data → beacon 不算 → flow missing')
+  })
+
+  it('P3：真实 runConvergenceCheck 产出的记录经回放零 divergence / 零 violation', async () => {
+    const { buildCognitiveFrameRecord, replayCognitiveFrames } = await import('../cognitive-frame-replay.js')
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    const record = JSON.parse(JSON.stringify(buildCognitiveFrameRecord(
+      agent.latestCognitiveFrame!,
+      agent.latestStructureFlow,
+      agent.latestConvergenceResult,
+    )))
+    const report = replayCognitiveFrames([record])
+    assert.equal(report.checkedCount, 1)
+    assert.deepEqual(report.divergences, [], '真实路径记录必须自洽可重算')
+    assert.deepEqual(report.violations, [], '真实路径不得出现硬线违规')
+  })
+
+  it('P3：frame 不含控制结果（防 replay 把输出当输入）', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    const serialized = JSON.stringify(agent.latestCognitiveFrame)
+    for (const banned of ['relaxation', 'planRecommendation', '"mode"']) {
+      assert.ok(!serialized.includes(banned), `frame 不得含控制结果: ${banned}`)
+    }
+  })
+
+  it('P2：planning 态计入活跃计划上下文——稳定执行快照产出 exit 推荐', async () => {
+    const agent = flowAgent(healthySensorium)
+    agent.latestPolicySignals = { efe: healthyEfe, sensorium: healthySensorium }
+    agent.enterPlanMode()
+    // 需要 progress>0 才可能 exit：todo 推进由 getTodos 提供，这里直接用
+    // todoCompletedDelta 路径不可注入，改为验证 activePlan 传入生效 ——
+    // planning 态 + flow 模式下 planRecommendation 不为 'enter'。
+    await agent.runConvergenceCheck(8, 'explore', true, false, makeCallbacks())
+    assert.ok(agent.latestStructureFlow, 'EFE 就绪 → 快照存在')
+    assert.notEqual(agent.latestStructureFlow?.planRecommendation, 'enter',
+      'planning 态被视为活跃计划上下文，绝不推荐 enter')
   })
 })
 

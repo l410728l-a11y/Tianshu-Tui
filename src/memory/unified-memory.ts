@@ -45,8 +45,12 @@ export type MemoryKind =
   | 'selection_rule'
   | 'conceptual_reframe'
   | 'reusable_design_pattern'
+  // 虚空仓库 P0：agent 交付时主动标记的已验证模式
+  | 'verified_pattern'
 
 export type MemorySource = 'auto' | 'manual' | 'claim' | 'verification' | 'dream' | 'essence-gate'
+  // 虚空仓库 P0：agent 主动标记（deliver_task learned 参数 / PAL 自动收割），区分被动提取
+  | 'agent-crafted'
 
 export type MemoryStatus = 'observed' | 'claimed' | 'verified' | 'rejected' | 'expired'
 
@@ -319,9 +323,21 @@ export function recallMemoryEntries(
 }
 
 /** Render memory entries as XML block for prompt injection.
- *  Wave 1 起默认不再每轮推送（见 turn-step-producer.crossSessionMemoryPushEnabled）。 */
-export function renderMemoryBlock(cwd: string, query: string, maxChars = 2000): string | null {
-  const recalled = recallMemoryEntries(cwd, query, 8)
+ *  Wave 1 起默认不再每轮推送（见 turn-step-producer.crossSessionMemoryPushEnabled）。
+ *
+ *  虚空仓库 P0：`sourceFilter` 存在时**完全脱离 query 评分**——按 ts 降序取该
+ *  source 的最近 8 条 current 条目。理由（缓存纪律）：评分选集随 userInput
+ *  逐用户边界漂移 → 附录字节 churn（historical-lessons 同款遗留问题）；且
+ *  `split(/\W+/)` 对纯中文输入词项为零，评分/旁路双模式会随输入语言振荡。
+ *  恒定选集保证 memory.jsonl 不变 → 输出字节不变 → 跨边界前缀缓存命中。 */
+export function renderMemoryBlock(cwd: string, query: string, maxChars = 2000, sourceFilter?: MemorySource): string | null {
+  const recalled = sourceFilter
+    ? readMemoryEntries(cwd)
+        .filter(e => e.source === sourceFilter)
+        .filter(isCurrentEntry)
+        .sort((a, b) => b.ts - a.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .slice(0, 8)
+    : recallMemoryEntries(cwd, query, 8)
   if (recalled.length === 0) return null
 
   const lines = ['<cross-session-memory>']

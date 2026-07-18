@@ -5,6 +5,7 @@ import type { Usage } from '../api/types.js'
 import type { VerificationMetadata } from '../tools/types.js'
 import { profileRegistry } from './profile-registry.js'
 import { starDomainRegistry } from './star-domain-registry.js'
+import { resolveAuthorityReason } from './star-domain.js'
 import { progressiveTimeout } from './timeout-ladder.js'
 
 export const READ_ONLY_WORKER_TOOLS = ['read_file', 'read_section', 'glob', 'grep', 'diff', 'inspect_project', 'repo_map', 'repo_graph', 'related_tests'] as const
@@ -132,6 +133,8 @@ export const workOrderSchema = z.object({
   delegationDepth: z.number().int().min(0).default(0),
   /** Star domain authority for cognitive injection (V3 Component A). */
   authority: z.string().optional(),
+  /** Why this authority was chosen (≤60 chars). Omitted when authority unset. */
+  authorityReason: z.string().max(60).optional(),
   /** Team planner risk tier for shadow-only model tier recommendation. */
   riskTier: z.enum(['low', 'medium', 'high']).optional(),
   /** Per-order provider/model override (highest routing precedence). When set,
@@ -350,6 +353,7 @@ export function createReadOnlyWorkOrder(input: CreateReadOnlyWorkOrderInput): Wo
     reviewDepth: input.reviewDepth,
     delegationDepth: input.delegationDepth ?? 0,
     authority: input.authority,
+    authorityReason: resolveAuthorityReason(input.objective, input.authority),
     riskTier: input.riskTier,
     modelOverride: input.modelOverride,
     tierFloor: input.tierFloor,
@@ -400,6 +404,7 @@ export function createWriteWorkOrder(input: CreateWriteWorkOrderInput): WorkOrde
     reviewDepth: input.reviewDepth,
     delegationDepth: input.delegationDepth ?? 0,
     authority: input.authority,
+    authorityReason: resolveAuthorityReason(input.objective, input.authority),
     riskTier: input.riskTier,
     modelOverride: input.modelOverride,
     tierFloor: input.tierFloor,
@@ -611,7 +616,22 @@ export function parseWorkerResult(text: string, expectedWorkOrderId: string): Wo
  *  parseable finding objects and a summary string, and rebuilds a degraded but
  *  usable WorkerResult (status stays 'blocked', evidenceStatus 'unverified')
  *  so the primary keeps the scout's recoverable findings instead of losing the
- *  entire report to one syntax error. Returns null when nothing is salvageable. */
+ *  entire report to one syntax error. Returns null when nothing is salvageable.
+ *
+ *  Two-tier recovery:
+ *  1. Candidate-level — a balanced/fenced candidate that is itself a finding
+ *     object (`{claim,evidence,confidence}`) parses straight through.
+ *  2. Finding-element-level — a candidate that parses to a wrapper object with
+ *     a `findings` array (common when a fenced/tail candidate captures the full
+ *     WorkerResult but its sibling fields contain an unescaped quote that broke
+ *     `workerResultIngestSchema`). The wrapper itself fails the finding schema
+ *     at the top level, but each element of `findings` may still be valid.
+ *     Walk the array and safeParse each element. (Session f98bb237: a scout
+ *     report with two bare `"` inside `content` fields lost 2/6 findings under
+ *     tier 1 because their enclosing fenced candidate failed the finding
+ *     schema; tier 2 recovered them.)
+ *  Both tiers share one `seenClaims` set so the same finding isn't counted
+ *  twice when a balanced candidate already captured it at tier 1. */
 export function salvageWorkerResult(text: string, expectedWorkOrderId: string): WorkerResult | null {
   let candidates: string[]
   try {
@@ -622,6 +642,7 @@ export function salvageWorkerResult(text: string, expectedWorkOrderId: string): 
 
   const findings: z.infer<typeof workerFindingSchema>[] = []
   const seenClaims = new Set<string>()
+  let recoveredFromWrapper = 0
   for (const candidate of candidates) {
     let parsed: unknown
     try {
@@ -629,10 +650,30 @@ export function salvageWorkerResult(text: string, expectedWorkOrderId: string): 
     } catch {
       continue
     }
+    // Tier 1: candidate is itself a finding object.
     const finding = workerFindingSchema.safeParse(parsed)
-    if (finding.success && !seenClaims.has(finding.data.claim)) {
-      seenClaims.add(finding.data.claim)
-      findings.push(finding.data)
+    if (finding.success) {
+      if (!seenClaims.has(finding.data.claim)) {
+        seenClaims.add(finding.data.claim)
+        findings.push(finding.data)
+      }
+      continue
+    }
+    // Tier 2: candidate is a wrapper with a findings array (e.g. a fenced/
+    // tail candidate capturing the whole WorkerResult whose sibling fields
+    // failed schema validation). Walk the array and recover valid elements.
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const wrapped = (parsed as { findings?: unknown }).findings
+      if (Array.isArray(wrapped)) {
+        for (const element of wrapped) {
+          const inner = workerFindingSchema.safeParse(element)
+          if (inner.success && !seenClaims.has(inner.data.claim)) {
+            seenClaims.add(inner.data.claim)
+            findings.push(inner.data)
+            recoveredFromWrapper++
+          }
+        }
+      }
     }
   }
   if (findings.length === 0) return null
@@ -647,10 +688,14 @@ export function salvageWorkerResult(text: string, expectedWorkOrderId: string): 
     }
   }
 
+  const salvageDetail = recoveredFromWrapper > 0
+    ? ` (${recoveredFromWrapper} recovered from a malformed wrapper object)`
+    : ''
+
   return {
     workOrderId: expectedWorkOrderId,
     status: 'blocked',
-    summary: `Worker report JSON was malformed; salvaged ${findings.length}/${candidates.length} candidate(s) as findings.${extractedSummary ? ` Worker's own summary: ${extractedSummary.slice(0, 300)}` : ''}`,
+    summary: `Worker report JSON was malformed; salvaged ${findings.length}/${candidates.length} candidate(s) as findings${salvageDetail}.${extractedSummary ? ` Worker's own summary: ${extractedSummary.slice(0, 300)}` : ''}`,
     findings,
     artifacts: [{
       kind: 'note',

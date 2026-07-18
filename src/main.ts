@@ -565,14 +565,22 @@ async function main() {
   ctx!.agent.onAskUserQuestionRequested = (info) => {
     setImmediate(() => tuiApp.openAskUserQuestionPanel(info))
   }
-  // TUI 默认钉住天枢星域(与桌面端 auto 形成对比):在首个请求前设置,仅构建
-  // 初始 frozenBase,无缓存代价;setSessionDomain 后 bindSessionDomain 的
-  // `!== undefined` 守卫会跳过按任务的 auto 关键词绑定。尊重 STAR_SOUL 总开关;
-  // 若已有钉住的域(理论上不会,TUI 不持久化选择态)则沿用。
+  // TUI / 桌面共用 agent.defaultDomain（发版默认开阳）。在首个请求前钉住，
+  // 仅构建初始 frozenBase，无缓存代价；钉住后 bindSessionDomain 跳过 Auto 绑定。
+  // defaultDomain === 'auto' 时保持未钉定，由 bindSessionDomain 按 domainKeywordRouting
+  // 落到开阳（关键词路由默认关）。尊重 STAR_SOUL 总开关。
   if (ctx!.agent.getSessionDomain() === undefined && isStarSoulEnabled()) {
-    const tianshu = starDomainRegistry.get('tianshu')
-    if (tianshu) {
-      ctx!.agent.setSessionDomain({ id: tianshu.id, name: tianshu.name, volatileBlock: tianshu.volatileBlock, motto: tianshu.motto })
+    const key = ctx!.config.agent?.defaultDomain ?? 'kaiyang'
+    if (key !== 'auto') {
+      const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('kaiyang')
+      if (pinned) {
+        ctx!.agent.setSessionDomain({
+          id: pinned.id as import('./agent/star-domain.js').StarDomainId,
+          name: pinned.name,
+          volatileBlock: pinned.volatileBlock,
+          motto: pinned.motto,
+        })
+      }
     }
   }
   const initialDomain = ctx!.agent.getSessionDomain()?.name

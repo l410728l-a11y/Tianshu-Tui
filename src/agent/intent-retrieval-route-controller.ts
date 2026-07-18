@@ -1,5 +1,5 @@
 import { classifyIntentRetrievalRoute, type IntentRetrievalRouterConfigInput } from './intent-retrieval-router.js'
-import { LOW_CONFIDENCE_INTENT_ADVISORY, renderIntentRetrievalRoute, type RetrievalRoute } from './intent-retrieval-route.js'
+import { renderIntentRetrievalRoute, renderLowConfidenceIntentAdvisory, type RetrievalRoute } from './intent-retrieval-route.js'
 import { type SessionStateManager } from './session-state.js'
 import { type TaskContract, type TurnMode } from '../context/task-contract.js'
 import { type StreamClient } from '../api/stream-client.js'
@@ -84,7 +84,7 @@ export class IntentRetrievalRouteController {
         this.deps.setIntentRetrievalRoute(null)
       } else {
         // 低置信 ≠ 不注入：意图模糊的场景最需要先对齐再收敛
-        this.deps.setIntentRetrievalRoute(LOW_CONFIDENCE_INTENT_ADVISORY)
+        this.deps.setIntentRetrievalRoute(renderLowConfidenceIntentAdvisory(route))
       }
     } catch (err) {
       debugLog(`[intent-router] failed: ${(err as Error).message}`)

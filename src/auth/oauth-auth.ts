@@ -70,7 +70,10 @@ export class OAuthAuth implements AuthProvider {
   async getHeaders(): Promise<Record<string, string>> {
     let token = this.store.load()
     if (!token) {
-      throw new Error('Not authenticated — call authenticate() first')
+      throw new Error(
+        'Not authenticated — no stored OAuth token. ' +
+        'Run authenticate() first, or if using an API key set "auth": null in the provider config.'
+      )
     }
 
     if (shouldRefresh(token)) {
@@ -208,7 +211,10 @@ export class OAuthAuth implements AuthProvider {
 
   private async refreshToken(token: TokenData): Promise<TokenData> {
     if (!token.refreshToken) {
-      throw new Error('No refresh token — re-authenticate')
+      throw new Error(
+        'No refresh token — the stored OAuth token is incomplete or stale. ' +
+        'Delete the token file and re-authenticate, or if using an API key set "auth": null in the provider config.'
+      )
     }
 
     const fetchFn = this.config.fetch ?? globalThis.fetch

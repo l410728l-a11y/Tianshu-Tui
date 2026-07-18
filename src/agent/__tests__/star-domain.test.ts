@@ -1,7 +1,14 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { matchDomain, STAR_DOMAINS, buildActiveDomain } from '../star-domain.js'
-import { starDomainRegistry } from '../star-domain-registry.js'
+import {
+  matchDomain,
+  STAR_DOMAINS,
+  buildActiveDomain,
+  deriveAuthority,
+  resolveAuthorityReason,
+  DELEGATION_FALLBACK_AUTHORITY,
+} from '../star-domain.js'
+import { starDomainRegistry, MAX_MATCH_CHARS } from '../star-domain-registry.js'
 
 describe('StarDomain', () => {
   it('exports built-in domains', () => {
@@ -229,19 +236,25 @@ describe('buildActiveDomain', () => {
     assert.ok(result.motto)
   })
 
-  it('falls back to tianshu for ambiguous task', () => {
+  it('falls back to kaiyang for ambiguous task', () => {
     const result = buildActiveDomain('帮我看看')
-    assert.equal(result.id, 'tianshu')
-    assert.equal(result.name, '天枢')
+    assert.equal(result.id, 'kaiyang')
+    assert.equal(result.name, '开阳')
+  })
+
+  it('skips keyword routing when keywordRouting is false', () => {
+    const result = buildActiveDomain('尝试突破新的认证方案', { keywordRouting: false })
+    assert.equal(result.id, 'kaiyang')
+    assert.equal(result.name, '开阳')
   })
 })
 
 describe('四域分工模型（2026-07-04 校订）', () => {
-  it('tianshu carries all-round default-domain identity (可规划可执行)', () => {
+  it('tianshu carries all-round identity (可规划可执行); kaiyang is shipped default domain', () => {
     const tianshu = STAR_DOMAINS.tianshu
-    assert.match(tianshu.systemPromptSuffix, /默认域/, 'default-domain identity must be explicit')
     assert.match(tianshu.systemPromptSuffix, /全能/, 'all-round capability must be explicit')
     assert.doesNotMatch(tianshu.systemPromptSuffix, /不在逐行编码/, 'orchestrator-only framing must be removed')
+    assert.match(STAR_DOMAINS.kaiyang.systemPromptSuffix, /发版默认域/, 'kaiyang claims shipped default')
   })
 
   it('tianshu is a global partner star (意图至上/闭环/委派只是手段)', () => {
@@ -330,5 +343,124 @@ describe('tianliang cognitive field + delivery discipline split', () => {
   it('volatileBlock is concise (cognitive field, not procedural manual)', () => {
     const lines = STAR_DOMAINS.tianliang.volatileBlock.split('\n').filter(l => l.trim().length > 0)
     assert.ok(lines.length <= 6, `volatileBlock should be ≤6 non-empty lines, got ${lines.length}`)
+  })
+})
+
+
+describe('kaiyang（开阳·对账者，2026-07-17 第十二域）', () => {
+  it('kaiyang domain exists with full field set', () => {
+    const k = STAR_DOMAINS.kaiyang
+    assert.ok(k)
+    assert.equal(k.id, 'kaiyang')
+    assert.equal(k.name, '开阳')
+    assert.equal(k.motto, '双星互证，实测为凭')
+    assert.equal(k.decisionStyle, 'methodical')
+    assert.equal(k.courageThreshold, 0.55)
+    assert.equal(k.isCustom, false)
+    assert.match(k.volatileBlock, /开阳/)
+    assert.match(k.volatileBlock, /双星互证/)
+    assert.ok(k.keywords.includes('对账'))
+    assert.ok(k.keywords.includes('插桩'))
+    assert.ok(k.keywords.includes('仿真'))
+    assert.equal(k.uiPersona.glyph, '☌')
+    assert.equal(k.uiPersona.separator, 'dots')
+    assert.equal(k.uiPersona.accent, 'secondary')
+  })
+
+  it('routes measurement/cross-check keywords to kaiyang', () => {
+    assert.equal(matchDomain('插桩对账这个状态机的实际行为'), 'kaiyang')
+    assert.equal(matchDomain('造一个仿真模拟器回放这个竞态'), 'kaiyang')
+    assert.equal(matchDomain('先测量一下真实耗时再下结论'), 'kaiyang')
+  })
+
+  it('kaiyang does not steal yaoguang/tianliang routes (keyword orthogonality)', () => {
+    // 瑶光拥有 复现/验证/回归 —— 开阳不拦截
+    assert.equal(matchDomain('复现这个缺陷并归族处理'), 'yaoguang')
+    assert.equal(matchDomain('回归测试验证修复是否真的生效'), 'yaoguang')
+    assert.equal(matchDomain('按计划实现用户注册'), 'tianliang')
+  })
+
+  it('kaiyang carries 对账 discipline（独立通道 / 循环验证 / 排除法 / 域间边界）', () => {
+    const k = STAR_DOMAINS.kaiyang
+    assert.match(k.systemPromptSuffix, /独立通道/)
+    assert.match(k.systemPromptSuffix, /循环验证/)
+    assert.match(k.systemPromptSuffix, /排除法/)
+    assert.match(k.systemPromptSuffix, /精确构成/)
+    // 叙事警觉：开阳的创始教训——叙事引力不是证据
+    assert.match(k.systemPromptSuffix, /叙事警觉/)
+    assert.match(k.systemPromptSuffix, /最安静的那条/)
+    assert.match(k.volatileBlock, /叙事最响的方向未必是对账最准的方向/)
+    // 域间边界：量的归开阳，证的归瑶光（辅域「边界不可侵蚀」纪律）
+    assert.match(k.systemPromptSuffix, /量的归开阳，证的归瑶光/)
+    // 星域名胶囊入口（与天权/辅同款 recall）
+    assert.match(k.systemPromptSuffix, /recall_capsule\("开阳"\)/)
+    // 双星叙事：与辅相伴
+    assert.match(k.systemPromptSuffix, /与辅相伴/)
+  })
+})
+
+describe('deriveAuthority — explicit routing with reasons', () => {
+  it('hit: authority id matches matchDomain ?? tianliang lock; reason carries keywords', () => {
+    const objectives = [
+      '重构优化性能',
+      '审查这个方案',
+      '按计划实现用户注册',
+      '探索新的可能性',
+      '修复登录回归并验证',
+    ]
+    for (const objective of objectives) {
+      const derived = deriveAuthority(objective)
+      const legacy = matchDomain(objective) ?? DELEGATION_FALLBACK_AUTHORITY
+      assert.equal(derived.authority, legacy, `id lock broken for: ${objective}`)
+      assert.ok(derived.reasons.length >= 1)
+      assert.ok(derived.reasons[0]!.startsWith('命中:'), `expected hit reason for ${objective}, got ${derived.reasons[0]}`)
+      // At most 3 keywords in the reason
+      const after = derived.reasons[0]!.slice('命中: '.length)
+      assert.ok(after.split('+').length <= 3)
+    }
+  })
+
+  it('tie → tianliang with 平手 reason; no-match → 无关键词命中', () => {
+    const tie = deriveAuthority('这个方案')
+    assert.equal(tie.authority, DELEGATION_FALLBACK_AUTHORITY)
+    assert.equal(matchDomain('这个方案'), null)
+    assert.match(tie.reasons[0]!, /平手\(.+\)→天梁兜底/)
+
+    const miss = deriveAuthority('hello world xyz')
+    assert.equal(miss.authority, DELEGATION_FALLBACK_AUTHORITY)
+    assert.equal(miss.reasons[0], '无关键词命中→天梁兜底')
+  })
+
+  it('deterministic for same input', () => {
+    assert.deepEqual(deriveAuthority('重构 auth 模块'), deriveAuthority('重构 auth 模块'))
+  })
+
+  it('exposes the match detail so callers avoid a second scan', () => {
+    const derived = deriveAuthority('重构优化性能')
+    assert.equal(derived.detail.verdict, 'hit')
+    assert.equal(derived.detail.id, 'tianfu')
+    assert.deepEqual(derived.detail, starDomainRegistry.matchDomainDetailed('重构优化性能'))
+  })
+
+  it('truncates matching scan for oversized objectives', () => {
+    const pad = 'x'.repeat(MAX_MATCH_CHARS)
+    // Keyword only after the cap — must not match
+    const buried = pad + '审查方案'
+    assert.equal(matchDomain(buried), null)
+    assert.equal(deriveAuthority(buried).authority, DELEGATION_FALLBACK_AUTHORITY)
+    // Keyword inside the cap — still matches
+    const early = '审查方案' + pad
+    assert.equal(matchDomain(early), 'tianquan')
+    assert.equal(deriveAuthority(early).authority, 'tianquan')
+  })
+
+  it('resolveAuthorityReason: hit match / explicit override / absent', () => {
+    assert.equal(resolveAuthorityReason('随便聊聊', undefined), undefined)
+    const hit = resolveAuthorityReason('重构优化性能', 'tianfu')
+    assert.ok(hit && hit.startsWith('命中:'))
+    // Mismatch → 显式指定
+    assert.equal(resolveAuthorityReason('重构优化性能', 'tianquan'), '显式指定')
+    // Fallback authority with no keyword hit → 显式指定 (not a hit)
+    assert.equal(resolveAuthorityReason('hello world xyz', 'tianliang'), '显式指定')
   })
 })

@@ -663,6 +663,12 @@ describe('formatExitSummary（退出回连指引）', () => {
     assert.ok(!out!.includes('“'), `无标题引号: ${out}`)
   })
 
+  it('首行是品牌告别语（✦ 启明星）', () => {
+    const out = formatExitSummary({ turnCount: 3 }, SID)
+    assert.ok(out)
+    assert.ok(out!.startsWith('✦ 后会有期'), `告别行应在首行: ${out}`)
+  })
+
   it('空会话（turnCount 0 / 缺省 / null meta）不打印', () => {
     assert.equal(formatExitSummary({ turnCount: 0 }, SID), null)
     assert.equal(formatExitSummary({}, SID), null)

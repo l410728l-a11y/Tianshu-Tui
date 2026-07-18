@@ -55,3 +55,12 @@ export function authorityStarName(authority: string | undefined): string | undef
   const domain = starDomainRegistry.get(authority)
   return domain?.name
 }
+
+/**
+ * Authority display for fleet detail: `破军（命中: 重构+回归）` or `tianquan（显式指定）`.
+ * Unknown domains fall back to the raw id; reason omitted when absent.
+ */
+export function formatAuthorityLabel(authority: string, reason?: string): string {
+  const name = authorityStarName(authority) ?? authority
+  return reason ? `${name}（${reason}）` : name
+}

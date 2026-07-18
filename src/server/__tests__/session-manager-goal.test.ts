@@ -1,0 +1,198 @@
+/**
+ * Goal mode wiring tests for RuntimeSessionManager.
+ *
+ * Covers the layer added in commit 5f76e7fc: setGoal/pauseGoal/resumeGoal/
+ * cancelGoal/getGoalState, the resolveGoalHandles callback contract, and the
+ * critical cancel→setGoal race that motivated making cancelGoal async.
+ *
+ * These tests use a REAL GoalTracker + a REAL temp sessionDir (via os.tmpdir)
+ * so the persist/restore path is exercised end-to-end — not a mock.
+ */
+import { describe, test, beforeEach, afterEach } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { RuntimeSessionManager, type ManagedAgent, type GoalHandles } from '../session-manager.js'
+import { GoalTracker } from '../../agent/goal-tracker.js'
+import { saveGoalState, restoreGoalTracker, loadGoalState } from '../../agent/goal-persist.js'
+import type { GoalSnapshot } from '../session-manager.js'
+import type { Artifact } from '../../artifact/types.js'
+import type { AgentCallbacks } from '../../agent/loop-types.js'
+import type { OaiMessage } from '../../api/oai-types.js'
+
+/** Minimal fake agent that remembers the tracker it was handed (for the
+ *  double-track assertion: cancelGoal must clear BOTH refs AND agent field). */
+class GoalFakeAgent implements ManagedAgent {
+  tracker: GoalTracker | null = null
+  run(_p: string, _cb: AgentCallbacks): Promise<void> { return Promise.resolve() }
+  abort(): void {}
+  listArtifacts(): Artifact[] { return [] }
+  readArtifact(): Promise<string | null> { return Promise.resolve(null) }
+  getMessages(): OaiMessage[] { return [] }
+  replaceMessages(): void {}
+  rewindToMessages(): void {}
+  setGoalTracker(t: GoalTracker | null): void { this.tracker = t }
+  getGoalTracker(): GoalTracker | null { return this.tracker }
+}
+
+function makeManager(sessionDir: string) {
+  // The goalTrackerRef is shared between the resolver and the fake agent via
+  // closure — mirrors how serve-agent wires it (refs hold the slot that tool
+  // closures read; agent holds its own field).
+  const goalTrackerRef: { current: GoalTracker | null } = { current: null }
+  const fakeAgents: GoalFakeAgent[] = []
+  const manager = new RuntimeSessionManager({
+    createAgent: () => { const a = new GoalFakeAgent(); fakeAgents.push(a); return a },
+    defaultCwd: '/tmp',
+    resolveGoalHandles: () => ({ goalTrackerRef, sessionDir } as GoalHandles),
+  })
+  return { manager, goalTrackerRef, fakeAgents }
+}
+
+describe('RuntimeSessionManager goal mode', () => {
+  let sessionDir: string
+
+  beforeEach(() => {
+    sessionDir = mkdtempSync(join(tmpdir(), 'rivet-goal-test-'))
+  })
+  afterEach(() => {
+    rmSync(sessionDir, { recursive: true, force: true })
+  })
+
+  test('setGoal creates a tracker, syncs agent + refs, and persists state', async () => {
+    const { manager, goalTrackerRef, fakeAgents } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    // Trigger agent build so setGoalTracker has a target.
+    void manager.run(s.id, "go")
+
+    const snap = await manager.setGoal(s.id, {
+      goal: 'refactor foo',
+      maxIterations: 50,
+      contextWindow: 100_000,
+    })
+    assert.equal(snap?.status, 'active')
+    assert.equal(snap?.goal, 'refactor foo')
+    // Double-track sync: both the refs slot and the agent field point at it.
+    assert.ok(goalTrackerRef.current, 'refs.goalTrackerRef.current populated')
+    assert.equal(fakeAgents[0]?.tracker, goalTrackerRef.current, 'agent tracker === refs tracker')
+    // Persisted to disk (GoalStateRecord uses `objective`, not `goal`).
+    const record = loadGoalState(sessionDir, s.id)
+    assert.ok(record, 'goal state persisted')
+    assert.equal(record!.objective, 'refactor foo')
+  })
+
+  test('getGoalState reads from refs first, falls back to agent field', async () => {
+    const { manager, goalTrackerRef } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, "go")
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    // Primary path: refs.current populated.
+    assert.equal(manager.getGoalState(s.id)?.goal, 'x')
+
+    // Fallback path: clear refs.current, agent field still has it.
+    goalTrackerRef.current = null
+    const fromAgent = manager.getGoalState(s.id)
+    assert.equal(fromAgent?.goal, 'x', 'getGoalState falls back to agent.getGoalTracker()')
+  })
+
+  test('pauseGoal/resumeGoal round-trip through tracker state', async () => {
+    const { manager } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, "go")
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    const paused = manager.pauseGoal(s.id)
+    assert.equal(paused?.status, 'paused')
+
+    const resumed = manager.resumeGoal(s.id)
+    assert.equal(resumed?.status, 'active')
+  })
+
+  test('cancelGoal clears agent field + refs + persisted file', async () => {
+    const { manager, goalTrackerRef, fakeAgents } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, "go")
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+    assert.ok(existsSync(join(sessionDir, `${s.id}.goal.json`)), 'state file written')
+
+    const snap = await manager.cancelGoal(s.id)
+    assert.equal(snap?.status, 'complete')
+    assert.equal(snap?.terminalReason, 'cancelled')
+    assert.equal(goalTrackerRef.current, null, 'refs cleared')
+    assert.equal(fakeAgents[0]?.tracker, null, 'agent field cleared')
+    assert.equal(existsSync(join(sessionDir, `${s.id}.goal.json`)), false, 'persisted file deleted')
+  })
+
+  test('cancel→setGoal race: a setGoal right after cancel is NOT wiped', async () => {
+    // Regression guard for the fire-and-forget delete race (commit msg §①).
+    // Before the fix, cancelGoal's delete was a dynamic-import .then() that
+    // could land AFTER a subsequent setGoal's saveGoalState, deleting the new
+    // goal's state file. Now cancelGoal awaits the delete.
+    const { manager } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, "go")
+    await manager.setGoal(s.id, { goal: 'first', maxIterations: 10, contextWindow: 1000 })
+
+    await manager.cancelGoal(s.id)
+    // Immediately set a new goal — this is the race window.
+    const snap = await manager.setGoal(s.id, { goal: 'second', maxIterations: 10, contextWindow: 1000 })
+    assert.equal(snap?.goal, 'second')
+
+    // The new goal's state file must still exist (not wiped by a late delete).
+    // Give any pending microtasks a chance to flush — if the old fire-and-
+    // forget delete were still in play, it would land here.
+    await new Promise((r) => setImmediate(r))
+    await new Promise((r) => setTimeout(r, 10))
+    const record = loadGoalState(sessionDir, s.id)
+    assert.ok(record, 'second goal state survived (no late delete)')
+    assert.equal(record!.objective, 'second', 'persisted state is the NEW goal, not wiped')
+    // And the live tracker reflects the new goal.
+    assert.equal(manager.getGoalState(s.id)?.goal, 'second')
+  })
+
+  test('restoreGoalTracker normalizes active→paused across a restart', () => {
+    // Mirrors the sidecar-restart safety: a goal that was active when the
+    // sidecar died must come back as paused, never auto-resume.
+    const sessionId = 'restart-test'
+    const tracker = new GoalTracker({
+      goal: 'survive restart',
+      maxIterations: 20,
+      contextWindow: 1000,
+    })
+    saveGoalState(sessionDir, sessionId, tracker)
+    assert.equal(loadGoalState(sessionDir, sessionId)?.status, 'active')
+
+    // Simulate a restart: restore via the same path serve-agent uses.
+    const restored = restoreGoalTracker(sessionDir, sessionId, { maxJudgeRuns: 3 })
+    assert.ok(restored, 'restored from disk')
+    assert.equal(restored!.getStatus(), 'paused', 'active downgraded to paused on restore')
+    assert.equal(restored!.getGoal(), 'survive restart')
+  })
+
+  test('cancelGoal on a session with no tracker returns null (no throw)', async () => {
+    const { manager } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, "go")
+    // No setGoal yet — cancelGoal must degrade cleanly.
+    const snap = await manager.cancelGoal(s.id)
+    assert.equal(snap, null)
+  })
+
+  test('goal methods return null when resolveGoalHandles is absent', async () => {
+    // Test doubles / legacy sidecar: no resolveGoalHandles wired. Every goal
+    // method must degrade to null rather than throw.
+    const manager = new RuntimeSessionManager({
+      createAgent: () => new GoalFakeAgent(),
+      defaultCwd: '/tmp',
+      // Note: NO resolveGoalHandles.
+    })
+    const s = manager.createSession({})
+    void manager.run(s.id, "go")
+    assert.equal(manager.getGoalState(s.id), null)
+    assert.equal(manager.pauseGoal(s.id), null)
+    assert.equal(await manager.cancelGoal(s.id), null)
+    assert.equal(await manager.setGoal(s.id, { goal: 'x', maxIterations: 5, contextWindow: 1000 }), null)
+  })
+})

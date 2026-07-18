@@ -1,7 +1,7 @@
 import type { DomainArea, WorkOrderScope } from './work-order.js'
 import type { StarDomainId } from './star-domain.js'
 import type { TaskContract } from '../context/task-contract.js'
-import { matchDomain } from './star-domain.js'
+import { deriveAuthority } from './star-domain.js'
 
 /** 按文件路径分类到领域轴。测试文件优先匹配（可出现在任何域目录下）。 */
 export function classifyFile(path: string): DomainArea {
@@ -32,6 +32,8 @@ export interface DecomposedTask {
   objective: string
   domain: DomainArea
   authority: StarDomainId
+  /** Why this authority was chosen (from deriveAuthority); empty only if unset. */
+  authorityReasons: string[]
   dependsOn: number[]  // 同一 decompose 调用内的 index
   scope: WorkOrderScope
 }
@@ -54,11 +56,13 @@ export interface DecomposedTask {
 export function decomposeByDataContract(contract: TaskContract): DecomposedTask[] {
   const files = contract.scope.mentionedFiles
   if (files.length === 0) {
+    const derived = deriveAuthority(contract.objective)
     return [{
       title: contract.objective.slice(0, 60),
       objective: contract.objective,
       domain: 'backend',
-      authority: (matchDomain(contract.objective) ?? 'tianliang') as StarDomainId,
+      authority: derived.authority as StarDomainId,
+      authorityReasons: derived.reasons,
       dependsOn: [],
       scope: { files: [] },
     }]
@@ -73,11 +77,13 @@ export function decomposeByDataContract(contract: TaskContract): DecomposedTask[
 
   for (const [domain, domainFiles] of groups) {
     const objective = `处理 ${domain} 域: ${domainFiles.join(', ')}`
+    const derived = deriveAuthority(objective)
     tasks.push({
       title: `[${domain}] ${contract.objective.slice(0, 40)}`,
       objective,
       domain,
-      authority: (matchDomain(objective) ?? 'tianliang') as StarDomainId,
+      authority: derived.authority as StarDomainId,
+      authorityReasons: derived.reasons,
       dependsOn: [],
       scope: { files: domainFiles },
     })

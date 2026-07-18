@@ -1,9 +1,10 @@
-import { describe, it } from 'node:test'
+import { describe, it, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { BASH_TOOL, isExecFailure, classifyBashOutcome, sanitizeEnv } from '../bash.js'
+import type { execFileSync } from 'node:child_process'
+import { BASH_TOOL, isExecFailure, classifyBashOutcome, sanitizeEnv, __setRtkExecForTests, __rtkRewriteForTests, buildAssemblyFailureResult } from '../bash.js'
 
 describe('isExecFailure: 非零退出码 ≠ 真失败', () => {
   it('把 0 和"非零非致命码"判为非失败(grep 1/diff 1/test 失败码)', () => {
@@ -110,6 +111,106 @@ describe('requiresApproval vs rtkRewrite', () => {
       cwd: '/tmp',
     }
     assert.equal(BASH_TOOL.requiresApproval(input), true)
+  })
+})
+
+describe('rtk 健康判定（探针失败停用重写）', () => {
+  type Exec = typeof execFileSync
+  function mockRtkExec(behavior: { lsOutput?: string; rewriteOut?: string; throwAll?: boolean }): { exec: Exec; calls: string[][] } {
+    const calls: string[][] = []
+    const exec = ((cmd: string, args?: string[]) => {
+      calls.push([cmd, ...(args ?? [])])
+      if (behavior.throwAll) throw new Error('spawn rtk ENOENT')
+      if (args?.[0] === 'ls') return behavior.lsOutput ?? ''
+      if (args?.[0] === 'rewrite') return behavior.rewriteOut ?? ''
+      return ''
+    }) as unknown as Exec
+    return { exec, calls }
+  }
+  function captureStderr(): { lines: string[]; restore: () => void } {
+    const lines: string[] = []
+    const orig = process.stderr.write
+    ;(process.stderr as { write: unknown }).write = (chunk: unknown) => { lines.push(String(chunk)); return true }
+    return { lines, restore: () => { process.stderr.write = orig } }
+  }
+  let savedRtkEnv: string | undefined
+  afterEach(() => {
+    __setRtkExecForTests(undefined)
+    if (savedRtkEnv !== undefined) { process.env.RIVET_RTK = savedRtkEnv; savedRtkEnv = undefined }
+    else delete process.env.RIVET_RTK
+  })
+
+  it('broken rtk（ls 无标记输出）→ 重写停用 + 一次性告警，后续命令全部原生执行', () => {
+    const { exec, calls } = mockRtkExec({ lsOutput: '(empty)\n' })
+    __setRtkExecForTests(exec)
+    const cap = captureStderr()
+    try {
+      assert.equal(__rtkRewriteForTests('ls -la', 't1'), 'ls -la', '损坏 rtk 不得改写命令')
+      assert.equal(__rtkRewriteForTests('git status', 't2'), 'git status')
+      const warnings = cap.lines.filter((l) => l.includes('rtk health probe failed'))
+      assert.equal(warnings.length, 1, '告警只发一次')
+      // 探针只跑一次（--version + ls），rewrite 从未被调用
+      assert.equal(calls.filter((c) => c[1] === 'ls').length, 1)
+      assert.equal(calls.filter((c) => c[1] === 'rewrite').length, 0)
+    } finally {
+      cap.restore()
+    }
+  })
+
+  it('healthy rtk（ls 返回标记）→ 重写正常生效', () => {
+    const { exec } = mockRtkExec({ lsOutput: 'rivet-rtk-marker\n', rewriteOut: 'rtk ls' })
+    __setRtkExecForTests(exec)
+    const cap = captureStderr()
+    try {
+      assert.equal(__rtkRewriteForTests('ls', 't3'), 'rtk ls')
+      assert.equal(cap.lines.filter((l) => l.includes('rtk health probe failed')).length, 0)
+    } finally {
+      cap.restore()
+    }
+  })
+
+  it('missing rtk（二进制缺失）→ 静默透传，不告警', () => {
+    const { exec } = mockRtkExec({ throwAll: true })
+    __setRtkExecForTests(exec)
+    const cap = captureStderr()
+    try {
+      assert.equal(__rtkRewriteForTests('ls -la', 't4'), 'ls -la')
+      assert.equal(cap.lines.filter((l) => l.includes('rtk')).length, 0, '未安装 rtk 的机器不受打扰')
+    } finally {
+      cap.restore()
+    }
+  })
+
+  it('RIVET_RTK=0 → 不探针直接停用，零 exec 调用', () => {
+    savedRtkEnv = process.env.RIVET_RTK
+    process.env.RIVET_RTK = '0'
+    const { exec, calls } = mockRtkExec({ lsOutput: 'rivet-rtk-marker\n' })
+    __setRtkExecForTests(exec)
+    const cap = captureStderr()
+    try {
+      assert.equal(__rtkRewriteForTests('ls -la', 't5'), 'ls -la')
+      assert.equal(calls.length, 0, 'kill switch 下连探针都不发')
+      assert.equal(cap.lines.filter((l) => l.includes('rtk health probe failed')).length, 0)
+    } finally {
+      cap.restore()
+    }
+  })
+})
+
+describe('buildAssemblyFailureResult（结果装配兜底）', () => {
+  it('含根因/退出码/输出尾部，且明确不是命令本身的失败', () => {
+    const r = buildAssemblyFailureResult('isTestRunCommand is not defined', 0, 'partial output here')
+    assert.equal(r.isError, true)
+    assert.match(r.content, /结果装配失败/)
+    assert.match(r.content, /isTestRunCommand is not defined/)
+    assert.match(r.content, /exit=0/)
+    assert.match(r.content, /partial output here/)
+    assert.match(r.content, /不是命令失败/, '不得伪装成命令本身的失败')
+  })
+
+  it('无输出时显式标注 (no output)', () => {
+    const r = buildAssemblyFailureResult('boom', 1, '')
+    assert.match(r.content, /\(no output\)/)
   })
 })
 

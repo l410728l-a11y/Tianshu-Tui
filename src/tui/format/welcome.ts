@@ -1,13 +1,18 @@
 /**
- * T9 格式化函数 — 首屏欢迎（Claude Code v2 头部样式：3 行紧凑头）。
+ * T9 格式化函数 — 首屏欢迎（概念 A「启明」紧凑刊头，graphite 专业终端美学）。
  *
- * 渲染结构：
- *    ✦   Tianshu Code v2.15.1
- *        deepseek-v4 · auto-safe
- *        ~/app/deepseek-tui/opencode-tui
+ * 渲染结构（6 行含呼吸空行）：
+ *    ✦  天枢 Tianshu Code                          v2.19.3
+ *       ────────────────────────────────────────────────
+ *       deepseek-v4 · ◎high · auto-safe
+ *       ~/app/deepseek-tui/opencode-tui · #7281
  *
- * 无边框、无大字 logo、无快捷键矩阵——欢迎屏只回答三个问题：
- * 这是什么（品牌+版本）、现在什么配置（模型+权限）、在哪里（cwd）。
+ * 设计纪律（Apple Design 转译）：
+ * - 单一 accent：冰青只落在品牌星与 effort glyph，其余全部灰阶；
+ *   层级靠字重（bold/regular/dim）而非颜色数量。
+ * - 刊头线 `─` 用 pulseQuiet（最暗结构色），chrome 后退、内容前进。
+ * - 版本号右对齐形成刊头右栏；窄终端自动并入品牌行（无右栏）。
+ * - 行数纪律：≤6 行；矮终端 / 恢复会话 / 窄终端走 compact 单行降级。
  */
 
 import { homedir } from 'node:os'
@@ -38,9 +43,12 @@ export interface FormatWelcomeInput {
   reasoningEffort?: string
 }
 
-/** 3 行头 + 前后空行 2 行 + 输入框 3 行 + 终端底部状态栏/呼吸余量 ~2 行。 */
-const BANNER_ROWS = 5
+/** 刊头 4 行内容 + 前后空行 2 行；输入框 3 行 + 底部状态栏/呼吸余量 ~2 行。 */
+const BANNER_ROWS = 6
 const RESERVED_ROWS = 5
+
+/** 刊头线最大列数——超过则在右侧留白，不让 chrome 铺满整行（后退原则）。 */
+const RULE_MAX = 72
 
 function truncateToWidth(text: string, maxWidth: number): string {
   const ellW = displayWidth('…', WIDE)
@@ -83,36 +91,51 @@ export function formatWelcome(input: FormatWelcomeInput, theme: RivetTheme): str
     return [compactLine()]
   }
 
-  // 高度自适应：极矮终端（放不下 3 行头 + 输入框）退单行。
+  // 高度自适应：极矮终端（放不下刊头 + 输入框）退单行。
   const rows = input.rows && input.rows > 0 ? input.rows : Number.POSITIVE_INFINITY
   if (rows < BANNER_ROWS + RESERVED_ROWS) {
     return [compactLine()]
   }
 
-  // ── CC 头式 3 行 ──────────────────────────────────────────────
-  // 左列：单颗启明星（只在第一行），下两行按其显示宽度留白对齐。
-  const prefix = ' ✦   '
-  const indent = ' '.repeat(displayWidth(prefix, WIDE))
-  const star = ` ${color('✦', theme.primary, { bold: true })}   `
+  // ── 「启明」刊头 ────────────────────────────────────────────────
+  // 左列：单颗启明星（只在第一行），下行按其显示宽度留白对齐。
+  const prefixPlain = '  ✦  '
+  const indent = ' '.repeat(displayWidth(prefixPlain, WIDE))
+  const star = `  ${color('✦', theme.primary, { bold: true })}  `
 
-  const brand = color('Tianshu Code', theme.primary, { bold: true })
-  const version = input.version ? ` ${color(`v${input.version}`, theme.muted)}` : ''
+  // L1 刊头行：品牌（亮白 bold 中文 + muted 英文）+ 版本号右对齐右栏。
+  const brand = `${color('天枢', theme.userColor, { bold: true })} ${color('Tianshu Code', theme.muted)}`
+  const brandPlainW = displayWidth(`${prefixPlain}天枢 Tianshu Code`, WIDE)
+  let headLine: string
+  if (input.version) {
+    const versionText = color(`v${input.version}`, theme.dim)
+    const pad = cols - brandPlainW - displayWidth(`v${input.version}`, WIDE)
+    // 右栏至少留 2 列间隔才成立，否则并入品牌行（窄终端降级）。
+    headLine = pad >= 2
+      ? `${star}${brand}${' '.repeat(pad)}${versionText}`
+      : `${star}${brand} ${versionText}`
+  } else {
+    headLine = `${star}${brand}`
+  }
 
-  // 权限模式短标签——与输入框下方权限行同一口径（yolo 而非全称）。
+  // L2 刊头线：pulseQuiet（最暗结构色），长度封顶 RULE_MAX，chrome 后退。
+  const ruleLen = Math.max(0, Math.min(cols - indent.length, RULE_MAX))
+  const rule = `${indent}${color('─'.repeat(ruleLen), theme.pulseQuiet)}`
+
+  // L3 配置行：模型 + effort + 权限模式（短标签，与输入框下方权限行同口径）。
   const modeLabel = input.approvalMode === 'dangerously-skip-permissions' ? 'yolo' : input.approvalMode
   const modeSuffix = modeLabel
     ? ` ${color('·', theme.dim)} ${color(modeLabel, theme.muted)}`
     : ''
+  const configLine = `${indent}${color(input.modelName, theme.muted)}${effortLabel}${modeSuffix}`
+
+  // L4 位置行：cwd（~ 缩写）+ 会话标识（有 numericId 用友好的 #id，否则 session 前缀）。
+  const idLabel = input.numericId ? `#${input.numericId}` : session
+  const placeLine = `${indent}${color(tildify(input.cwd), theme.muted)} ${color('·', theme.dim)} ${color(idLabel, theme.dim)}`
 
   // 前后各留一行呼吸空行：欢迎块上贴启动日志、下贴历史会话提示/输入框时
   // 不至于挤成一坨（压抑感的主要来源）。
-  const out: string[] = [
-    '',
-    `${star}${brand}${version}`,
-    `${indent}${color(input.modelName, theme.secondary)}${effortLabel}${modeSuffix}`,
-    `${indent}${color(session, theme.dim)} ${color('·', theme.dim)} ${color(tildify(input.cwd), theme.muted)}`,
-    '',
-  ]
+  const out: string[] = ['', headLine, rule, configLine, placeLine, '']
 
   return out.map(line => truncateToWidth(line, cols))
 }

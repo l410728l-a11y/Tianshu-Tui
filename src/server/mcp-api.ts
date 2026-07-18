@@ -19,6 +19,7 @@ import type { Tool } from '../tools/types.js'
 import { findMcpOAuthProvider } from '../mcp/oauth/providers.js'
 import { startMcpOAuth, loadMcpOAuthToken, revokeMcpOAuth } from '../mcp/oauth/connector.js'
 import type { McpOAuthToken } from '../mcp/oauth/types.js'
+import { isAbsolute } from 'node:path'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
@@ -122,6 +123,17 @@ export function buildMcpRoutes(
       const parsed = mcpServerConfigSchema.safeParse(configInput)
       if (!parsed.success) {
         return { status: 400, body: { error: parsed.error.issues.map(i => i.message).join('; ') } }
+      }
+
+      // cwd must be absolute. The sidecar's working directory is not stable
+      // (packaged desktop ≠ repo root), so a relative cwd resolves to an
+      // unpredictable location — same bug class as the plugin-install path.
+      // Route-level (not schema-level) so CLI config files keep relative cwd.
+      if (parsed.data.cwd && !isAbsolute(parsed.data.cwd)) {
+        return {
+          status: 400,
+          body: { error: `cwd must be an absolute path (got "${parsed.data.cwd}") — the sidecar working directory is not fixed, so a relative cwd would resolve unpredictably.` },
+        }
       }
 
       const servers = cloneMcpServers()

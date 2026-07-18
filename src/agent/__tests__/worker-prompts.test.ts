@@ -35,6 +35,26 @@ describe('worker prompts', () => {
     assert.ok(prompt.includes('Do not call disallowed tools'))
   })
 
+  // 廉价模型（LongCat/MiMo 一类）常在 JSON 字符串值里写未转义的裸双引号，
+  // 导致整份报告 JSON.parse 失败、只能 salvage 部分字段（见 docs/analysis/
+  // 2026-07-17-worker-batch-0-salvage-incident.md）。首次输出路径必须有明文
+  // 转义纪律，不能只在 repair 路径补。
+  it('includes JSON string-escape discipline in the first-output prompt', () => {
+    const order = createReadOnlyWorkOrder({
+      id: 'wo_esc',
+      parentTurnId: 'turn_1',
+      kind: 'code_search',
+      profile: 'code_scout',
+      objective: 'Find routing seams.',
+      scope: { files: ['src/main.tsx'] },
+    })
+    const prompt = buildWorkerPrompt(order)
+    assert.ok(prompt.includes('JSON string discipline'), 'escape discipline heading present')
+    assert.ok(prompt.includes('Escape any double-quote inside a string'), 'specific escape rule')
+    assert.ok(prompt.includes('summary, findings[].claim/evidence, and artifacts[].content'),
+      'discipline names the fields most prone to bare quotes')
+  })
+
   // 天枢 agent 的默认项目约定文件是 .rivet.md / AGENTS.md——worker 的发现引导
   // 不指向其他工具的记忆文件（CLAUDE.md 曾在此处被引用，误导 worker 采信外部记忆）。
   it('project discovery points workers at rivet defaults, not other tools\' memory files', () => {

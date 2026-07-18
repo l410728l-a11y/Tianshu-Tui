@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatTaskList } from '../format/task-list.js'
+import { formatTaskList, shouldShowTaskPanel } from '../format/task-list.js'
 import { getTheme } from '../theme.js'
 import { displayWidth } from '../width.js'
 import type { TodoItem } from '../../tools/todo-store.js'
@@ -100,12 +100,12 @@ describe('formatTaskList', () => {
   it('truncates CJK content by display width, not code-unit length', () => {
     // 旧实现用 .length 截断：30 个 CJK 字符 length=30 但实际占 60 列，width=40 时不触发
     // 截断 → 单行任务溢出终端宽度折行 → rowsForLine 低估 → chrome 残留重影。
-    // 新实现按显示宽度截断：每 CJK 字符 2 列，30 字 = 60 列 > 36（width-4）→ 截断。
+    // 新实现按显示宽度截断：每 CJK 字符 2 列，30 字 = 60 列 > 35（width-5 边距）→ 截断。
     const long = '重构'.repeat(15) // 30 个 CJK 字符
     const lines = formatTaskList([mk('1', long, 'pending')], theme, { width: 40 })
     const plain = stripAnsi(lines[1]!)
     assert.ok(plain.includes('…'), 'CJK 超宽应截断带省略号')
-    // 去掉 glyph(1) + 空格(1) 后，内容显示宽度应 ≤ width-4（maxContentWidth）
+    // 去掉 glyph(1) + 空格(1) 后，内容显示宽度应 ≤ width-5（maxContentWidth 含 1 列安全边距）
     assert.ok(displayWidth(plain, { ambiguousAsWide: true }) <= 40,
       `CJK 任务行显示宽度应 ≤ 40: ${displayWidth(plain, { ambiguousAsWide: true })}`)
   })
@@ -202,5 +202,28 @@ describe('formatTaskList', () => {
     assert.ok(header.includes('◇ 任务 (1/2)'), `compact header: ${header}`)
     assert.ok(!header.includes('█'), 'no filled progress cells')
     assert.ok(!header.includes('░'), 'no empty progress cells')
+  })
+})
+
+describe('shouldShowTaskPanel（run 结束隐藏门禁）', () => {
+  it('hides when idle and every item is completed', () => {
+    const items = [mk('1', 'a', 'completed'), mk('2', 'b', 'completed')]
+    assert.equal(shouldShowTaskPanel(items, 'idle'), false)
+  })
+
+  it('shows while the run is active, even if all completed', () => {
+    const items = [mk('1', 'a', 'completed')]
+    assert.equal(shouldShowTaskPanel(items, 'streaming'), true)
+    assert.equal(shouldShowTaskPanel(items, 'tool'), true)
+  })
+
+  it('shows when items remain unfinished, even at idle', () => {
+    const items = [mk('1', 'a', 'completed'), mk('2', 'b', 'pending')]
+    assert.equal(shouldShowTaskPanel(items, 'idle'), true)
+  })
+
+  it('hides for an empty list', () => {
+    assert.equal(shouldShowTaskPanel([], 'idle'), false)
+    assert.equal(shouldShowTaskPanel([], 'streaming'), false)
   })
 })

@@ -1,10 +1,17 @@
 /**
  * GET /environment — host toolchain availability for the desktop setup UI.
- * Reports whether python, uv, git, node are installed, plus platform.
+ * Reports whether python, uv, git, node, java, maven, gradle are installed,
+ * plus platform, shell info, and PATH-recovery diff.
+ *
+ * Probes under the RESOLVED env (getResolvedEnv), not the raw process env —
+ * the GUI launch path on macOS/Windows often lacks /opt/homebrew/bin,
+ * %PROGRAMFILES%, etc., so raw-env probes would falsely report tools missing.
+ * This mirrors the CLI `/doctor` behavior (slash-commands.ts:950).
  */
 import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
 import { detectEnv, type PythonEnvInfo } from '../tools/env-check.js'
+import { getResolvedEnv, getResolvedPathDiff } from '../tools/resolved-env.js'
 import { getShellDiagnostics } from '../platform.js'
 import { execSync } from 'node:child_process'
 
@@ -14,14 +21,24 @@ export function buildEnvRoute(apiToken?: string): Record<string, RouteHandler> {
       if (!isAuthorizedRequest({ body, headers }, apiToken)) {
         return { status: 401, body: { error: 'Unauthorized' } }
       }
-      const env = await detectEnv()
+      const resolved = getResolvedEnv()
+      const env = await detectEnv(undefined, resolved)
       const diag = getShellDiagnostics()
       env.shell = {
         kind: diag.kind,
         gitBashAvailable: diag.gitBashPath !== null,
         ...(diag.fallbackReason ? { fallbackReason: diag.fallbackReason } : {}),
       }
-      return { status: 200, body: env as PythonEnvInfo }
+      // PATH-recovery diff: dirs the resolver added beyond the raw process PATH.
+      // Helps users understand why a tool is/isn't found under GUI launch.
+      const added = getResolvedPathDiff().added
+      return {
+        status: 200,
+        body: {
+          ...env,
+          ...(added.length > 0 ? { pathDiff: added } : {}),
+        } as PythonEnvInfo & { pathDiff?: string[] },
+      }
     },
 
     'POST /config/fix-autocrlf': withAuthPost((_body, _params, _headers) => {

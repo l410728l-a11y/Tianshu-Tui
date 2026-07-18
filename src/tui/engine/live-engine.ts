@@ -34,6 +34,13 @@ export interface LiveEngineOptions {
   reservedRows?: number
   /** 最大 live region 行数（安全上限，防止意外超屏） */
   maxRows?: number
+  /**
+   * CPR 探针请求回调（通常写 `\x1B[6n` 到 stdout）。响应经 stdin 回到
+   * InputHandler，再喂给 {@link LiveEngine.noteCpr}。提供后启用外来写入检测。
+   */
+  onProbeRequest?: () => void
+  /** 检测到 live region 被外来写入污染（光标偏离驻停点）时回调——调用方应重渲染。 */
+  onPolluted?: () => void
 }
 
 /**
@@ -106,6 +113,29 @@ export class LiveEngine {
    */
   private ambiguousWideCache: boolean | null = null
 
+  // ── CPR 自愈状态 ──────────────────────────────────────────────
+  // 渲染后光标应驻停在 live region 末行末尾。任何外来写入（其他进程写共享
+  // TTY、stderr 直写）会移动光标并撑高屏上区域，使 lastDisplayRows 失同步——
+  // 之后 cursorUp 回顶量不足，旧帧顶部残留进 scrollback（叠屏/重复帧）。
+  // 机制：渲染后（节流）发 CPR 探针记录驻停基线；后续探针响应偏离基线即判污染，
+  // 经 onPolluted 通知调用方重渲染，render 开头走恢复路径重锚。
+  private onProbeRequest?: () => void
+  private onPolluted?: () => void
+  /** 最近一次确认的驻停位置（CPR 响应，1-based）。null = 未建立基线。 */
+  private cprBaseline: { row: number; col: number } | null = null
+  /** 已发出探针但未收到响应（带超时自愈，防终端不应答导致探针停摆）。 */
+  private cprProbePending = false
+  private lastCprProbeMs = 0
+  /** 污染标记：下一帧 render 跳过 H2 短路/diff，走恢复重铺。 */
+  private polluted = false
+  /** 最近一次探针响应的光标行（恢复路径的爬升上限——绝不爬出视口顶）。 */
+  private cprReportRow = 1
+
+  /** 探针最小间隔：渲染每帧都可能触发，防探针风暴。 */
+  private static readonly CPR_PROBE_MIN_INTERVAL_MS = 1000
+  /** 探针响应超时：超过即允许重发（兼容不应答 DSR 的环境）。 */
+  private static readonly CPR_PROBE_TIMEOUT_MS = 5000
+
   /** ambiguous 宽度模式（缓存 process.env 读取）。 */
   private ambiguousWide(): boolean {
     if (this.ambiguousWideCache === null) {
@@ -118,6 +148,75 @@ export class LiveEngine {
     this.stdout = options.stdout
     this.reservedRows = options.reservedRows ?? 2
     this.maxRows = options.maxRows ?? 20
+    this.onProbeRequest = options.onProbeRequest
+    this.onPolluted = options.onPolluted
+  }
+
+  // ── CPR 自愈 ──────────────────────────────────────────────────
+
+  /**
+   * 暂停 CPR 污染检测。overlay（picker/pager 等）激活期间光标在 alt screen，
+   * CPR 响应的位置不代表主屏 live region，若照常比对会误判污染并触发 renderLive
+   * 把主屏帧写进 alt screen（picker 残影泄漏回主会话的根因）。
+   * 调用方应在 overlay 激活时 suppress，退出时 resume（并作废基线等下一帧重建）。
+   */
+  private probeSuppressed = false
+
+  /** overlay 激活：暂停探针发送与污染判定。 */
+  suppressProbe(): void {
+    this.probeSuppressed = true
+    this.cprProbePending = false
+    this.cprBaseline = null
+  }
+
+  /** overlay 退出：恢复检测；基线作废，下一帧/探针重新建立，避免跨 alt screen 误判。 */
+  resumeProbe(): void {
+    this.probeSuppressed = false
+    this.cprBaseline = null
+  }
+
+  /**
+   * 请求发一次 CPR 探针（受节流与 pending 去重；无 onProbeRequest 时 no-op）。
+   * 调用点：render 结束（帧后驻停基线）+ 空闲期定时器（检出 idle 污染）。
+   * overlay 激活期间不发（见 suppressProbe）。
+   */
+  requestProbe(): void {
+    if (this.probeSuppressed) return
+    if (!this.onProbeRequest) return
+    const now = Date.now()
+    if (this.cprProbePending && now - this.lastCprProbeMs < LiveEngine.CPR_PROBE_TIMEOUT_MS) return
+    if (!this.cprProbePending && now - this.lastCprProbeMs < LiveEngine.CPR_PROBE_MIN_INTERVAL_MS) return
+    this.cprProbePending = true
+    this.lastCprProbeMs = now
+    this.onProbeRequest()
+  }
+
+  /**
+   * 喂入一条 CPR 响应（row/col 1-based，来自 InputHandler 的 onCpr）。
+   * 首个响应建立驻停基线；后续响应与基线比对——偏离说明光标被外来写入移动，
+   * 标记污染并回调 onPolluted（由调用方触发重渲染走恢复路径）。
+   */
+  noteCpr(row: number, col: number): void {
+    this.cprProbePending = false
+    // overlay 激活期间（alt screen）：光标位置不代表主屏 live region，
+    // 不判污染也不更新基线，避免退出后用跨 alt screen 的基线误判。
+    if (this.probeSuppressed) return
+    this.cprReportRow = row
+    // 区域未在屏上（clear/commit 途中）时只更新基线，不判污染。
+    if (!this.hasRendered || this.lastDisplayRows === 0) {
+      this.cprBaseline = { row, col }
+      return
+    }
+    if (!this.cprBaseline) {
+      this.cprBaseline = { row, col }
+      return
+    }
+    if (this.cprBaseline.row !== row || this.cprBaseline.col !== col) {
+      this.polluted = true
+      // 立即采纳新位置为基线：迟到的响应（渲染/commit 交错）不会造成持续误判。
+      this.cprBaseline = { row, col }
+      this.onPolluted?.()
+    }
   }
 
   /**
@@ -186,6 +285,34 @@ export class LiveEngine {
   render(lines: readonly LiveRegionLine[], opts?: { reservedTail?: number }): void {
     const bounded = this.applyRowBudget(lines, opts?.reservedTail)
 
+    // 恢复重铺：CPR 检出外来写入污染后，不再信任 lastDisplayRows 的屏上假设
+    // （H2 短路会被 lineCache 与屏上不符的内容欺骗，diff 会加剧错位）。
+    // 爬升量以「追踪行数」与「最近 CPR 报告行」双封顶——绝不爬出视口顶。
+    // 外来行撑高区域的行数不可知，顶部残留 ≤δ 行无法避免（相对寻址的固有限制），
+    // 但外来文本被擦除、帧重新锚定，后续帧恢复一致。
+    if (this.polluted) {
+      this.polluted = false
+      // resize 与污染判定常并发（reflow 移动光标即触发）：爬升前先按当前宽度从
+      // lineCache 重算屏上行数。否则 lastDisplayRows 仍是旧宽度计数，变窄 reflow
+      // 把区域撑高后爬升不足，旧帧顶部残留进 scrollback（resize 输入框叠屏）。
+      this.reconcileWidth()
+      const newDisplayRows = this.countDisplayRows(bounded)
+      if (this.hasRendered && this.lastDisplayRows > 0) {
+        const climb = Math.min(this.lastDisplayRows - 1, Math.max(0, this.cprReportRow - 1))
+        const body = (climb > 0 ? cursorUp(climb) : '') + '\r' + ANSI.ERASE_SCREEN_END + this.buildAppend(bounded)
+        this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + body + ANSI.END_SYNC)
+      } else {
+        this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + this.buildAppend(bounded) + ANSI.END_SYNC)
+      }
+      this.lastDisplayRows = newDisplayRows
+      this.lineCache = bounded.map(l => l.text)
+      this.hasRendered = true
+      this.lastColumns = this.stdout.columns || 80
+      this.cprBaseline = null // 重锚完成，帧后探针重建基线
+      this.requestProbe()
+      return
+    }
+
     // H2 无变化短路：屏上 live region 内容与本帧逐行完全一致且终端宽度未变 →
     // 无需任何重绘（省去 diff 计算与 stdout 写入）。idle / ticker 空转的主要省功点。
     // 用 lineCache（屏上真实内容的权威记录）比对，天然兼容 clear/reset/overlay 退出：
@@ -217,6 +344,7 @@ export class LiveEngine {
       this.lastDisplayRows = newDisplayRows
       this.lineCache = bounded.map(l => l.text)
       this.hasRendered = true
+      this.requestProbe()
       return
     }
 
@@ -247,6 +375,7 @@ export class LiveEngine {
     this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + body + ANSI.END_SYNC)
     this.lastDisplayRows = newDisplayRows
     this.lineCache = bounded.map(l => l.text)
+    this.requestProbe()
   }
 
   /**
@@ -346,6 +475,8 @@ export class LiveEngine {
     this.stdout.write(ANSI.HIDE_CURSOR + this.moveToTop(this.lastDisplayRows) + '\r' + ANSI.ERASE_SCREEN_END)
     this.lastDisplayRows = 0
     this.lineCache = []
+    // 区域已离屏：污染标记随帧状态一起作废（noteCpr 此时只更新基线不判污染）。
+    this.polluted = false
   }
 
   /**

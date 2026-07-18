@@ -150,4 +150,28 @@ describe('V3 Component A — authority injection', () => {
       console.warn = origWarn
     }
   })
+
+  // 开阳（第十二域 · 对账者）：worker 提示词链路全流程——人格注入、权域指令、白名单交集。
+  test('buildWorkerPrompt injects kaiyang persona + suffix in order (你是谁 → 权域指令)', () => {
+    const order = readOnlyOrder({ authority: 'kaiyang' })
+    const prompt = buildWorkerPrompt(order)
+    const def = starDomainRegistry.get('kaiyang')!
+    assert.ok(prompt.includes(def.volatileBlock.slice(0, 20)), 'volatileBlock 人格注入')
+    assert.match(prompt, /## 你是谁/)
+    assert.match(prompt, /权域指令/)
+    assert.match(prompt, /双星互证/)
+    assert.match(prompt, /独立通道/)
+    assert.ok(prompt.indexOf('你是谁') < prompt.indexOf('权域指令'), '人格先于方法论（注意力权重序）')
+  })
+
+  test('toolWhitelist intersection: kaiyang read-only keeps read tools, write keeps write tools', () => {
+    const ro = readOnlyOrder({ authority: 'kaiyang' })
+    assert.ok(ro.allowedTools.includes('read_file'))
+    assert.ok(ro.allowedTools.includes('grep'))
+    assert.ok(ro.allowedTools.includes('glob'))
+    const wo = writeOrder({ authority: 'kaiyang' })
+    assert.ok(wo.allowedTools.includes('write_file'))
+    assert.ok(wo.allowedTools.includes('edit_file'))
+    assert.ok(wo.allowedTools.includes('bash'))
+  })
 })

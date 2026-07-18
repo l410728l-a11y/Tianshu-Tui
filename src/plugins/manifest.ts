@@ -38,6 +38,21 @@ export type Permissions = z.infer<typeof permissionsSchema>
 
 // ── Manifest ───────────────────────────────────────────────────────
 
+/** Hook events a plugin can bind. MUST stay in sync with VALID_EVENTS in
+ *  src/hooks/user-hooks-runner.ts — duplicated here to avoid the plugins layer
+ *  importing from the hooks layer (keeps the schema self-contained + testable). */
+export const PLUGIN_HOOK_EVENTS = ['preTurn', 'postTurn', 'postTool', 'postSession', 'onError'] as const
+export type PluginHookEvent = typeof PLUGIN_HOOK_EVENTS[number]
+
+/** A single hook declared in the manifest. `script` is a path relative to the
+ *  plugin root (resolved to absolute by plugin-loader). */
+export const pluginHookSchema = z.object({
+  event: z.enum(PLUGIN_HOOK_EVENTS),
+  script: z.string().min(1),
+  timeoutMs: z.number().int().positive().optional(),
+})
+export type PluginHookDeclaration = z.infer<typeof pluginHookSchema>
+
 export const pluginManifestSchema = z.object({
   /** Unique plugin id (npm package name convention). */
   name: z.string().min(1).max(128),
@@ -54,6 +69,14 @@ export const pluginManifestSchema = z.object({
   permissions: permissionsSchema,
   /** Optional bundled skills — relative paths to directories containing SKILL.md. */
   skills: z.array(z.string().min(1)).optional(),
+  /** Optional bundled hooks — event-bound scripts relative to plugin root.
+   *  Resolved to absolute paths by plugin-loader; the user-hooks-runner merges
+   *  them with project-level .rivet/hooks.json at fire time. */
+  hooks: z.array(pluginHookSchema).optional(),
+  /** Optional bundled slash commands — relative paths to .md files or
+   *  directories under the plugin root. Loaded as /command-name prompts,
+   *  same shape as .rivet/commands/*.md. */
+  commands: z.array(z.string().min(1)).optional(),
   /** Minimum core version required (semver range, advisory only in v1). */
   minCoreVersion: z.string().optional(),
 })

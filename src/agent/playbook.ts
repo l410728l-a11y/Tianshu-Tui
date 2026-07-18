@@ -486,7 +486,8 @@ export function distillFromFailures(
       importance: 0.6,
       source: classifySource(representative),
       errorSignal: representative.error,
-      fixApproach: representative.hypothesis,
+      // fixApproach 曾取 representative.hypothesis——该字段生产路径零写入
+      //（恒 undefined），PAL 第四波删除后行为不变：失败蒸馏不产出修复方式。
     })
   }
 
@@ -502,7 +503,7 @@ export function distillFromFailures(
     if (group.length < 2) continue
     const first = group[0]!
 
-    const lesson = `当 ${errorKey}（出现 ${group.length} 次），根因大概率是 ${first.hypothesis ?? first.context}。检查 ${first.target ?? '相关文件'}。`
+    const lesson = `当 ${errorKey}（出现 ${group.length} 次），根因大概率是 ${first.context}。检查 ${first.target ?? '相关文件'}。`
     if (isDefensiveLesson(lesson)) continue
 
     const id = hashId(lesson)
@@ -520,7 +521,6 @@ export function distillFromFailures(
       importance: 0.6,
       source: classifySource(first),
       errorSignal: errorKey,
-      fixApproach: first.hypothesis,
     })
   }
 

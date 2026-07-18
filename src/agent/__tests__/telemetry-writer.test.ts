@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createTelemetryWriter, VITALS_LITE_KIND } from '../telemetry-writer.js'
+import { createTelemetryWriter, VITALS_LITE_KIND, COGNITIVE_FRAME_LITE_KIND } from '../telemetry-writer.js'
 import type { PerceptionTelemetrySnapshot } from '../perception.js'
 import { buildTelemetrySnapshot } from '../perception.js'
 
@@ -160,6 +160,22 @@ describe('createTelemetryWriter — lite mode (W5)', () => {
       const raw = readFileSync(join(dir, '.rivet', 'sensorium.jsonl'), 'utf-8')
       const lines = raw.trim().split('\n').map(line => JSON.parse(line) as { kind?: string })
       assert.deepEqual(lines.map(line => line.kind), ['perf-summary'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('P3：cognitive-frame-lite 默认落盘，cognitive-frame 全量记录仍被过滤', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-telemetry-cogframe-'))
+    try {
+      const writer = createTelemetryWriter(dir)
+      writer.write({ kind: COGNITIVE_FRAME_LITE_KIND, v: 1, turn: 4, fp: 'abc', mode: 'flow', relax: 0.25, lvl: 0, abort: null, q: 'mmmmmmmm' })
+      writer.write({ kind: 'cognitive-frame', v: 1, turn: 4 }) // full 记录——lite 模式必须丢弃
+      await writer.flush()
+
+      const raw = readFileSync(join(dir, '.rivet', 'sensorium.jsonl'), 'utf-8')
+      const lines = raw.trim().split('\n').map(line => JSON.parse(line) as { kind?: string })
+      assert.deepEqual(lines.map(line => line.kind), [COGNITIVE_FRAME_LITE_KIND])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

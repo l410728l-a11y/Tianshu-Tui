@@ -298,6 +298,7 @@ export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string, op
     'Return exactly one JSON object and no prose outside the object.',
     'The JSON object must match this shape:',
     resultShape,
+    'JSON string discipline: every string value MUST be valid JSON. Escape any double-quote inside a string as \\", escape newlines as \\\\n, and escape backslashes as \\\\\\. Never put a raw unescaped " inside a string value — common offenders are summary, findings[].claim/evidence, and artifacts[].content (e.g. when quoting code, paths, or emphasizing a term). If you want to quote or emphasize something inside a string, use single quotes, backticks, or Chinese quotes 「」 instead of a bare ". A single unescaped " breaks the whole report and forces the caller to salvage individual fields.',
   )
 
   if (effectiveSuffix) {

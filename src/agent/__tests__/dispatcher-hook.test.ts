@@ -139,7 +139,8 @@ describe('createDispatcherHook (delegation advisor)', () => {
     assert.equal(entries.length, 1)
     // tests task depends on the backend source task → arrow notation
     // (C2: each subtask now also carries its authority inline)
-    assert.match(entries[0]!.content, /tests\(authority:[a-z]+\)←\[backend\]/)
+    // Optional｜reason suffix after authority id (Wave: authority routing explicit)
+    assert.match(entries[0]!.content, /tests\(authority:[a-z]+(?:｜[^)]*)?\)←\[backend\]/)
   })
 
   it('C2: advisory carries per-task authority (default tianliang) and tells the model to pass it', async () => {
@@ -151,9 +152,27 @@ describe('createDispatcherHook (delegation advisor)', () => {
     assert.equal(entries.length, 1)
     const content = entries[0]!.content
     // decomposeByDataContract falls back to tianliang when no domain keyword matches.
-    assert.match(content, /\(authority:[a-z]+\)/)
+    assert.match(content, /\(authority:[a-z]+(?:｜[^)]*)?\)/)
     assert.ok(content.includes('authority'), 'advisory 必须指示模型透传 authority')
     assert.ok(content.includes('星域人格'), 'advisory 说明 authority 的作用')
+  })
+
+  it('advisory includes authority reason without empty separators', async () => {
+    const { hook, ctx, entries } = runHook({
+      contract: makeContract({
+        objective: '重构优化性能并补测试',
+        scope: { mentionedFiles: ['src/agent/auth.ts', 'src/tui/login.tsx'] },
+      }),
+      sensorium: makeSensorium(0.5),
+    })
+    await hook.run(ctx)
+    assert.equal(entries.length, 1)
+    const content = entries[0]!.content
+    assert.ok(!content.includes('｜)'), 'no empty reason separator')
+    assert.ok(!content.includes('authority:)'), 'no empty authority')
+    // Per-domain objectives like "处理 backend 域: ..." often fall to 无关键词命中;
+    // the contract-level no-file path carries hit reasons — at least one reason marker present.
+    assert.match(content, /authority:[a-z]+｜/)
   })
 
   it('only advises once per contract', async () => {

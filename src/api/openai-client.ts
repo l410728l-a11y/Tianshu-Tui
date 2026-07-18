@@ -161,25 +161,25 @@ interface ToolCallChunk {
 }
 
 const FIRST_BYTE_TIMEOUT_MS = 45_000
-const REASONING_FIRST_BYTE_TIMEOUT_MS = 90_000
+export const REASONING_FIRST_BYTE_TIMEOUT_MS = 90_000
 const READ_TIMEOUT_MS = 120_000
 const REASONING_READ_TIMEOUT_MS = 180_000
 // GLM-5.1, Mimo, and DeepSeek (max reasoning) mandatory thinking can take 2-3
 // minutes before first token. Use generous timeouts to avoid false-positive errors.
-const SLOW_FIRST_BYTE_TIMEOUT_MS = 180_000
+export const SLOW_FIRST_BYTE_TIMEOUT_MS = 180_000
 const SLOW_READ_TIMEOUT_MS = 300_000
 // Size-scaled first-byte budget (B): a large cold-context prefill legitimately
 // needs longer before the first token arrives. On top of the derived/configured
 // base first-byte timeout, add PER_100K per 100k estimated input tokens, capped
 // by MAX (kept below the 10min base hard cap and retry budget). Pre-first-chunk
 // only — read timeout and thinking-stall detection are unchanged.
-const FIRST_BYTE_PER_100K_MS = 60_000
+export const FIRST_BYTE_PER_100K_MS = 60_000
 const FIRST_BYTE_MAX_MS = 420_000
 // GLM-5.2 reasoning_effort=max: 服务端完整推理阶段可能 5min+ 不发 token，
 // 300s read timeout 会误杀。单独给到 720s（12min 硬顶兜底 runaway）。
 const GLM_READ_TIMEOUT_MS = 720_000
 /** Providers whose thinking mode can exceed 90s before first token. */
-const SLOW_THINKING_PROVIDERS = new Set(['glm', 'mimo', 'deepseek', 'codex', 'minimax'])
+export const SLOW_THINKING_PROVIDERS = new Set(['glm', 'mimo', 'deepseek', 'codex', 'minimax'])
 /**
  * Per-process cap on the always-on tool-stream event log (logToolStreamEvent).
  * These events fire only on rare streaming pathologies (ambiguous continuation

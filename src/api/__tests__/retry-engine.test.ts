@@ -142,7 +142,7 @@ describe('withStructuredRetry', () => {
     )
   })
 
-  it('should NOT retry 413 context overflow errors', async () => {
+  it('should retry 413 image_strip once, then fail', async () => {
     let calls = 0
     const fn = async (): Promise<string> => {
       calls++
@@ -152,7 +152,8 @@ describe('withStructuredRetry', () => {
       () => withStructuredRetry(fn),
       (err: unknown) => {
         assert.ok(err instanceof FakeApiError)
-        assert.equal(calls, 1)
+        // 413 is now retryable (image_strip) with maxRetries=1, so 2 total calls
+        assert.equal(calls, 2)
         return true
       },
     )

@@ -325,3 +325,48 @@ describe('InputHandler · Shift+Tab and Alt+letter (领航星 2026-06-28)', () =
     handler.dispose()
   })
 })
+
+describe('InputHandler · CPR（cursor position report）通道', () => {
+  it('\\x1B[{row};{col}R 路由给 onCpr，不产生按键', () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin })
+    const keys: KeyPress[] = []
+    const reports: Array<[number, number]> = []
+    handler.onAnyKey((k) => { keys.push(k) })
+    handler.onCpr((row, col) => { reports.push([row, col]) })
+
+    stdin.emitData('\x1B[24;80R')
+    assert.deepEqual(reports, [[24, 80]])
+    assert.equal(keys.length, 0, 'CPR 不应作为按键派发')
+    handler.dispose()
+  })
+
+  it('跨 chunk 拆分的 CPR 序列缓冲后完整解析', () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin })
+    const reports: Array<[number, number]> = []
+    handler.onCpr((row, col) => { reports.push([row, col]) })
+
+    stdin.emitData('\x1B[24;')
+    assert.equal(reports.length, 0, '未完整序列不应提前解析')
+    stdin.emitData('8R')
+    assert.deepEqual(reports, [[24, 8]])
+    handler.dispose()
+  })
+
+  it('夹在按键流中的 CPR 只消费不派发，前后按键不受影响', () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin })
+    const keys: KeyPress[] = []
+    const reports: Array<[number, number]> = []
+    handler.onAnyKey((k) => { keys.push(k) })
+    handler.onCpr((row, col) => { reports.push([row, col]) })
+
+    stdin.emitData('a\x1B[10;5Rb')
+    assert.deepEqual(reports, [[10, 5]])
+    assert.equal(keys.length, 2)
+    assert.equal(keys[0]!.char, 'a')
+    assert.equal(keys[1]!.char, 'b')
+    handler.dispose()
+  })
+})

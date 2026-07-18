@@ -374,6 +374,37 @@ const COBALT: ThemePaletteDef = {
   fallbackOverrides: { userColor: 'white', assistantColor: 'white', muted: 'gray' },
 }
 
+// ── Graphite — 石墨·冰青（专业默认）─────────────────────────────────
+// Apple 式专业终端美学：中性石墨灰阶承载内容，单一冰青 accent 只落在品牌星、
+// 光标与关键动作上；语义色统一降饱和防 Neon 疲劳。层级靠字重与明度梯度，
+// 不靠颜色数量——为长时间编码的低视觉疲劳而调。
+const GRAPHITE: ThemePaletteDef = {
+  background: 'dark',
+  description: '石墨冰青 (专业默认)。中性灰阶 + 单一冰青 accent，低饱和语义色，长时间编码不疲劳。',
+  truecolor: {
+    primary: '#7cc4e8',   // 冰青 accent — 品牌星 / 光标 / 关键动作
+    secondary: '#8b98ab', // 钢灰蓝 — 次级结构
+    success: '#7fbf8e',   // 鼠尾草绿
+    warning: '#d9b36c',   // 哑琥珀
+    error: '#e07a6f',     // 软珊瑚红（非纯红防光晕）
+    dim: '#78828f',       // 结构灰
+    pulseQuiet: '#2f3540',
+    pulseActive: '#7cc4e8',
+    pulseAlert: '#e07a6f',
+    toolShell: '#7ba7c9',
+    toolEdit: '#8b98ab',
+    toolTest: '#7fbf8e',
+    toolDelegate: '#d9b36c',
+  },
+  // userColor 亮白 / assistantColor 中性灰：靠 ▌+bold 与灰度区分说话人，不引入第二彩色。
+  overrides: { userColor: '#eef1f5', assistantColor: '#c8cdd6', muted: '#9aa4b0', systemColor: '#8b95a1' },
+  fallback: {
+    primary: 'cyan', secondary: 'blue', success: 'green', warning: 'yellow',
+    error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'cyan', pulseAlert: 'red',
+  },
+  fallbackOverrides: { userColor: 'white', assistantColor: 'white', muted: 'gray' },
+}
+
 // ── Gemini — Indigo, Purple & Mint Teal ───────────────────────────
 const GEMINI: ThemePaletteDef = {
   background: 'dark',
@@ -473,6 +504,7 @@ export const THEME_PALETTES = {
   dawn: DAWN,
   antigravity: ANTIGRAVITY,
   cobalt: COBALT,
+  graphite: GRAPHITE,
   gemini: GEMINI,
   paper: PAPER,
   'light-ansi': LIGHT_ANSI,

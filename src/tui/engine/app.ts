@@ -14,6 +14,7 @@
 import type { WriteStream, ReadStream } from 'node:tty'
 import { CommitEngine } from './commit-engine.js'
 import { LiveEngine, padDynamicRegion, type LiveRegionLine } from './live-engine.js'
+import { installOutputGuard, type OutputGuard } from './output-guard.js'
 import { OverlayEngine } from './overlay-engine.js'
 import { InputHandler, type KeyPress } from './input-handler.js'
 import { ResizeHandler } from './resize-handler.js'
@@ -28,7 +29,7 @@ import { ApprovalIntentController } from './approval-intent-controller.js'
 import { MetricsGlanceController } from './metrics-glance-controller.js'
 import { StreamRenderController } from './stream-render-controller.js'
 import { InputController } from './input-controller.js'
-import { ANSI, color, fg, bg } from './ansi.js'
+import { ANSI, color, fg, bg, QUERY_CURSOR_POS } from './ansi.js'
 import { debugLog } from '../../utils/debug.js'
 import { BlockStreamWriter } from '../block-stream-writer.js'
 import { SteerBuffer } from '../steer-buffer.js'
@@ -42,9 +43,9 @@ import { formatCollapsedBashGroup, formatCollapsedBashGroupLive, isCollapsibleBa
 import { formatPermissionDiff } from '../format/permission-diff.js'
 import { formatApprovalPrompt } from '../format/approval-renderers.js'
 import { formatThinking } from '../format/thinking.js'
-import { formatGlanceBar, resolveStarDomainDisplay, resolveStarDomainAccent, formatGlanceLeft, formatGlanceRight, formatPermissionModeLine } from '../format/glance-bar.js'
+import { formatGlanceBar, resolveStarDomainDisplay, formatGlanceLeft, formatGlanceRight, formatPermissionModeLine } from '../format/glance-bar.js'
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
-import { formatTaskList } from '../format/task-list.js'
+import { formatTaskList, shouldShowTaskPanel } from '../format/task-list.js'
 import type { TodoItem } from '../../tools/todo-store.js'
 import { formatTeamPanel } from '../format/team-panel.js'
 import { formatWorkerFleet } from '../format/worker-fleet.js'
@@ -71,6 +72,7 @@ import { extractAtToken, getCompletions, applyCompletion } from '../file-complet
 import stringWidth from 'string-width'
 import { resolve } from 'node:path'
 import { truncateToDisplayWidth, displayWidth, ambiguousWideEnabled } from '../width.js'
+import { useAsciiBorders } from '../term-caps.js'
 import { appendHistoryAsync, nextHistoryAfterSubmit } from '../history.js'
 import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, renderTasks, renderDomainPicker, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect } from '../format/overlay.js'
 import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData } from '../format/overlay.js'
@@ -185,10 +187,21 @@ const INPUT_BOX_CHARS = {
   thin:  { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', m: '┬' },
   thick: { tl: '┏', tr: '┓', bl: '┗', br: '┛', h: '━', v: '┃', m: '┳' },
   dots:  { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '┄', v: '┊', m: '┬' },
+  /**
+   * legacy conhost 降级档：GBK 点阵字体把框线字符按 2 列渲染（或缺字形出
+   * tofu），边框行实际宽度超过 cols → 折行 → LiveEngine 回顶欠擦 → 输入框
+   * 逐帧重影。ASCII 字符宽度确定为 1 列，任何字体/代码页下都不折行。
+   */
+  ascii: { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', m: '+' },
 } as const
 
-/** 按 separator 取线框字符集，未知 separator 回退到 thin。返回值确定非空。 */
-function boxCharsFor(separator: string): BoxCharSet {
+/**
+ * 按 separator 取线框字符集，未知 separator 回退到 thin。返回值确定非空。
+ * legacy conhost（useAsciiBorders）下无条件走 ascii 档——该开关进程内恒定
+ * （term-caps 缓存），getInputChrome 的 memo key 无需包含它。
+ */
+export function boxCharsFor(separator: string): BoxCharSet {
+  if (useAsciiBorders()) return INPUT_BOX_CHARS.ascii
   switch (separator) {
     case 'thick': return INPUT_BOX_CHARS.thick
     case 'dots': return INPUT_BOX_CHARS.dots
@@ -312,6 +325,10 @@ export class TuiApp {
   private input: InputHandler
   private resize: ResizeHandler
   private inputLine: InputLine
+  /** 空闲期 CPR 探针定时器（2s，unref'd）——idle 无 ticker，靠它检出外来写入污染。 */
+  private cprProbeTimer: ReturnType<typeof setInterval> | null = null
+  /** TUI 存活期 stderr 护栏（游离 stderr 文本走 commit 通道，防污染 live region）。 */
+  private outputGuard: OutputGuard | null = null
 
 
   // State
@@ -503,12 +520,25 @@ export class TuiApp {
 
     // Initialize engines
     this.commit = new CommitEngine({ stdout: options.stdout })
-    this.live = new LiveEngine({ stdout: options.stdout, reservedRows: 3, maxRows: liveMaxRowsFor(options.rows) })
+    this.live = new LiveEngine({
+      stdout: options.stdout,
+      reservedRows: 3,
+      maxRows: liveMaxRowsFor(options.rows),
+      // CPR 自愈：帧后/空闲探针经 stdout 发出，响应由 InputHandler 的 onCpr 喂回；
+      // 检出污染（外来写入移动光标）→ 重渲染走恢复路径重锚帧。
+      onProbeRequest: () => { options.stdout.write(QUERY_CURSOR_POS) },
+      onPolluted: () => { this.renderLive() },
+    })
     this.overlay = new OverlayEngine({
       stdout: options.stdout,
       getSize: () => ({ cols: this.columns, rows: this.rows }),
+      // alt screen 切换统一驱动 CPR 污染检测的暂停/恢复，覆盖所有 overlay
+      // 入口（含直接调 this.overlay.activate 的快捷键路径）。
+      onEnterAltScreen: () => this.live.suppressProbe(),
+      onExitAltScreen: () => this.live.resumeProbe(),
     })
     this.input = new InputHandler({ stdin: options.stdin, mode: 'input' })
+    this.input.onCpr((row, col) => this.live.noteCpr(row, col))
     this.resize = new ResizeHandler({ stdout: options.stdout })
     this.inputController.inputHistory = options.history ?? []
     this.inputLine = new InputLine({
@@ -1072,6 +1102,14 @@ export class TuiApp {
     // 会 moveToTop 到错误位置、把输入框顶进欢迎屏中段并丢掉输入行/底边框。reset() 令
     // 本帧当作全新首帧，在当前光标（欢迎屏正下方）干净 append。
     this.live.reset()
+    // stderr 护栏：TUI 存活期把游离 stderr 文本（LSP/typecheck 告警、unhandled
+    // rejection、第三方库）导入 commit 通道，防止直写 TTY 污染 live region。
+    this.outputGuard = installOutputGuard((text) => {
+      this.commitStatic(color(`⚠ ${text}`, this.theme.warning))
+    })
+    // 空闲期 CPR 探针：idle 无 ticker，2s 轮询光标驻停位置，检出外来写入后自愈。
+    this.cprProbeTimer = setInterval(() => this.live.requestProbe(), 2000)
+    this.cprProbeTimer.unref?.()
     this.renderLive()
   }
 
@@ -2256,6 +2294,13 @@ export class TuiApp {
       clearInterval(this.streamRenderController.ticker)
       this.streamRenderController.ticker = null
     }
+    if (this.cprProbeTimer) {
+      clearInterval(this.cprProbeTimer)
+      this.cprProbeTimer = null
+    }
+    // 先拆 stderr 护栏：dispose 期间的诊断直写真实 stderr（TUI 已退场，不再破坏布局）。
+    this.outputGuard?.dispose()
+    this.outputGuard = null
     // 关闭 bracketed paste，恢复终端默认；同时恢复硬件光标可见性。
     this.stdout.write('\x1B[?2004l')
     this.stdout.write(ANSI.SHOW_CURSOR)
@@ -3730,12 +3775,15 @@ export class TuiApp {
     //    不会裁掉任务面板与输入框。
     let chromeStart = lines.length
 
-    // 3b. 常驻任务面板（todo 列表）——空列表不渲染。宽屏时已由 side panel 承载。
-    if (!showSidePanel) {
+    // 3b. 常驻任务面板（todo 列表）——空列表不渲染；run 空闲且全部完成时隐藏
+    //    （shouldShowTaskPanel）。宽屏时已由 side panel 承载。
+    if (!showSidePanel && shouldShowTaskPanel(this.state.todos, this.state.phase)) {
       const taskLines = formatTaskList(this.state.todos, this.theme, { width: cols, maxRows: 6, showProgressBar: false })
       if (taskLines.length > 0) {
         lines.push({ text: '' })
-        for (const taskLine of taskLines) lines.push({ text: taskLine })
+        // 面板行走 clampLine（与其余 chrome 同口径）：满列行会在 CJK 终端折行，
+        // rowsForLine 少算导致旧帧残留被提交进 scrollback。
+        for (const taskLine of taskLines) lines.push({ text: this.clampLine(taskLine) })
         lines.push({ text: '' })
       }
     }
@@ -3762,10 +3810,12 @@ export class TuiApp {
       const isSlash = inputVal.startsWith('/') && !inputVal.includes('\n') && !looksLikeFilePath(inputVal, this.getCommandPredicate(), this.getCommandPrefixPredicate())
       const isStreaming = this.state.phase !== 'idle'
 
-      // Domain-accent border color: slash=primary, streaming=dim, else domain accent
+      // 边框三态：slash=primary（激活态）、streaming=pulseQuiet、静息=dim。
+      // chrome 后退但须可见——pulseQuiet 在深底上近乎隐形（实测回归），静息用
+      // 结构灰 dim 保持框线可读；星域个性由顶框标签的 glyph/名称色与 separator 承载。
       const borderColor = isSlash ? this.theme.primary
-        : isStreaming ? this.theme.dim
-        : resolveStarDomainAccent(this.state.domainName, this.theme)
+        : isStreaming ? this.theme.pulseQuiet
+        : this.theme.dim
 
       // 1. 获取当前生效星域的 Persona
       const activeDomainId = this.state.domainName ? Object.keys(STAR_DOMAINS).find(k => (STAR_DOMAINS as any)[k].name === this.state.domainName) : null
@@ -3807,45 +3857,35 @@ export class TuiApp {
         density: this.glanceDensity,
       }, this.theme)
 
-      // 用 wide 上界度量指标串宽度：CJK/Windows 终端把 East-Asian Ambiguous 符号
+      // 用 wide 上界度量标签串宽度：CJK/Windows 终端把 East-Asian Ambiguous 符号
       // （↑↓ · — … 等）按 2 列渲染。若按 narrow(string-width) 计算填充量，顶边框实际
       // 渲染宽度会超过 cols → 终端折行成 2 显示行，而 LiveEngine.rowsForLine 按 narrow
       // 数成 1 行 → 回顶欠擦（moveToTop/ERASE 少擦一行）→ 输入框重影/逐帧堆叠重复。
       // 按 wide 定尺后顶边框恒 ≤ cols，任何终端都占 1 显示行，行数估算与实际一致。
       const plainLeft = displayWidth(leftStr, { ambiguousAsWide: true })
-      const plainRight = displayWidth(rightStr, { ambiguousAsWide: true })
 
-      // 4. 计算并拼接一体化顶部边框：╭─ leftStr ─┬─ rightStr ─╮
+      // 4. 顶边框：╭─ leftStr ─────╮ —— 无 ┬ 交汇、无右侧 metrics（下移底部状态行）。
+      //    宽度恒 = innerWidth + 4，与输入行/底边框精确对齐（修复右角 1 列残缺）。
       const chars = boxCharsFor(uiSep)
-      let topBorder = ''
-      if (innerWidth < plainLeft + plainRight + 10) {
-        topBorder = color(`${chars.tl}${chars.h.repeat(innerWidth + 2)}${chars.tr}`, borderColor)
-      } else {
-        const lineRem = innerWidth - plainLeft - plainRight - 4 // 4 = label border paddings
-        const leftFill = Math.max(2, Math.floor(lineRem * 0.4))
-        const rightFill = Math.max(2, lineRem - leftFill)
-        
-        topBorder = color(chars.tl, borderColor) + 
-                    color(chars.h.repeat(2), borderColor) + 
-                    leftStr + 
-                    color(chars.h.repeat(leftFill), borderColor) + 
-                    color(chars.m, borderColor) + 
-                    color(chars.h.repeat(rightFill), borderColor) + 
-                    rightStr + 
-                    color(chars.h.repeat(2), borderColor) + 
-                    color(chars.tr, borderColor)
-      }
+      const labelFill = innerWidth - plainLeft - 1
+      const topBorder = labelFill < 2
+        ? color(`${chars.tl}${chars.h.repeat(innerWidth + 2)}${chars.tr}`, borderColor)
+        : color(`${chars.tl}${chars.h} `, borderColor)
+          + leftStr
+          + color(` ${chars.h.repeat(labelFill)}${chars.tr}`, borderColor)
 
       const MAX_INPUT_DISPLAY_LINES = 12
-      const arrowColor = '#3ba55c'  // 暗绿色，沉稳不刺眼
+      // 暗绿 + bold：用户验收过的提示符质感，与 primary 色光标块 █ 形成前后层次——
+      // graphite 单色纪律下保留的唯一例外（同色 ❯ 与光标块粘连、无辨识度）。
+      const arrowColor = '#3ba55c'
       const inputLines = this.inputLine.value
         ? this.inputLine.displayLines({ maxLines: MAX_INPUT_DISPLAY_LINES, maxWidth: innerWidth })
-        : [`${color('❯', arrowColor)} ${color('█', this.theme.primary)}${color(this.inputLine.placeholder, this.theme.dim)}`]
+        : [`${color('❯', arrowColor, { bold: true })} ${color('█', this.theme.primary)}${color(this.inputLine.placeholder, this.theme.dim)}`]
 
-      /** 着色输入行：光标行前缀 ❯ 涂暗绿，其余保持原样。
+      /** 着色输入行：光标行前缀 ❯ 涂暗绿 bold，其余保持原样。
        *  光标行已在 displayLines 内做了水平视窗截断，不再二次 truncateToWidth。 */
       const colorizeInputLine = (raw: string): string => {
-        if (raw.startsWith('❯ ')) return color('❯', arrowColor) + ' ' + raw.slice(2)
+        if (raw.startsWith('❯ ')) return color('❯', arrowColor, { bold: true }) + ' ' + raw.slice(2)
         return raw
       }
 
@@ -3869,10 +3909,23 @@ export class TuiApp {
         lines.push({ text: this.clampLine(color(imageLabel, this.theme.muted)) })
       }
 
-      // 5b. 权限模式行（CC parity：输入框正下方常驻，单一事实来源）。
-      //     slash 提示打开时让位，避免与候选列表叠在一起。
+      // 5b. 状态行：左 metrics（模型/effort/cache/ctx/耗时）+ 右权限模式（右对齐）——
+      //     顶框不再承载指标，收敛到输入框正下方这一行（权限行仍是单一事实来源）。
+      //     slash 提示打开时权限让位；整行放不下时权限独占下一行。
+      const permLine = formatPermissionModeLine({ approvalMode: this._approvalMode, planMode: planModeActive, askMode: askModeActive }, this.theme)
+      const permTrim = permLine.trimStart()
+      const metricsW = displayWidth(rightStr, { ambiguousAsWide: true })
+      const permW = displayWidth(permTrim, { ambiguousAsWide: true })
       if (!isSlash) {
-        lines.push({ text: this.clampLine(formatPermissionModeLine({ approvalMode: this._approvalMode, planMode: planModeActive, askMode: askModeActive }, this.theme)) })
+        const pad = cols - 1 - 2 - metricsW - permW
+        if (metricsW > 0 && pad >= 2) {
+          lines.push({ text: `  ${rightStr}${' '.repeat(pad)}${permTrim}` })
+        } else {
+          if (metricsW > 0) lines.push({ text: this.clampLine(`  ${rightStr}`) })
+          lines.push({ text: this.clampLine(permLine) })
+        }
+      } else if (metricsW > 0) {
+        lines.push({ text: this.clampLine(`  ${rightStr}`) })
       }
 
       // 5b. slash 命令提示（输入以 / 开头；支持 /skill <name> 等多 token 过滤）
@@ -3935,6 +3988,7 @@ export class TuiApp {
       const sidePanelInput: SidePanelInput = {
         columns: sidePanelWidth,
         todos: this.state.todos,
+        phase: this.state.phase,
         workers: this.fleet.getActiveWorkers(),
         currentTool,
         modelName: this.state.modelName,

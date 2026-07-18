@@ -10,7 +10,12 @@
 
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { WorkerLiveness, EXPLORE_STALL_MS, WRITE_STALL_MS } from '../worker-liveness.js'
+import { WorkerLiveness, EXPLORE_STALL_MS, WRITE_STALL_MS, deriveWorkerStallMs } from '../worker-liveness.js'
+import {
+  REASONING_FIRST_BYTE_TIMEOUT_MS,
+  SLOW_FIRST_BYTE_TIMEOUT_MS,
+  FIRST_BYTE_PER_100K_MS,
+} from '../../api/openai-client.js'
 import { DelegationCoordinator } from '../coordinator.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { ToolRegistry } from '../../tools/registry.js'
@@ -62,6 +67,47 @@ describe('worker liveness sweep', () => {
 
   it('write tolerance exceeds explore tolerance (edits pause longer)', () => {
     assert.ok(WRITE_STALL_MS > EXPLORE_STALL_MS)
+  })
+
+  it('tolerance() reports the per-id or default stall window', () => {
+    const live = new WorkerLiveness({ stallMs: 60_000, now: () => 0 })
+    assert.equal(live.tolerance('ghost'), undefined, 'untracked id')
+    live.register('a')
+    live.register('b', 120_000)
+    assert.equal(live.tolerance('a'), 60_000)
+    assert.equal(live.tolerance('b'), 120_000)
+  })
+})
+
+describe('deriveWorkerStallMs (provider-aware silence tolerance)', () => {
+  it('keeps the fixed base for non-thinking providers (fast kill for real deadlocks)', () => {
+    assert.equal(deriveWorkerStallMs({ providerName: 'openai', isWrite: false, thinking: false }), EXPLORE_STALL_MS)
+    assert.equal(deriveWorkerStallMs({ providerName: 'openai', isWrite: true, thinking: false }), WRITE_STALL_MS)
+  })
+
+  it('raises the floor past the API first-byte budget for thinking providers', () => {
+    // thinking 非 slow set（如 longcat）：90s 基础 + 3 桶规模余量 + 30s 重试窗口
+    const ms = deriveWorkerStallMs({ providerName: 'longcat', isWrite: false, thinking: true })
+    assert.equal(ms, REASONING_FIRST_BYTE_TIMEOUT_MS + 3 * FIRST_BYTE_PER_100K_MS + 30_000)
+    assert.ok(ms > EXPLORE_STALL_MS, `thinking floor must exceed the fixed 90s: ${ms}`)
+  })
+
+  it('slow-thinking providers get the widest leash', () => {
+    const ms = deriveWorkerStallMs({ providerName: 'deepseek', isWrite: false, thinking: true })
+    assert.equal(ms, SLOW_FIRST_BYTE_TIMEOUT_MS + 3 * FIRST_BYTE_PER_100K_MS + 30_000)
+    assert.ok(ms > deriveWorkerStallMs({ providerName: 'longcat', isWrite: false, thinking: true }))
+  })
+
+  it('covers the observed 351k-token scout case (2026-07-18 四 scout 齐死)', () => {
+    // 351k token LongCat thinking 请求的 API 首字节预算 = 90s + 3×60s = 270s；
+    // 静默下限必须严格大于它，否则 sweep 抢在 API 层自己的超时/重试前误杀。
+    const ms = deriveWorkerStallMs({ providerName: 'longcat', isWrite: false, thinking: true })
+    const apiFirstByteBudget = 90_000 + 3 * 60_000
+    assert.ok(ms > apiFirstByteBudget, `${ms} must exceed API first-byte budget ${apiFirstByteBudget}`)
+  })
+
+  it('thinking defaults to true (provider schema default) when unknown', () => {
+    assert.ok(deriveWorkerStallMs({ providerName: 'longcat', isWrite: false }) > EXPLORE_STALL_MS)
   })
 })
 

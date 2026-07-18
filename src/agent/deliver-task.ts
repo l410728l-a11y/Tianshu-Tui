@@ -22,7 +22,8 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { spawnGitSync } from '../tools/spawn-git.js'
 import { join, isAbsolute } from 'node:path'
-import type { Tool, ToolCallParams, ToolResult } from '../tools/types.js'
+import type { Tool, ToolCallParams, ToolResult, DelegationActivity } from '../tools/types.js'
+import { createDelegationActivityMapper } from '../tools/worker-activity-stream.js'
 import type { TaskLedger } from './task-ledger.js'
 import type { OwnershipLedger } from './ownership-ledger.js'
 import type { DeliveryGateV2 } from './delivery-gate-v2.js'
@@ -46,7 +47,9 @@ import { auditDeliveryClaims, claimAuditEnabled } from './claim-audit.js'
 import { scanFilesForProbes, formatProbeHits, type ProbeHit } from './probe-detector.js'
 import { findApprovedPlanInventory, verifyRegressionInventory, formatInventoryReport, type InventorySearcher } from './regression-inventory.js'
 import { enqueuePostCommitReviewOutcome } from './post-commit-review-queue.js'
+import { addPendingReviewFiles, consumePendingReview, __resetPostCommitReviewPending } from './post-commit-review-pending.js'
 import { isUiFilePath, isVisualVerifyTool } from './hooks/render-verify-hook.js'
+import { appendMemoryEntry, countSimilarMemoryEntries } from '../memory/unified-memory.js'
 
 export interface B1Context {
   taskLedger: TaskLedger
@@ -114,18 +117,43 @@ export interface B1Context {
   /** W1 回归防线: Meridian blast-radius tests (EvidenceTracker.impactedTests).
    *  Absent → coverage check disabled (unchanged behavior). */
   getImpactedTests?: () => string[]
+  /** P4 收束闸：PAL 收敛案件快照（bootstrap 闭包现读 store）。收敛假设的
+   *  targets 完全没进本次交付范围 → 弱 advisory 提示，绝不阻断。 */
+  getPalConvergedCases?: () => import('./problem-attack-loop.js').ConvergedCaseEntry[]
+  /** 遗产回收 W-A1：PAL needs_user 案件快照（minimalQuestion 由 store 预计算）。
+   *  交付时卡在等用户裁决的案件必须披露为遗留项 → 弱 advisory，绝不阻断。 */
+  getPalNeedsUserCases?: () => Array<{ caseId: string; problem: string; minimalQuestion: string }>
 }
 
 // ── Post-commit review batching ──
 // When multiple deliver_task commits fire in quick succession (e.g. splitting
 // a large changeset into area-scoped commits), each would trigger a separate
 // review worker — wasteful when one review can cover the whole session's work.
-// Cooldown: after a review launches, skip subsequent launches within this window.
+// Two layers of batching:
+// 1. Cooldown: after a review launches, skip subsequent launches within this
+//    window — but RECORD the commit scope into post-commit-review-pending so
+//    the next launched review covers it (previously it went unreviewed).
+// 2. In-flight singleton: at most one system-triggered review worker at a
+//    time. Commits arriving while one runs (e.g. a git-lock retry landing
+//    40s later, inside the 180s review budget) merge into the pending scope
+//    instead of spawning an overlapping worker; the in-flight review's
+//    completion chains ONE follow-up review over the accumulated scope.
 const POST_COMMIT_REVIEW_COOLDOWN_MS = 30_000
 let lastPostCommitReviewAt = 0
+let postCommitReviewInFlight = false
 
-/** Test-only: reset the module-level cooldown so it does not leak across cases. */
+/** Test-only: reset the module-level batching state (cooldown, in-flight
+ *  flag, pending scope) so it does not leak across cases. */
 export function resetPostCommitReviewCooldown(): void {
+  lastPostCommitReviewAt = 0
+  postCommitReviewInFlight = false
+  __resetPostCommitReviewPending()
+}
+
+/** Test-only: expire ONLY the time cooldown, keeping the in-flight flag and
+ *  pending scope — needed to exercise the in-flight merge branch (a commit
+ *  landing >30s after a still-running review launched). */
+export function __expirePostCommitReviewCooldown(): void {
   lastPostCommitReviewAt = 0
 }
 
@@ -246,6 +274,44 @@ export function detectMissingVisualVerify(
   return `⚠️ 渲染未验证：UI 文件已修改（${uiFiles.slice(0, 2).join(', ')}${uiFiles.length > 2 ? ' 等' : ''}），但未见 browser_debug/computer_use 视觉验证。交付前用 browser_debug open → navigate → screenshot 检查渲染结果。`
 }
 
+// ── 虚空仓库 P0：learned 参数解析 ──────────────────────────────────────────
+
+export interface LearnedPattern {
+  text: string
+  evidence: string
+  tags: string[]
+  topic?: string
+}
+
+/** 解析 deliver_task `learned` 数组。约定格式："模式描述——证据：文件路径或复现步骤"。
+ *  分隔符容忍 "——证据："/"--证据:" 等变体；缺分隔符时整条入 text、evidence 为空。
+ *  topic 从 evidence 里提取第一个带扩展名的路径样 token（供召回结构化预过滤）。 */
+export function parseLearnedEntries(raw: unknown): LearnedPattern[] {
+  if (!Array.isArray(raw)) return []
+  const out: LearnedPattern[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed) continue
+    const sep = trimmed.match(/[—–-]{1,2}\s*证据\s*[:：]/)
+    let text = trimmed
+    let evidence = ''
+    if (sep && sep.index !== undefined) {
+      text = trimmed.slice(0, sep.index).trim()
+      evidence = trimmed.slice(sep.index + sep[0].length).trim()
+    }
+    if (!text) continue
+    const pathLike = evidence.match(/[\w@./-]+\.[A-Za-z]{1,8}\b/)
+    out.push({
+      text,
+      evidence,
+      tags: ['agent-learned'],
+      topic: pathLike?.[0],
+    })
+  }
+  return out
+}
+
 export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) => B1Context): Tool {
   return {
     definition: {
@@ -265,6 +331,8 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
 - files: optional array of owned file paths to commit (subset). When omitted, commits all owned files. Use this to commit logical units separately.
 - adopt: array of external or co-owned file paths to claim ownership of before committing. Use when taking over work from a crashed/frozen session. Requires commit=true. The adopted files are force-added to the owned set and included in the commit scope.
 - force: set to true to override the cohesion gate when committing many files across multiple areas. Use sparingly.
+- learned: array of reusable patterns confirmed this session (each "模式描述——证据：路径或复现步骤"). Persisted to the project knowledge base and auto-injected in future sessions. Only submit verified patterns.
+- review_policy: post-commit review batching for long tasks. each (default) reviews per commit; defer accumulates commits into a session pending scope without reviewing; final runs one review over everything accumulated. Prefer defer+final over many small commits to avoid paying a review worker per commit.
 
 ### Complex spec delivery checklist
 For complex specs or cross-module integration, include checklist entries: fact-flow graph verified, condition matrix verified, counterexample tests verified.`,
@@ -308,6 +376,16 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           skipAutoReview: {
             type: 'boolean',
             description: 'Suppress automatic post-commit review. Set automatically when a goal tracker is active (goal-driven auto-continuation). Set manually to bypass review for trivial or urgent changes.',
+          },
+          review_policy: {
+            type: 'string',
+            enum: ['each', 'defer', 'final'],
+            description: 'Post-commit review batching for long tasks. each (default): review per commit. defer: skip immediate review and accumulate this commit into the session pending scope. final: run one review over all accumulated deferred commits plus this one. Ignored when review_level is set.',
+          },
+          learned: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '本次 session 确认的可复用知识（每条格式："模式描述——证据：文件路径或复现步骤"）。只在交付时提交经过验证的模式：诊断方法/架构边界/工具链事实/已验证修复。不确定的不要写。',
           },
         },
       },
@@ -544,6 +622,62 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         }
       } catch {
         // advisory: 回归契约核验绝不让交付本身失败
+      }
+
+      // ── P4 收束闸: PAL 收敛假设 ↔ 交付范围一致性（弱 advisory，绝不阻断）──
+      // 攻坚案件收敛出了 selectedHypothesis，但其 targets 完全没出现在本次
+      // 交付文件里 → 大概率"诊断收敛了、修复没落地"或改错了地方。只提示。
+      try {
+        const converged = ctx.getPalConvergedCases?.() ?? []
+        if (converged.length > 0) {
+          const deliveredFiles = [
+            ...report.ownedFiles, ...report.coOwnedFiles,
+            ...(currentDirtyFiles ?? []),
+          ]
+          for (const c of converged) {
+            const fileTargets = c.targets.filter(t => t.includes('/') || t.includes('.'))
+            if (fileTargets.length === 0) continue
+            const touched = fileTargets.some(t =>
+              deliveredFiles.some(f => f.includes(t) || t.includes(f)))
+            if (!touched) {
+              lines.push('', `⚠️ 攻坚案件 ${c.caseId} 已收敛（假设 ${c.selectedHypothesisId}，targets: ${fileTargets.slice(0, 3).join(', ')}${fileTargets.length > 3 ? ' …' : ''}），但这些 targets 不在本次交付文件中——确认修复真的落在了收敛假设指向的位置。`)
+            }
+          }
+        }
+      } catch {
+        // advisory: PAL 收束闸绝不让交付本身失败
+      }
+
+      // ── 遗产回收 W-A1: needs_user 案件披露（弱 advisory，绝不阻断）──
+      // 卡在等用户裁决的攻坚案件在交付时静默消失 = 违反交付报告"必须覆盖
+      // 遗留项"纪律。只提示：列为遗留项并附最小决策问题。
+      try {
+        const needsUser = ctx.getPalNeedsUserCases?.() ?? []
+        for (const c of needsUser) {
+          lines.push('', `⚠️ 攻坚案件 ${c.caseId} 卡在等用户裁决（needs_user）：${c.problem} —— 交付报告必须把它列为遗留项，并附最小决策问题：${c.minimalQuestion}`)
+        }
+      } catch {
+        // advisory: PAL 披露绝不让交付本身失败
+      }
+
+      // ── 虚空仓库 P0: 知识收割邀请（弱 advisory，绝不阻断）──
+      // 条件展示控 token：本次调用未带 learned，且 session 有实质工作量
+      // （存在 PAL 案件，或交付 ≥3 个文件）。agent 看到邀请后在 commit
+      // 调用（或下一次调用）里经 learned 参数提交。
+      try {
+        const learnedProvided = Array.isArray(params.input.learned) && params.input.learned.length > 0
+        const palActivity = (ctx.getPalConvergedCases?.() ?? []).length > 0
+          || (ctx.getPalNeedsUserCases?.() ?? []).length > 0
+        if (!learnedProvided && (palActivity || report.ownedFileCount >= 3)) {
+          lines.push(
+            '',
+            '### 知识收割（虚空仓库）',
+            '本次 session 若确认了可复用模式（诊断方法/架构边界/工具链事实/已验证修复），',
+            '在 commit 调用时通过 learned 参数提交（每条："模式描述——证据：路径或复现步骤"）。不确定的不要写。',
+          )
+        }
+      } catch {
+        // advisory: 收割邀请绝不让交付本身失败
       }
 
       if (commit) {
@@ -845,6 +979,12 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           || ctx.reviewConfig?.skipAuto === true
         const goalAchieved = ctx.isGoalAchieved?.() === true
         const goalVerdict = ctx.getLastVerdict?.() ?? null
+        // review_policy（长任务审查批处理）：'each' 默认逐 commit；'defer'
+        // 跳过即时审查并累积进会话 pending；'final' 对累积范围一次终审。
+        // 显式 review_level 优先——组合传入时 review_policy 被忽略。
+        const reviewPolicyRaw = params.input.review_policy
+        const reviewPolicy: 'each' | 'defer' | 'final' =
+          reviewPolicyRaw === 'defer' || reviewPolicyRaw === 'final' ? reviewPolicyRaw : 'each'
 
         // Goal-achieved commit: auto-upgrade to L3 for final review sweep.
         // Best-effort — if review deps are unavailable the commit still lands.
@@ -942,100 +1082,220 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         if (skipAutoReview) {
           lines.push('', '⏭ 自动审查已跳过（goal 模式或 skipAutoReview）。')
         } else if (reviewDepth === 0 && shouldRouteReviewWorkflow(change) && isReviewDisciplineEnabled()) {
-          // Batch: skip if a review was already launched within the cooldown window.
-          const now = Date.now()
-          if (now - lastPostCommitReviewAt < POST_COMMIT_REVIEW_COOLDOWN_MS) {
-            const sinceSec = Math.round((now - lastPostCommitReviewAt) / 1000)
-            const windowSec = Math.round(POST_COMMIT_REVIEW_COOLDOWN_MS / 1000)
-            lines.push('', `⏭ 提交后审查跳过：距上轮审查仅 ${sinceSec}s（<${windowSec}s 冷却窗口）。本轮变更未被审查，必要时用 \`/review\` 手动覆盖。`)
+          // review_policy=defer：长任务声明"过程不审、收尾终审"——commit 范围
+          // 累积进会话级 pending（typecheck 升级标记一并记录），由 final /
+          // goal-achieved L3 / 下一次换审统一消费，本轮不起 worker。
+          if (reviewPolicy === 'defer' && !explicitReviewLevel) {
+            const scope = addPendingReviewFiles(ctx.sessionId, filesToCommit, { escalate: change.forceLevel === 'L3' })
+            lines.push('', `⏭ 提交后审查已延迟（review_policy=defer）：会话已累积 ${scope.commits} 个 commit、${scope.files.size} 个文件待审。收尾用 review_policy:'final' 或 /review max 统一审查。`)
           } else {
-            const route = ctx.routeReviewWorkflow ?? (ctx.reviewDeps ? routeReviewWorkflow : undefined)
-            if (!route || !ctx.reviewDeps) {
-              // Advisory: review deps unavailable is a caveat, not a blocker.
-              lines.push('', '⚠️ 提交后审查跳过：审查依赖不可用（ReviewRouter 未接入）。')
+            // 批量约束只作用于系统触发的审查。显式 review_level（手动 /review）
+            // 与 goal-achieved L3 终审是明确意图，不被冷却/在飞单例跳过；
+            // final 绕过冷却但在在飞时仍并入 pending（重叠审查比延迟更浪费）。
+            const bypassCooldown = explicitReviewLevel !== undefined || reviewPolicy === 'final' || goalAchieved
+            const bypassInFlight = explicitReviewLevel !== undefined || goalAchieved
+            const now = Date.now()
+            if (!bypassCooldown && now - lastPostCommitReviewAt < POST_COMMIT_REVIEW_COOLDOWN_MS) {
+              const sinceSec = Math.round((now - lastPostCommitReviewAt) / 1000)
+              const windowSec = Math.round(POST_COMMIT_REVIEW_COOLDOWN_MS / 1000)
+              addPendingReviewFiles(ctx.sessionId, filesToCommit, { escalate: change.forceLevel === 'L3' })
+              lines.push('', `⏭ 提交后审查跳过：距上轮审查仅 ${sinceSec}s（<${windowSec}s 冷却窗口）。本轮变更已记入待审范围，下次审查自动覆盖，也可 /review 手动立即审查。`)
+            } else if (!bypassInFlight && postCommitReviewInFlight) {
+              const scope = addPendingReviewFiles(ctx.sessionId, filesToCommit, { escalate: change.forceLevel === 'L3' })
+              lines.push('', `⏭ 已有在飞审查：本轮 commit 并入待审范围（会话累计 ${scope.commits} 个 commit），在飞审查完成后统一补审，不重复起 worker。`)
             } else {
-              const reviewMode: ReviewMode = change.forceLevel ? 'manual' : 'auto'
-              const REVIEW_TIMEOUT_MS = reviewWorkflowBudgetMs(reviewMode, change.forceLevel)
-              const reviewAbort = new AbortController()
-              if (params.abortSignal) {
-                if (params.abortSignal.aborted) {
-                  lines.push('', '⚠️ 提交后审查跳过：工具已取消。')
-                } else {
-                  params.abortSignal.addEventListener('abort', () => reviewAbort.abort(), { once: true })
-                }
-              }
-              if (!params.abortSignal?.aborted) {
-                const budgetSec = Math.round(REVIEW_TIMEOUT_MS / 1000)
-                lastPostCommitReviewAt = Date.now()
-                const reviewDeps = ctx.reviewDeps
-                const fallbackTier = reviewMode === 'auto' ? 'auto' as const : (effectiveReviewLevel ?? 'L2')
-                const runReview = async (): Promise<ReviewOutcome> => {
-                  let reviewTimer: NodeJS.Timeout | undefined
-                  let outcome: ReviewOutcome
-                  try {
-                    const timeoutPromise = new Promise<never>((_, reject) => {
-                      reviewTimer = setTimeout(() => {
-                        reviewAbort.abort()
-                        reject(new Error('Review workflow timed out'))
-                      }, REVIEW_TIMEOUT_MS)
-                    })
-                    outcome = await Promise.race([
-                      route(change, reviewDeps, { abortSignal: reviewAbort.signal, mode: reviewMode, depthLayer: ctx.getDepthLayer?.() }),
-                      timeoutPromise,
-                    ])
-                  } catch (err) {
-                    const reason = err instanceof Error ? err.message : String(err)
-                    // Review is best-effort post-commit: a timeout/crash never blocks
-                    // delivery — the commit already landed. Report honestly.
-                    outcome = {
-                      tier: fallbackTier,
-                      verdict: 'inconclusive',
-                      rounds: 0,
-                      evidence: `post-commit review DID NOT run (${reason.includes('timed out') ? 'timed out' : 'infra failure'}: ${reason})`,
-                      infraFailures: [{ kind: reason.includes('timed out') ? 'timeout' : 'crash', claim: reason }],
-                    }
-                  } finally {
-                    if (reviewTimer) clearTimeout(reviewTimer)
+              const route = ctx.routeReviewWorkflow ?? (ctx.reviewDeps ? routeReviewWorkflow : undefined)
+              if (!route || !ctx.reviewDeps) {
+                // Advisory: review deps unavailable is a caveat, not a blocker.
+                lines.push('', '⚠️ 提交后审查跳过：审查依赖不可用（ReviewRouter 未接入）。')
+              } else {
+                // Fold the session's accumulated pending scope (cooldown-skipped /
+                // in-flight-merged / deferred commits) into this launch — recorded
+                // commits must be covered by the next review, never stranded.
+                const accumulated = consumePendingReview(ctx.sessionId)
+                let reviewChange: ChangeSet = change
+                if (accumulated && accumulated.files.size > 0) {
+                  const mergedFiles = [...new Set([...accumulated.files, ...change.files])]
+                  reviewChange = {
+                    ...change,
+                    files: mergedFiles,
+                    crossModule: isCrossModule(mergedFiles),
+                    largeFiles: collectLargeFiles(params.cwd, mergedFiles),
+                    ...(accumulated.escalate && !change.forceLevel
+                      ? {
+                          forceLevel: 'L3' as ReviewScale,
+                          focusHint: change.focusHint
+                            ? `Deferred commits escalated by typecheck/declared-check failure | ${change.focusHint}`
+                            : 'Deferred commits escalated by typecheck/declared-check failure',
+                        }
+                      : {}),
                   }
-                  // Review infra health observability (/status): auto runs only.
-                  if (reviewMode === 'auto' && outcome.rounds !== undefined && outcome.verdict !== 'nudge') {
-                    if (outcome.verdict === 'inconclusive') {
-                      recordAutoReviewRun({ ran: false, failureKinds: (outcome.infraFailures ?? []).map(f => f.kind) })
-                    } else {
-                      recordAutoReviewRun({ ran: true, ...(outcome.recoveredByRetry ? { recoveredByRetry: true } : {}) })
-                    }
-                  }
-                  return outcome
+                  lines.push('', reviewPolicy === 'final'
+                    ? `🔍 终审（review_policy=final）：覆盖 ${accumulated.commits} 个延迟 commit + 本次提交，共 ${mergedFiles.length} 个文件。`
+                    : `📎 本次审查一并覆盖此前累积的 ${accumulated.commits} 个未审 commit（共 ${mergedFiles.length} 个文件）。`)
+                } else if (reviewPolicy === 'final') {
+                  lines.push('', '🔍 终审（review_policy=final）：无累积的延迟 commit，仅审查本次提交。')
                 }
+                const reviewMode: ReviewMode = reviewChange.forceLevel ? 'manual' : 'auto'
+                const REVIEW_TIMEOUT_MS = reviewWorkflowBudgetMs(reviewMode, reviewChange.forceLevel)
+                const reviewAbort = new AbortController()
+                if (params.abortSignal) {
+                  if (params.abortSignal.aborted) {
+                    lines.push('', '⚠️ 提交后审查跳过：工具已取消。')
+                  } else {
+                    params.abortSignal.addEventListener('abort', () => reviewAbort.abort(), { once: true })
+                  }
+                }
+                if (!params.abortSignal?.aborted) {
+                  const budgetSec = Math.round(REVIEW_TIMEOUT_MS / 1000)
+                  const reviewDeps = ctx.reviewDeps
+                  // 审查门 UI 可见性：复用会话级 DelegationActivity 通道把审查
+                  // worker 进度上行到子代理面板（tool 完成后该回调仍有效）。
+                  const activityMapper = params.onWorkerActivity
+                    ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity)
+                    : undefined
+                  const runReviewOnce = async (
+                    targetChange: ChangeSet,
+                    runMode: ReviewMode,
+                    timeoutMs: number,
+                    controller: AbortController,
+                  ): Promise<ReviewOutcome> => {
+                    const fallbackTier = runMode === 'auto' ? 'auto' as const : (targetChange.forceLevel ?? effectiveReviewLevel ?? 'L2')
+                    let reviewTimer: NodeJS.Timeout | undefined
+                    let outcome: ReviewOutcome
+                    try {
+                      const timeoutPromise = new Promise<never>((_, reject) => {
+                        reviewTimer = setTimeout(() => {
+                          controller.abort()
+                          reject(new Error('Review workflow timed out'))
+                        }, timeoutMs)
+                      })
+                      outcome = await Promise.race([
+                        route(targetChange, reviewDeps, { abortSignal: controller.signal, mode: runMode, depthLayer: ctx.getDepthLayer?.(), onActivity: activityMapper }),
+                        timeoutPromise,
+                      ])
+                    } catch (err) {
+                      const reason = err instanceof Error ? err.message : String(err)
+                      // Review is best-effort post-commit: a timeout/crash never blocks
+                      // delivery — the commit already landed. Report honestly.
+                      outcome = {
+                        tier: fallbackTier,
+                        verdict: 'inconclusive',
+                        rounds: 0,
+                        evidence: `post-commit review DID NOT run (${reason.includes('timed out') ? 'timed out' : 'infra failure'}: ${reason})`,
+                        infraFailures: [{ kind: reason.includes('timed out') ? 'timeout' : 'crash', claim: reason }],
+                      }
+                    } finally {
+                      if (reviewTimer) clearTimeout(reviewTimer)
+                    }
+                    // Review infra health observability (/status): auto runs only.
+                    if (runMode === 'auto' && outcome.rounds !== undefined && outcome.verdict !== 'nudge') {
+                      if (outcome.verdict === 'inconclusive') {
+                        recordAutoReviewRun({ ran: false, failureKinds: (outcome.infraFailures ?? []).map(f => f.kind) })
+                      } else {
+                        recordAutoReviewRun({ ran: true, ...(outcome.recoveredByRetry ? { recoveredByRetry: true } : {}) })
+                      }
+                    }
+                    return outcome
+                  }
 
-                if (explicitReviewLevel) {
-                  // Explicit review_level: the caller asked for review — the
-                  // verdict belongs in this tool result, so wait for it.
-                  params.onOutput?.(`\n⏳ 提交后审查启动中 (${reviewMode} ${explicitReviewLevel}, ≤${budgetSec}s)...\n`)
-                  const outcome = await runReview()
-                  const outcomeLines = formatReviewOutcomeLines(outcome)
-                  if (outcomeLines.length > 0) lines.push('', ...outcomeLines)
-                } else {
-                  // System-triggered review (auto wiring inspector / typecheck-
-                  // escalated L3 / goal-achieved L3): detach. The 240s-timeout
-                  // incident chain (2026-07-07) showed a synchronous 180s review
-                  // await drives models to bypass deliver_task for raw git
-                  // commit — the review is advisory, the commit has already
-                  // landed, so the main loop must not stall on it. Outcome
-                  // flows through post-commit-review-queue → runtime hook →
-                  // AdvisoryBus into a later turn.
-                  const commitRef = headAfterHash ?? 'HEAD'
-                  void runReview().then(outcome => {
-                    enqueuePostCommitReviewOutcome({
-                      lines: [`提交 ${commitRef} 的提交后审查完成：`, ...formatReviewOutcomeLines(outcome)],
-                      verdict: outcome.verdict,
-                      tier: String(outcome.tier),
+                  // Detached launcher — shared by the initial system-triggered
+                  // review and the in-flight follow-up sweep. Owns the in-flight
+                  // singleton: commits landing while a review runs merge into the
+                  // session pending scope (see the inFlight branch above) instead
+                  // of spawning an overlapping worker, and the completion chain
+                  // below consumes that scope with ONE follow-up review.
+                  const launchDetached = (targetChange: ChangeSet, runMode: ReviewMode, commitRef: string): void => {
+                    lastPostCommitReviewAt = Date.now()
+                    postCommitReviewInFlight = true
+                    const controller = new AbortController()
+                    if (params.abortSignal) {
+                      if (params.abortSignal.aborted) {
+                        postCommitReviewInFlight = false
+                        return
+                      }
+                      params.abortSignal.addEventListener('abort', () => controller.abort(), { once: true })
+                    }
+                    const timeoutMs = reviewWorkflowBudgetMs(runMode, targetChange.forceLevel)
+                    const runBudgetSec = Math.round(timeoutMs / 1000)
+                    // 审查门 UI 可见性（detached 路径此前对用户完全隐形）：
+                    // 启动行走 onOutput；「审查门自身」发 phantom running/终态事件
+                    // （独立于 worker 事件，保证 nudge/超时也至少有始有终）；
+                    // worker 实时进度由上面的 activityMapper 上行。
+                    params.onOutput?.(`\n⏳ 提交后审查启动中 (${runMode}${targetChange.forceLevel ? ' ' + targetChange.forceLevel : ''}, ≤${runBudgetSec}s)——审查 worker 进度见子代理面板...\n`)
+                    const reviewRunId = `review-gate-${String(commitRef).slice(0, 7)}-${Math.random().toString(36).slice(2, 7)}`
+                    params.onWorkerActivity?.({ workOrderId: reviewRunId, parentToolId: params.toolUseId, profile: 'reviewer', status: 'running', progressLine: `审查门启动 (${runMode}…)` })
+                    void runReviewOnce(targetChange, runMode, timeoutMs, controller).then(outcome => {
+                      enqueuePostCommitReviewOutcome({
+                        lines: [`提交 ${commitRef} 的提交后审查完成：`, ...formatReviewOutcomeLines(outcome)],
+                        verdict: outcome.verdict,
+                        tier: String(outcome.tier),
+                      })
+                      const outcomeLines = formatReviewOutcomeLines(outcome)
+                      const terminalStatus: DelegationActivity['status'] =
+                        outcome.verdict === 'verified' || outcome.verdict === 'nudge' ? 'passed' : 'failed'
+                      const failureReason = outcome.verdict === 'rejected' ? 'review-findings'
+                        : outcome.verdict === 'inconclusive' ? 'review-infra' : undefined
+                      // nudge 的 outcomeLines 是给模型看的纪律提醒，面板改用一句
+                      // 人话回退文案；其余 verdict 取首行作为终态摘要。
+                      const progressLine = outcome.verdict === 'nudge'
+                        ? '审查门完成 (nudge)：变更琐碎，免深审'
+                        : (outcomeLines[0]?.slice(0, 120) ?? `审查门完成 (${outcome.verdict})`)
+                      params.onWorkerActivity?.({
+                        workOrderId: reviewRunId,
+                        parentToolId: params.toolUseId,
+                        profile: 'reviewer',
+                        status: terminalStatus,
+                        progressLine,
+                        ...(failureReason ? { failureReason } : {}),
+                      })
+                    }).catch(() => { /* runReviewOnce never rejects; double guard */ }).finally(() => {
+                      postCommitReviewInFlight = false
+                      if (params.abortSignal?.aborted) return
+                      // 补审：在飞期间到达的 commit 已并入会话 pending（inFlight
+                      // 分支与冷却分支），统一一轮覆盖，不再逐 commit 起 worker。
+                      // （defer 累积的范围也可能被提前消费——审查是 advisory，
+                      // 提前覆盖不违反交付语义，final 时只会看到更小的范围。）
+                      const followUp = consumePendingReview(ctx.sessionId)
+                      if (!followUp || followUp.files.size === 0) return
+                      const mergedFiles = [...followUp.files]
+                      const followChange: ChangeSet = {
+                        files: mergedFiles,
+                        crossModule: isCrossModule(mergedFiles),
+                        isFix: false,
+                        goalActive: false,
+                        largeFiles: collectLargeFiles(params.cwd, mergedFiles),
+                        ...(followUp.escalate ? { forceLevel: 'L3' as ReviewScale } : {}),
+                      }
+                      const followMode: ReviewMode = followChange.forceLevel ? 'manual' : 'auto'
+                      launchDetached(followChange, followMode, 'HEAD（合并补审）')
                     })
-                  }).catch(() => { /* runReview never rejects; double guard */ })
-                  lines.push('', `⏳ 提交后审查已转后台 (${reviewMode}${change.forceLevel ? ' ' + change.forceLevel : ''}, ≤${budgetSec}s)——结论会以 system 通道注入后续对话，本次交付不等待。`)
+                  }
+
+                  if (explicitReviewLevel) {
+                    lastPostCommitReviewAt = Date.now()
+                    // Explicit review_level: the caller asked for review — the
+                    // verdict belongs in this tool result, so wait for it.
+                    params.onOutput?.(`\n⏳ 提交后审查启动中 (${reviewMode} ${explicitReviewLevel}, ≤${budgetSec}s)...\n`)
+                    const outcome = await runReviewOnce(reviewChange, reviewMode, REVIEW_TIMEOUT_MS, reviewAbort)
+                    const outcomeLines = formatReviewOutcomeLines(outcome)
+                    if (outcomeLines.length > 0) lines.push('', ...outcomeLines)
+                  } else {
+                    // System-triggered review (auto wiring inspector / typecheck-
+                    // escalated L3 / goal-achieved L3): detach. The 240s-timeout
+                    // incident chain (2026-07-07) showed a synchronous 180s review
+                    // await drives models to bypass deliver_task for raw git
+                    // commit — the review is advisory, the commit has already
+                    // landed, so the main loop must not stall on it. Outcome
+                    // flows through post-commit-review-queue → runtime hook →
+                    // AdvisoryBus into a later turn.
+                    const commitRef = headAfterHash ?? 'HEAD'
+                    launchDetached(reviewChange, reviewMode, String(commitRef))
+                    lines.push('', `⏳ 提交后审查已转后台 (${reviewMode}${reviewChange.forceLevel ? ' ' + reviewChange.forceLevel : ''}, ≤${budgetSec}s)——进度见子代理面板，结论将以 system 通道注入后续对话并汇总到面板，本次交付不等待。`)
+                  }
                 }
               }
-              }
+            }
           }
         }
       }
@@ -1049,6 +1309,35 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         if (reviewChecklist.length > 2) {
           lines.push(`  ... 还有 ${reviewChecklist.length - 2} 条原则`)
         }
+      }
+
+      // ── 虚空仓库 P0: learned 收割 → memory.jsonl 直写 ──────────────────
+      // appendMemoryEntry 自动生成 id/ts/repeatCount 并走共享锁协议；不经
+      // essence-gate——agent 交付时标记的知识，"agent 觉得重要"即裁决。
+      // 只在成功路径执行（错误分支已早退，交付被拦时不收割）。
+      try {
+        const entries = parseLearnedEntries(params.input.learned)
+        let written = 0
+        for (const lp of entries) {
+          // 写前相似去重：上一次 learned 重提 / 第四层 PAL 自动收割同结论 → 跳过
+          if (countSimilarMemoryEntries(params.cwd, lp.text) > 0) continue
+          appendMemoryEntry(params.cwd, {
+            text: lp.text,
+            kind: 'verified_pattern',
+            confidence: 0.95,
+            source: 'agent-crafted',
+            status: 'verified',
+            evidence: lp.evidence || undefined,
+            sessionId: ctx.sessionId,
+            tags: lp.tags,
+            transferableTo: ['all'],
+            topic: lp.topic,
+          })
+          written++
+        }
+        if (written > 0) lines.push('', `🧠 虚空仓库：已收割 ${written} 条知识，下次会话自动可用。`)
+      } catch {
+        // 收割失败绝不阻断交付
       }
 
       return { content: lines.join('\n') }

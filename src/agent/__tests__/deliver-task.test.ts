@@ -4,7 +4,8 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { createDeliverTaskTool, detectSymptomPatch, resetPostCommitReviewCooldown } from '../deliver-task.js'
+import { createDeliverTaskTool, detectSymptomPatch, parseLearnedEntries, resetPostCommitReviewCooldown, __expirePostCommitReviewCooldown } from '../deliver-task.js'
+import { appendMemoryEntry, readMemoryEntries } from '../../memory/unified-memory.js'
 import { consumePostCommitReviewOutcomes, __resetPostCommitReviewQueue } from '../post-commit-review-queue.js'
 import { createTaskLedger } from '../task-ledger.js'
 import { createOwnershipLedger } from '../ownership-ledger.js'
@@ -13,7 +14,7 @@ import type { ReviewOutcome, ReviewRouterDeps, ReviewRouterOptions } from '../re
 import { createWorktreeBaseline } from '../worktree-baseline.js'
 import { createDeliveryGateV2 } from '../delivery-gate-v2.js'
 import { createVerificationAttribution } from '../verification-attribution.js'
-import type { ToolCallParams, ToolResult } from '../../tools/types.js'
+import type { ToolCallParams, ToolResult, DelegationActivity } from '../../tools/types.js'
 import type { SessionRegistry } from '../session-registry.js'
 import { getReviewHealth, resetReviewHealth } from '../review-health.js'
 
@@ -39,6 +40,8 @@ function makeContext(opts: {
   taskContract?: import('../../context/task-contract.js').TaskContract
   inventorySearcher?: import('../regression-inventory.js').InventorySearcher
   impactedTests?: string[]
+  palConvergedCases?: import('../problem-attack-loop.js').ConvergedCaseEntry[]
+  palNeedsUserCases?: Array<{ caseId: string; problem: string; minimalQuestion: string }>
 }) {
   const baseline = createWorktreeBaseline({
     branch: 'feat/b1',
@@ -76,6 +79,8 @@ function makeContext(opts: {
     getTaskContract: opts.taskContract ? () => opts.taskContract : undefined,
     inventorySearcher: opts.inventorySearcher,
     getImpactedTests: opts.impactedTests ? () => opts.impactedTests! : undefined,
+    getPalConvergedCases: opts.palConvergedCases ? () => opts.palConvergedCases! : undefined,
+    getPalNeedsUserCases: opts.palNeedsUserCases ? () => opts.palNeedsUserCases! : undefined,
   }))
 
   const params: ToolCallParams = {
@@ -100,6 +105,14 @@ function toolDescription(): string {
 /** Let the detached (fire-and-forget) post-commit review promise settle. */
 async function settleDetachedReview(): Promise<void> {
   await new Promise(resolve => setImmediate(resolve))
+}
+
+/** Settle a whole detached review CHAIN: initial review + in-flight follow-up
+ *  sweep (each hop is microtask-only once the route mock resolves, but the
+ *  chain is launched from .finally callbacks — give it several macrotask
+ *  ticks instead of one). */
+async function settleReviewChain(): Promise<void> {
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve))
 }
 
 describe('deliver-task — semantic task delivery tool', () => {
@@ -628,6 +641,87 @@ describe('deliver-task — semantic task delivery tool', () => {
     assert.match(outcomes[0]!.lines[0]!, /^提交 \S+ 的提交后审查完成：$/)
   })
 
+  it('detached review is visible: startup line + phantom running/terminal events (review-gate UI)', async () => {
+    const outputs: string[] = []
+    const activities: DelegationActivity[] = []
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => ({ tier: 'auto', verdict: 'verified', evidence: 'no blocking findings', rounds: 1 }),
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+    })
+
+    const result = await tool.execute({
+      ...params,
+      input: { commit: true, message: 'feat: scoped delivery' },
+      onOutput: chunk => outputs.push(chunk),
+      onWorkerActivity: activity => activities.push(activity),
+    })
+
+    assert.match(result.content, /提交后审查已转后台/)
+    // 启动行同步发出，措辞与显式路径一致并指向子代理面板
+    assert.match(outputs.join(''), /提交后审查启动中 \(auto, ≤\d+s\)——审查 worker 进度见子代理面板/)
+    const running = activities.filter(a => a.status === 'running')
+    assert.equal(running.length, 1, '审查门自身必须有一条 phantom running 事件')
+    assert.match(running[0]!.workOrderId, /^review-gate-/)
+    assert.equal(running[0]!.parentToolId, 'test-1')
+    assert.equal(running[0]!.profile, 'reviewer')
+
+    await settleDetachedReview()
+    const terminal = activities.filter(a => a.status !== 'running')
+    assert.equal(terminal.length, 1, '有始必须有终：detached 审查结束要补终态事件')
+    assert.equal(terminal[0]!.workOrderId, running[0]!.workOrderId)
+    assert.equal(terminal[0]!.status, 'passed')
+    assert.match(terminal[0]!.progressLine ?? '', /审查通过 \(auto\)/)
+    assert.equal(terminal[0]!.failureReason, undefined)
+  })
+
+  it('detached review terminal events map verdict → status/failureReason (rejected/inconclusive/nudge)', async () => {
+    const activities: DelegationActivity[] = []
+    const cases: Array<{ outcome: ReviewOutcome; status: DelegationActivity['status']; failureReason?: string; progress: RegExp }> = [
+      {
+        outcome: { tier: 'L2', verdict: 'rejected', escalated: true, rounds: 3, evidence: 'still broken' },
+        status: 'failed', failureReason: 'review-findings', progress: /审查门发现问题 \(L2\)/,
+      },
+      {
+        outcome: { tier: 'auto', verdict: 'inconclusive', evidence: 'review DID NOT run (infra failure): timed out', rounds: 1, infraFailures: [{ kind: 'timeout', claim: 'x' }] },
+        status: 'failed', failureReason: 'review-infra', progress: /审查未决 \(auto\)/,
+      },
+      {
+        outcome: { tier: 'auto', verdict: 'nudge' },
+        status: 'passed', failureReason: undefined, progress: /审查门完成 \(nudge\)：变更琐碎，免深审/,
+      },
+    ]
+    for (const c of cases) {
+      // 同一用例内多次 deliver 会触发 30s 冷却，逐轮复位
+      resetPostCommitReviewCooldown()
+      activities.length = 0
+      const { tool, params } = makeContext({
+        taskId: 't1',
+        ownedFiles: ['src/a.ts'],
+        dirtyFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        routeReviewWorkflow: async () => c.outcome,
+        reviewDeps: {} as ReviewRouterDeps,
+        commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+      })
+      await tool.execute({
+        ...params,
+        input: { commit: true, message: 'feat: scoped delivery' },
+        onWorkerActivity: activity => activities.push(activity),
+      })
+      await settleDetachedReview()
+      const terminal = activities.filter(a => a.status !== 'running')
+      assert.equal(terminal.length, 1, `verdict=${c.outcome.verdict} 必须补终态事件`)
+      assert.equal(terminal[0]!.status, c.status)
+      assert.equal(terminal[0]!.failureReason, c.failureReason)
+      assert.match(terminal[0]!.progressLine ?? '', c.progress)
+    }
+  })
+
   it('tool timeout budget dominates internal stage budgets (240s 事故链)', () => {
     const { tool, params } = makeContext({ taskId: 't1', ownedFiles: [] })
     const timeoutMs = tool.timeoutMs!
@@ -696,6 +790,161 @@ describe('deliver-task — semantic task delivery tool', () => {
     assert.equal(routeCalls, 1, 'second review must be skipped by cooldown')
     assert.match(second.content, /提交后审查跳过：距上轮审查/)
     assert.doesNotMatch(second.content, /合并入上一轮/, 'must not claim a merge that never happens')
+  })
+
+  it('in-flight review singleton: a commit landing while a review runs merges into pending, one follow-up covers it', async () => {
+    const routedFiles: string[][] = []
+    let releaseFirstReview!: () => void
+    const firstReviewGate = new Promise<void>(resolve => { releaseFirstReview = resolve })
+    let callIdx = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts', 'src/b.ts'],
+      dirtyFiles: ['src/a.ts', 'src/b.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async change => {
+        routedFiles.push([...change.files])
+        callIdx++
+        if (callIdx === 1) await firstReviewGate // hold review #1 in flight
+        return { tier: 'auto', verdict: 'verified', evidence: 'ok', rounds: 1 }
+      },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+    })
+
+    await tool.execute({ ...params, input: { commit: true, message: 'feat: part 1', files: ['src/a.ts'] } })
+    assert.equal(routedFiles.length, 1, 'first commit launches the review')
+    // Review #1 is still in flight. Expire ONLY the time cooldown so the
+    // second commit reaches the in-flight branch (the git-lock retry scenario:
+    // retry lands >30s later, well inside the 180s review budget).
+    __expirePostCommitReviewCooldown()
+    const second = await tool.execute({ ...params, input: { commit: true, message: 'feat: part 2', files: ['src/b.ts'] } })
+
+    assert.match(second.content, /已有在飞审查/)
+    assert.equal(routedFiles.length, 1, 'no overlapping review worker while one is in flight')
+
+    releaseFirstReview()
+    await settleReviewChain()
+
+    assert.equal(routedFiles.length, 2, 'exactly one follow-up review for the merged scope')
+    assert.deepEqual(routedFiles[1], ['src/b.ts'], 'follow-up covers the merged commit, not a re-review of everything')
+    const outcomes = consumePostCommitReviewOutcomes()
+    assert.equal(outcomes.length, 2)
+    assert.match(outcomes[1]!.lines[0]!, /HEAD（合并补审）/)
+  })
+
+  it('cooldown-skipped commits are recorded and folded into the next launched review', async () => {
+    const routedFiles: string[][] = []
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+      dirtyFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async change => {
+        routedFiles.push([...change.files])
+        return { tier: 'auto', verdict: 'verified', evidence: 'ok', rounds: 1 }
+      },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+    })
+
+    await tool.execute({ ...params, input: { commit: true, message: 'feat: part 1', files: ['src/a.ts'] } })
+    await settleReviewChain()
+    assert.equal(routedFiles.length, 1)
+    // Second commit inside the 30s cooldown: skipped, but its scope is recorded.
+    const second = await tool.execute({ ...params, input: { commit: true, message: 'feat: part 2', files: ['src/b.ts'] } })
+    assert.match(second.content, /提交后审查跳过：距上轮审查/)
+    assert.match(second.content, /已记入待审范围/)
+    assert.equal(routedFiles.length, 1, 'cooldown skip must not launch a worker')
+    // Third commit after the cooldown expires: the launched review folds the
+    // recorded scope in — commit #2 no longer silently unreviewed.
+    __expirePostCommitReviewCooldown()
+    const third = await tool.execute({ ...params, input: { commit: true, message: 'feat: part 3', files: ['src/c.ts'] } })
+    assert.match(third.content, /一并覆盖此前累积的 1 个未审 commit（共 2 个文件）/)
+    assert.equal(routedFiles.length, 2)
+    assert.deepEqual(routedFiles[1]!.slice().sort(), ['src/b.ts', 'src/c.ts'])
+    await settleReviewChain()
+    assert.equal(consumePostCommitReviewOutcomes().length, 2)
+  })
+
+  it('review_policy=defer accumulates commits; review_policy=final runs one review over the union', async () => {
+    const routedFiles: string[][] = []
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      sessionId: 'sess-defer',
+      ownedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+      dirtyFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async change => {
+        routedFiles.push([...change.files])
+        return { tier: 'auto', verdict: 'verified', evidence: 'ok', rounds: 1 }
+      },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+    })
+
+    const d1 = await tool.execute({ ...params, input: { commit: true, message: 'feat: step 1', files: ['src/a.ts'], review_policy: 'defer' } })
+    assert.match(d1.content, /已延迟（review_policy=defer）：会话已累积 1 个 commit、1 个文件/)
+    const d2 = await tool.execute({ ...params, input: { commit: true, message: 'feat: step 2', files: ['src/b.ts'], review_policy: 'defer' } })
+    assert.match(d2.content, /会话已累积 2 个 commit、2 个文件/)
+    assert.equal(routedFiles.length, 0, 'defer must never spawn a review worker')
+
+    const fin = await tool.execute({ ...params, input: { commit: true, message: 'feat: step 3', files: ['src/c.ts'], review_policy: 'final' } })
+    assert.match(fin.content, /终审（review_policy=final）：覆盖 2 个延迟 commit \+ 本次提交，共 3 个文件/)
+    assert.equal(routedFiles.length, 1, 'final runs exactly one review')
+    assert.deepEqual(routedFiles[0]!.slice().sort(), ['src/a.ts', 'src/b.ts', 'src/c.ts'], 'final review covers the deferred union + this commit')
+
+    await settleReviewChain()
+    const outcomes = consumePostCommitReviewOutcomes()
+    assert.equal(outcomes.length, 1)
+
+    // pending consumed: a later plain commit sees no leftover accumulation.
+    __expirePostCommitReviewCooldown()
+    const after = await tool.execute({ ...params, input: { commit: true, message: 'feat: step 4', files: ['src/a.ts'] } })
+    assert.doesNotMatch(after.content, /一并覆盖此前累积/)
+    assert.equal(routedFiles.length, 2)
+    assert.deepEqual(routedFiles[1], ['src/a.ts'])
+  })
+
+  it('defer records typecheck escalation; final review inherits forceLevel L3', async () => {
+    let captured: ChangeSet | undefined
+    let routeCalls = 0
+    let tcCalls = 0
+    // First commit (defer, src/bad.ts) trips the typecheck backstop; the final
+    // commit (src/good.ts) is clean — L3 must come from the deferred record.
+    const selectiveRunner: import('../typecheck-gate.js').TypecheckRunner = async () => {
+      tcCalls++
+      return tcCalls === 1
+        ? { diagnostics: [{ file: 'src/bad.ts', line: 1, col: 1, severity: 'error', message: 'TS9999: boom' }], formatted: '', ranOk: true }
+        : { diagnostics: [], formatted: '', ranOk: true }
+    }
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      sessionId: 'sess-defer-tc',
+      ownedFiles: ['src/bad.ts', 'src/good.ts'],
+      dirtyFiles: ['src/bad.ts', 'src/good.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      typecheckRunner: selectiveRunner,
+      routeReviewWorkflow: async change => {
+        routeCalls++
+        captured = change
+        return { tier: 'L3', verdict: 'verified', evidence: 'shim', rounds: 1 }
+      },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+    })
+
+    const d1 = await tool.execute({ ...params, input: { commit: true, message: 'feat: bad step', files: ['src/bad.ts'], review_policy: 'defer' } })
+    assert.match(d1.content, /已延迟（review_policy=defer）/)
+    // NB: assert against the call counter, never `captured === undefined` —
+    // aliased-condition narrowing would pin `captured` to undefined (→ never).
+    assert.equal(routeCalls, 0, 'defer must not route even when typecheck fails')
+
+    await tool.execute({ ...params, input: { commit: true, message: 'feat: good step', files: ['src/good.ts'], review_policy: 'final' } })
+    assert.ok(captured, 'final must route the accumulated scope')
+    assert.equal(captured!.forceLevel, 'L3', 'deferred typecheck failure escalates the final review')
+    assert.match(captured!.focusHint ?? '', /Deferred commits escalated/)
+    assert.deepEqual(captured!.files.slice().sort(), ['src/bad.ts', 'src/good.ts'])
   })
 
   it('commit succeeds when review deps are not wired — advisory skip, not block', async () => {
@@ -2280,6 +2529,245 @@ Do not declare a streamed response duplicate in the middle of the stream.
         if (prev === undefined) delete process.env.RIVET_TEST_PRESENCE_GATE
         else process.env.RIVET_TEST_PRESENCE_GATE = prev
       }
+    })
+  })
+
+  describe('P4 收束闸：PAL 收敛假设 ↔ 交付范围（弱 advisory）', () => {
+    const CONVERGED = [{ caseId: 'case-9', selectedHypothesisId: 'hyp-9', targets: ['src/root-cause.ts'], claim: '根因在 root-cause 模块', evidenceRefs: ['tool:grep:4'] }]
+
+    it('收敛 targets 不在交付文件中 → 提示但不阻断', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-miss',
+        ownedFiles: ['src/unrelated.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        palConvergedCases: CONVERGED,
+      })
+      const result = await tool.execute(params)
+      assert.equal(result.isError ?? false, false, '弱 advisory 绝不让交付失败')
+      assert.match(result.content, /攻坚案件 case-9 已收敛/)
+      assert.match(result.content, /src\/root-cause\.ts/)
+    })
+
+    it('收敛 targets 在交付文件中 → 零提示（修复真的落在收敛位置）', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-hit',
+        ownedFiles: ['src/root-cause.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        palConvergedCases: CONVERGED,
+      })
+      const result = await tool.execute(params)
+      assert.equal(/攻坚案件 case-9 已收敛/.test(result.content), false)
+    })
+
+    it('反证：非文件形态 targets（纯符号名）不触发路径比对提示', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-symbol',
+        ownedFiles: ['src/a.ts'],
+        palConvergedCases: [{ caseId: 'case-s', selectedHypothesisId: 'hyp-s', targets: ['someSymbolName'], claim: '符号级假设', evidenceRefs: [] }],
+      })
+      const result = await tool.execute(params)
+      assert.equal(/攻坚案件 case-s/.test(result.content), false)
+    })
+
+    it('getter 缺席（headless 旧接线）→ 行为不变', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-absent',
+        ownedFiles: ['src/a.ts'],
+      })
+      const result = await tool.execute(params)
+      assert.equal(/攻坚案件/.test(result.content), false)
+    })
+  })
+
+  describe('遗产回收 W-A1：needs_user 案件披露（弱 advisory）', () => {
+    it('needs_user 案件 → 遗留项提示 + 最小决策问题，不阻断', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-nu',
+        ownedFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        palNeedsUserCases: [
+          { caseId: 'case-nu', problem: '登录偶发 401', minimalQuestion: '生产环境的 token 刷新周期是多少？' },
+        ],
+      })
+      const result = await tool.execute(params)
+      assert.equal(result.isError ?? false, false, '弱 advisory 绝不让交付失败')
+      assert.match(result.content, /攻坚案件 case-nu 卡在等用户裁决/)
+      assert.match(result.content, /登录偶发 401/)
+      assert.match(result.content, /生产环境的 token 刷新周期是多少？/)
+    })
+
+    it('无 needs_user 案件（空数组）→ 零提示', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-nu-empty',
+        ownedFiles: ['src/a.ts'],
+        palNeedsUserCases: [],
+      })
+      const result = await tool.execute(params)
+      assert.equal(/等用户裁决/.test(result.content), false)
+    })
+
+    it('getter 缺席（headless 旧接线）→ 行为不变', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-pal-nu-absent',
+        ownedFiles: ['src/a.ts'],
+      })
+      const result = await tool.execute(params)
+      assert.equal(/等用户裁决/.test(result.content), false)
+    })
+  })
+
+  // ── 虚空仓库 P0：learned 参数解析 ──
+  describe('parseLearnedEntries — learned 参数解析', () => {
+    it('标准格式："模式描述——证据：..." 拆出 text/evidence/topic', () => {
+      const [e] = parseLearnedEntries(['此项目用 npx tsx --test 运行测试——证据：package.json scripts 全用 tsx'])
+      assert.ok(e)
+      assert.equal(e!.text, '此项目用 npx tsx --test 运行测试')
+      assert.equal(e!.evidence, 'package.json scripts 全用 tsx')
+      assert.equal(e!.topic, 'package.json', 'topic 从证据里提取路径样 token')
+      assert.deepEqual(e!.tags, ['agent-learned'])
+    })
+
+    it('分隔符变体容忍："--证据:" 也能拆', () => {
+      const [e] = parseLearnedEntries(['模式 X 成立--证据: src/a/b.ts 的实现'])
+      assert.equal(e!.text, '模式 X 成立')
+      assert.equal(e!.evidence, 'src/a/b.ts 的实现')
+      assert.equal(e!.topic, 'src/a/b.ts')
+    })
+
+    it('缺分隔符 → 整条入 text、evidence 为空、topic undefined', () => {
+      const [e] = parseLearnedEntries(['没有证据分隔符的整句知识'])
+      assert.equal(e!.text, '没有证据分隔符的整句知识')
+      assert.equal(e!.evidence, '')
+      assert.equal(e!.topic, undefined)
+    })
+
+    it('非数组 / 空数组 / 非字符串元素 / 空白串 → 全部安全过滤', () => {
+      assert.deepEqual(parseLearnedEntries(undefined), [])
+      assert.deepEqual(parseLearnedEntries('not-an-array'), [])
+      assert.deepEqual(parseLearnedEntries([]), [])
+      assert.deepEqual(parseLearnedEntries([42, null, '   ', { x: 1 }]), [])
+    })
+  })
+
+  // ── 虚空仓库 P0：deliver_task 收割集成 ──
+  describe('虚空仓库 P0：learned 收割 → memory.jsonl 直写', () => {
+    it('带两条 learned → 写入两条 agent-crafted 记录（含 id/ts，可读回）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'void-harvest-'))
+      try {
+        const { tool, params } = makeContext({
+          taskId: 't-learn',
+          ownedFiles: ['src/a.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+          sessionId: 'sess-learn',
+        })
+        params.cwd = dir
+        params.input = { learned: [
+          '此项目用 tsx 而非 ts-node——证据：package.json',
+          '压缩只在 turn 0 重写历史——证据：compact-boundary-coordinator.ts',
+        ] }
+        const result = await tool.execute(params)
+        assert.equal(result.isError ?? false, false)
+        assert.match(result.content, /🧠 虚空仓库：已收割 2 条知识/)
+
+        const entries = readMemoryEntries(dir)
+        assert.equal(entries.length, 2)
+        for (const e of entries) {
+          assert.equal(e.source, 'agent-crafted')
+          assert.equal(e.kind, 'verified_pattern')
+          assert.equal(e.status, 'verified')
+          assert.equal(e.sessionId, 'sess-learn')
+          assert.ok(e.id.startsWith('mem_') && e.ts > 0, 'id/ts 由 appendMemoryEntry 生成')
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('相似条目已存在 → 跳过不双写（含第四层 PAL 收割同结论场景）', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'void-dedup-'))
+      try {
+        appendMemoryEntry(dir, {
+          text: '此项目用 tsx 而非 ts-node',
+          kind: 'verified_pattern', confidence: 0.95, source: 'agent-crafted', status: 'verified', tags: [],
+        })
+        const { tool, params } = makeContext({
+          taskId: 't-learn-dup',
+          ownedFiles: ['src/a.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        })
+        params.cwd = dir
+        params.input = { learned: ['此项目用 tsx 而非 ts-node——证据：package.json'] }
+        const result = await tool.execute(params)
+        assert.equal(readMemoryEntries(dir).length, 1, '相似条目挡住重复写入')
+        assert.equal(/已收割/.test(result.content), false, '零新写入不报收割')
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('收割失败（cwd 不可写）不阻断交付', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-learn-fail',
+        ownedFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      })
+      // params.cwd 保持 '/fake/project'（不存在且不可创建）
+      params.input = { learned: ['某模式——证据：某路径'] }
+      const result = await tool.execute(params)
+      assert.equal(result.isError ?? false, false, '收割失败绝不阻断交付')
+      assert.ok(result.content.includes('GREEN'))
+    })
+  })
+
+  // ── 虚空仓库 P0：收割邀请（条件展示）──
+  describe('虚空仓库 P0：知识收割邀请', () => {
+    it('有 PAL 案件且未带 learned → 展示收割邀请', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-invite-pal',
+        ownedFiles: ['src/root-cause.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        palConvergedCases: [{ caseId: 'case-i', selectedHypothesisId: 'hyp-i', targets: ['src/root-cause.ts'], claim: 'c', evidenceRefs: [] }],
+      })
+      const result = await tool.execute(params)
+      assert.match(result.content, /知识收割（虚空仓库）/)
+      assert.match(result.content, /learned 参数提交/)
+    })
+
+    it('交付 ≥3 文件（长 session 代理指标）且未带 learned → 展示邀请', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-invite-big',
+        ownedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      })
+      const result = await tool.execute(params)
+      assert.match(result.content, /知识收割（虚空仓库）/)
+    })
+
+    it('本次调用已带 learned → 不重复邀请', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'void-invite-'))
+      try {
+        const { tool, params } = makeContext({
+          taskId: 't-invite-provided',
+          ownedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        })
+        params.cwd = dir
+        params.input = { learned: ['模式——证据：路径'] }
+        const result = await tool.execute(params)
+        assert.equal(/知识收割（虚空仓库）/.test(result.content), false)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('小交付（<3 文件）且无 PAL 活动 → 零邀请（token 纪律）', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-invite-small',
+        ownedFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      })
+      const result = await tool.execute(params)
+      assert.equal(/知识收割（虚空仓库）/.test(result.content), false)
     })
   })
 })

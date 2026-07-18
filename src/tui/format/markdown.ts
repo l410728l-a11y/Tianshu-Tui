@@ -400,26 +400,20 @@ function formatCodeBlock(language: string | undefined, content: string, columns:
 
   const result: string[] = []
 
-  // Header
-  const headerText = `── ${language || 'code'}`
-  const headerWidth = Math.max(20, columns - 6)
-  const headerBorder = '┌' + headerText + '─'.repeat(Math.max(0, headerWidth - headerText.length))
-  result.push(color(headerBorder, theme.dim))
+  // 轻量语言标签（不含竖线/边框，不会污染选区复制）：
+  // 仅用一行 dim 的「╴ ts ╴」标识语言，代码行裸输出便于整体选中。
+  const label = language || 'code'
+  result.push(color(`╴ ${label} ╴`, theme.muted))
 
-  // Code lines with left border
+  // 代码行直接渲染：不加左侧 │ 竖线，用户可干净选中整段复制。
   for (const line of visible) {
     const segs = highlightLine(line, keywords, caseInsensitive, theme)
-    const rendered = formatInlineToAnsi(segs, theme)
-    result.push(`${color('│ ', theme.dim)}${rendered}`)
+    result.push(formatInlineToAnsi(segs, theme))
   }
 
   if (truncated) {
     result.push(color(`… (${lines.length - MAX_CODE_LINES} more lines)`, theme.muted))
   }
-
-  // Footer
-  const footerBorder = '└' + '─'.repeat(headerWidth)
-  result.push(color(footerBorder, theme.dim))
 
   return result
 }

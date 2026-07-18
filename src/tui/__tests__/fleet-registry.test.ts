@@ -166,3 +166,18 @@ test('FleetRegistry: getWorkers 按 startedAt 升序', () => {
   const ids = fleet.getWorkers(200).map(w => w.workerId)
   assert.deepEqual(ids, ['early', 'late'])
 })
+
+test('FleetRegistry: authorityReason 透传到 view', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply({
+    workOrderId: 'wo_ar',
+    parentToolId: 't',
+    profile: 'patcher',
+    authority: 'tianfu',
+    authorityReason: '命中: 重构+优化',
+    status: 'running',
+  }, 0)
+  const view = fleet.getWorkerById('wo_ar', 1)!
+  assert.equal(view.authority, 'tianfu')
+  assert.equal(view.authorityReason, '命中: 重构+优化')
+})

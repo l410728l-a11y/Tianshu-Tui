@@ -9,10 +9,50 @@
  * wall-clock budget stays a far backstop; this is the primary runtime gate.
  */
 
+import {
+  REASONING_FIRST_BYTE_TIMEOUT_MS,
+  SLOW_FIRST_BYTE_TIMEOUT_MS,
+  SLOW_THINKING_PROVIDERS,
+  FIRST_BYTE_PER_100K_MS,
+} from '../api/openai-client.js'
+
 /** Default silence tolerance for read-only (explore) workers. */
 export const EXPLORE_STALL_MS = 90_000
 /** Default silence tolerance for write (hands) workers — edits pause longer. */
 export const WRITE_STALL_MS = 120_000
+
+/** Conservative size-scaled first-byte headroom: 3 buckets (~300k-token prompts). */
+const FIRST_BYTE_SIZE_MARGIN_MS = 3 * FIRST_BYTE_PER_100K_MS
+/** Window for one internal transient retry (backoff + reconnect) to start ticking. */
+const RETRY_WINDOW_MS = 30_000
+
+export interface DeriveWorkerStallOpts {
+  providerName?: string
+  isWrite?: boolean
+  /** Worker uses thinking mode. Default true — provider schema 的 thinking 默认
+   *  'enabled'（src/config/schema.ts），未知时按 true 取保守长绳。 */
+  thinking?: boolean
+}
+
+/**
+ * Per-worker silence tolerance derived from the API layer's OWN first-byte
+ * budget. The fixed 90/120s defaults pre-empt healthy slow first-byte waits:
+ * a thinking worker's API first-byte budget is 90s（slow set 180s）+ up to
+ * 60s per 100k input tokens — e.g. a 351k-token LongCat scout legally waits
+ * 270s for its first token, but the 90s sweep killed it first（2026-07-18
+ * 会话 2058615c 四个 scout 同窗口齐死）。慢 ≠ 死：thinking/slow provider
+ * 的静默下限必须覆盖"基础首字节 + 规模上浮余量 + 一次内部重试窗口"；
+ * 非 thinking provider 保持原档，快杀真死锁。
+ */
+export function deriveWorkerStallMs(opts: DeriveWorkerStallOpts): number {
+  const base = opts.isWrite ? WRITE_STALL_MS : EXPLORE_STALL_MS
+  const thinking = opts.thinking ?? true
+  if (!thinking) return base
+  const firstByteBase = SLOW_THINKING_PROVIDERS.has(opts.providerName ?? '')
+    ? SLOW_FIRST_BYTE_TIMEOUT_MS
+    : REASONING_FIRST_BYTE_TIMEOUT_MS
+  return Math.max(base, firstByteBase + FIRST_BYTE_SIZE_MARGIN_MS + RETRY_WINDOW_MS)
+}
 
 export interface WorkerLivenessOptions {
   /** No activity for this long ⇒ worker is considered stalled. */
@@ -58,6 +98,12 @@ export class WorkerLiveness {
       if (t - last > tolerance) out.push(id)
     }
     return out
+  }
+
+  /** Registered silence tolerance for an id (undefined when not tracked). */
+  tolerance(id: string): number | undefined {
+    if (!this.lastActivity.has(id)) return undefined
+    return this.stallMsById.get(id) ?? this.defaultStallMs
   }
 
   /** Number of workers currently tracked. */

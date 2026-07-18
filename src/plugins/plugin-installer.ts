@@ -14,6 +14,7 @@ import { cpSync } from 'node:fs'
 import { execSync, execFileSync } from 'node:child_process'
 import { rivetHome } from '../config/paths.js'
 import { parseManifest, type PluginManifest, type PluginPackageJson } from './manifest.js'
+import { cloneGitSource, GitCloneError } from './git-source.js'
 
 // ── npm resolution ─────────────────────────────────────────────────
 
@@ -84,6 +85,26 @@ function npmInstallArgs(cmd: string): { command: string; options: import('node:c
 
 // ── Types ──────────────────────────────────────────────────────────
 
+/** Discriminated source for installPlugin. `local` is a filesystem path;
+ *  `git` clones from an arbitrary git URL (optional ref = branch/tag/commit). */
+export type PluginSource =
+  | { kind: 'local'; path: string }
+  | { kind: 'git'; url: string; ref?: string }
+
+/** Provenance of an installed plugin, persisted as `.tianshu-origin.json`
+ *  inside the install dir. Lets the UI show "from github.com/x/y" and supports
+ *  future upgrade (re-pull) flows. */
+export interface PluginOrigin {
+  kind: 'local' | 'git'
+  /** Git-only: the cloned URL. */
+  url?: string
+  /** Git-only: the ref passed at install time (branch/tag/commit). */
+  ref?: string
+  /** Git-only: resolved commit SHA at clone time. */
+  commit?: string
+  installedAt: number
+}
+
 export interface InstallSuccess {
   ok: true
   manifest: PluginManifest
@@ -112,6 +133,8 @@ export interface InstalledPluginInfo {
   toolCount: number
   toolNames: string[]
   tools: string
+  /** Source provenance (undefined for plugins installed before origin tracking). */
+  origin?: PluginOrigin
 }
 
 // ── Public API ─────────────────────────────────────────────────────
@@ -122,16 +145,52 @@ export function pluginsDir(): string {
 }
 
 /**
- * Install a plugin from a local directory path.
+ * Install a plugin from a local path or git URL.
  *
- * Steps:
- *  1. Read and validate manifest from source directory
- *  2. Check for duplicate install
- *  3. Copy source tree to ~/.rivet/plugins/<name>/
- *  4. Run `npm install --ignore-scripts --omit=dev` inside
- *  5. Write install metadata
+ * - `kind: 'local'` — copies the local dir + npm install (legacy behavior)
+ * - `kind: 'git'` — clones from an arbitrary git URL (optional ref) into a
+ *   temp dir, then runs the same install-from-local flow. The temp clone is
+ *   cleaned up in a finally block regardless of success/failure.
+ *
+ * On git source, clone errors are surfaced as InstallError.error with the git
+ * stderr attached, so the user sees "Repository not found" / "Could not read
+ * username" etc. instead of an opaque message.
  */
-export async function installPlugin(sourcePath: string): Promise<InstallResult> {
+export async function installPlugin(source: PluginSource): Promise<InstallResult> {
+  if (source.kind === 'git') {
+    let cloned: { sourcePath: string; commit: string; cleanup: () => void } | null = null
+    try {
+      cloned = await cloneGitSource(source.url, source.ref)
+    } catch (err) {
+      if (err instanceof GitCloneError) {
+        return { ok: false, error: err.stderr ? `${err.message}` : err.message }
+      }
+      return { ok: false, error: `Clone failed: ${(err as Error).message}` }
+    }
+    try {
+      const origin: PluginOrigin = {
+        kind: 'git',
+        url: source.url,
+        ...(source.ref ? { ref: source.ref } : {}),
+        ...(cloned.commit ? { commit: cloned.commit } : {}),
+        installedAt: Date.now(),
+      }
+      return await installFromLocal(cloned.sourcePath, origin)
+    } finally {
+      cloned.cleanup()
+    }
+  }
+  return installFromLocal(source.path)
+}
+
+/**
+ * Install from a local directory: validate manifest → cpSync to
+ * ~/.rivet/plugins/<name>/ → npm install → write origin metadata (if any).
+ *
+ * Extracted from the old installPlugin(sourcePath) so the git path can reuse
+ * the exact same copy+install+metadata flow after cloning.
+ */
+async function installFromLocal(sourcePath: string, origin?: PluginOrigin): Promise<InstallResult> {
   // 1. Read package.json from source
   const srcPkgPath = join(sourcePath, 'package.json')
   let pkg: PluginPackageJson
@@ -201,6 +260,15 @@ export async function installPlugin(sourcePath: string): Promise<InstallResult> 
     return { ok: false, error: `npm install failed: ${stderr}` }
   }
 
+  // 5. Persist origin metadata (git source). Best-effort: a failed write does
+  // not roll back a successful install — the plugin works, just without
+  // provenance for future upgrades.
+  if (origin) {
+    try {
+      writeFileSync(join(installPath, '.tianshu-origin.json'), JSON.stringify(origin, null, 2) + '\n')
+    } catch { /* best-effort */ }
+  }
+
   return { ok: true, manifest, installPath }
 }
 
@@ -233,6 +301,13 @@ export function getInstalledPlugins(): InstalledPluginInfo[] {
         if (pkg.tianshu && typeof pkg.tianshu === 'object') {
           const manifest = pkg.tianshu as Record<string, unknown>
           const tools = Array.isArray(manifest.tools) ? manifest.tools as Array<{ name: string }> : []
+          // Origin provenance (git-installed plugins). Absent for legacy installs.
+          let origin: PluginOrigin | undefined
+          try {
+            const originRaw = readFileSync(join(root, name, '.tianshu-origin.json'), 'utf-8')
+            const parsed = JSON.parse(originRaw) as PluginOrigin
+            if (parsed && typeof parsed.kind === 'string') origin = parsed
+          } catch { /* no origin file — legacy local install */ }
           results.push({
             name: (manifest.name as string) ?? name,
             version: (manifest.version as string) ?? 'unknown',
@@ -242,6 +317,7 @@ export function getInstalledPlugins(): InstalledPluginInfo[] {
             toolCount: tools.length,
             toolNames: tools.map(t => t.name),
             tools: tools.map(t => t.name).join(', '),
+            ...(origin ? { origin } : {}),
           })
         }
       } catch {

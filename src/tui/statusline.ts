@@ -74,7 +74,7 @@ export class StatusLineRunner {
 
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn(this.command, { shell: true, stdio: ['pipe', 'pipe', 'ignore'] })
+      child = spawn(this.command, { shell: true, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
     } catch {
       this.inFlight = false
       return

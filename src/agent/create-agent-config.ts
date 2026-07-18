@@ -49,6 +49,8 @@ export interface AgentConfigInput {
   autoDelegateEnabled?: boolean
   autoReasoning?: boolean
   crossSessionEnabled?: boolean
+  /** Session Auto keyword routing; default false via createMainAgentConfigInput. */
+  domainKeywordRouting?: boolean
   goalJudge?: { enabled?: boolean; maxRuns?: number; browser?: boolean }
   auth?: AuthProvider
   habituationThreshold?: number
@@ -106,6 +108,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
     llmSpeculation: params.config.agent.llmSpeculation,
     autoDelegateEnabled: params.config.agent.autoDelegateEnabled,
     autoReasoning: params.config.agent.autoReasoning,
+    domainKeywordRouting: params.config.agent.domainKeywordRouting,
     goalJudge: params.config.agent.goal?.judge,
     auth: params.auth,
     habituationThreshold: params.habituationThreshold,
@@ -123,7 +126,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
 
 export function createAgentConfig(input: AgentConfigInput): Pick<
   AgentConfig,
-  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens'
+  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens'
 > {
   const { model, apiKey, cwd, provider } = input
   const capabilities = resolveCapabilities(provider.name, provider.capabilities)
@@ -213,6 +216,7 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     intentRetrievalRouter: input.intentRetrievalRouter,
     llmSpeculation: input.llmSpeculation,
     autoDelegateEnabled: input.autoDelegateEnabled,
+    domainKeywordRouting: input.domainKeywordRouting ?? false,
     goalJudge: input.goalJudge,
     allProviders: input.allProviders,
     autoReasoning: input.autoReasoning ?? true,

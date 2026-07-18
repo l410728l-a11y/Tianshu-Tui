@@ -1,5 +1,6 @@
 import { classifyChangeScale, isTrivialChange, upgradeScaleByDepth, type ChangeSet, type ReviewScale } from './review-discipline.js'
 import { profileRegistry } from './profile-registry.js'
+import type { WorkerActivityEvent } from './coordinator.js'
 
 export type ReviewVerdict = 'verified' | 'rejected'
 
@@ -40,12 +41,12 @@ export interface SquadronResult {
 }
 
 export interface ReviewRouterDeps {
-  spawnVerifier: (change: ChangeSet, signal?: AbortSignal) => Promise<VerifierResult>
-  spawnPatcher: (change: ChangeSet, verifier: VerifierResult, signal?: AbortSignal) => Promise<PatcherResult>
-  spawnSquadron: (change: ChangeSet, signal?: AbortSignal) => Promise<SquadronResult>
+  spawnVerifier: (change: ChangeSet, signal?: AbortSignal, onActivity?: (event: WorkerActivityEvent) => void) => Promise<VerifierResult>
+  spawnPatcher: (change: ChangeSet, verifier: VerifierResult, signal?: AbortSignal, onActivity?: (event: WorkerActivityEvent) => void) => Promise<PatcherResult>
+  spawnSquadron: (change: ChangeSet, signal?: AbortSignal, onActivity?: (event: WorkerActivityEvent) => void) => Promise<SquadronResult>
   /** Auto mode: single wiring-effectiveness inspector on a short budget.
    *  When absent, auto mode degrades to a non-blocking nudge. */
-  spawnWiringReviewer?: (change: ChangeSet, signal?: AbortSignal) => Promise<SquadronResult>
+  spawnWiringReviewer?: (change: ChangeSet, signal?: AbortSignal, onActivity?: (event: WorkerActivityEvent) => void) => Promise<SquadronResult>
 }
 
 export type ReviewMode = 'auto' | 'manual'
@@ -65,6 +66,9 @@ export interface ReviewRouterOptions {
   /** User-provided focus hint (from /review max <focus>). Injected into
    *  inspector/verifier objectives so workers know what to prioritize. */
   focusHint?: string
+  /** Review-gate UI visibility: forwarded to every spawned review worker as
+   *  DelegationRequest.onActivity so the subagent panel sees live progress. */
+  onActivity?: (event: WorkerActivityEvent) => void
 }
 
 export interface ReviewOutcome {
@@ -188,7 +192,7 @@ export async function routeReviewWorkflow(
     const reviewDidNotRun = (w: SquadronResult): boolean =>
       w.findings.length === 0 && (w.infraFailures?.length ?? 0) > 0
 
-    let wiring = await deps.spawnWiringReviewer(change, signal)
+    let wiring = await deps.spawnWiringReviewer(change, signal, options.onActivity)
     let infraFailures = wiring.infraFailures ?? []
     let recoveredByRetry = false
     let attempts = 1
@@ -201,7 +205,7 @@ export async function routeReviewWorkflow(
     const firstAttemptTimedOut = infraFailures.some(f => f.kind === 'timeout')
     if (reviewDidNotRun(wiring) && !firstAttemptTimedOut && !signal?.aborted) {
       attempts = 2
-      const retry = await deps.spawnWiringReviewer(change, signal)
+      const retry = await deps.spawnWiringReviewer(change, signal, options.onActivity)
       if (!reviewDidNotRun(retry)) {
         wiring = retry
         infraFailures = retry.infraFailures ?? []
@@ -252,7 +256,7 @@ export async function routeReviewWorkflow(
 
   let infraFailures: ReviewInfraFailure[] = []
   if (tier === 'L3') {
-    const squadron = await deps.spawnSquadron(change, signal)
+    const squadron = await deps.spawnSquadron(change, signal, options.onActivity)
     infraFailures = squadron.infraFailures ?? []
     if (hasBlockingSquadronFinding(squadron)) {
       return {
@@ -279,7 +283,7 @@ export async function routeReviewWorkflow(
   let last: VerifierResult = { verdict: 'rejected', evidence: '' }
 
   for (let round = 1; round <= maxRounds; round++) {
-    last = normalizeVerifierResult(await deps.spawnVerifier(change, signal))
+    last = normalizeVerifierResult(await deps.spawnVerifier(change, signal, options.onActivity))
     if (last.verdict === 'verified') {
       const infraEvidence = infraFailures.length > 0
         ? `${last.evidence}\nReview infra caveats: ${summarizeInfraFailures(infraFailures)}`
@@ -292,7 +296,7 @@ export async function routeReviewWorkflow(
         ...(infraFailures.length > 0 ? { infraFailures } : {}),
       }
     }
-    const patcher = await deps.spawnPatcher(change, last, signal)
+    const patcher = await deps.spawnPatcher(change, last, signal, options.onActivity)
     if (!patcher.patched) {
       return {
         tier,

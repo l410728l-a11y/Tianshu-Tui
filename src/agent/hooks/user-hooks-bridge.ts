@@ -5,7 +5,7 @@ import type {
   PostSessionRuntimeHook,
   RuntimeHook,
 } from '../runtime-hooks.js'
-import { runHooksForEvent, type HookEvent, type HookResult } from '../../hooks/user-hooks-runner.js'
+import { runHooksForEvent, type HookEvent, type HookResult, type PluginHook } from '../../hooks/user-hooks-runner.js'
 
 export interface HookResultMeta {
   event: HookEvent
@@ -20,6 +20,10 @@ export interface UserHooksBridgeDeps {
   getTurn: () => number
   /** I4: surfaced as `hook_result` events on the desktop event stream. */
   emitHookResult?: (results: HookResult[], meta: HookResultMeta) => void
+  /** Lazy getter for plugin-contributed hooks (absolute script paths). Plugins
+   *  load after agent assembly, so this is read at every fire — not captured
+   *  once at bridge creation. Merged with project .rivet/hooks.json. */
+  getPluginHooks?: () => PluginHook[]
 }
 
 function bridgeHook(deps: UserHooksBridgeDeps, event: HookEvent): RuntimeHook {
@@ -27,13 +31,16 @@ function bridgeHook(deps: UserHooksBridgeDeps, event: HookEvent): RuntimeHook {
   const emit = (results: HookResult[], extra?: Partial<HookResultMeta>) => {
     deps.emitHookResult?.(results, { event, turn: deps.getTurn(), ...extra })
   }
+  // Shared runner: project hooks (.rivet/hooks.json) + plugin hooks (merged).
+  const run = (ctx: Parameters<typeof runHooksForEvent>[1]) =>
+    runHooksForEvent(deps.cwd, ctx, deps.getPluginHooks?.())
 
   if (event === 'preTurn') {
     return {
       phase: 'preTurn',
       name: 'user-hooks-preTurn',
       run() {
-        emit(runHooksForEvent(deps.cwd, { ...base, event: 'preTurn', turn: deps.getTurn() }))
+        emit(run({ ...base, event: 'preTurn', turn: deps.getTurn() }))
       },
     } satisfies PreTurnRuntimeHook
   }
@@ -43,7 +50,7 @@ function bridgeHook(deps: UserHooksBridgeDeps, event: HookEvent): RuntimeHook {
       phase: 'postTurn',
       name: 'user-hooks-postTurn',
       run() {
-        emit(runHooksForEvent(deps.cwd, { ...base, event: 'postTurn', turn: deps.getTurn() }))
+        emit(run({ ...base, event: 'postTurn', turn: deps.getTurn() }))
       },
     } satisfies PostTurnRuntimeHook
   }
@@ -53,7 +60,7 @@ function bridgeHook(deps: UserHooksBridgeDeps, event: HookEvent): RuntimeHook {
       phase: 'postSession',
       name: 'user-hooks-postSession',
       run() {
-        emit(runHooksForEvent(deps.cwd, { ...base, event: 'postSession', turn: deps.getTurn() }))
+        emit(run({ ...base, event: 'postSession', turn: deps.getTurn() }))
       },
     } satisfies PostSessionRuntimeHook
   }
@@ -63,7 +70,7 @@ function bridgeHook(deps: UserHooksBridgeDeps, event: HookEvent): RuntimeHook {
     name: 'user-hooks-postTool',
     run(_ctx, tool) {
       emit(
-        runHooksForEvent(deps.cwd, {
+        run({
           ...base,
           event: 'postTool',
           turn: deps.getTurn(),
@@ -85,7 +92,7 @@ export function runOnErrorHooks(deps: UserHooksBridgeDeps, error: string): void 
     turn: deps.getTurn(),
     event: 'onError',
     error,
-  })
+  }, deps.getPluginHooks?.())
   deps.emitHookResult(results, { event: 'onError', turn: deps.getTurn(), error })
 }
 

@@ -469,7 +469,7 @@ describe('distillFromFailures', () => {
     return {
       type: 'anchoring',
       count: 3,
-      evidence: [makeEntry({ target: 'src/foo.ts', hypothesis: 'wrong type cast' })],
+      evidence: [makeEntry({ target: 'src/foo.ts' })],
       suggestion: '尝试换一种类型转换方式',
       ...overrides,
     }
@@ -489,13 +489,14 @@ describe('distillFromFailures', () => {
     assert.equal(bullets[0]!.importance, 0.6)
     assert.equal(bullets[0]!.source, 'typecheck')
     assert.equal(bullets[0]!.errorSignal, 'TS2322 type mismatch')
-    assert.equal(bullets[0]!.fixApproach, 'wrong type cast')
+    // hypothesis 死字段删除后（PAL 第四波），失败蒸馏不再产出 fixApproach。
+    assert.equal(bullets[0]!.fixApproach, undefined)
   })
 
   it('distills from repeated error classes (2+ occurrences)', () => {
     const entries = [
-      makeEntry({ error: 'test failed: expected true got false', target: 'src/auth.ts', hypothesis: 'missing mock', context: 'unit test' }),
-      makeEntry({ error: 'test failed: expected true got false', target: 'src/auth.ts', hypothesis: 'missing mock', context: 'unit test', turn: 2 }),
+      makeEntry({ error: 'test failed: expected true got false', target: 'src/auth.ts', context: 'unit test' }),
+      makeEntry({ error: 'test failed: expected true got false', target: 'src/auth.ts', context: 'unit test', turn: 2 }),
     ]
     const bullets = distillFromFailures(entries, [], { now: NOW })
     assert.equal(bullets.length, 1)
@@ -508,7 +509,7 @@ describe('distillFromFailures', () => {
     const patterns: FailurePattern[] = [{
       type: 'rework',
       count: 2,
-      evidence: [makeEntry({ target: 'src/foo.ts', hypothesis: '小心处理边界' })],
+      evidence: [makeEntry({ target: 'src/foo.ts', context: '小心处理边界' })],
       suggestion: '注意检查边界条件',
     }]
     const bullets = distillFromFailures(entries, patterns, { now: NOW })

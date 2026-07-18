@@ -9,7 +9,7 @@
  * A domain's voice is not an add-on; it's the message itself.
  */
 
-export type DomainVoiceId = 'tianshu' | 'pojun' | 'tianfu' | 'tianliang' | 'tianquan' | 'tianji' | 'tianxuan' | 'fu' | 'wenqu' | 'yaoguang' | 'huagai' | null
+export type DomainVoiceId = 'tianshu' | 'pojun' | 'tianfu' | 'tianliang' | 'tianquan' | 'tianji' | 'tianxuan' | 'fu' | 'wenqu' | 'kaiyang' | 'yaoguang' | 'huagai' | null
 
 // ---------------------------------------------------------------------------
 // Domain tone tables
@@ -22,6 +22,7 @@ const DOMAIN_NAMES: Record<string, string> = {
   tianliang: '天梁',
   fu: '辅',
   wenqu: '文曲',
+  kaiyang: '开阳',
   yaoguang: '瑶光',
   huagai: '华盖',
 }
@@ -132,6 +133,23 @@ const DOMAIN_TONE: Record<string, Array<[string, string]>> = {
     ['最后验证中', '验证域间边界'],
     ['正在分析', '诊断认知场中'],
     ['测一下', '验证一下'],
+  ],
+  kaiyang: [
+    // 开阳 — 对账者。双星互证，实测为凭。凡事量过再说。
+    ['准备制定方案', '先算精确构成，再定测量计划'],
+    ['开始修改', '期望值已独立推导，开始对账'],
+    ['正在修复', '插桩采实际值，与期望对账'],
+    ['代码修改完成', '修复完成，实测对账通过'],
+    ['测试全部通过', '实测与期望两通道一致'],
+    ['运行测试验证', '跑对账脚本，量实际行为'],
+    ['准备交付结果', '对账闭环，交付实测证据'],
+    ['收到任务，开始分析', '收到，先问：真实数值是什么'],
+    ['可能遇到困难', '探测无信息——换手段，不换文案'],
+    ['接近完成', '最后一轮对账中'],
+    ['继续执行中', '逐帧对账中'],
+    ['最后验证中', '独立通道复核中'],
+    ['正在分析', '推导精确构成中'],
+    ['测一下', '量一下'],
   ],
   yaoguang: [
     // 瑶光 — rigorous, time-aware, self-reflective. A verifier who sees recurrence.

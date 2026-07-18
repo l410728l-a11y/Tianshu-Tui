@@ -23,6 +23,18 @@ export interface CorrectPlanResult {
   addedSteps: PlanStep[]
 }
 
+/**
+ * PAL 第四波 W2：活跃攻坚案件的只读上下文（由 PlanTraceCoordinator 从
+ * ProblemAttackStore 派生后传入）。replan 只用它改写 blocked/stalled 的
+ * 修正文案——引用 caseId 与下一判别探针建议，**绝不注入开案建议**
+ * （开案建议是 CV3 的单声道职责，见 ④c 反证记录）。
+ */
+export interface ReplanPalContext {
+  caseId: string
+  /** chooseDiscriminator 建议的下一探针描述；无可选型时 null。 */
+  nextProbe: string | null
+}
+
 export interface ReplanContext {
   /** 注入到下一轮 prompt 的文本 */
   text: string
@@ -55,6 +67,7 @@ function nextStepId(trace: PlanExecutionTrace): string {
 export function correctPlan(
   trace: PlanExecutionTrace,
   deviation: DeviationResult,
+  pal?: ReplanPalContext | null,
 ): CorrectPlanResult {
   switch (deviation.type) {
     case 'none':
@@ -63,7 +76,9 @@ export function correctPlan(
     case 'blocked': {
       const step: PlanStep = {
         id: nextStepId(trace),
-        description: `诊断阻塞原因 — ${deviation.reason}`,
+        description: pal
+          ? `诊断阻塞原因 — ${deviation.reason}（活跃攻坚案件 ${pal.caseId}${pal.nextProbe ? `：先执行判别探针 ${pal.nextProbe}` : '：attack_case status 复盘假设板'}）`
+          : `诊断阻塞原因 — ${deviation.reason}`,
         expectedTools: ['bash', 'read_file', 'grep'],
         verificationHint: '确认阻塞已解除或路径已切换',
         status: 'pending',
@@ -119,7 +134,9 @@ export function correctPlan(
     case 'stalled': {
       const step: PlanStep = {
         id: nextStepId(trace),
-        description: `打破停滞 — 选择最相关的未用工具推进`,
+        description: pal
+          ? `打破停滞 — 活跃攻坚案件 ${pal.caseId}${pal.nextProbe ? ` 有下一判别探针 ${pal.nextProbe}，执行它` : '，attack_case status 复盘假设板'}`
+          : `打破停滞 — 选择最相关的未用工具推进`,
         expectedTools: ['todo', 'read_file', 'grep'],
         verificationHint: '确认 agent 恢复推进',
         status: 'pending',
@@ -140,6 +157,7 @@ export function correctPlan(
 export function injectReplanContext(
   deviation: DeviationResult,
   addedSteps: PlanStep[],
+  pal?: ReplanPalContext | null,
 ): ReplanContext {
   if (deviation.type === 'none') {
     return { text: '', deviationType: 'none' }
@@ -167,6 +185,12 @@ export function injectReplanContext(
     for (const step of addedSteps) {
       lines.push(`  - ${step.description}`)
     }
+  }
+
+  // W2：blocked/stalled 且有活跃攻坚案件 → 引用案件事实（只读感知增强，
+  // 不建议开新案件——无案件时不加任何 PAL 文案，保持原行为）。
+  if (pal && (deviation.type === 'blocked' || deviation.type === 'stalled')) {
+    lines.push(`攻坚案件: ${pal.caseId}${pal.nextProbe ? ` — 下一判别探针建议: ${pal.nextProbe}` : ' — 无可选型探针，attack_case status 复盘'}`)
   }
 
   lines.push('</replan-context>')

@@ -88,11 +88,32 @@ describe('classifyApiError', () => {
     assert.equal(result.maxRetries, 3)
   })
 
-  it('classifies 413 as context_overflow', () => {
+  it('classifies 413 as image_strip (retry with image removal)', () => {
     const result = classifyApiError(new FakeApiError('Payload too large', 413))
-    assert.equal(result.category, 'context_overflow')
-    assert.equal(result.retryable, false)
-    assert.equal(result.maxRetries, 0)
+    assert.equal(result.category, 'image_strip')
+    assert.equal(result.retryable, true)
+    assert.equal(result.maxRetries, 1)
+    assert.equal(result.stripImages, true)
+  })
+
+  it('classifies image processing 400 as image_strip', () => {
+    const result = classifyApiError(new FakeApiError('Could not process image: bad format', 400))
+    assert.equal(result.category, 'image_strip')
+    assert.equal(result.retryable, true)
+    assert.equal(result.stripImages, true)
+  })
+
+  it('classifies wrapped image processing 500 as image_strip', () => {
+    const result = classifyApiError(new FakeApiError('upstream: 400 Bad Request: Could not process image', 500))
+    assert.equal(result.category, 'image_strip')
+    assert.equal(result.retryable, true)
+    assert.equal(result.stripImages, true)
+  })
+
+  it('classifies unsupported image format 400 as image_strip', () => {
+    const result = classifyApiError(new FakeApiError('unsupported image format', 400))
+    assert.equal(result.category, 'image_strip')
+    assert.equal(result.stripImages, true)
   })
 
   it('classifies generic 4xx as client_error', () => {
@@ -318,8 +339,11 @@ describe('classifyApiError', () => {
     // Verify all categories are reachable
     const categories: ErrorCategory[] = [
       'rate_limit', 'overloaded', 'server_error', 'timeout',
-      'auth_error', 'client_error', 'context_overflow',
-      'stream_parse', 'unknown',
+      'auth_error', 'client_error',
+      'image_strip', 'stream_parse', 'unknown',
+      // 'context_overflow' is reserved — currently no status code triggers it
+      // directly (413 defaults to image_strip). Will be added when 413 message
+      // disambiguation lands.
     ]
     const covered = new Set<ErrorCategory>()
 
@@ -330,7 +354,7 @@ describe('classifyApiError', () => {
       Object.assign(new Error(''), { name: 'ECONNRESET' }), // timeout
       new FakeApiError('', 401),          // auth_error
       new FakeApiError('', 409),          // client_error
-      new FakeApiError('', 413),          // context_overflow
+      new FakeApiError('', 413),          // image_strip
       new Error('stream parse error'),    // stream_parse
       new Error('mystery'),              // unknown
     ]

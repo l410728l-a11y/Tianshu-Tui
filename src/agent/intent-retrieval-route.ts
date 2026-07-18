@@ -1,5 +1,6 @@
 import { isSocialOrTrivial, type TaskContract } from '../context/task-contract.js'
 import type { TaskListItem } from './session-state.js'
+import { deriveCollabBranches, normalizeCollabBranches, reasonForCollabBranch, type CollabBranch } from './collab-branches.js'
 import {
   resolveContextualIdentifier,
   enrichUserMessageWithContext,
@@ -38,6 +39,9 @@ export interface RetrievalRoute {
   confidence: number
   fallbackUsed: boolean
   objectiveSummary?: string
+  /** 协作路径分支：由确定性 heuristic 产生，LLM 只能补充不能删除。 */
+  collabBranches?: CollabBranch[]
+  branchReasons?: string[]
 }
 
 export interface RetrievalRouteInput {
@@ -168,13 +172,25 @@ export function buildHeuristicRetrievalRoute(input: RetrievalRouteInput): Retrie
   }
   const objectiveSummary = summarizeObjective(input)
   const directions = mergeDirections(taskKinds.flatMap(kind => baselineForKind(kind, input.taskContract)))
+  const resolvedContexts = resolveContextualIdentifier(input.userMessage, input.lastAssistantMessage, input.taskList)
+  const enriched = enrichUserMessageWithContext(input.userMessage, resolvedContexts)
+  const { sanitized } = sanitizeForIntentClassification(enriched)
+  const confidence = confidenceFor(taskKinds)
+  const collaboration = deriveCollabBranches({
+    taskKinds,
+    sanitizedText: sanitized,
+    confidence,
+    taskContract: input.taskContract,
+  })
   return {
     taskKinds,
     directions,
     antiAnchorNote: DEFAULT_ANTI_ANCHOR_NOTE,
-    confidence: confidenceFor(taskKinds),
+    confidence,
     fallbackUsed: true,
     objectiveSummary,
+    collabBranches: collaboration.branches,
+    branchReasons: collaboration.reasons,
   }
 }
 
@@ -195,6 +211,22 @@ export function normalizeRetrievalRoute(raw: unknown, fallbackInput?: RetrievalR
   const directionsFromRaw = rawDirections.flatMap(normalizeDirection)
   const baselineDirections = taskKinds.flatMap(kind => baselineForKind(kind, fallbackInput?.taskContract))
   const directions = mergeDirections([...baselineDirections, ...directionsFromRaw]).slice(0, MAX_DIRECTIONS)
+  const heuristic = fallbackInput ? buildHeuristicRetrievalRoute(fallbackInput) : undefined
+  const routeDerived = fallbackInput
+    ? deriveCollabBranches({
+      taskKinds,
+      sanitizedText: sanitizeForIntentClassification(fallbackInput.userMessage).sanitized,
+      confidence: clampNumber(obj.confidence, 0, 1, heuristic?.confidence ?? confidenceFor(taskKinds)),
+      taskContract: fallbackInput.taskContract,
+    })
+    : undefined
+  const llmBranches = normalizeCollabBranches(obj.branches ?? obj.collabBranches)
+  const collabBranches = normalizeCollabBranches([
+    ...(heuristic?.collabBranches ?? []),
+    ...(routeDerived?.branches ?? []),
+    ...llmBranches,
+  ])
+  const branchReasons = collabBranches.map(reasonForCollabBranch)
 
   if (directions.length === 0 && !taskKinds.includes('social_idle')) {
     return fallbackInput ? buildHeuristicRetrievalRoute(fallbackInput) : buildHeuristicRetrievalRoute({ userMessage: '' })
@@ -207,6 +239,8 @@ export function normalizeRetrievalRoute(raw: unknown, fallbackInput?: RetrievalR
     confidence: clampNumber(obj.confidence, 0, 1, 0.6),
     fallbackUsed: typeof obj.fallbackUsed === 'boolean' ? obj.fallbackUsed : false,
     objectiveSummary: truncate(cleanString(obj.objectiveSummary), MAX_FIELD_LENGTH) || undefined,
+    collabBranches,
+    branchReasons,
   }
 }
 
@@ -220,6 +254,17 @@ export const LOW_CONFIDENCE_INTENT_ADVISORY = [
   '</intent-retrieval-route>',
 ].join('\n')
 
+export function renderLowConfidenceIntentAdvisory(route: RetrievalRoute): string {
+  const branches = normalizeCollabBranches(route.collabBranches)
+  if (branches.length === 0) return LOW_CONFIDENCE_INTENT_ADVISORY
+  return [
+    '<intent-retrieval-route advisory="true" scope="current-turn" confidence="low">',
+    '  意图分类不确定：先用一句话向用户同步你对任务的理解（必要时问至多一个澄清问题），检索按实际问题自主展开，不受用户关键词锚定。',
+    `  协作路径: 骨干+${branches.join('+')}`,
+    '</intent-retrieval-route>',
+  ].join('\n')
+}
+
 export function renderIntentRetrievalRoute(route: RetrievalRoute): string {
   const normalized = normalizeRetrievalRoute(route)
   const attrs = [
@@ -232,6 +277,12 @@ export function renderIntentRetrievalRoute(route: RetrievalRoute): string {
   lines.push('  <authority>项目规则、工具权限、实际证据优先于本路由；必要时可查其它来源。</authority>')
   if (normalized.objectiveSummary) lines.push(`  <objective-summary>${escapeXml(normalized.objectiveSummary)}</objective-summary>`)
   lines.push(`  <task-kinds>${normalized.taskKinds.map(escapeXml).join(', ')}</task-kinds>`)
+  if (normalized.collabBranches && normalized.collabBranches.length > 0) {
+    lines.push(`  <collaboration-path>骨干+${normalized.collabBranches.join('+')}</collaboration-path>`)
+    if (normalized.branchReasons && normalized.branchReasons.length > 0) {
+      lines.push(`  <collaboration-reasons>${normalized.branchReasons.map(escapeXml).join('；')}</collaboration-reasons>`)
+    }
+  }
   lines.push(`  <anti-anchor-note>${escapeXml(normalized.antiAnchorNote)}</anti-anchor-note>`)
   lines.push('  <directions>')
   for (const direction of normalized.directions) {

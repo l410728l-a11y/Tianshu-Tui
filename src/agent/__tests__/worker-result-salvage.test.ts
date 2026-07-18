@@ -129,6 +129,58 @@ describe('salvageWorkerResult (field-level terminal tier)', () => {
     assert.equal(salvaged.findings.length, 1)
   })
 
+  it('recovers findings from a wrapper candidate that parses but fails schema (f98bb237 regression)', () => {
+    // Reproduces the tier-2 recovery path added for the f98bb237 incident.
+    // A fenced ```json``` block holds a COMPLETE WorkerResult whose JSON is
+    // syntactically valid, but one finding has a bad `confidence` value (not in
+    // the low/medium/high enum). workerResultIngestSchema rejects the whole
+    // wrapper → parseWorkerResult throws → salvageWorkerResult fires.
+    //
+    // Tier 1 (candidate-is-a-finding) cannot use the wrapper candidate (its top
+    // level is {workOrderId,...}, not {claim,...}). Tier 2 must walk
+    // parsed.findings[] and safeParse each element: the good one recovers, the
+    // bad-confidence one is dropped. This is the exact salvage path that
+    // upgrades a 4/6 recovery to 5/6 when a single malformed field would
+    // otherwise sink the whole wrapper candidate.
+    const text = '```json\n' + JSON.stringify({
+      workOrderId: 'batch:0',
+      status: 'passed',
+      summary: 'CV3-open 调研：原计划引用失准',
+      findings: [
+        { claim: 'CvmVectorInput 接口定义于 L562', evidence: 'cognitive-capsule-router.ts:562-598', confidence: 'high' },
+        { claim: 'bad confidence value', evidence: 'cognitive-capsule-router.ts:696', confidence: 'very-high' },
+      ],
+      artifacts: [],
+      changedFiles: [],
+      risks: [],
+      nextActions: [],
+      evidenceStatus: 'verified',
+    }) + '\n```'
+
+    const salvaged = salvageWorkerResult(text, 'batch:0')
+    assert.ok(salvaged, 'wrapper-level recovery must fire when the wrapper parses but fails schema')
+    if (!salvaged) return // narrow for TS — assert.ok above guarantees non-null
+    assert.equal(salvaged.findings.length, 1, 'only the schema-valid finding survives; the bad-confidence one is dropped')
+    assert.equal(salvaged.findings[0]?.claim, 'CvmVectorInput 接口定义于 L562')
+    assert.equal(salvaged.failureReason, 'json_parse')
+    assert.ok(salvaged.summary.includes('malformed wrapper'),
+      'summary must flag that wrapper-level recovery fired (auditable in mailbox)')
+  })
+
+  it('shares seenClaims across tier 1 and tier 2 (no double counting)', () => {
+    // A wrapper candidate AND a balanced candidate both surface the same finding.
+    // Tier 1 picks it up from the balanced candidate; tier 2 must not re-add it.
+    const sharedFinding = { claim: 'shared claim', evidence: 'a.ts:1', confidence: 'high' }
+    const text = JSON.stringify({
+      findings: [sharedFinding, { claim: 'extra', evidence: 'b.ts:2', confidence: 'medium' }],
+    }) + '\n' + JSON.stringify(sharedFinding)
+    const salvaged = salvageWorkerResult(text, 'wo1')
+    assert.ok(salvaged)
+    // shared claim counted once + extra = 2 distinct findings, not 3.
+    assert.equal(salvaged.findings.length, 2)
+    assert.equal(salvaged.findings.filter(f => f.claim === 'shared claim').length, 1)
+  })
+
   it('returns null when nothing is salvageable', () => {
     assert.equal(salvageWorkerResult('{"broken json', 'wo1'), null)
     assert.equal(salvageWorkerResult('no json at all', 'wo1'), null)

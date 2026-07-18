@@ -22,7 +22,7 @@ import { formatElapsed } from '../tool-elapsed.js'
 import { formatDiff, isDiffContent } from './diff.js'
 import { brailleSpinnerFrame } from '../braille-spinner.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
-import chalk from 'chalk'
+import { useAsciiGlyphs } from '../term-caps.js'
 
 /** 宽度口径：与 LiveEngine.rowsForLine 一致。工具输出（git diff/代码/日志）常含
  *  `— … │ →` 等 ambiguous 符号 + CJK，按 .length/stringWidth(narrow) 截断会低估
@@ -261,7 +261,7 @@ export interface FormatToolCardLiveInput {
  */
 export function formatToolCardLive(input: FormatToolCardLiveInput, theme: RivetTheme): string[] {
   const title = toolCardTitle(input.toolName, input.toolInput)
-  const useAscii = chalk.level < 3
+  const useAscii = useAsciiGlyphs()
   const bullet = input.tick !== undefined
     ? (useAscii ? ['-', '\\', '|', '/'][((input.tick % 4) + 4) % 4]! : brailleSpinnerFrame(input.tick))
     : '●'

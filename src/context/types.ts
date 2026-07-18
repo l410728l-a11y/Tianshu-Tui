@@ -204,6 +204,12 @@ export interface SessionMetadata {
   /** Ask Mode mirror — resume re-enters Ask when 'asking'. */
   askModeState?: 'off' | 'asking'
   /**
+   * H4-D3：PAL 攻坚层快照（cases + evidence registry + completedWorkers）。
+   * postTurn 有攻坚活动时写入；agent 创建（resume/模型切换重建）时恢复，
+   * 避免案件/预算/已消费证据随进程重建归零。
+   */
+  palSnapshot?: import('../agent/problem-attack-loop.js').PalSnapshot
+  /**
    * 最近一次 run 结束的结构化停止原因（2026-07-07 观测缺口修复）。
    * 此前 StopReason 只走 debugLog/遥测——不开 RIVET_DEBUG 时事后无法区分
    * "护栏熔断 / 用户中断 / 流错误 / 自然收尾"（会话 519216c0 取证时的盲区）。

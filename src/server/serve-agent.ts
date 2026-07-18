@@ -5,9 +5,10 @@
  */
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { activityProgressLine } from '../tools/worker-activity-stream.js'
+import { createDelegationActivityMapper } from '../tools/worker-activity-stream.js'
 import type { DelegateWorkerInput, DelegateActivityUpdate, ManagedAgent, RuntimeSessionManager } from './session-manager.js'
-import { SessionPersist } from '../agent/session-persist.js'
+import { SessionPersist, getSessionDir } from '../agent/session-persist.js'
+import { restoreGoalTracker } from '../agent/goal-persist.js'
 import { FileHistory } from '../agent/file-history.js'
 import { loadProjectRules } from '../context/rules-loader.js'
 import { createDefaultToolRegistry } from '../tools/default-registry.js'
@@ -27,6 +28,8 @@ import { DomainKnowledgeStore } from '../agent/domain-knowledge-store.js'
 import type { ProviderHealthTracker } from '../agent/provider-health.js'
 import { MeridianIndexer } from '../repo/meridian-indexer.js'
 import { resetLegacyMemoryIfNeeded } from '../agent/memory-epoch.js'
+import { buildCockpitSnapshot } from '../tui/cockpit/state.js'
+import { computeUsageCost, findModelPricing } from '../utils/pricing.js'
 import { createMultiLspManager } from '../lsp/multi-manager.js'
 import type { LspManager } from '../lsp/manager.js'
 import { createGotoDefinitionTool, createFindReferencesTool } from '../lsp/tools.js'
@@ -195,6 +198,42 @@ interface SessionStores {
   refs: RuntimeRefs
 }
 
+/**
+ * Per-session SessionStores registry, keyed by sessionId. Used by
+ * resolveGoalHandles (below) so the session-manager can reach the
+ * RuntimeRefs.goalTrackerRef + sessionDir for goal mode wiring — without
+ * exposing the full stores surface or coupling the generic manager to the
+ * serve-agent module.
+ *
+ * Entries are written in buildManagedAgent and overwritten on rebuild
+ * (switchModel rebuilds stores' agent half on the SAME stores instance).
+ * Forgetting is best-effort: a stale entry holds a modest object; rebuild
+ * overwrites it. Call forgetSessionStores when a session is permanently
+ * destroyed to bound memory.
+ */
+const sessionStoresById = new Map<string, { stores: SessionStores; cwd: string }>()
+
+/** Late-bound goal handles for the session-manager's goal methods. Returns
+ *  undefined when no stores have been built for this session yet (idle /
+ *  rehydrated session whose agent hasn't been created). */
+export function resolveGoalHandles(
+  sessionId: string,
+  config: { workers?: { profiles?: { cheap?: { provider: string; model: string } } } } | undefined,
+): import('./session-manager.js').GoalHandles | undefined {
+  const entry = sessionStoresById.get(sessionId)
+  if (!entry) return undefined
+  return {
+    goalTrackerRef: entry.stores.refs.goalTrackerRef,
+    sessionDir: getSessionDir(entry.cwd),
+    ...(config?.workers?.profiles?.cheap ? { cheapProfile: config.workers.profiles.cheap } : {}),
+  }
+}
+
+/** Drop the stores entry for a permanently-destroyed session (memory bound). */
+export function forgetSessionStores(sessionId: string): void {
+  sessionStoresById.delete(sessionId)
+}
+
 function buildSessionStores(
   ctx: ServeContext,
   cwd: string,
@@ -254,10 +293,23 @@ function buildSessionStores(
       ? () => shared.sameCwdRunningCount?.(cwd, sessionId) ?? 0
       : undefined,
     goalTrackerRef: { current: null },
+    // 插件 hooks/commands：sidecar 暂不加载插件（TUI bootstrap 专属装配链），
+    // 保持空数组与 RuntimeRefs 契约对齐——消费方按空集处理，不影响会话。
+    pluginHooks: [],
+    pluginCommands: [],
     // 多会话隔离：每会话独立内存态 TodoStore，杜绝并发会话清单串台（提示词注入污染）。
     // 不做磁盘持久化（按决策），展示与跨重启恢复靠事件日志重放。
     todoStore: new TodoStore(),
   }
+  // Goal mode restore — recover an in-flight goal across sidecar restarts.
+  // restoreGoalTracker internally normalizes active→paused (safe downgrade)
+  // so a restarted sidecar never auto-resumes a goal without user opt-in.
+  // Aligns with the TUI bootstrap path (bootstrap.ts:1739-1745).
+  const sessionDir = getSessionDir(cwd)
+  try {
+    const restored = restoreGoalTracker(sessionDir, sessionId, { maxJudgeRuns: ctx.config.agent?.goal?.judge?.maxRuns })
+    if (restored) refs.goalTrackerRef.current = restored
+  } catch { /* non-fatal — start without a restored goal */ }
   const { registry: toolRegistry } = createInteractiveToolRegistry(refs, ctx.config, cwd)
 
   // memory (unified recall + remember)：bootstrap 在 createInteractiveToolRegistry 外装的工具，
@@ -453,6 +505,10 @@ export function buildManagedAgent(
   preferredModelId?: string,
 ): import('./session-manager.js').ManagedAgent {
   const stores = buildSessionStores(ctx, cwd, sessionId, registry, shared)
+  // Register stores so the session-manager's goal methods can reach
+  // refs.goalTrackerRef + sessionDir via resolveGoalHandles. Overwrites any
+  // stale entry from a prior build of the same session (switchModel rebuild).
+  sessionStoresById.set(sessionId, { stores, cwd })
   // Model affinity: a rehydrated session carries the model its prefix cache
   // was built on (record.model → preferredModelId). Build directly on it so a
   // resumed conversation never silently lands on the default model. Falls back
@@ -555,6 +611,31 @@ export function buildManagedAgent(
     getEstimatedTokens: () => agent.session.getRealOccupancy(),
     getContextWindow: () => spec.model.contextWindow,
     getReasoningEffort: () => agent.getReasoningEffort(),
+    // Cockpit snapshot for the desktop cockpit panel. Assembles the full
+    // runtime state (safety/verify/context/model/advisory) via the pure
+    // buildCockpitSnapshot function — same source the TUI uses (main.ts:706).
+    // try/catch: the agent may be mid-rebuild (switchModel) — degrade to null
+    // instead of 500'ing the cockpit poll.
+    getCockpitSnapshot: () => {
+      try {
+        const usage = agent.session.getTotalUsage()
+        const pricing = findModelPricing(ctx.config.provider?.providers, spec.provider.name, spec.model.id)
+        const cost = computeUsageCost(usage, pricing).total
+        return buildCockpitSnapshot({
+          agent,
+          session: agent.session,
+          model: spec.model.id,
+          cacheHitRate: agent.session.getRecentTurnHitRate(3) ?? agent.session.getCacheHitRate(),
+          cost,
+          mcpManager: shared?.mcpManager ?? null,
+          reasoningEffort: agent.getReasoningEffort(),
+          // claimCounts / advisoryStatusNotices omitted — safe degradation
+          // (claimCounts defaults to zero counts, statusNotices to []).
+        })
+      } catch {
+        return null
+      }
+    },
     // Wave L: 进程退出释放本 session 的 coordinator timer + in-flight worker
     // 句柄。abort() 仅中止当前 turn；shutdown() 是终结性操作。
     shutdown: () => {
@@ -741,15 +822,23 @@ async function delegateWorkerOnCoordinator(
     profile: profile as import('../agent/work-order.js').WorkerProfile,
     scope: input.files && input.files.length ? { files: input.files } : {},
     delegationDepth: 0,
-    onActivity: (ev) => {
+    // Reuse the shared mapper so user-dispatched workers get the same live
+    // counters (toolUseCount/tokenCount) and eventKind/eventDetail passthrough
+    // as agent-initiated delegations.
+    onActivity: createDelegationActivityMapper(opts.workerId, (a) => {
       opts.onActivity({
         workOrderId: opts.workerId,
-        profile: ev.profile ?? profile,
-        authority: ev.authority,
-        status: 'running',
-        progressLine: activityProgressLine(ev),
+        parentToolId: a.parentToolId,
+        profile: a.profile ?? profile,
+        authority: a.authority,
+        status: a.status,
+        progressLine: a.progressLine,
+        toolUseCount: a.toolUseCount,
+        tokenCount: a.tokenCount,
+        eventKind: a.eventKind,
+        eventDetail: a.eventDetail,
       })
-    },
+    }),
   }
   if (input.authority) request.authority = input.authority
   const run = await coordinator.delegate(request, opts.signal)
@@ -760,6 +849,7 @@ async function delegateWorkerOnCoordinator(
     profile,
     status,
     progressLine: result?.summary ? result.summary.slice(0, 120) : undefined,
+    failureReason: result?.failureReason,
     summary: buildDelegateSummary(input, run),
     changedFiles: result?.changedFiles && result.changedFiles.length > 0 ? result.changedFiles : undefined,
     artifactId: result?.diffArtifactId,

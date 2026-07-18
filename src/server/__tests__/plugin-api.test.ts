@@ -210,6 +210,83 @@ test('DELETE /plugins/:name rejects missing name (400)', async () => {
   assert.equal(res.status, 400)
 })
 
+test('POST /plugins/install with confirm:true resolves relative preset path to bundled dir', async () => {
+  // Regression: installPlugin received the unresolved relative path
+  // (e.g. "plugins/foo"), and installFromLocal joined it against CWD
+  // instead of the bundled plugins dir. Preflight (readSourceManifest)
+  // resolved correctly, but the actual install didn't — so preflight
+  // passed and install failed with "No valid package.json found at
+  // plugins/foo". This test exercises confirm:true to hit installPlugin.
+  const { resolveSourcePath } = await import('../plugin-api.js')
+  const bundled = join(testHome, 'bundled-plugins-confirm')
+  const pluginDir = join(bundled, 'confirm-test-plugin')
+  mkdirSync(pluginDir, { recursive: true })
+  writeFileSync(join(pluginDir, 'package.json'), JSON.stringify({
+    name: 'confirm-test-plugin', version: '1.0.0',
+    tianshu: {
+      name: 'confirm-test-plugin', version: '1.0.0', description: 'Confirm install',
+      entry: 'index.js', tools: [{ name: 'confirm_tool', description: 'x' }],
+      permissions: {},
+    },
+  }))
+  writeFileSync(join(pluginDir, 'index.js'), 'export const tools = []')
+  cleanupDirs.push(bundled)
+
+  const prev = process.env.RIVET_BUNDLED_PLUGINS_DIR
+  process.env.RIVET_BUNDLED_PLUGINS_DIR = bundled
+  try {
+    // Preflight should resolve the path correctly
+    const resolved = resolveSourcePath('plugins/confirm-test-plugin')
+    assert.equal(resolved, pluginDir)
+
+    // confirm:true should succeed — before the fix this failed with
+    // "No valid package.json found at plugins/confirm-test-plugin"
+    const res = await ROUTES['POST /plugins/install']!(
+      { path: 'plugins/confirm-test-plugin', confirm: true },
+      undefined,
+      authHeaders(),
+      undefined,
+    )
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`)
+    const body = res.body as { ok: boolean; manifest: { name: string }; message: string }
+    assert.equal(body.ok, true)
+    assert.equal(body.manifest.name, 'confirm-test-plugin')
+  } finally {
+    if (prev === undefined) delete process.env.RIVET_BUNDLED_PLUGINS_DIR
+    else process.env.RIVET_BUNDLED_PLUGINS_DIR = prev
+  }
+})
+
+test('POST /plugins/install rejects an unresolvable relative path with absolute-path guidance', async () => {
+  // Packaged-desktop guard: a non-`plugins/` relative path can only resolve
+  // against the install root (no repo tree) — fail with the real cause
+  // instead of "No package.json found" at a meaningless path.
+  const res = await ROUTES['POST /plugins/install']!(
+    { path: 'no-such-dir-rivet-test/nonexistent-plugin' },
+    undefined,
+    authHeaders(),
+    undefined,
+  )
+  assert.equal(res.status, 400)
+  const body = res.body as { ok: boolean; error: string }
+  assert.equal(body.ok, false)
+  assert.ok(body.error.includes('Cannot resolve relative path'), `got: ${body.error}`)
+  assert.ok(body.error.includes('absolute path'), `got: ${body.error}`)
+})
+
+test('POST /plugins/install reports a missing absolute path plainly', async () => {
+  const missing = join(testHome, 'definitely-missing-plugin')
+  const res = await ROUTES['POST /plugins/install']!(
+    { path: missing },
+    undefined,
+    authHeaders(),
+    undefined,
+  )
+  assert.equal(res.status, 400)
+  const body = res.body as { ok: boolean; error: string }
+  assert.ok(body.error.includes('does not exist'), `got: ${body.error}`)
+})
+
 test('resolveSourcePath falls back to RIVET_BUNDLED_PLUGINS_DIR for plugins/* presets', async () => {
   const { resolveSourcePath } = await import('../plugin-api.js')
   // Use an id that is NOT present under the repo's plugins/ so projectRoot

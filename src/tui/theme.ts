@@ -156,7 +156,7 @@ export function resolveThemeEntry(name: string): ThemeEntry | undefined {
 
 // ── 主题切换 ───────────────────────────────────────────────────────
 
-let activeTheme: string = 'cobalt'
+let activeTheme: string = 'graphite'
 
 /** 切换主题。接受内置名或 `custom:<name>`；未知名 no-op 并返回 false。 */
 export function setTheme(name: ThemeName | (string & {})): boolean {

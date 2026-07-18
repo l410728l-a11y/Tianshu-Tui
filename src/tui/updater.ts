@@ -506,6 +506,7 @@ export async function runUpdate(
       shell: true,
       cwd: root,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     })
     let lastErr = ''
     // Windows: npm/git may emit localized lines in the console code page (GBK),

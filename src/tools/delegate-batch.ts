@@ -110,6 +110,7 @@ export function createDelegateBatchTool(
   coordinator: DelegateBatchCoordinator,
   getClaimStore?: () => ContextClaimStore | undefined,
   getSessionId?: () => string | undefined,
+  getProblemAttackStore?: () => import('../agent/problem-attack-loop.js').ProblemAttackStore | null,
 ): Tool {
   return {
     definition: {
@@ -276,6 +277,15 @@ export function createDelegateBatchTool(
         }
       }
 
+      // H4-D4 producer：worker 完成即打点精确 orderId（passed 才算完成，
+      // failed/blocked 不得作为 attack_case supported 证据来源）。
+      const attackStore = getProblemAttackStore?.()
+      if (attackStore) {
+        for (const r of run.results) {
+          if (r.status === 'passed') attackStore.markWorkerCompleted(r.workOrderId)
+        }
+      }
+
       // Extract worker findings into claim store
       if (run.status === 'completed') {
         const claimStore = getClaimStore?.()
@@ -293,6 +303,7 @@ export function createDelegateBatchTool(
             parentToolId: params.toolUseId,
             status: r.status,
             progressLine: r.summary.slice(0, 80),
+            failureReason: r.failureReason,
             model: r.model,
             provider: r.provider,
             usage: r.usage,

@@ -16,6 +16,7 @@ export function activityProgressLine(event: WorkerActivityEvent): string {
   if (event.kind === 'tool_use') return `⚙ ${event.detail ? event.detail.slice(0, 60) : 'tool'}`
   if (event.kind === 'tool_result') return `✓ ${event.detail ? event.detail.slice(0, 50) : 'done'}`
   if (event.kind === 'thinking') return 'thinking'
+  if (event.kind === 'retry') return '↻ upstream retry'
   if (event.kind === 'turn') return ''
   return 'writing'
 }
@@ -52,6 +53,7 @@ export function createDelegationActivityMapper(
       parentToolId,
       profile: event.profile,
       authority: event.authority,
+      authorityReason: event.authorityReason,
       status: 'running',
       progressLine: line || undefined,
       toolUseCount: c.toolUseCount,
@@ -76,6 +78,7 @@ export function createActivityStreamer(
   _opts?: { textEvery?: number },
 ): (event: WorkerActivityEvent) => void {
   const textSeen = new Set<string>()
+  const retrySeen = new Set<string>()
 
   return (event: WorkerActivityEvent) => {
     if (event.kind === 'turn') return  // 计数心跳，不产生文本行
@@ -88,6 +91,14 @@ export function createActivityStreamer(
     if (event.kind === 'tool_result') {
       const resultHint = event.detail ? ` (${event.detail.slice(0, 40)})` : ''
       emit(`  ↳ [${label}] ✓ 完成${resultHint}\n`)
+      return
+    }
+    // retry: 上游内部重试（慢 ≠ 死）——每个 worker 只报一次，避免刷屏
+    if (event.kind === 'retry') {
+      if (!retrySeen.has(event.workOrderId)) {
+        retrySeen.add(event.workOrderId)
+        emit(`  ↳ [${label}] ↻ 上游重试中\n`)
+      }
       return
     }
     // text / thinking: 首次输出状态行，之后静默——避免 deltas 计数刷屏

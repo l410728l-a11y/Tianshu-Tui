@@ -150,6 +150,9 @@ export class InputHandler {
   private mode: InputMode
   private handlers = new Map<string, Set<KeyHandler>>()
   private pasteHandlers = new Set<(text: string) => void>()
+  /** CPR（cursor position report）处理器：终端对 DSR `\x1B[6n` 的响应
+   *  `\x1B[{row};{col}R` 不是按键，单独走这个通道（LiveEngine 自愈用）。 */
+  private cprHandlers = new Set<(row: number, col: number) => void>()
   private escapeTimeoutMs: number
   private escapeTimer: ReturnType<typeof setTimeout> | null = null
   /** 当为 true 时，单独的 ESC 字节立即派发为 escape，不等待超时。
@@ -206,6 +209,12 @@ export class InputHandler {
     return () => { this.pasteHandlers.delete(handler) }
   }
 
+  /** 注册 CPR 处理器（终端光标位置报告，row/col 为 1-based）。 */
+  onCpr(handler: (row: number, col: number) => void): () => void {
+    this.cprHandlers.add(handler)
+    return () => { this.cprHandlers.delete(handler) }
+  }
+
   /** 切换输入模式 */
   setMode(mode: InputMode): void {
     this.mode = mode
@@ -240,6 +249,7 @@ export class InputHandler {
     this.stdin.pause()
     this.handlers.clear()
     this.pasteHandlers.clear()
+    this.cprHandlers.clear()
   }
 
   // ── internal ─────────────────────────────────────────────────
@@ -280,8 +290,8 @@ export class InputHandler {
     let i = 0
     while (i < buf.length) {
       const parsed = this.parseInput(buf.slice(i))
-      if (!parsed.key) break
-      this.dispatch(parsed.key)
+      if (parsed.consumed === 0) break // 未完整序列，等后续字节
+      if (parsed.key) this.dispatch(parsed.key) // CPR 等非按键事件只消费不派发
       i += parsed.consumed
     }
     return i
@@ -399,6 +409,13 @@ export class InputHandler {
       const csiMatch = data.match(/^\x1B\[[0-9;]*[A-Za-z~]/)
       if (csiMatch) {
         const seq = csiMatch[0]
+        // CPR（DSR 响应 `\x1B[{row};{col}R`）：不是按键——路由给 cprHandlers，
+        // key=null + consumed>0 让 dispatchKeys 消费后继续解析后续输入。
+        const cprMatch = seq.match(/^\x1B\[(\d+);(\d+)R$/)
+        if (cprMatch) {
+          for (const handler of this.cprHandlers) handler(Number(cprMatch[1]), Number(cprMatch[2]))
+          return { key: null, consumed: seq.length }
+        }
         const name = this.resolveEscapeSequence(seq)
         const meta = seq.includes(';3') || seq.includes(';4')
         const shift = seq.includes(';2') || name === 'shift_tab'

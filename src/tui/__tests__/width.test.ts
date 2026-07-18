@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import stringWidth from 'string-width'
-import { displayWidth, truncateToDisplayWidth, ambiguousWideEnabled } from '../width.js'
+import { displayWidth, truncateToDisplayWidth, ambiguousWideEnabled, ambiguousWidthMode } from '../width.js'
 
 test('narrow 模式与 string-width 完全一致（零回归）', () => {
   const samples = ['hello', '天枢 main', '— … ↑↓ · ◧', '╭──┬──╮', '⚡ 99%', '混合 mixed テスト']
@@ -73,6 +73,31 @@ test('ambiguousWideEnabled 读取 RIVET_AMBIGUOUS_WIDTH（默认 narrow）', () 
     assert.equal(ambiguousWideEnabled(), true, '大小写不敏感')
     process.env.RIVET_AMBIGUOUS_WIDTH = 'narrow'
     assert.equal(ambiguousWideEnabled(), false)
+  } finally {
+    if (prev === undefined) delete process.env.RIVET_AMBIGUOUS_WIDTH
+    else process.env.RIVET_AMBIGUOUS_WIDTH = prev
+  }
+})
+
+test('full 档：框线/方块字符也 +1（legacy CJK conhost 口径）', () => {
+  const prev = process.env.RIVET_AMBIGUOUS_WIDTH
+  try {
+    process.env.RIVET_AMBIGUOUS_WIDTH = 'full'
+    assert.equal(ambiguousWidthMode(), 'full')
+    assert.equal(ambiguousWideEnabled(), true, 'full 也视为启用加宽')
+    // box-drawing：narrow/wide=1 → full=2
+    for (const ch of ['─', '│', '╭', '█']) {
+      assert.equal(displayWidth(ch, { ambiguousAsWide: true }), 2, `${ch} 在 full 档应为 2 列`)
+    }
+    // 非 box ambiguous 与 wide 档一致
+    assert.equal(displayWidth('—', { ambiguousAsWide: true }), 2)
+    // 截断口径同步：预算 4 只能放 2 个 ─
+    assert.equal(truncateToDisplayWidth('────', 4, { ambiguousAsWide: true }), '──')
+
+    // wide 档下 box 仍为 1 列（护栏不被 full 档污染）
+    process.env.RIVET_AMBIGUOUS_WIDTH = 'wide'
+    assert.equal(ambiguousWidthMode(), 'wide')
+    assert.equal(displayWidth('─', { ambiguousAsWide: true }), 1)
   } finally {
     if (prev === undefined) delete process.env.RIVET_AMBIGUOUS_WIDTH
     else process.env.RIVET_AMBIGUOUS_WIDTH = prev

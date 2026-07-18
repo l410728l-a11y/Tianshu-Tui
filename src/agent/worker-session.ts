@@ -97,8 +97,10 @@ export interface WorkerSessionConfig {
   sessionNonce?: string
 }
 
-/** `turn` 事件在每个 worker turn 结束时上报，detail 为累计 token 总数（字符串）。 */
-export type WorkerActivityKind = 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn'
+/** `turn` 事件在每个 worker turn 结束时上报，detail 为累计 token 总数（字符串）。
+ *  `retry` 事件在 API 层内部瞬时重试的每次 attempt 起始上报——重试中的健康
+ *  请求必须喂 liveness，否则被 stall sweep 误判为静默（慢 ≠ 死）。 */
+export type WorkerActivityKind = 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
 
 export interface WorkerTranscript {
   text: string
@@ -374,6 +376,9 @@ export async function runOnceWithTransientRetry(
       if (classified.retryable && isTransient(classified.class) && attempt < MAX_TRANSIENT_RETRIES) {
         const backoff = TRANSIENT_BACKOFF_BASE_MS * Math.pow(2, attempt)
         transcript.errors.push(`Transient error (attempt ${attempt + 1}/${MAX_TRANSIENT_RETRIES + 1}): ${message} — retrying in ${backoff}ms`)
+        // 喂 liveness：内部重试（含 backoff 等待）期间没有任何流式事件，
+        // 不上报会被 stall sweep 记为静默误杀（慢 ≠ 死）。
+        onActivity?.('retry', String(attempt + 1))
         await new Promise<void>(resolve => setTimeout(resolve, backoff))
         continue
       }

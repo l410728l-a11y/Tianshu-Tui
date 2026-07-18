@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatElapsedShort, truncateToWidth, looksLikeFilePath } from '../app.js'
+import { formatElapsedShort, truncateToWidth, looksLikeFilePath, boxCharsFor } from '../app.js'
+import { resetTermCapsCache } from '../../term-caps.js'
 
 /**
  * Safety net for the engine/app.ts decomposition (mid-tui). The 2002-line
@@ -95,4 +96,38 @@ test('looksLikeFilePath with isCommandPrefix: partial slash inputs stay as comma
   assert.equal(looksLikeFilePath('/x', isCmd, isPrefix), true)
   // 完整已知命令不受影响
   assert.equal(looksLikeFilePath('/help', isCmd, isPrefix), false)
+})
+
+test('boxCharsFor: ASCII 开关关闭时按 separator 返回 Unicode 线框', () => {
+  // 测试环境无 TTY（chalk.level=0）会自动降级 ASCII，需显式关掉以测 separator 分支
+  const prev = process.env.RIVET_ASCII_UI
+  try {
+    process.env.RIVET_ASCII_UI = '0'
+    assert.equal(boxCharsFor('thin').tl, '╭')
+    assert.equal(boxCharsFor('thick').h, '━')
+    assert.equal(boxCharsFor('dots').h, '┄')
+    assert.equal(boxCharsFor('unknown').tl, '╭', '未知 separator 回退 thin')
+  } finally {
+    if (prev === undefined) delete process.env.RIVET_ASCII_UI
+    else process.env.RIVET_ASCII_UI = prev
+    resetTermCapsCache()
+  }
+})
+
+test('boxCharsFor: ASCII 字形开关下所有 separator 统一降级为 +/-/|', () => {
+  const prev = process.env.RIVET_ASCII_UI
+  try {
+    process.env.RIVET_ASCII_UI = '1'
+    for (const sep of ['thin', 'thick', 'dots']) {
+      const chars = boxCharsFor(sep)
+      assert.equal(chars.tl, '+', `${sep} 角字符应为 +`)
+      assert.equal(chars.h, '-', `${sep} 横线应为 -`)
+      assert.equal(chars.v, '|', `${sep} 竖线应为 |`)
+      assert.equal(chars.m, '+', `${sep} 分叉应为 +`)
+    }
+  } finally {
+    if (prev === undefined) delete process.env.RIVET_ASCII_UI
+    else process.env.RIVET_ASCII_UI = prev
+    resetTermCapsCache()
+  }
 })

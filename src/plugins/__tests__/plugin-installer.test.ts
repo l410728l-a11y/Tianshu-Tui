@@ -64,7 +64,7 @@ describe('installPlugin', () => {
     const src = createPluginSource('test-plugin')
     activeSrcDirs.push(src)
 
-    const result = await installPlugin(src)
+    const result = await installPlugin({ kind: 'local', path: src })
     assert.equal(result.ok, true)
     if (result.ok) {
       assert.equal(result.manifest.name, 'test-plugin')
@@ -78,7 +78,7 @@ describe('installPlugin', () => {
     mkdirSync(emptyDir, { recursive: true })
     activeSrcDirs.push(emptyDir)
 
-    const result = await installPlugin(emptyDir)
+    const result = await installPlugin({ kind: 'local', path: emptyDir })
     assert.equal(result.ok, false)
     if (!result.ok) {
       assert.ok(result.error.includes('package.json') || result.error.includes('manifest'))
@@ -91,7 +91,7 @@ describe('installPlugin', () => {
     })
     activeSrcDirs.push(src)
 
-    const result = await installPlugin(src)
+    const result = await installPlugin({ kind: 'local', path: src })
     assert.equal(result.ok, false)
     if (!result.ok) {
       assert.ok(result.error.includes('manifest') || result.error.includes('Invalid'))
@@ -102,10 +102,10 @@ describe('installPlugin', () => {
     const src = createPluginSource('dup-plugin')
     activeSrcDirs.push(src)
 
-    const first = await installPlugin(src)
+    const first = await installPlugin({ kind: 'local', path: src })
     assert.equal(first.ok, true)
 
-    const second = await installPlugin(src)
+    const second = await installPlugin({ kind: 'local', path: src })
     assert.equal(second.ok, false)
     if (!second.ok) {
       assert.ok(second.error.includes('already installed'))
@@ -157,7 +157,7 @@ describe('removePlugin', () => {
     const src = createPluginSource('rm-plugin')
     activeSrcDirs.push(src)
 
-    await installPlugin(src)
+    await installPlugin({ kind: 'local', path: src })
     assert.ok(isPluginInstalled('rm-plugin'))
 
     const result = removePlugin('rm-plugin')

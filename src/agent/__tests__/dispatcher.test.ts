@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyFile, groupFilesByDomain, decomposeByDataContract } from '../dispatcher.js'
+import { deriveAuthority, matchDomain, DELEGATION_FALLBACK_AUTHORITY } from '../star-domain.js'
 import type { TaskContract } from '../../context/task-contract.js'
 
 function makeContract(files: string[], objective = 'test objective'): TaskContract {
@@ -77,6 +78,23 @@ describe('decomposeByDataContract', () => {
     const tasks = decomposeByDataContract(makeContract([], 'fix the bug'))
     assert.equal(tasks.length, 1)
     assert.equal(tasks[0]!.domain, 'backend')
+  })
+
+  it('authority id lock: same as matchDomain ?? tianliang; reasons populated', () => {
+    const cases = [
+      '重构优化性能',
+      '审查这个方案',
+      'hello world xyz',
+      '这个方案',
+      'fix the bug',
+    ]
+    for (const objective of cases) {
+      const tasks = decomposeByDataContract(makeContract([], objective))
+      assert.equal(tasks.length, 1)
+      const expected = (matchDomain(objective) ?? DELEGATION_FALLBACK_AUTHORITY)
+      assert.equal(tasks[0]!.authority, expected, `id lock for: ${objective}`)
+      assert.deepEqual(tasks[0]!.authorityReasons, deriveAuthority(objective).reasons)
+    }
   })
 
   it('returns multiple tasks for multi-domain files', () => {

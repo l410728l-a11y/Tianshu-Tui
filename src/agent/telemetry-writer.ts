@@ -30,6 +30,10 @@ const NOOP_WRITER: TelemetryWriter = {
 export const VITALS_LITE_KIND = 'vitals-lite'
 /** CLI perf summary is emitted only by an explicitly enabled TUI monitor. */
 export const PERF_SUMMARY_KIND = 'perf-summary'
+/** P3：认知帧 lite 摘要（单行 <200B），默认落盘——事后回答"该 turn 松弛了
+ *  多少、哪些 source 缺数据"。full 全量 facts 记录仍由 RIVET_DEBUG_TELEMETRY
+ *  opt-in。 */
+export const COGNITIVE_FRAME_LITE_KIND = 'cognitive-frame-lite'
 
 export function createTelemetryWriter(cwd: string, sessionId?: string): TelemetryWriter {
   // W5（incident 20b9714e）：完整遥测仍由 RIVET_DEBUG_TELEMETRY opt-in，但
@@ -46,7 +50,7 @@ export function createTelemetryWriter(cwd: string, sessionId?: string): Telemetr
   return {
     write(snapshot: TelemetryRecord) {
       const kind = (snapshot as { kind?: string }).kind
-      if (!full && kind !== VITALS_LITE_KIND && kind !== PERF_SUMMARY_KIND) return
+      if (!full && kind !== VITALS_LITE_KIND && kind !== PERF_SUMMARY_KIND && kind !== COGNITIVE_FRAME_LITE_KIND) return
       const line = JSON.stringify(snapshot)
       const shouldTrim = ++writesSinceTrim >= TRIM_CHECK_EVERY
       if (shouldTrim) writesSinceTrim = 0

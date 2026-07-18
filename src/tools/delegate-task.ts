@@ -52,6 +52,7 @@ export function createDelegateTaskTool(
   coordinator: DelegateTaskCoordinator,
   getClaimStore?: () => ContextClaimStore | undefined,
   getSessionId?: () => string | undefined,
+  getProblemAttackStore?: () => import('../agent/problem-attack-loop.js').ProblemAttackStore | null,
 ): Tool {
   return {
     definition: {
@@ -138,12 +139,23 @@ export function createDelegateTaskTool(
             authority: parsed.data.authority,
             status: r.status,
             progressLine: r.summary.slice(0, 80),
+            failureReason: r.failureReason,
             model: r.model,
             provider: r.provider,
             usage: r.usage,
             artifactId: r.diffArtifactId,
             changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
           })
+        }
+      }
+
+      // H4-D4 producer：worker 完成即打点精确 orderId——attack_case 的
+      // worker: 证据验真依赖此记录（passed 才算完成；failed/blocked 的
+      // worker 结果不得作为 supported 证据来源）。
+      const attackStore = getProblemAttackStore?.()
+      if (attackStore) {
+        for (const r of run.results) {
+          if (r.status === 'passed') attackStore.markWorkerCompleted(r.workOrderId)
         }
       }
 

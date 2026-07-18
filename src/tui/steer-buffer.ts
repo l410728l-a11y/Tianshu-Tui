@@ -7,7 +7,19 @@
  * Within the same priority, items stay FIFO. This prevents task notifications
  * from starving user steer messages and keeps urgent slash commands ahead of
  * background guidance.
+ *
+ * Entries also carry a deterministic SteerIntent (see steer-intent.ts). Drain
+ * tags non-guidance messages and attaches one action tip for the drained
+ * subset only — all-guidance drains stay byte-identical to the legacy format.
  */
+
+import { debugLog } from '../utils/debug.js'
+import {
+  actionTipForIntent,
+  classifySteerIntent,
+  highestSteerIntent,
+  type SteerIntent,
+} from './steer-intent.js'
 
 export type SteerPriority = 'now' | 'next' | 'later'
 
@@ -18,12 +30,43 @@ export interface SteerEntry {
   text: string
   /** Drain priority */
   priority: SteerPriority
+  /** Classified intent (guidance for explicit pushNow / slash path). */
+  intent: SteerIntent
 }
 
 const PRIORITY_ORDER: Record<SteerPriority, number> = {
   now: 0,
   next: 1,
   later: 2,
+}
+
+const HEADER = '[User guidance — 用户新指令，优先于当前计划/目标/续跑指示，立即遵从并调整方向]'
+
+/** Raise priority for halt/redirect; never lower an explicitly higher request. */
+function elevatePriority(requested: SteerPriority, intent: SteerIntent): SteerPriority {
+  const floor: SteerPriority =
+    intent === 'halt' ? 'now' : intent === 'redirect' ? 'next' : 'later'
+  return PRIORITY_ORDER[requested] <= PRIORITY_ORDER[floor] ? requested : floor
+}
+
+function formatDrain(entries: readonly SteerEntry[]): string {
+  const allGuidance = entries.every(e => e.intent === 'guidance')
+  const texts = entries.map(e =>
+    allGuidance ? e.text : `[${e.intent}] ${e.text}`,
+  )
+
+  if (allGuidance) {
+    return texts.length === 1
+      ? `${HEADER}: ${texts[0]}`
+      : `${HEADER}:\n${texts.map((m, i) => `${i + 1}. ${m}`).join('\n')}`
+  }
+
+  const tipIntent = highestSteerIntent(entries.map(e => e.intent))
+  const tip = actionTipForIntent(tipIntent)
+  const body = texts.length === 1
+    ? `${HEADER}: ${texts[0]}`
+    : `${HEADER}:\n${texts.map((m, i) => `${i + 1}. ${m}`).join('\n')}`
+  return tip ? `${body}\n${tip}` : body
 }
 
 export class SteerBuffer {
@@ -33,13 +76,29 @@ export class SteerBuffer {
 
   /** Add a user guidance message to the buffer (default priority: later). */
   push(message: string, priority: SteerPriority = 'later'): void {
-    this.pending.push({ id: this.nextId++, text: message, priority })
+    const { intent } = classifySteerIntent(message)
+    this.pending.push({
+      id: this.nextId++,
+      text: message,
+      priority: elevatePriority(priority, intent),
+      intent,
+    })
     this.notify()
   }
 
-  /** Add an urgent command that should be processed before normal guidance. */
+  /**
+   * Add an urgent command that should be processed before normal guidance.
+   * Skips intent classification (slash / explicit path) — always `guidance`
+   * at `now` priority so caller-chosen urgency is not rewritten.
+   */
   pushNow(message: string): void {
-    this.push(message, 'now')
+    this.pending.push({
+      id: this.nextId++,
+      text: message,
+      priority: 'now',
+      intent: 'guidance',
+    })
+    this.notify()
   }
 
   /** Add a high-priority message, processed after `now` but before `later`. */
@@ -69,6 +128,8 @@ export class SteerBuffer {
    * Drain pending messages and format them for injection.
    * If `maxPriority` is given, only messages at or above that priority are
    * drained; the rest remain queued.
+   *
+   * Action tip is chosen from the drained subset only (not leftover queue).
    */
   drain(maxPriority?: SteerPriority): string | null {
     if (this.pending.length === 0) return null
@@ -80,20 +141,24 @@ export class SteerBuffer {
     this.pending = this.pending.filter(entry => PRIORITY_ORDER[entry.priority] > threshold)
     this.notify()
 
-    const messages = drainable.sort((a, b) => {
+    const ordered = drainable.sort((a, b) => {
       const pa = PRIORITY_ORDER[a.priority]
       const pb = PRIORITY_ORDER[b.priority]
       if (pa !== pb) return pa - pb
       return a.id - b.id
-    }).map(entry => entry.text)
+    })
 
-    // Priority framing: mid-run user words must beat any standing plan or
-    // auto-continuation reminder ([GOAL CONTINUATION] etc.), otherwise the
-    // agent barrels on and the user feels unheard ("刹不住").
-    const header = '[User guidance — 用户新指令，优先于当前计划/目标/续跑指示，立即遵从并调整方向]'
-    return messages.length === 1
-      ? `${header}: ${messages[0]}`
-      : `${header}:\n${messages.map((m, i) => `${i + 1}. ${m}`).join('\n')}`
+    // W3 observation: class distribution for the drained subset.
+    const counts: Partial<Record<SteerIntent, number>> = {}
+    for (const e of ordered) {
+      counts[e.intent] = (counts[e.intent] ?? 0) + 1
+    }
+    const dist = (Object.entries(counts) as [SteerIntent, number][])
+      .map(([k, n]) => `${k}=${n}`)
+      .join(' ')
+    if (dist) debugLog(`[steer-intent] ${dist}`)
+
+    return formatDrain(ordered)
   }
 
   /** Peek at the highest-priority pending text without removing it. */

@@ -467,6 +467,8 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     sessionId: self.config.sessionId,
     getTurn: () => self.session.getTurnCount(),
     emitHookResult: self.config.emitHookResult,
+    // Plugin hooks lazy-bound (plugins load after agent assembly).
+    getPluginHooks: () => self.config.getPluginHooks?.() ?? [],
   }
   const hooks = createDefaultRuntimeHooks({
     stigmergyDeposit: deposit => self.stigmergyStore.deposit(deposit),
@@ -504,7 +506,15 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     // convergence 真实发射过（相邻轮）才压制 CCR/kick，避免冷却静默期陪葬。
     wasConvergenceTriggered: () =>
       (self.latestConvergenceResult?.shouldKick ?? false) && self.wasConvergenceEmittedRecently(),
-    telemetryWriter: self.telemetryWriter,
+    // 组合 writer：postSession 的 telemetry-flush hook 收尾时同时 flush
+    // frames.jsonl（P3-D 收尾强制 trim）。write 原样透传，不改写入语义。
+    telemetryWriter: {
+      write: record => self.telemetryWriter.write(record),
+      flush: async () => {
+        await self.telemetryWriter.flush()
+        await self.frameRecorder.flush()
+      },
+    },
     // Phase 0 观测：CCR 触发落遥测（sensorium.jsonl 同通道）+ guardian 计数。
     // 此前 onCcrTrigger 无生产接线 — 触发频次不可观测，静音只能靠体感发现。
     onCcrTrigger: event => {
@@ -522,6 +532,13 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     // P1a 核销闭环：advisory 采纳核销器 + 会话累计采纳/忽略同步到 guardian meta。
     advisoryReadback: self.advisoryReadback,
     onAdvisoryOutcomes: totals => self.recordAdvisoryOutcomes(totals),
+    // PAL 攻坚层：会话级案件容器（attack_case 工具与 hook 共享同一实例）。
+    problemAttackStore: self.problemAttack,
+    // H4-D3 保存半边：有攻坚活动的 turn 把快照写进 session meta（恢复由
+    // bootstrap 在 agent 创建时从 meta 读回）。
+    persistPalSnapshot: snapshot => {
+      try { self.persist?.updateMetadata({ palSnapshot: snapshot }) } catch { /* best-effort */ }
+    },
     // Phase 3 异步副驾：cheap client 懒初始化（首次触发才 loadConfig/建连接）。
     // 构建失败 resolve null → hook 永久休眠,不影响主链路。
     asyncCopilot: {
@@ -756,6 +773,21 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
         } catch { /* shadow accounting is best-effort */ }
       },
     },
+    // 遗产回收 W-B 检索 POD shadow 观察：行落 cache-log.jsonl
+    // （event:'search-pod'），与 amnesia_shadow 同通道，离线分析共用读取面。
+    searchPod: {
+      record: row => {
+        try {
+          const sid = self.config.sessionId ?? 'anon'
+          const line = JSON.stringify({ ts: Date.now(), ...row })
+          import('node:fs/promises').then(fs => {
+            const dir = join(getSessionDir(self.cwd), sid)
+            return fs.mkdir(dir, { recursive: true })
+              .then(() => fs.appendFile(join(dir, 'cache-log.jsonl'), line + '\n'))
+          }).catch(() => {})
+        } catch { /* shadow accounting is best-effort */ }
+      },
+    },
   })
 
   // I4: when any runtime hook throws, run user `onError` hooks and emit the
@@ -778,6 +810,7 @@ export function createPlanTraceCoordinator(self: AgentLoop): PlanTraceCoordinato
     getTraceStore: () => self.traceStore,
     addSystemReminder: content => { self.session.appendSystemReminder(content) },
     setPlanTraceAppendix: appendix => { self.config.promptEngine.setPlanTraceAppendix(appendix) },
+    getProblemAttackStore: () => self.problemAttack,
   })
 }
 

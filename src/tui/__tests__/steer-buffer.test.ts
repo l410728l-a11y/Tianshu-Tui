@@ -143,4 +143,60 @@ describe('SteerBuffer', () => {
     assert.equal(buf.hasPending('now'), false)
     assert.equal(buf.hasPending('next'), true)
   })
+
+  it('all-guidance drain stays byte-identical to legacy format', () => {
+    const buf = new SteerBuffer()
+    buf.push('focus on performance')
+    assert.equal(
+      buf.drain(),
+      '[User guidance — 用户新指令，优先于当前计划/目标/续跑指示，立即遵从并调整方向]: focus on performance',
+    )
+  })
+
+  it('halt elevates to now and tags drain with action tip', () => {
+    const buf = new SteerBuffer()
+    buf.push('later guidance')
+    buf.push('停')
+    const drained = buf.drain()
+    assert.ok(drained?.startsWith('[User guidance — 用户新指令，优先于当前计划/目标/续跑指示，立即遵从并调整方向]:'))
+    assert.ok(drained?.includes('1. [halt] 停'), 'halt first after elevate')
+    assert.ok(drained?.includes('2. [guidance] later guidance'))
+    assert.ok(drained?.endsWith('立即停下当前动作，等用户明确后再继续'))
+  })
+
+  it('pushNow skips classification — stays guidance at now', () => {
+    const buf = new SteerBuffer()
+    buf.pushNow('停') // would be halt if classified
+    const entries = buf.getPendingEntries()
+    assert.equal(entries[0]!.intent, 'guidance')
+    assert.equal(entries[0]!.priority, 'now')
+    // all-guidance → legacy byte format (no tags)
+    assert.equal(
+      buf.drain(),
+      '[User guidance — 用户新指令，优先于当前计划/目标/续跑指示，立即遵从并调整方向]: 停',
+    )
+  })
+
+  it('drain(maxPriority) action tip uses drained subset only', () => {
+    const buf = new SteerBuffer()
+    buf.push('停') // elevates to now / halt
+    buf.push('为什么选这个') // question at later
+    // Drain only now — tip must be halt, not influenced by queued question
+    const first = buf.drain('now')
+    assert.ok(first?.includes('[halt] 停'))
+    assert.ok(first?.endsWith('立即停下当前动作，等用户明确后再继续'))
+    assert.ok(!first?.includes('question'))
+    // Remaining question drains with its own tip
+    const second = buf.drain()
+    assert.ok(second?.includes('[question]'))
+    assert.ok(second?.endsWith('先回答问题；除非答案要求，不改变当前任务方向'))
+  })
+
+  it('redirect elevates to next', () => {
+    const buf = new SteerBuffer()
+    buf.push('换个思路')
+    const e = buf.getPendingEntries()[0]!
+    assert.equal(e.intent, 'redirect')
+    assert.equal(e.priority, 'next')
+  })
 })

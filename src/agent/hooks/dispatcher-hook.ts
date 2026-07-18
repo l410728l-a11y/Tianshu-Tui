@@ -70,19 +70,28 @@ export function createDispatcherHook(deps: DispatcherHookDeps): AfterPerceptionR
       // 会丢失人格注入（team 路径的 patcher 硬绑 tianliang，这里对齐）。
       const depHint = subtasks
         .map(st => {
-          const base = `${st.domain}(authority:${st.authority})`
+          const reason = st.authorityReasons[0]
+          const auth = reason
+            ? `authority:${st.authority}｜${reason}`
+            : `authority:${st.authority}`
+          const base = `${st.domain}(${auth})`
           return st.dependsOn.length > 0
             ? `${base}←[${st.dependsOn.map(d => subtasks[d]?.domain ?? `#${d}`).join(',')}]`
             : base
         })
         .join('; ')
+      // Cap advisory bulk so a many-shard decompose cannot flood the reminder channel.
+      const MAX_DEP_HINT = 400
+      const clippedHint = depHint.length > MAX_DEP_HINT
+        ? depHint.slice(0, MAX_DEP_HINT - 1) + '…'
+        : depHint
 
       deps.advisoryBus?.submit({
         key: `delegation-advisor:${contract.id}`,
         priority: 0.5,
         category: 'delegation',
         ttl: 2,
-        content: `【天梁】检测到可并行拆分为 ${subtasks.length} 个子任务（${depHint}）。如需并行推进，显式调 delegate_batch，按上面顺序列 tasks，每个 task 带上括号内的 authority（星域人格注入），并用 dependsOn 传被依赖任务的 0-based 下标（被指向方先跑）；只读探查用 code_search profile。`,
+        content: `【天梁】检测到可并行拆分为 ${subtasks.length} 个子任务（${clippedHint}）。如需并行推进，显式调 delegate_batch，按上面顺序列 tasks，每个 task 带上括号内的 authority（星域人格注入），并用 dependsOn 传被依赖任务的 0-based 下标（被指向方先跑）；只读探查用 code_search profile。`,
       })
 
       advisedIds.add(contract.id)

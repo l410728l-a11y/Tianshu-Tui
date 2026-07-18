@@ -6,8 +6,13 @@
  *
  * 设计原则：
  * - 只记录失败，不记录成功（成功案例在 playbook 中）
- * - 每条记录包含：turn, tool, error, context, hypothesis
+ * - 每条记录包含：turn, tool, error, context
  * - 支持模式检测：anchoring（同文件 3+ 次修改）、rework（同任务 2+ 次返工）
+ *
+ * 历史：曾有 `hypothesis?: string` 字段——生产路径零写入（turn-harness 只传
+ * turn/tool/target/error/context），且与 attack_case 的假设生命周期/语义不同
+ * （playbook 把它当根因文本消费）。PAL 第四波（2026-07-17）删除，不留两个
+ * 假设通道；竞争假设的唯一入口是 `attack_case`。
  */
 
 export interface FailureEntry {
@@ -16,7 +21,6 @@ export interface FailureEntry {
   target?: string
   error: string
   context: string
-  hypothesis?: string
   timestamp: number
 }
 

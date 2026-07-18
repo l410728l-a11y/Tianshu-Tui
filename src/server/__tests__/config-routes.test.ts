@@ -157,3 +157,90 @@ describe('PUT /config/vision-model', () => {
     assert.equal(res.status, 401)
   })
 })
+
+describe('GET /config/mirrors', () => {
+  const prevHome = process.env.RIVET_HOME
+  let home: string
+  before(() => {
+    home = mkdtempSync(join(tmpdir(), 'rivet-mirror-routes-'))
+    process.env.RIVET_HOME = home
+  })
+  after(() => {
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('returns the default mirror config (disabled, default preset) on a fresh install', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/mirrors', {}, AUTH)
+    assert.equal(res.status, 200)
+    const body = res.body as { enabled: boolean; preset: string; github: string }
+    assert.equal(body.enabled, false)
+    assert.equal(body.preset, 'default')
+    assert.equal(body.github, 'default')
+  })
+
+  it('rejects unauthorized requests', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/mirrors', {}, {})
+    assert.equal(res.status, 401)
+  })
+})
+
+describe('PUT /config/mirrors', () => {
+  const prevHome = process.env.RIVET_HOME
+  let home: string
+  before(() => {
+    home = mkdtempSync(join(tmpdir(), 'rivet-mirror-put-'))
+    process.env.RIVET_HOME = home
+  })
+  after(() => {
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('enables the china preset and returns the updated config', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/mirrors', { enabled: true, preset: 'china' }, AUTH)
+    assert.equal(res.status, 200)
+    const body = res.body as { ok: boolean; mirrors: { enabled: boolean; preset: string } }
+    assert.equal(body.ok, true)
+    assert.equal(body.mirrors.enabled, true)
+    assert.equal(body.mirrors.preset, 'china')
+  })
+
+  it('persists across requests (a follow-up GET sees the change)', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    await router('PUT', '/config/mirrors', { enabled: true, github: 'gitcode', npm: 'taobao' }, AUTH)
+    const res = await router('GET', '/config/mirrors', {}, AUTH)
+    const body = res.body as { enabled: boolean; github: string; npm: string }
+    assert.equal(body.enabled, true)
+    assert.equal(body.github, 'gitcode')
+    assert.equal(body.npm, 'taobao')
+  })
+
+  it('rejects an invalid preset value (schema validation)', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/mirrors', { preset: 'bogus' }, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('rejects an invalid github mirror enum', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/mirrors', { github: 'not-a-real-mirror' }, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('rejects unauthorized requests', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/mirrors', { enabled: true }, {})
+    assert.equal(res.status, 401)
+  })
+})

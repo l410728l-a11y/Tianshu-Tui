@@ -319,6 +319,31 @@ export function resetResolvedEnvCache(): void {
 }
 
 /**
+ * Environment variables that prevent CLI tools from launching interactive
+ * programs which would block waiting for user input (pagers, editors,
+ * credential prompts). Inspired by grok-build's `xai-tty-utils::pager_env()`.
+ *
+ * All spawn points that go through `getResolvedEnv()` inherit these
+ * automatically. Spawn points that bypass it must apply `ANTI_INTERACTIVE_ENV`
+ * manually.
+ */
+export const ANTI_INTERACTIVE_ENV: Record<string, string> = {
+  PAGER: 'cat',
+  GIT_PAGER: 'cat',
+  GH_PAGER: 'cat',
+  MANPAGER: 'cat',
+  GIT_TERMINAL_PROMPT: '0', // git never prompts for credentials interactively
+  GIT_EDITOR: 'true',       // git never launches an editor
+  GIT_SEQUENCE_EDITOR: 'true',
+  GPG_TTY: '',              // empty = gpg/pinentry can't grab the tty, fails cleanly
+}
+
+/** Merge anti-interactive vars into an env object (last-wins override). */
+function withAntiInteractive(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, ...ANTI_INTERACTIVE_ENV }
+}
+
+/**
  * The resolved environment for command execution: real host PATH + toolchain
  * vars + user config overlay. Host resolution is cached; config is re-read and
  * layered on every call so `cwd`-scoped `env.extraPath/extraVars` take effect.
@@ -333,13 +358,13 @@ export function getResolvedEnv(cwd?: string): NodeJS.ProcessEnv {
   }
 
   if (envConfig.resolve === false) {
-    return applyConfigEnv({ ...process.env }, envConfig, process.platform)
+    return withAntiInteractive(applyConfigEnv({ ...process.env }, envConfig, process.platform))
   }
 
   if (!_cachedHost) _cachedHost = resolveHostEnv(realDeps())
   const merged: NodeJS.ProcessEnv = { ..._cachedHost.vars, ...process.env }
   merged[_cachedHost.pathKey] = _cachedHost.path
-  return applyConfigEnv(merged, envConfig, process.platform)
+  return withAntiInteractive(applyConfigEnv(merged, envConfig, process.platform))
 }
 
 /** PATH diff between the raw process env and the resolved env — for `/doctor`. */

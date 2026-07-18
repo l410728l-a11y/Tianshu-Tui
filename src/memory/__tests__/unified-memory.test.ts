@@ -271,3 +271,94 @@ describe('unified-memory', () => {
 
   teardown()
 })
+
+// ── 虚空仓库 P0: renderMemoryBlock sourceFilter（忽略 query、ts 恒定选集）──
+
+describe('renderMemoryBlock sourceFilter — 虚空仓库 P0', () => {
+  const DIR = join(tmpdir(), 'rivet-um-sourcefilter-test')
+
+  function reset() {
+    if (existsSync(DIR)) rmSync(DIR, { recursive: true })
+    mkdirSync(DIR, { recursive: true })
+    try { rmSync(memoryDir(projectHash(DIR)), { recursive: true }) } catch {}
+  }
+
+  function addCrafted(text: string, ts: number): MemoryEntry {
+    return appendMemoryEntry(DIR, {
+      text, kind: 'verified_pattern', confidence: 0.95, source: 'agent-crafted',
+      status: 'verified', tags: ['agent-learned'], ts,
+    })
+  }
+
+  it('只返回指定 source 的 current 条目', () => {
+    reset()
+    addCrafted('agent 标记的模式 A', 100)
+    appendMemoryEntry(DIR, {
+      text: 'auto 提取噪声', kind: 'fact', confidence: 0.6, source: 'auto', status: 'observed', tags: [], ts: 200,
+    })
+    const block = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    assert.ok(block!.includes('agent 标记的模式 A'))
+    assert.equal(block!.includes('auto 提取噪声'), false)
+  })
+
+  it('query 变化不改变选集与输出字节（缓存稳定回归锚）', () => {
+    reset()
+    addCrafted('此项目用 npx tsx --test 运行测试', 100)
+    addCrafted('appendix 块必须字节稳定', 200)
+    const a = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    const b = renderMemoryBlock(DIR, 'tsx 测试怎么跑', 2000, 'agent-crafted')
+    const c = renderMemoryBlock(DIR, 'completely unrelated english query about databases', 2000, 'agent-crafted')
+    assert.equal(a, b, '中文 query 不改变输出字节')
+    assert.equal(a, c, '英文 query 不改变输出字节')
+  })
+
+  it('memory.jsonl 不变时输出逐字节相等；追加一条后变化恰好一次再稳定', () => {
+    reset()
+    addCrafted('稳定条目一', 100)
+    const before1 = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    const before2 = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    assert.equal(before1, before2, '文件不变 → 字节不变')
+
+    addCrafted('稳定条目二', 300)
+    const after1 = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    assert.notEqual(after1, before1, '追加后输出变化')
+    const after2 = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    assert.equal(after1, after2, '再次稳定')
+  })
+
+  it('ts 降序取最近 8 条（超出的旧条目不进块）', () => {
+    reset()
+    for (let i = 1; i <= 10; i++) addCrafted(`模式编号 ${i}`, i * 10)
+    const block = renderMemoryBlock(DIR, '', 8000, 'agent-crafted')
+    assert.ok(block!.includes('模式编号 10'), '最新条目在块内')
+    assert.ok(block!.includes('模式编号 3<'), '第 8 新条目在块内')
+    assert.equal(block!.includes('模式编号 2<'), false, '第 9 新条目被裁掉')
+    assert.equal(block!.includes('模式编号 1<'), false, '最旧条目被裁掉')
+  })
+
+  it('被 supersede 封口的条目不进选集（尊重 isCurrentEntry）', () => {
+    reset()
+    const oldE = addCrafted('旧版模式', 100)
+    const newE = addCrafted('新版模式', 200)
+    assert.equal(supersedeMemoryEntry(DIR, oldE.id, newE.id), true)
+    const block = renderMemoryBlock(DIR, '', 2000, 'agent-crafted')
+    assert.ok(block!.includes('新版模式'))
+    assert.equal(block!.includes('旧版模式'), false)
+  })
+
+  it('向后兼容：不传 sourceFilter 且空 query → null（评分路径行为不变）', () => {
+    reset()
+    addCrafted('agent 条目', 100)
+    assert.equal(renderMemoryBlock(DIR, '', 2000), null)
+  })
+
+  it('无匹配条目 → null', () => {
+    reset()
+    assert.equal(renderMemoryBlock(DIR, '', 2000, 'agent-crafted'), null)
+  })
+
+  it('teardown', () => {
+    try { rmSync(DIR, { recursive: true }) } catch {}
+    try { rmSync(memoryDir(projectHash(DIR)), { recursive: true }) } catch {}
+  })
+})

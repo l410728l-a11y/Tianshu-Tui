@@ -210,6 +210,12 @@ function makeContract(
 }
 
 describe('classifyPlanMethodology', () => {
+  it('upgrades a route-marked architecture task to full methodology', () => {
+    const contract = makeContract('设计一个轻量组件', ['src/agent/a.ts'])
+    const depth = classifyTaskDepth(contract)
+    assert.equal(classifyPlanMethodology(contract, depth, undefined, undefined, ['B']), 'full')
+  })
+
   // ── Rule 1: SYSTEM depth → always 'full' ──
   it('routes system-depth task to full even with zero enforcement files', () => {
     const contract = makeContract('端到端重构整个请求管线')

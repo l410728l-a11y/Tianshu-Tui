@@ -9,7 +9,7 @@ const theme = getTheme()
 
 const strip = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, '')
 
-test('welcome renders Dawn-style bordered card with breathing blanks', () => {
+test('welcome renders 「启明」masthead with breathing blanks', () => {
   const lines = formatWelcome({
     modelName: 'opus-4-8',
     cwd: '/Users/x/app/deepseek-tui/opencode-tui',
@@ -19,8 +19,7 @@ test('welcome renders Dawn-style bordered card with breathing blanks', () => {
     version: '2.15.1',
     approvalMode: 'auto-safe',
   }, theme)
-  assert.ok(lines.length <= 20, `welcome should be ≤20 lines, got ${lines.length}`)
-  assert.ok(lines.length >= 3, `welcome should be ≥3 lines, got ${lines.length}`)
+  assert.equal(lines.length, 6, `masthead is 6 lines (blank + 4 + blank), got ${lines.length}`)
   assert.equal(lines[0], '', 'leading blank line for breathing room')
   assert.equal(lines[lines.length - 1], '', 'trailing blank line for breathing room')
 })
@@ -37,10 +36,21 @@ test('welcome contains brand, version, model, approval mode and cwd', () => {
   }, theme)
   const joined = lines.join('\n')
   assert.ok(joined.includes('Tianshu Code'), 'should show brand')
+  assert.ok(joined.includes('天枢'), 'should show Chinese brand name')
   assert.ok(joined.includes('v2.15.1'), 'should show version')
   assert.ok(joined.includes('glm-5.1'), 'should show model')
   assert.ok(joined.includes('auto-safe'), 'should show approval mode')
   assert.ok(joined.includes('/tmp/x/proj'), 'should show cwd')
+})
+
+test('version is right-aligned as masthead right column on wide terminals', () => {
+  const lines = formatWelcome({
+    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 80,
+    version: '2.15.1',
+  }, theme)
+  const head = strip(lines[1]!)
+  assert.ok(head.endsWith('v2.15.1'), `version sits at the right edge: "${head}"`)
+  assert.ok(/Code {2,}v2\.15\.1$/.test(head), `right column separated by padding: "${head}"`)
 })
 
 test('welcome omits version/mode gracefully when not provided', () => {
@@ -52,14 +62,18 @@ test('welcome omits version/mode gracefully when not provided', () => {
   assert.ok(!joined.includes('v undefined') && !joined.includes('vnull'), 'no dangling version text')
 })
 
-test('welcome is borderless compact header with no shortcut matrix', () => {
+test('masthead rule line recedes (no box frame, no shortcut matrix)', () => {
   const lines = formatWelcome({
     modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 120, rows: 40,
     version: '2.15.1',
   }, theme)
   const joined = lines.join('\n')
-  assert.ok(!joined.includes('┌') && !joined.includes('└') && !joined.includes('─'), 'no border')
+  assert.ok(!/[╭╮╰╯┌┐└┘│]/.test(joined), 'no box frame characters')
+  assert.ok(joined.includes('─'), 'thin masthead rule present')
   assert.ok(!joined.includes('Ctrl+'), 'no shortcut matrix')
+  // 刊头线是第 2 行内容（索引 2），宽度 ≤ 72 封顶
+  const rule = strip(lines[2]!)
+  assert.ok(stringWidth(rule) <= 72 + 6, `rule capped at RULE_MAX + indent, got ${stringWidth(rule)}`)
 })
 
 test('welcome shows session prefix and reasoning effort', () => {
@@ -75,8 +89,23 @@ test('welcome shows session prefix and reasoning effort', () => {
     reasoningEffort: 'high',
   }, theme)
   const joined = lines.join('\n')
-  assert.ok(joined.includes('8938a88f'), 'should show session prefix')
+  assert.ok(joined.includes('8938a88f'), 'should show session prefix when no numericId')
   assert.ok(joined.includes('◎high'), 'should show reasoning effort')
+})
+
+test('welcome prefers friendly #numericId over session prefix on place line', () => {
+  const lines = formatWelcome({
+    modelName: 'over2',
+    cwd: '/tmp/x/proj',
+    sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24',
+    priorMsgCount: 0,
+    columns: 120,
+    rows: 40,
+    numericId: 7281,
+  }, theme)
+  const placeLine = strip(lines[4]!)
+  assert.ok(placeLine.includes('#7281'), `numericId shown: "${placeLine}"`)
+  assert.ok(!placeLine.includes('8938a88f'), 'session prefix replaced by numericId')
 })
 
 test('welcome shows auto reasoning effort', () => {
@@ -125,7 +154,7 @@ test('compact mode shows prior count', () => {
   assert.ok(lines.join('\n').includes('7 prior'), 'should show prior message count')
 })
 
-test('height-aware: very short terminal (<8 rows) collapses to single line', () => {
+test('height-aware: very short terminal (<11 rows) collapses to single line', () => {
   const lines = formatWelcome({
     modelName: 'gpt-5.5', cwd: '/x', sessionId: 'abcdef012345', priorMsgCount: 0, columns: 100, rows: 6,
   }, theme)
@@ -133,17 +162,17 @@ test('height-aware: very short terminal (<8 rows) collapses to single line', () 
   assert.ok(lines[0]!.includes('天枢'), 'single line still branded')
 })
 
-test('24-row terminal keeps the full header (fits easily)', () => {
+test('24-row terminal keeps the full masthead (fits easily)', () => {
   const lines = formatWelcome({
     modelName: 'deepseek-v4', cwd: '/x/proj', sessionId: 'abcdef012345', priorMsgCount: 0, columns: 80, rows: 24,
     version: '2.15.1', approvalMode: 'auto-safe',
   }, theme)
-  assert.ok(lines.length >= 3 && lines.length <= 20, `80×24 → full header, got ${lines.length}`)
+  assert.equal(lines.length, 6, `80×24 → full masthead, got ${lines.length}`)
 })
 
-test('no rows provided → 3-line header (back-compat)', () => {
+test('no rows provided → full masthead (back-compat)', () => {
   const lines = formatWelcome({ modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 100 }, theme)
-  assert.ok(lines.length >= 3, 'defaults to full header')
+  assert.equal(lines.length, 6, 'defaults to full masthead')
 })
 
 test('no line exceeds terminal width (display width ≤ columns)', () => {

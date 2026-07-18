@@ -14,6 +14,7 @@ import type { TranscriptMessage } from './scrollback-transcript.js'
 import { parseScrollbackTranscript } from './scrollback-transcript.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import { shortOrderLabel } from '../tools/worker-activity-stream.js'
+import { formatAuthorityLabel } from './format/profile-labels.js'
 
 const MAX_CONTENT_CHARS = 500
 
@@ -96,7 +97,9 @@ export function buildWorkerDetailContent(
   lines.push(`══ Worker ${shortLabel} ══`)
   lines.push(`id: ${workerId}`)
   if (liveView?.profile) lines.push(`profile: ${liveView.profile}`)
-  if (liveView?.authority) lines.push(`authority: ${liveView.authority}`)
+  if (liveView?.authority) {
+    lines.push(`authority: ${formatAuthorityLabel(liveView.authority, liveView.authorityReason)}`)
+  }
   const statusLineParts: string[] = []
   statusLineParts.push(`status: ${liveView?.status ?? 'unknown'}`)
   if (liveView?.elapsedMs !== undefined) {

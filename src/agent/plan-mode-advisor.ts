@@ -12,6 +12,7 @@
 
 import type { TaskContract, TaskDepthLayer, PlanMethodology, TurnMode } from '../context/task-contract.js'
 import type { PlanModeState } from './plan-mode.js'
+import type { StructureFlowSnapshot } from './structure-flow-controller.js'
 
 export interface PlanModeSuggestInput {
   turnMode: TurnMode
@@ -59,6 +60,62 @@ export function shouldSuggestPlanMode(input: PlanModeSuggestInput): PlanModeSugg
   }
   const reason = parts.length > 0 ? parts.join(' · ') : 'full 方法论命中（多门/安全关键信号）'
   return { suggest: true, reason }
+}
+
+// ─── P2 阴阳调度：structure-flow 驱动的 plan 建议（advisory-only）──────
+//
+// 与上面的任务入口建议（full 方法论 one-shot）互补：本通道由运行中的
+// structure-flow 快照驱动——未知域高结构压力时建议进 plan mode，稳定执行
+// 区建议收敛计划退出。生命周期幂等由调用方持有的 firedKeys 保证：
+// 同一 (recommendation, 首因) 键本 session 只发一次；用户干预或 plan
+// 生命周期变化时调用方清空 firedKeys 允许新建议。绝不直接改 plan mode。
+
+export interface StructureFlowPlanAdvisoryInput {
+  snapshot: Pick<StructureFlowSnapshot, 'planRecommendation' | 'reasons'>
+  planModeState: PlanModeState
+  /** 已批准的计划文件在执行中（plan execution session）。 */
+  activePlanFile: boolean
+  /** 本 session 已发过的建议键（调用方持有；用户干预/生命周期变化时清空）。 */
+  firedKeys: ReadonlySet<string>
+}
+
+export interface StructureFlowPlanAdvisoryResult {
+  key: string
+  content: string
+}
+
+/** 纯函数：从 structure-flow 快照产出至多一条 plan 建议；不满足门槛 → null。 */
+export function buildStructureFlowPlanAdvisory(
+  input: StructureFlowPlanAdvisoryInput,
+): StructureFlowPlanAdvisoryResult | null {
+  const rec = input.snapshot.planRecommendation
+  if (rec === 'enter') {
+    // 已在 planning / 已有批准计划 → 不建议进入（生命周期优先于自动建议）。
+    if (input.planModeState !== 'off' || input.activePlanFile) return null
+    const key = `structure-flow-plan:enter:${input.snapshot.reasons[0] ?? 'unknown'}`
+    if (input.firedKeys.has(key)) return null
+    return {
+      key,
+      content:
+        '结构压力信号持续偏高（认知不确定性/新颖域占优）且当前没有计划上下文。'
+        + '如果任务规模成立，考虑用 `ask_user_question` 征询用户是否进入计划模式'
+        + '（`plan` 工具 action="enter_mode"，先并行调研再动手）；小任务可忽略本条。',
+    }
+  }
+  if (rec === 'exit') {
+    // 只对 planning 态建议退出——批准计划执行中的 flow 是健康形态，不打扰。
+    if (input.planModeState !== 'planning') return null
+    const key = 'structure-flow-plan:exit'
+    if (input.firedKeys.has(key)) return null
+    return {
+      key,
+      content:
+        '稳定执行信号持续健康（目标推进+清单推进、认知不确定性低）——当前 plan mode '
+        + '的调研开销可能不再必要。可以考虑收敛计划提交审批，或与用户确认后退出计划模式转入执行。',
+    }
+  }
+  // 'stay' 不重复发声；'none' 无建议。
+  return null
 }
 
 /** 建议 advisory 文案 — 指令主控先用 ask_user_question 征询用户。 */

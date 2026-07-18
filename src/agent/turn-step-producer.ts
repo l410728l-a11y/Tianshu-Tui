@@ -13,7 +13,7 @@ import { mapQueriedPheromones } from './pheromone-map.js'
 import { getGitInjectedContext } from '../prompt/volatile-git.js'
 import { detectWorktreeReality, type InjectedWorktreeContext } from './worktree-reality.js'
 import { advanceContractStatus, classifyPlanMethodology, classifyTaskDepth, classifyTurnMode, contractStatusFromPhaseClass, extractTaskContract, mergeFollowUpIntoContract, type TurnMode } from '../context/task-contract.js'
-import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, planModeSuggestEnabled } from './plan-mode-advisor.js'
+import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestEnabled } from './plan-mode-advisor.js'
 import { skillRegistry } from '../skills/skill-loader.js'
 import { renderMemoryBlock } from '../memory/unified-memory.js'
 import { parseMentions, renderMentionContext } from '../tui/mention-parser.js'
@@ -28,6 +28,8 @@ import { classifySeason } from './cognitive-season.js'
 import { renderToolContext, type AffordanceState, adaptAffordanceFromHistory, computeAffordanceScores } from './affordance.js'
 import { selectPolicy } from './policy-selection.js'
 import { checkTddGate, buildTddGateHint } from './tdd-gate.js'
+import { EXPLORATION_SIGNAL_RE } from './collab-branches.js'
+import { selectCollabAdvisories } from './collab-branch-advisories.js'
 import { buildCognitiveProjectionParts, createCognitiveLedger, getCognitivePhaseSnapshot } from '../context/cognitive-ledger.js'
 import { formatImmuneContext } from './immune-context.js'
 import { VITALS_LITE_KIND } from './telemetry-writer.js'
@@ -35,6 +37,9 @@ import { getCapsuleByStar } from './seed-capsule-store.js'
 import { BlockChargeTracker } from './injection-meter.js'
 import { signalFromLedgerDelta, signalsFromDelivered, signalsFromObligations } from './control-plane-adapters.js'
 import { renderControlPlaneAppendix } from './control-plane.js'
+import { palMode } from './hooks/problem-attack-hook.js'
+import { collectCaseOpenSignals } from './case-open-signals.js'
+import { getWaveGate } from './wave-gate.js'
 
 /**
  * Resolve the turn-level hard-stall watchdog ceiling (ms) from provider +
@@ -86,25 +91,36 @@ export function crossSessionDisabled(configEnabled?: boolean): boolean {
  * 注意与 crossSessionDisabled 的分工：后者门控另外三个点位
  * （warmup / 跨会话事件 / 伙伴 presence——多会话协作功能，不是知识推送），
  * 本开关只管记忆块推送，默认关。
+ *
+ * 虚空仓库 P0 例外：source='agent-crafted' 的条目（agent 交付时主动标记）
+ * **默认注入**、不受本开关门控——那是 agent 自己确认的精选知识，不是
+ * 正则提取噪声；选集恒定（忽略 query、ts 取最近）保证附录字节稳定。
  */
 export function crossSessionMemoryPushEnabled(): boolean {
   const v = process.env.RIVET_CROSS_SESSION_INJECT
   return v === '1' || v === 'true'
 }
 
+/** 虚空仓库 P0：合并双路记忆块（默认 agent-crafted 块在前，opt-in 全量块在后）。
+ *  两路都空 → null（附录零占用）。导出供契约测试锁定合并语义。 */
+export function combineMemoryBlocks(agentCrafted: string | null, full: string | null): string | null {
+  if (agentCrafted && full) return `${agentCrafted}\n${full}`
+  return agentCrafted ?? full
+}
+
 /**
  * B4（将星点亮·贪狼触发面）：勘探/盘点类任务关键词。
  * 贪狼是任务型触发（objective 语义），不是状态型触发（CCR 的 P 规则管状态）——
  * 勘探停滞已有 P6 覆盖，这里只在任务意图分类处点一盏 informational 灯。
+ * W3 起正则由 collab-branches 单一持有（E 分支与触发器共用同一实现）。
  */
-const TANLANG_EXPLORATION_RE = /勘探|盘点|考古|半接|休眠|架构审计|死代码|孤儿代码|技术债盘|dead.?code|archaeolog/i
 
 /**
  * 勘探型任务 → 指向 recall_capsule("贪狼") 的 informational advisory 文案。
  * 命中关键词才返回；informational tier 填空位，不占 operational Top-N。
  */
 export function buildTanlangExplorationAdvisory(userInput: string, gist?: string): string | null {
-  if (!TANLANG_EXPLORATION_RE.test(userInput)) return null
+  if (!EXPLORATION_SIGNAL_RE.test(userInput)) return null
   return `【贪狼·胶囊】检测到勘探/盘点型任务。${gist ?? '能力勘探/系统联合方法论已封存'}——动手前调用 recall_capsule("贪狼") 取完整方法（能力非成本框架、陈旧度判据、半接诊断到行号）。`
 }
 
@@ -309,9 +325,30 @@ export class TurnStepProducer {
 
     await this.self.intentRoute.buildForTurn(userInput, actionable, turnMode)
 
-    // B4：勘探/盘点型任务 → 贪狼胶囊 informational advisory（任务型触发，
-    // 复用 CCR 的 capsule-recall 通道语义；不新增 CCR 状态规则）。
+    // 协作分支 advisory（W3）：分支事实来自同一 turn route；social_idle 已在
+    // route 层 fail-closed。A/D/CV3 仲裁全部在纯函数 selectCollabAdvisories
+    // 内完成（可测的 yielded/selected）：A 与低置信对齐提示渠道去重、按契约
+    // 一次性；D 在非 plan mode 且无活跃 PAL 案件时投递；convergence 相邻轮
+    // 已发射则 A/D 一律让位（wasConvergenceEmittedRecently，与 CCR/kick 同判据）。
     if (turnMode === 'task') {
+      const route = this.self._lastRetrievalRoute
+      const branches = route?.collabBranches ?? []
+      const decision = selectCollabAdvisories({
+        branches,
+        contractId: this.self.taskContract?.id,
+        lowConfidenceRendered: route !== null && route.confidence < 0.6,
+        planMode: this.self.planModeState === 'planning',
+        palActiveCases: this.self.problemAttack.snapshotForCvm()?.activeCases ?? 0,
+        convergenceEmitted: this.self.wasConvergenceEmittedRecently(),
+        alignFiredContracts: this.self.collabAlignFiredContracts,
+      })
+      for (const spec of decision.selected) {
+        this.self.advisoryBus.submit(spec)
+        if (spec.branch === 'A') this.self.collabAlignFiredContracts.add(spec.key)
+      }
+
+      // E 复用既有贪狼触发器（单一实现：EXPLORATION_SIGNAL_RE 由 collab-branches
+      // 持有）；分支只是 route 事实，不新增第二套触发逻辑或 advisory key。
       let gist: string | undefined
       try {
         gist = getCapsuleByStar(this.self.cwd, '贪狼')?.gist
@@ -376,7 +413,7 @@ export class TurnStepProducer {
       // execution-mode tasks still route between lightweight and full based on depth + safety.
       this.self._planMethodology = this.self.planModeState === 'planning'
         ? 'full'
-        : classifyPlanMethodology(this.self.taskContract, this.self._taskDepthLayer)
+        : classifyPlanMethodology(this.self.taskContract, this.self._taskDepthLayer, undefined, undefined, this.self._lastRetrievalRoute?.collabBranches)
       this.self.config.promptEngine.setPlanMethodology(
         this.self._planMethodology,
         undefined,
@@ -423,11 +460,19 @@ export class TurnStepProducer {
     this.self.config.promptEngine.setSkillAdvisoryBlock(
       skillRegistry.renderDiscoveryBlock(userInput, { exclude: this.self.getDisabledSkills() }),
     )
-    this.self.config.promptEngine.setCrossSessionMemoryBlock(
+    // 虚空仓库 P0 双路注入：
+    //   默认路径——agent-crafted 知识（deliver_task learned / PAL 自动收割）
+    //   无条件注入。选集完全忽略 query（ts 降序取最近 8 条）——评分选集随
+    //   userInput 漂移是附录字节 churner；恒定选集下 memory.jsonl 不变则
+    //   字节不变，满足 appendixDelta 稳定纪律。
+    //   opt-in 路径——全量记忆按 query 评分（RIVET_CROSS_SESSION_INJECT=1，
+    //   行为不变，对照实验用）。
+    this.self.config.promptEngine.setCrossSessionMemoryBlock(combineMemoryBlocks(
+      renderMemoryBlock(this.self.cwd, '', 1000, 'agent-crafted'),
       crossSessionMemoryPushEnabled() && !crossSessionDisabled(this.self.config.crossSessionEnabled)
         ? renderMemoryBlock(this.self.cwd, userInput)
         : null,
-    )
+    ))
     this.self.config.promptEngine.setMentionContextBlock(renderMentionContext(parseMentions(userInput)))
 
     this.self.config.promptEngine.setPlanCacheAdvisory(
@@ -527,6 +572,19 @@ export class TurnStepProducer {
           convergenceEmittedRecently: this.self.wasConvergenceEmittedRecently(),
           scoutOwned: this.self.anchorScoutOwned,
           hasDecisionGates: this.self.controlPlane.getFrame().decisionGates.length > 0,
+          // PAL 攻坚层（计划 v2 CV3）：存活案件只读快照 + 层开关。
+          attack: palMode() === 'off' ? null : this.self.problemAttack.snapshotForCvm(),
+          attackLayerEnabled: palMode() !== 'off',
+          // W1 开案信号聚合（第四波）：带稳定锚的"卡住形状"事实——纯函数，
+          // trace 无 steps / 无 wave-gate 记录时对应源自然缺席。
+          caseOpenSignals: palMode() === 'off' ? [] : collectCaseOpenSignals({
+            pendingAdvisoryKeys: this.self.advisoryBus.peekPendingKeys(),
+            obligations: this.self.obligations.getStore(),
+            planTrace: this.self.planTrace,
+            waveGate: getWaveGate(this.self.config.sessionId),
+            // 遗产回收 W-A2：convergence 硬熔断事实（本轮无结果 → 源缺席）。
+            convergenceAbort: conv ? { shouldAbort: conv.shouldAbort, abortCause: conv.abortCause } : null,
+          }),
         })
         if (decision.classification || decision.candidate || decision.yielded) {
           this.self.telemetryWriter.write({
@@ -541,11 +599,39 @@ export class TurnStepProducer {
           })
         }
         if (this.self.cvmVector.mode === 'active' && decision.candidate) {
+          // attack_case 已是 CORE 常驻（2026-07-17，26→27）——绝不在会话中途
+          // enableTool：改 tool fingerprint = 200K 前缀全量重建（V4 创建 ¥3/M、
+          // 高峰 ¥6/M，一次一两块）。CV3-open 直接发声即可，工具恒可见。
           this.self.advisoryBus.submit(decision.candidate.entry)
         }
       } catch {
         // CVM-vector 评估失败不影响 turn 主路径
       }
+    }
+
+    // P2 阴阳调度 plan advisory：structure-flow 快照驱动的进/退 plan 建议。
+    // advisory-only（不改 plan mode）、session 级去重（用户干预/生命周期清空）、
+    // 纯函数判定——失败吞掉，不阻断主 turn。
+    if (this.self.latestStructureFlow) {
+      try {
+        const planAdvisory = buildStructureFlowPlanAdvisory({
+          snapshot: this.self.latestStructureFlow,
+          planModeState: this.self.planModeState,
+          activePlanFile: this.self.activePlanFilePath !== null,
+          firedKeys: this.self.structureFlowPlanAdvisoryKeys,
+        })
+        if (planAdvisory) {
+          this.self.structureFlowPlanAdvisoryKeys.add(planAdvisory.key)
+          this.self.advisoryBus.submit({
+            key: planAdvisory.key,
+            priority: 0.55,
+            category: 'discipline',
+            tier: 'operational',
+            content: planAdvisory.content,
+            ttl: 2,
+          })
+        }
+      } catch { /* advisory 通道失败不影响 turn 主路径 */ }
     }
 
     // A1: flush advisory bus into prompt engine (unified corrective guidance)
@@ -997,7 +1083,9 @@ export class TurnStepProducer {
         // Only sets _lastImmuneHint when checkTddGate didn't already produce one,
         // since "no test file touched" is the more critical message.
         const tddConfig = this.self.config.tddGate ?? { enabled: true, mode: 'suggest' as const, threshold: 3, skipIfNoTests: true }
-        const gateHint = buildTddGateHint(this.self.evidence.getGateState(), tddConfig)
+        // P2 阴阳调度：flow 态只降低提示频率（advisory projection），
+        // evaluateTddGate 的 allow/block 硬门不经此路径、不受影响。
+        const gateHint = buildTddGateHint(this.self.evidence.getGateState(), tddConfig, this.self.latestStructureFlow)
         if (gateHint && !this.self._lastImmuneHint) {
           this.self._lastImmuneHint = gateHint
         }

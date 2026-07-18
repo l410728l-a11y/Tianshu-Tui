@@ -9,7 +9,7 @@
 
 1. **认知虚拟机 (CVM)** — `RuntimeHookPipeline` 五阶段条件装配 60+ hook 模块，拦截服从性漂移 / doom loop / 验证债务
 2. **前缀缓存工程** — 冻结 system prompt + 字节稳定 appendix + 边界压缩，DeepSeek V4 长会话稳态命中率 95–99%
-3. **星域 + 多模型编排** — 11 星域认知纪律；worker / council / team / plan 分波执行
+3. **星域 + 多模型编排** — 12 星域认知纪律；worker / council / team / plan 分波执行
 
 表面入口：`src/main.ts` → `bootstrap` → `AgentLoop`；桌面端 `desktop/`（Tauri + React）经 `src/server/` sidecar HTTP/SSE 驱动同一 agent 内核。
 
@@ -38,9 +38,9 @@
 | 插件 / Skills | `src/plugins/` · `src/skills/` | 清单加载；`.rivet/skills/*.md` |
 | Cron / 任务 | `src/server/cron-*.ts` · task routes | 桌面 sidecar 调度 |
 
-### 内置星域（11）
+### 内置星域（12）
 
-天枢 · 破军 · 天府 · 天梁 · 天权 · 天机 · 天璇 · 辅 · 文曲 · 瑶光 · 华盖 — 详见 README「星域系统」与 `docs/stars/`。
+天枢 · 破军 · 天府 · 天梁 · 天权 · 天机 · 天璇 · 辅 · 文曲 · 开阳 · 瑶光 · 华盖 — 详见 README「星域系统」与 `docs/stars/`。
 
 ### 提供商（预设）
 
@@ -78,6 +78,8 @@ DeepSeek · GLM · MiMo · MiniMax · SiliconFlow · Codex (OAuth) · LongCat；
 | `src/platform/` | 平台路径 / EPERM / Node CLI 解析 |
 | `src/workers/` | CPU worker 池（重计算卸载） |
 | `src/workflows/` | 生态工作流定义 |
+| `docs/adaptive-collaboration-flow.md` | A-E 自适应协作路径与验收矩阵 |
+| `.rivet/skills/adaptive-collaboration-flow.md` | 按需召回的协作路径执行 skill |
 | `src/constellation/` | 星座里程碑与持久化 |
 | `src/benchmark/` | 基准任务与报告 |
 | `src/utils/` | 通用工具（sanitize、pricing、frontmatter） |

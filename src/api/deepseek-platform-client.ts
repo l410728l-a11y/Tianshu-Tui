@@ -77,6 +77,22 @@ function platformBaseUrl(baseUrl: string | undefined): string {
   return 'https://platform.deepseek.com'
 }
 
+/** Load persisted platform auth (from webview login). Returns null if not logged in. */
+function loadPlatformAuth(): { token: string; cookies: string } | null {
+  try {
+    const home = process.env.RIVET_HOME || ''
+    const filePath = home + '/deepseek-platform-auth.json'
+    // Use dynamic require to avoid pulling fs into the browser bundle
+    const { existsSync, readFileSync } = require('node:fs')
+    if (!existsSync(filePath)) return null
+    const data = JSON.parse(readFileSync(filePath, 'utf-8')) as { token?: string; cookies?: string }
+    if (!data.token) return null
+    return { token: data.token, cookies: data.cookies ?? '' }
+  } catch {
+    return null
+  }
+}
+
 // ── API 调用 ──────────────────────────────────────────────────────
 
 async function platformFetch<T>(
@@ -85,18 +101,25 @@ async function platformFetch<T>(
   baseUrl: string | undefined,
   signal?: AbortSignal,
 ): Promise<T | null> {
-  if (!apiKey || !isDeepSeekProvider(baseUrl)) return null
+  // Auth priority: platform webview login (cookie+token) > API Key
+  const platformAuth = loadPlatformAuth()
+  if (!platformAuth && (!apiKey || !isDeepSeekProvider(baseUrl))) return null
+
   const url = `${platformBaseUrl(baseUrl)}${path}`
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (platformAuth) {
+    headers['Authorization'] = `Bearer ${platformAuth.token}`
+    if (platformAuth.cookies) headers['Cookie'] = platformAuth.cookies
+  } else if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`
+  }
+  headers['Origin'] = 'https://platform.deepseek.com'
+  headers['Referer'] = 'https://platform.deepseek.com/usage'
+
   try {
     const timeoutSignal = AbortSignal.timeout(10_000)
     const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-    const res = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      signal: combinedSignal,
-    })
+    const res = await fetch(url, { headers, signal: combinedSignal })
     if (!res.ok) return null
     return (await res.json()) as T
   } catch {

@@ -1,6 +1,7 @@
 import type { CoordinatorRun, DelegationRequest } from './coordinator.js'
 import type { AggregationPolicy } from './work-order.js'
-import { matchDomain } from './star-domain.js'
+import { deriveAuthority } from './star-domain.js'
+import { debugLog } from '../utils/debug.js'
 import { parseTeamTaskDrafts, parseTeamTasks, buildUnifiedTeamPlan, hasOverlappingFiles, type TeamTaskDraft, type TeamTask, type UnifiedTeamPlan } from './team-plan.js'
 import { groupTeamTasks, type TeamWave } from './team-grouping.js'
 import { buildTeamWaveTelemetry, type TeamWaveTelemetry } from './team-wave-telemetry.js'
@@ -91,7 +92,9 @@ function buildExecutionObjective(task: TeamTaskDraft): string {
 export function taskAuthority(task: TeamTaskDraft): string {
   if (task.profile === 'patcher') return 'tianliang'
   if (task.profile === 'reviewer' || task.profile === 'adversarial_verifier') return 'tianquan'
-  return matchDomain(task.objective) ?? 'tianliang'
+  const derived = deriveAuthority(task.objective)
+  debugLog(`[team-authority] ${derived.authority} — ${derived.reasons[0] ?? 'n/a'}`)
+  return derived.authority
 }
 
 export function selectDispatchableTeamTasks(tasks: TeamTaskDraft[], maxParallel = 3): { selected: TeamTaskDraft[]; blocked: string[] } {

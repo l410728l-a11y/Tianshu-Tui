@@ -4,6 +4,11 @@
  *
  * P1: Command-Aware filtering — applied in buildModelOutput and directly in
  * bash.ts for commands whose raw output is noisy but semantically simple.
+ *
+ * 纪律（git log/diff、test 三族沿用）：
+ * - 小输出返回 null（无收益零风险）；
+ * - 只删不编（除合成摘要/截断标记外不改写原文行），丢内容必留 [+N omitted] 标记；
+ * - 模型只看过滤结果，原文始终经 rawPath/ArtifactStore 可恢复。
  */
 export function applyCommandFilter(
   command: string,
@@ -27,7 +32,34 @@ export function applyCommandFilter(
     return filterGitStatus(stdout)
   }
 
+  // git log（-p/--patch 走 diff 过滤器）
+  if (/^git\s+log\b/.test(cmd)) {
+    return filterGitLog(cmd, stdout)
+  }
+
+  // git diff / git show
+  if (/^git\s+(diff|show)\b/.test(cmd)) {
+    return filterGitDiff(stdout)
+  }
+
+  // npm/pnpm/yarn/bun test、vitest/jest 直跑
+  if (isTestRunCommand(cmd)) {
+    return filterTestRun(stdout, exitCode)
+  }
+
   return null
+}
+
+// ── shared helpers ─────────────────────────────────────────────
+
+const SGR_RE = /\x1B\[[0-9;]*m/g
+
+function stripSgr(text: string): string {
+  return text.includes('\x1B') ? text.replace(SGR_RE, '') : text
+}
+
+function truncateLine(line: string, width: number): string {
+  return line.length > width ? `${line.slice(0, width - 3)}...` : line
 }
 
 // ── tsc --noEmit ────────────────────────────────────────────────────────────
@@ -99,4 +131,188 @@ function filterGitStatus(stdout: string): string {
     return true
   })
   return filtered.join('\n')
+}
+
+// ── git log ─────────────────────────────────────────────────────────────────
+// 策略参照 rtk `filter_log_output`（git.rs:553）：自定义格式行宽截断；默认格式按
+// commit 块压缩——保留 commit/Date 行 + 最多 3 行 message，剥 Author/空行/trailer，
+// 上限 15 个 commit。≤30 行不过滤（返回 null）。
+
+const GIT_LOG_MAX_COMMITS = 15
+const GIT_LOG_LINE_WIDTH = 120
+
+function filterGitLog(cmd: string, stdout: string): string | null {
+  if (/(?:^|\s)-p\b|--patch/.test(cmd)) return filterGitDiff(stdout)
+  const lines = stripSgr(stdout).split('\n')
+  if (lines.length <= 30) return null
+
+  const userFormat = /--oneline|--pretty|--format/.test(cmd) || !lines.some(l => l.startsWith('commit '))
+  if (userFormat) {
+    const shown = lines.slice(0, 40).map(l => truncateLine(l, GIT_LOG_LINE_WIDTH))
+    const omitted = lines.length - shown.length
+    if (omitted > 0) shown.push(`[+${omitted} commits omitted]`)
+    return shown.join('\n')
+  }
+
+  const out: string[] = []
+  let commits = 0
+  let omittedCommits = 0
+  let i = 0
+  while (i < lines.length) {
+    if (!lines[i]!.startsWith('commit ')) { i++; continue }
+    if (commits >= GIT_LOG_MAX_COMMITS) { omittedCommits++; i++; continue }
+    commits++
+    out.push(lines[i]!)
+    i++
+    let messageKept = 0
+    while (i < lines.length && !lines[i]!.startsWith('commit ')) {
+      const raw = lines[i]!
+      const t = raw.trim()
+      i++
+      if (t.startsWith('Date:')) { out.push(t); continue }
+      if (t.startsWith('Author:')) continue
+      if (t === '') continue
+      if (t.startsWith('Signed-off-by:') || t.startsWith('Co-authored-by:')) continue
+      if (messageKept < 3) {
+        out.push(`    ${truncateLine(t, GIT_LOG_LINE_WIDTH)}`)
+        messageKept++
+      }
+    }
+  }
+  if (omittedCommits > 0) out.push(`[+${omittedCommits} commits omitted]`)
+  return out.join('\n')
+}
+
+// ── git diff / git show ─────────────────────────────────────────────────────
+// 移植 rtk `compact_diff`（git.rs:333）：保留文件头（精简为文件名）+ @@ hunk 头
+// + 变更行 + hunk 内上下文；剥 index/mode/similarity/`\ No newline` 行；每 hunk
+// 上限 60 行截断；每文件尾附 +A -R 计数。≤40 行不过滤。
+
+const DIFF_HUNK_MAX_LINES = 60
+const DIFF_MAX_LINES = 300
+
+function filterGitDiff(stdout: string): string | null {
+  const lines = stripSgr(stdout).split('\n')
+  if (lines.length <= 40) return null
+
+  const out: string[] = []
+  let currentFile = ''
+  let added = 0
+  let removed = 0
+  let inHunk = false
+  let hunkShown = 0
+  let hunkSkipped = 0
+  // git show 的 commit 头（commit/Author/Date/message）保留前 4 行
+  let preambleKept = 0
+
+  const flushFile = (): void => {
+    if (hunkSkipped > 0) {
+      out.push(`  ... (${hunkSkipped} lines truncated)`)
+      hunkSkipped = 0
+    }
+    if (currentFile && (added > 0 || removed > 0)) {
+      out.push(`  +${added} -${removed}`)
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git')) {
+      flushFile()
+      currentFile = line.split(' b/').pop() ?? 'unknown'
+      out.push(`\n${currentFile}`)
+      added = 0
+      removed = 0
+      inHunk = false
+      hunkShown = 0
+      continue
+    }
+    if (line.startsWith('@@')) {
+      if (hunkSkipped > 0) {
+        out.push(`  ... (${hunkSkipped} lines truncated)`)
+        hunkSkipped = 0
+      }
+      inHunk = true
+      hunkShown = 0
+      out.push(`  ${line}`)
+      continue
+    }
+    if (inHunk) {
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        added++
+        if (hunkShown < DIFF_HUNK_MAX_LINES) { out.push(`  ${line}`); hunkShown++ } else { hunkSkipped++ }
+        continue
+      }
+      if (line.startsWith('-') && !line.startsWith('---')) {
+        removed++
+        if (hunkShown < DIFF_HUNK_MAX_LINES) { out.push(`  ${line}`); hunkShown++ } else { hunkSkipped++ }
+        continue
+      }
+      if (line.startsWith('\\')) continue // "\ No newline at end of file"
+      // 上下文行：hunk 内首条变更之前的纯上下文不保留（rtk 同款）
+      if (hunkShown > 0 && hunkShown < DIFF_HUNK_MAX_LINES) { out.push(`  ${line}`); hunkShown++ }
+      continue
+    }
+    // hunk 外：preamble（git show 的 commit 头 / --stat 块）只保留首个文件
+    // 之前的 4 行非空行；文件头之后的 index/mode/---/+++ 行一律丢弃。
+    if (!currentFile && preambleKept < 4 && line.trim() !== '') {
+      out.push(line)
+      preambleKept++
+    }
+    if (out.length >= DIFF_MAX_LINES) {
+      out.push('\n... (more changes truncated)')
+      return out.join('\n')
+    }
+  }
+  flushFile()
+  return out.join('\n')
+}
+
+// ── test runners（npm/pnpm/yarn/bun test、vitest/jest）───────────────────────
+// 策略参照 rtk vitest/npm 过滤器：剥生命周期头/WARN/进度噪声；成功只留统计行；
+// 失败保留失败块（失败名 + 断言详情窗口）+ 统计行，丢通过项与 coverage 表。
+// ≤15 行不过滤。
+
+const TEST_SUMMARY_RE = /Test Files|Test Suites|Tests\s+\d|Duration|^\s*ℹ\s+(tests|suites|pass|fail|skipped|todo)|\d+\s+passed|\d+\s+failed|Ran all test suites/
+const TEST_FAILURE_START_RE = /^\s*(FAIL\b|✕|×|✖|✗|not ok\b|●\s|ERR_ASSERTION|AssertionError)/
+const TEST_FAILURE_DETAIL_RE = /(AssertionError|Expected|Actual|Difference|error:\s|Error:\s|\bat\s+\S+\s*\(|\bpassed\b|\bfailed\b)/
+const TEST_PASS_LINE_RE = /^\s*(✓|✔|ok\b|PASS\b)/
+const TEST_NOISE_RE = /^>\s+\S+@[\w.-]+\s+\S|^\s*npm\s+(WARN|notice)\b|^\s*pnpm\s+WARN\b/
+
+function isTestRunCommand(cmd: string): boolean {
+  if (/^(npm|pnpm|yarn|bun)\s+(run\s+)?[\w:-]*test[\w:-]*(\s|$)/.test(cmd)) return true
+  if (/^(npx|pnpm\s+exec|pnpm\s+dlx|bunx)\s+(vitest|jest)\b/.test(cmd)) return true
+  return /^(vitest|jest)\b/.test(cmd)
+}
+
+function filterTestRun(stdout: string, exitCode: number): string | null {
+  const rawLines = stripSgr(stdout).split('\n')
+  if (rawLines.length <= 15) return null
+
+  const lines = rawLines.filter(l => !TEST_NOISE_RE.test(l))
+
+  if (exitCode === 0) {
+    const summary = lines.filter(l => TEST_SUMMARY_RE.test(l))
+    if (summary.length === 0) return lines.slice(-10).join('\n').trim() || null
+    const passedMatch = summary.find(l => /(\d+)\s+passed/.test(l))?.match(/(\d+)\s+passed/)
+      ?? summary.find(l => /ℹ\s+pass\s+(\d+)/.test(l))?.match(/ℹ\s+pass\s+(\d+)/)
+    const head = passedMatch ? `✓ ${passedMatch[1]} passed` : '✓ tests passed'
+    return [head, ...summary].join('\n')
+  }
+
+  const kept: string[] = []
+  let window = 0
+  for (const line of lines) {
+    if (TEST_SUMMARY_RE.test(line)) { kept.push(line); window = Math.max(window, 0); continue }
+    if (TEST_FAILURE_START_RE.test(line)) { kept.push(line); window = 5; continue }
+    if (TEST_FAILURE_DETAIL_RE.test(line) && !TEST_PASS_LINE_RE.test(line)) { kept.push(line); window = Math.max(window, 3); continue }
+    if (window > 0 && !TEST_PASS_LINE_RE.test(line)) { kept.push(line); window--; continue }
+    if (window > 0) window--
+    // 通过项、coverage 行、npm ERR! 前言全部丢弃
+  }
+  if (kept.length === 0) return lines.slice(-15).join('\n')
+  const MAX_KEPT = 120
+  if (kept.length > MAX_KEPT) {
+    return [...kept.slice(0, MAX_KEPT), `[+${kept.length - MAX_KEPT} lines omitted]`].join('\n')
+  }
+  return kept.join('\n')
 }

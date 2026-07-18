@@ -123,6 +123,8 @@ export function createTeamOrchestrateTool(
      *  以保持直接构造方（测试等）行为不变；bootstrap 按 pro-license 传真值。 */
     teamMaxEnabled?: boolean
   },
+  /** H4-D4：team_orchestrate 派发 worker 完成后标记已完成 orderId */
+  getAttackStore?: () => import('../agent/problem-attack-loop.js').ProblemAttackStore | null,
 ): Tool {
   return {
     definition: {
@@ -281,18 +283,24 @@ export function createTeamOrchestrateTool(
 
       // T4: terminal per-worker status for the subagent panel.
       if (params.onWorkerActivity && summary.run) {
+        const attackStore = getAttackStore?.() ?? null
         for (const r of summary.run.results) {
           params.onWorkerActivity({
             workOrderId: r.workOrderId,
             parentToolId: params.toolUseId,
             status: r.status,
             progressLine: r.summary.slice(0, 80),
+            failureReason: r.failureReason,
             model: r.model,
             provider: r.provider,
             usage: r.usage,
             artifactId: r.diffArtifactId,
             changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
           })
+          // H4-D4：标记已完成 worker，供 PAL worker: 引用验真
+          if (r.status === 'passed' && attackStore) {
+            attackStore.markWorkerCompleted(r.workOrderId)
+          }
         }
       }
 

@@ -31,12 +31,12 @@ import type { PlanMethodology } from '../context/task-contract.js'
 // against. Zero new tools; just nudges the model toward the existing todo tool.
 const METHODOLOGY_ADVISORY_TEMPLATES: Record<PlanMethodology, string> = {
   lightweight: '<plan-methodology route="lightweight">推荐使用轻量版计划模板（5阶段），路径: docs/superpowers/plans/2026-06-14-plan-methodology-lightweight.md。本任务 scope 内聚，单模块边界内变更，轻量版足以覆盖。至少画一张架构或数据流图（Mermaid），哪怕只画核心 3-5 个节点。开工前先用 todo 列出有序步骤（即为执行计划基线）。</plan-methodology>',
-  full: '<plan-methodology route="full">推荐使用基础计划模板（Superpowers writing-plans），路径: docs/superpowers/plans/2026-06-28-plan-methodology-base.md。这是所有计划的默认基础：零上下文假设、任务粒度 2-5 分钟、禁止占位符、TDD、探针先行、瑶光反证、频繁提交。强制要求：① 至少一张 Mermaid 图（架构/数据流/状态图）；② 每个任务 RED→GREEN；③ 复杂实现前先打 30 秒探针；④ 用真实输入复现原问题再验修复，不取信声称取 exit code；⑤ 计划含「瑶光反证」章节（submit 门禁）——设计定稿后回读关键断言到 file:line、bugfix 先跑 run_tests 拿 RED 复现、跑不了的派 adversarial_verifier，复现不了的降级为待验证假设。如果任务涉及安全/权限/沙箱/多 enforcement gate，在基础模板之上追加安全附录（安全不变量、触发路径清单、双门对齐数据流图）。开工前先用 todo 列出有序步骤（即为执行计划基线）。</plan-methodology>',
+  full: '<plan-methodology route="full">推荐使用基础计划模板（Superpowers writing-plans），路径: docs/superpowers/plans/2026-06-28-plan-methodology-base.md。这是所有计划的默认基础：零上下文假设、任务粒度 2-5 分钟、禁止占位符、TDD、探针先行、瑶光反证、频繁提交。强制要求：① 至少一张 Mermaid 图（架构/数据流/状态图）；② 每个任务 RED→GREEN；③ 复杂实现前先打 30 秒探针；④ 用真实输入复现原问题再验修复，不取信声称取 exit code；⑤ 计划含「瑶光反证」章节（submit 门禁）——设计定稿后回读关键断言到 file:line、bugfix 先跑 run_tests 拿 RED 复现、跑不了的派 adversarial_verifier，复现不了的降级为待验证假设；⑥ 大计划（checkbox 任务 >8 或引用文件 >15）必须显式分波——`### Wave N` 标题 + 每波验证命令（submit 门禁）。如果任务涉及安全/权限/沙箱/多 enforcement gate，在基础模板之上追加安全附录（安全不变量、触发路径清单、双门对齐数据流图）。开工前先用 todo 列出有序步骤（即为执行计划基线）。</plan-methodology>',
 }
 
 /** Plan Mode 专用：设计文档口径，不注入可执行 TDD/bash「执行计划基线」。 */
 const PLAN_MODE_METHODOLOGY_ADVISORY =
-  '<plan-methodology route="full" mode="design-doc">Plan Mode 产出完整设计文档（写入活动计划文件），不是逐步 bash/commit 菜谱。章节要求：① 问题与根因；② 至少一张 Mermaid 架构/数据流图；③ 方案取舍表（有决策时）；④ 文件:行锚点 + 提议 diff/伪代码；⑤ 验证清单（测什么/看什么，不写逐步 shell 块）；⑥ 「瑶光反证」——关键断言 + file:line 或 run_tests 证据摘要，复现不了的标待验证假设；⑦ 重构类须含「回归清单」。逐步命令与 git commit 留给批准后的执行阶段。</plan-methodology>'
+  '<plan-methodology route="full" mode="design-doc">Plan Mode 产出完整设计文档（写入活动计划文件），不是逐步 bash/commit 菜谱。章节要求：① 问题与根因；② 至少一张 Mermaid 架构/数据流图；③ 方案取舍表（有决策时）；④ 文件:行锚点 + 提议 diff/伪代码；⑤ 验证清单（测什么/看什么，不写逐步 shell 块）；⑥ 「瑶光反证」——关键断言 + file:line 或 run_tests 证据摘要，复现不了的标待验证假设；⑦ 重构类须含「回归清单」；⑧ 大计划（任务 >8 或引用文件 >15）须显式分波——`### Wave N` 标题 + 每波验证命令（submit 门禁）。逐步命令与 git commit 留给批准后的执行阶段。</plan-methodology>'
 
 export function renderPlanMethodologyAdvisory(
   methodology: PlanMethodology | undefined,
@@ -118,7 +118,8 @@ flowchart LR
 - 每个文件给出提议代码（diff 或伪代码），不能只有文件路径或 "TODO"
 - 存在设计决策时，用表格对比备选方案；多方案时在 submit 的 \`options\` 参数中列出供用户选择
 - **验证清单**（不是逐步命令剧本）：列出要测的用例名/场景、人工检查点、期望可见结果；不要写 \`\`\`bash\`\`\` / \`git commit\` 菜谱
-- **瑶光反证**：关键断言 + file:line 或 run_tests 证据摘要；复现不了的标「待验证假设」
+- **瑶光反证**：必须含**标题**带「反证」或「复现」的 ## 级章节（正文/列表里提到不算，submit 门禁）；关键断言 + file:line 或 run_tests 证据摘要；复现不了的标「待验证假设」
+- **分波结构（大计划硬性，submit 门禁）**：checkbox 任务 >8 或引用文件 >15 时，必须含 \`### Wave N\` 分波章节 + 每波验证命令
 - **重构条款（重构/迁移/重写类计划硬性）**：必须包含「回归清单」章节——列出改动前存在、改动后必须仍存在的功能锚点（路由、导航项、导出符号、命令入口等 grep 可验证的断言，每条附验证方式）。重构的行为等价不靠感觉靠清单：交付前逐项核对，缺清单的重构计划视为未完成。
 - 自检：如果 plan 字段里出现 "TODO"、"FIXME"、"待补充"、"placeholder"、"TBD"、"[x]" 空白条目或仅标题无正文的章节，说明计划尚未打磨完成，继续探索并补充内容后再提交。
 

@@ -12,16 +12,19 @@ import {
 
 describe('tool-tiers', () => {
   describe('CORE_TOOLS', () => {
-    it('stays within kernel budget (≤26)', () => {
+    it('stays within kernel budget (≤27)', () => {
       // ≤26 after the 2026-07-01 CORE trim: demoted read_section (read_file covers
       // ranges), diff (git covers), inspect_project (one-shot orientation), related_tests,
       // file_info (bash/read_file cover), leave_mark (constellation opt-in) → EXTENDED.
       // They stay worker-available and main can /tools enable them; this only shrinks
       // the main agent's default visible set to fight choice overload.
+      // 26→27（2026-07-17）：attack_case 直入 CORE——攻坚场景在会话中期出现，
+      // EXTENDED 中途挂载改 tool fingerprint = 200K 前缀全量重建（DeepSeek V4
+      // 创建 ¥3/M、高峰 ¥6/M）；常驻字节稳定是唯一缓存零成本方案。
       assert.ok(
-        CORE_TOOLS.length <= 26,
-        `CORE_TOOLS has ${CORE_TOOLS.length} tools (limit: 26). ` +
-          `Beyond ~26, agents experience choice overload. ` +
+        CORE_TOOLS.length <= 27,
+        `CORE_TOOLS has ${CORE_TOOLS.length} tools (limit: 27). ` +
+          `Beyond ~26-27, agents experience choice overload. ` +
           `Before adding: can you merge two tools, or demote a low-use one to EXTENDED?`,
       )
     })
@@ -137,6 +140,8 @@ describe('tool-tiers', () => {
         'apply_patch', 'plan_task', 'deliver_task', 'undo', 'memory', 'plan',
         // browser_debug 在 bootstrap 的 interactive registry 注册（CORE since 2026-07-15）
         'browser_debug',
+        // attack_case 同为 interactive registry 注册（CORE since 2026-07-17，PAL 攻坚层）
+        'attack_case',
       ])
       for (const name of CORE_TOOLS) {
         assert.ok(

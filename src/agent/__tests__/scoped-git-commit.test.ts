@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { commitScopedFiles } from '../scoped-git-commit.js'
@@ -95,5 +95,39 @@ describe('commitScopedFiles', () => {
     assert.match(result.output, /No changes in owned files to commit/)
     assert.match(result.output, /owned\.txt/)
     assert.equal(after, before)
+  })
+
+  it('retries through transient index.lock contention and commits once the lock clears', { timeout: 30_000 }, () => {
+    writeFileSync(join(TMP, 'owned.txt'), 'owned change')
+    const lockPath = join(TMP, '.git', 'index.lock')
+    writeFileSync(lockPath, '')
+    // The main thread blocks in sleepSync during backoff, so the lock must be
+    // cleared by an external process — simulates the other git process exiting.
+    spawnSync('sh', ['-c', `(sleep 2; rm -f "${lockPath}") &`], { encoding: 'utf-8' })
+
+    const result = commitScopedFiles({ cwd: TMP, files: ['owned.txt'], message: 'fix: retried through lock' })
+
+    assert.equal(result.ok, true, `expected retry to recover, got: ${result.output}`)
+    const committedFiles = git(['show', '--name-only', '--pretty=format:', 'HEAD']).split('\n').filter(Boolean)
+    assert.deepEqual(committedFiles, ['owned.txt'])
+  })
+
+  it('returns the lock error after retry exhaustion without deleting the lock', { timeout: 30_000 }, () => {
+    writeFileSync(join(TMP, 'owned.txt'), 'owned change')
+    const lockPath = join(TMP, '.git', 'index.lock')
+    writeFileSync(lockPath, '')
+    const before = git(['rev-parse', 'HEAD']).trim()
+
+    const started = Date.now()
+    const result = commitScopedFiles({ cwd: TMP, files: ['owned.txt'], message: 'fix: lock persists' })
+    const elapsed = Date.now() - started
+
+    assert.equal(result.ok, false)
+    assert.match(result.output, /index\.lock|Unable to create/i)
+    // Backoff was actually applied (1s+2s+4s) rather than failing instantly.
+    assert.ok(elapsed >= 7000, `expected ≥7s of backoff, got ${elapsed}ms`)
+    // No commit landed and the lock was NOT deleted (a live process may hold it).
+    assert.equal(git(['rev-parse', 'HEAD']).trim(), before)
+    assert.equal(existsSync(lockPath), true)
   })
 })

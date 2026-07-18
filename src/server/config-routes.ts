@@ -40,6 +40,8 @@ import {
   setCheckpointConfig,
   getNetworkConfig,
   setNetworkConfig,
+  getMirrorConfig,
+  setMirrorConfig,
   getPermissionDirs,
   setPermissionDirs,
   getVisionModelConfig,
@@ -48,7 +50,9 @@ import {
 import { applyConfiguredPathGrants } from '../tools/path-grants.js'
 import { expandHome } from '../platform.js'
 import { resolve } from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { rivetHome } from '../config/paths.js'
 import { PROVIDER_PRESETS, providerPresetKeys, type ProviderPresetKey } from '../config/provider-presets.js'
 import { modelConfigSchema, type ModelConfig } from '../config/schema.js'
 import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.js'
@@ -344,6 +348,21 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
     }, apiToken),
 
+    // Mirror acceleration (GitHub/npm/pip/go/rust) for users behind the GFW.
+    // Takes effect on the next bash execution (bash.ts reloads mirrors each
+    // call) — no restart needed. CLI equivalent: /mirror on|off|china|default.
+    'GET /config/mirrors': withAuth(() => {
+      return { status: 200, body: getMirrorConfig() }
+    }, apiToken),
+
+    'PUT /config/mirrors': withAuth((body) => {
+      try {
+        return { status: 200, body: { ok: true, mirrors: setMirrorConfig(body ?? {}) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
     // Computer Use (desktop GUI automation) status for the desktop settings UI:
     // platform availability, Pro gating, system permission probe, and per-app grants.
     'GET /config/computer-use': withAuth(async () => {
@@ -472,6 +491,40 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const year = Number(params?.year ?? now.getFullYear())
       const cost = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
       return { status: 200, body: { cost } }
+    }, apiToken),
+
+    // ── DeepSeek 平台网页登录（token + cookie 持久化） ────────────
+
+    'GET /config/deepseek/auth': withAuth(() => {
+      const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
+      if (!existsSync(filePath)) return { status: 200, body: { loggedIn: false } }
+      try {
+        const data = JSON.parse(readFileSync(filePath, 'utf-8')) as { token?: string }
+        return { status: 200, body: { loggedIn: !!data.token } }
+      } catch {
+        return { status: 200, body: { loggedIn: false } }
+      }
+    }, apiToken),
+
+    'POST /config/deepseek/auth': withAuth((body) => {
+      const { token, cookies } = (body ?? {}) as { token?: string; cookies?: string }
+      if (!token) return { status: 400, body: { error: 'token is required' } }
+      try {
+        const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
+        mkdirSync(join(rivetHome()), { recursive: true })
+        writeFileSync(filePath, JSON.stringify({ token, cookies: cookies ?? '', savedAt: Date.now() }), 'utf-8')
+        return { status: 200, body: { ok: true, loggedIn: true } }
+      } catch (err) {
+        return { status: 500, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    'DELETE /config/deepseek/auth': withAuth(() => {
+      const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
+      if (existsSync(filePath)) {
+        try { writeFileSync(filePath, '{}', 'utf-8') } catch { /* best-effort */ }
+      }
+      return { status: 200, body: { ok: true, loggedIn: false } }
     }, apiToken),
   }
 }

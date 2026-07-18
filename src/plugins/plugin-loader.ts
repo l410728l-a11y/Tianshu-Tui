@@ -11,8 +11,8 @@
  *    install/enable takes effect next session.
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, resolve, sep, basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { rivetHome } from '../config/paths.js'
 import type { ToolRegistry } from '../tools/registry.js'
@@ -28,7 +28,33 @@ export interface PluginLoadResult {
   status: 'loaded' | 'skipped_disabled' | 'skipped_no_manifest' | 'skipped_invalid_manifest' | 'skipped_no_entry' | 'skipped_import_error' | 'skipped_conflict' | 'skipped_no_tools'
   toolCount?: number
   skillCount?: number
+  hookCount?: number
+  commandCount?: number
   error?: string
+  /** Resolved hooks contributed by this plugin (only present when status='loaded'). */
+  hooks?: PluginHookEntry[]
+  /** Resolved commands contributed by this plugin (only present when status='loaded'). */
+  commands?: PluginCommandEntry[]
+}
+
+/** A hook contributed by a plugin, with its script resolved to an absolute path.
+ *  Merged into the user-hooks-runner alongside project-level .rivet/hooks.json. */
+export interface PluginHookEntry {
+  pluginName: string
+  event: 'preTurn' | 'postTurn' | 'postTool' | 'postSession' | 'onError'
+  /** Absolute path to the script inside the plugin directory. */
+  script: string
+  timeoutMs?: number
+}
+
+/** A slash command contributed by a plugin, with its .md resolved to an absolute
+ *  path. Merged into the commands loader alongside .rivet/commands/*.md. */
+export interface PluginCommandEntry {
+  pluginName: string
+  /** Command name (basename without .md). */
+  name: string
+  /** Absolute path to the .md prompt file. */
+  file: string
 }
 
 export interface PluginsInitResult {
@@ -40,6 +66,10 @@ export interface PluginsInitResult {
   warnings: string[]
   /** Built-in tool names to suppress because a plugin has taken over. */
   suppressTools: string[]
+  /** Hooks contributed by all loaded plugins (merged from manifest.hooks). */
+  hooks: PluginHookEntry[]
+  /** Slash commands contributed by all loaded plugins (merged from manifest.commands). */
+  commands: PluginCommandEntry[]
 }
 
 /** Minimal config subset needed by the plugin loader. */
@@ -80,7 +110,7 @@ export async function initializePlugins(
   const results: PluginLoadResult[] = []
 
   if (!existsSync(pluginsDir)) {
-    return { scanned: 0, loaded: 0, skipped: 0, totalTools: 0, results, warnings, suppressTools: [] }
+    return { scanned: 0, loaded: 0, skipped: 0, totalTools: 0, results, warnings, suppressTools: [], hooks: [], commands: [] }
   }
 
   let entries: string[]
@@ -90,13 +120,15 @@ export async function initializePlugins(
       .map(d => d.name)
   } catch {
     warnings.push(`[plugins] Cannot read plugins directory: ${pluginsDir}`)
-    return { scanned: 0, loaded: 0, skipped: 0, totalTools: 0, results, warnings, suppressTools: [] }
+    return { scanned: 0, loaded: 0, skipped: 0, totalTools: 0, results, warnings, suppressTools: [], hooks: [], commands: [] }
   }
 
   const enabled = pluginConfig?.enabled ?? {}
+  // Cross-plugin dedup set for slash command names (first-loaded wins).
+  const commandNameSeen = new Set<string>()
 
   for (const dirName of entries) {
-    const result = await loadOnePlugin(dirName, pluginsDir, enabled, toolRegistry, cwd, warnings)
+    const result = await loadOnePlugin(dirName, pluginsDir, enabled, toolRegistry, cwd, warnings, commandNameSeen)
     results.push(result)
     if (result.error) {
       warnings.push(`[plugins] ${result.pluginName}: ${result.error}`)
@@ -106,6 +138,9 @@ export async function initializePlugins(
   const loaded = results.filter(r => r.status === 'loaded')
   const totalTools = loaded.reduce((sum, r) => sum + (r.toolCount ?? 0), 0)
   const suppressTools = loaded.flatMap(r => PLUGIN_TOOL_SUPPRESS_MAP[r.pluginName] ?? [])
+  // Merge hooks + commands across all loaded plugins.
+  const hooks = loaded.flatMap(r => r.hooks ?? [])
+  const commands = loaded.flatMap(r => r.commands ?? [])
 
   return {
     scanned: entries.length,
@@ -115,6 +150,8 @@ export async function initializePlugins(
     results,
     warnings,
     suppressTools,
+    hooks,
+    commands,
   }
 }
 
@@ -241,6 +278,88 @@ function loadPluginSkills(
   return loaded
 }
 
+/**
+ * Load bundled hooks declared in the plugin manifest. Resolves each script to
+ * an absolute path inside the plugin dir (path-escape guard). Returns the
+ * resolved entries; the caller (initializePlugins) merges them across all
+ * plugins and hands them to the user-hooks-runner. Does NOT write to
+ * .rivet/hooks.json — plugin hooks stay in-memory + resolve from the plugin
+ * directory, so removing the plugin instantly removes its hooks.
+ */
+function loadPluginHooks(
+  manifest: PluginManifest,
+  pluginDir: string,
+  warnings: string[],
+): PluginHookEntry[] {
+  const decls = manifest.hooks
+  if (!decls || decls.length === 0) return []
+
+  const out: PluginHookEntry[] = []
+  for (const decl of decls) {
+    const scriptAbs = resolve(pluginDir, decl.script)
+    if (!pathStaysInDir(scriptAbs, pluginDir)) {
+      warnings.push(`[plugins] ${manifest.name}: hook script "${decl.script}" escapes plugin directory`)
+      continue
+    }
+    if (!existsSync(scriptAbs)) {
+      warnings.push(`[plugins] ${manifest.name}: hook script not found at "${decl.script}"`)
+      continue
+    }
+    out.push({
+      pluginName: manifest.name,
+      event: decl.event,
+      script: scriptAbs,
+      ...(decl.timeoutMs !== undefined ? { timeoutMs: decl.timeoutMs } : {}),
+    })
+  }
+  return out
+}
+
+/**
+ * Load bundled slash commands declared in the plugin manifest. Each entry is
+ * a path relative to the plugin root — either a single .md file or a directory
+ * (scanned for *.md, like .rivet/commands/). Returns resolved entries; the
+ * caller merges them across plugins. Command name conflicts skip the later
+ * plugin's command (first-loaded wins), mirroring the skill conflict policy.
+ */
+function loadPluginCommands(
+  manifest: PluginManifest,
+  pluginDir: string,
+  warnings: string[],
+  seenNames: Set<string>,
+): PluginCommandEntry[] {
+  const paths = manifest.commands
+  if (!paths || paths.length === 0) return []
+
+  const out: PluginCommandEntry[] = []
+  for (const relPath of paths) {
+    const abs = resolve(pluginDir, relPath)
+    if (!pathStaysInDir(abs, pluginDir)) {
+      warnings.push(`[plugins] ${manifest.name}: command path "${relPath}" escapes plugin directory`)
+      continue
+    }
+    if (!existsSync(abs)) {
+      warnings.push(`[plugins] ${manifest.name}: command path not found at "${relPath}"`)
+      continue
+    }
+    // Directory → scan *.md; file → single entry (must be .md).
+    const stat = statSync(abs)
+    const files: string[] = stat.isDirectory()
+      ? readdirSync(abs).filter(f => f.endsWith('.md')).map(f => join(abs, f))
+      : abs.endsWith('.md') ? [abs] : []
+    for (const file of files) {
+      const name = basename(file, '.md')
+      if (seenNames.has(name)) {
+        warnings.push(`[plugins] ${manifest.name}: command "/${name}" conflicts — skipped`)
+        continue
+      }
+      seenNames.add(name)
+      out.push({ pluginName: manifest.name, name, file })
+    }
+  }
+  return out
+}
+
 // ── Per-plugin loading ─────────────────────────────────────────────
 
 async function loadOnePlugin(
@@ -250,6 +369,7 @@ async function loadOnePlugin(
   registry: ToolRegistry,
   cwd: string,
   warnings: string[],
+  commandNameSeen: Set<string>,
 ): Promise<PluginLoadResult> {
   const pluginDir = join(pluginsDir, dirName)
   const pkgPath = join(pluginDir, 'package.json')
@@ -354,6 +474,18 @@ async function loadOnePlugin(
 
   // 9. Load bundled skills (after tools succeed — skill conflict skips, never rejects plugin)
   const skillCount = loadPluginSkills(manifest, pluginDir, warnings)
+  // 10. Load bundled hooks + commands (same fail-safe policy as skills).
+  const hooks = loadPluginHooks(manifest, pluginDir, warnings)
+  const commands = loadPluginCommands(manifest, pluginDir, warnings, commandNameSeen)
 
-  return { pluginName: manifest.name, status: 'loaded', toolCount: tools.length, skillCount }
+  return {
+    pluginName: manifest.name,
+    status: 'loaded',
+    toolCount: tools.length,
+    skillCount,
+    hookCount: hooks.length,
+    commandCount: commands.length,
+    hooks,
+    commands,
+  }
 }

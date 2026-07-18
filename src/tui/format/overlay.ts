@@ -17,6 +17,7 @@ import { color } from '../engine/ansi.js'
 import { resolveThemeEntry, type RivetTheme } from '../theme.js'
 import { formatElapsed } from '../tool-elapsed.js'
 import { formatTokenCount } from './spinner-status.js'
+import { formatAuthorityLabel } from './profile-labels.js'
 import type { TranscriptMessage } from '../scrollback-transcript.js'
 import type { ConnectView } from '../connect-flow.js'
 import {
@@ -1221,7 +1222,9 @@ export function renderFleetDetail(worker: FleetWorkerView, width: number, height
   // Detail rows：标签列右对齐固定宽度，值列对齐成表
   const rows: [string, string][] = []
   rows.push(['Profile', worker.profile])
-  if (worker.authority) rows.push(['Authority', worker.authority])
+  if (worker.authority) {
+    rows.push(['Authority', formatAuthorityLabel(worker.authority, worker.authorityReason)])
+  }
   if (worker.model) rows.push(['Model', worker.model])
   rows.push(['Elapsed', formatElapsed(worker.elapsedMs)])
   const statBits: string[] = []

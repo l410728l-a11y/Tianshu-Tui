@@ -27,6 +27,8 @@ export interface FleetWorkerView {
   profile: string
   /** 星域 id（星名来源），从 DelegationActivity.authority 透传。 */
   authority?: string
+  /** Why this authority was chosen (from DelegationActivity.authorityReason). */
+  authorityReason?: string
   /** 原始委派状态。 */
   status: DelegationActivity['status']
   /** WorkerPanel 兼容状态（glyph / auto-collapse 用）。 */
@@ -64,6 +66,7 @@ interface FleetRecord {
   parentToolId: string
   profile: string
   authority?: string
+  authorityReason?: string
   status: DelegationActivity['status']
   terminal: boolean
   activity?: string
@@ -135,6 +138,7 @@ export class FleetRegistry {
       existing.activityLog = log
       if (activity.profile) existing.profile = activity.profile
       if (activity.authority) existing.authority = activity.authority
+      if (activity.authorityReason) existing.authorityReason = activity.authorityReason
       if (activity.progressLine) existing.activity = activity.progressLine
       // 计数只增不减（乱序事件防御）；终态 usage/model 保留供归档后查询。
       if (typeof activity.toolUseCount === 'number' && activity.toolUseCount > existing.toolUseCount) {
@@ -152,6 +156,7 @@ export class FleetRegistry {
       parentToolId: activity.parentToolId,
       profile: activity.profile ?? 'worker',
       authority: activity.authority,
+      authorityReason: activity.authorityReason,
       status: activity.status,
       terminal,
       activity: activity.progressLine,
@@ -173,6 +178,7 @@ export class FleetRegistry {
       parentToolId: r.parentToolId,
       profile: r.profile,
       authority: r.authority,
+      authorityReason: r.authorityReason,
       status: r.status,
       panelStatus: panelStatusOf(r.status),
       terminal: r.terminal,

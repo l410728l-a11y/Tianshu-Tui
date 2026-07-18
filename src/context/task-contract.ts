@@ -476,9 +476,16 @@ export function classifyPlanMethodology(
   depthLayer: TaskDepthLayer,
   _impact?: DepthImpactHint,
   override?: PlanMethodology,
+  collabBranches?: readonly ('A' | 'B' | 'C' | 'D' | 'E')[],
 ): PlanMethodology {
   // User override always wins — skip the entire rule chain
   if (override !== undefined) return override
+
+  // Route branches are derived once per turn. B/C/D are explicit full-methodology
+  // gates; A/E remain advisory-only and must not widen every task.
+  if (collabBranches?.some(branch => branch === 'B' || branch === 'C' || branch === 'D')) {
+    return 'full'
+  }
 
   const obj = contract.objective
   const files = contract.scope.mentionedFiles

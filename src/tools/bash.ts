@@ -1,4 +1,7 @@
 import { spawn, execFileSync } from 'child_process'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { DANGEROUS_BASH_PATTERNS } from '../agent/approval-risk.js'
 import type { Tool, ToolCallParams } from './types.js'
 import { track } from './process-tracker.js'
@@ -166,6 +169,24 @@ export function classifyBashOutcome(
 }
 
 /**
+ * 结果装配失败时的降级结果（finish 的 try/catch 兜底用）。导出以锁定契约：
+ * 必须含根因、真实退出码、输出尾部，且绝不伪装成命令本身的失败。
+ */
+export function buildAssemblyFailureResult(
+  message: string,
+  exitCode: number,
+  outputTail: string,
+): { content: string; uiContent: string; isError: boolean } {
+  return {
+    content: `[bash 内部错误：结果装配失败] ${message}\n` +
+      `[exit=${exitCode}] 命令本身已执行结束——这不是命令失败，是 rivet 组装输出时出错（请把本行原样报告给用户）。原始输出尾部：\n` +
+      `${outputTail || '(no output)'}`,
+    uiContent: `✗ 结果装配失败: ${message.slice(0, 80)}`,
+    isError: true,
+  }
+}
+
+/**
  * Wrap a command in a workspace-scoped sandbox. Default-OFF.
  * Enable with RIVET_SANDBOX=1.
  */
@@ -186,13 +207,85 @@ let _cachedCommand: string | undefined
 let _cachedResult: string | undefined
 let _cachedToolUseId: string | undefined
 
+/**
+ * rtk 健康判定（进程级缓存）。
+ *
+ * 背景（session 4df36bcd / f1bde946 两次事故）：rtk 未装 hook（`rtk init -g`）时
+ * `rtk ls` 对非空目录也返回 `(empty)`。盲信 `rtk rewrite` 的重写会把这种损坏
+ * 变成系统性假工具结果——模型看到 `(empty)` 就断定"目录不存在/文件丢失"，
+ * 进而重写用户文件。header 显示实际执行命令（:478-483）只是缓解：模型仍信 body。
+ *
+ * 对策：首次 rewrite 前做端到端探针——`rtk ls` 一个含标记文件的临时目录，
+ * 输出必须包含标记文件名。探针失败则整个进程停用 rtk 重写并一次性告警
+ * （命令照常原生执行，输出从此真实）。
+ *
+ * - `RIVET_RTK=0`：kill switch，直接停用（不探针、不告警）。
+ * - rtk 二进制缺失：静默透传（未安装 rtk 的机器不受任何影响）。
+ */
+type RtkVerdict = 'unknown' | 'ok' | 'broken' | 'missing'
+let _rtkVerdict: RtkVerdict = 'unknown'
+/** 测试注入点：替换 execFileSync（见 __setRtkExecForTests）。 */
+let _rtkExecOverride: typeof execFileSync | undefined
+
+function rtkExec(): typeof execFileSync {
+  return _rtkExecOverride ?? execFileSync
+}
+
+function probeRtkHealth(): RtkVerdict {
+  try {
+    rtkExec()('rtk', ['--version'], { timeout: 1000, encoding: 'utf-8' })
+  } catch {
+    return 'missing'
+  }
+  let dir: string | undefined
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'rivet-rtk-probe-'))
+    writeFileSync(join(dir, 'rivet-rtk-marker'), 'x')
+    const out = rtkExec()('rtk', ['ls', dir], { timeout: 2000, encoding: 'utf-8' })
+    return out.includes('rivet-rtk-marker') ? 'ok' : 'broken'
+  } catch {
+    return 'broken'
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function rtkVerdict(): RtkVerdict {
+  if (process.env.RIVET_RTK === '0') return 'broken' // kill switch：等同 broken 静默透传
+  if (_rtkVerdict === 'unknown') {
+    _rtkVerdict = probeRtkHealth()
+    if (_rtkVerdict === 'broken') {
+      const msg =
+        '[rivet] rtk health probe failed (`rtk ls` returned no marker output) — rtk command rewriting DISABLED for this process; commands run natively. Repair with `rtk init -g`, or silence with RIVET_RTK=0.'
+      debugLog(`[rtk-disabled] ${msg}`)
+      // 经 output-guard（TUI）成为 ⚠ 静态行；headless 直接可见。
+      process.stderr.write(`${msg}\n`)
+    }
+  }
+  return _rtkVerdict
+}
+
+/** 测试专用：注入 rtk 执行器 + 重置判定/调用缓存。 */
+export function __setRtkExecForTests(exec: typeof execFileSync | undefined): void {
+  _rtkExecOverride = exec
+  _rtkVerdict = 'unknown'
+  _cachedCommand = undefined
+  _cachedResult = undefined
+  _cachedToolUseId = undefined
+}
+
+/** 测试专用：暴露 rtkRewrite 的判定行为（不进入生产路径）。 */
+export const __rtkRewriteForTests = rtkRewrite
+
 function rtkRewrite(command: string, toolUseId?: string): string {
   if (command === _cachedCommand && _cachedResult !== undefined && toolUseId === _cachedToolUseId) {
     return _cachedResult
   }
   let result: string
   try {
-    result = execFileSync('rtk', ['rewrite', command], { timeout: 500, encoding: 'utf-8' }).trim()
+    result = rtkVerdict() === 'ok'
+      ? rtkExec()('rtk', ['rewrite', command], { timeout: 500, encoding: 'utf-8' }).trim()
+      : command
   } catch {
     result = command
   }
@@ -623,7 +716,19 @@ Long-running / non-terminating commands (dev servers, watchers, installs) run in
         if (timer) clearTimeout(timer)
         if (clearForceKill && forceKillTimer) clearTimeout(forceKillTimer)
         cleanupAbort()
-        resolve(await buildResult(code, isTimeout))
+        // 结果装配兜底：buildResult 内任何异常（如 dist 混构导致的
+        // ReferenceError，session 22d00a37）从 child 事件处理器逃逸时不会变成
+        // promise rejection——execute() 永不 settle，只能等管线 120s 看门狗，
+        // 模型干等两分钟后拿到一句误导性的 "spawn 卡住"。异常必须降级为带
+        // 根因的工具结果：命令真实执行过、输出尾部在、错误可见。
+        try {
+          resolve(await buildResult(code, isTimeout))
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          debugLog(`[bash-buildResult-failed] exit=${code} ${msg}`)
+          const tail = (stdout + (stderr ? `\n${stderr}` : '')).slice(-2000)
+          resolve(buildAssemblyFailureResult(msg, code, tail))
+        }
       }
 
       // 用户中止（Esc/Ctrl+C → AgentLoop.abort → pipeline abortSignal）：

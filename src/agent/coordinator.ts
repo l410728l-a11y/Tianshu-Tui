@@ -16,6 +16,7 @@ import {
   createWriteWorkOrder,
   mapWorkOrderKindToCapabilityTask,
   parseWorkerResult,
+  salvageWorkerResult,
   READ_ONLY_WORKER_TOOLS,
   WRITE_WORKER_TOOLS,
   type AggregationPolicy,
@@ -30,9 +31,9 @@ import {
   deriveWorkerSessionId,
 } from './work-order.js'
 import { buildPrimaryWorkerPacket } from './worker-prompts.js'
-import { runWorkerSession, type WorkerCheckpoint, type WorkerSessionConfig, type WorkerSessionRun } from './worker-session.js'
+import { runWorkerSession, type WorkerActivityKind, type WorkerCheckpoint, type WorkerSessionConfig, type WorkerSessionRun } from './worker-session.js'
 import { saveWorkerSession, loadWorkerSession } from './worker-session-persist.js'
-import { WorkerLiveness, EXPLORE_STALL_MS, WRITE_STALL_MS } from './worker-liveness.js'
+import { WorkerLiveness, EXPLORE_STALL_MS, deriveWorkerStallMs } from './worker-liveness.js'
 import { runHandsSession, type HandsSessionConfig, type HandsSessionRun } from './hands-session.js'
 import { buildWorkerEpisode } from './worker-episode.js'
 import { recordWorkerEpisodeClosure } from './reward-loop.js'
@@ -88,7 +89,9 @@ export interface WorkerActivityEvent {
   profile: string
   /** 星域 id（星名来源），由 coordinator 从 order.authority 透传。 */
   authority?: string
-  kind: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn'
+  /** Why this authority was chosen (from WorkOrder.authorityReason). */
+  authorityReason?: string
+  kind: WorkerActivityKind
   /** Tool name for tool events; text delta for text/thinking; 累计 token 总数 for turn. */
   detail?: string
 }
@@ -501,6 +504,13 @@ function tryResumeWorkerResult(
  *  planner profiles legitimately think-then-delegate, but unbounded recursion
  *  must be impossible. */
 export const MAX_DELEGATION_DEPTH = 2
+
+/** Grace period (ms) given to worker-session's internal salvageAbortedReport
+ *  before wrapAbort rejects. Without this, the abort signal's immediate reject
+ *  races ahead of the worker's wasAborted() handler, discarding partial output.
+ *  5s is enough for the salvage parse + field extraction; the worker's own API
+ *  call has already been aborted by its internal controller at this point. */
+const WORKER_ABORT_SALVAGE_GRACE_MS = 5_000
 
 /** B2: background (async) work order handle — Cursor `is_background` analog.
  *  The parent is NOT blocked; results are collected later by id (and are also
@@ -1382,6 +1392,13 @@ export class DelegationCoordinator {
     workerConfig.parentApprovalMode = this.config.parentApprovalMode
     workerConfig.domainKnowledgeStore = this.config.domainKnowledgeStore
     workerConfig.mailbox = this.mailbox
+    // Enable JSON-mode repair for OpenAI-protocol providers. The repair path
+    // sends a tool-free request with response_format: json_object, which is an
+    // OpenAI API standard. If the provider doesn't support it, the request
+    // fails silently and falls through to plain-text repair — no harm done.
+    // Without this, malformed worker JSON (common on LongCat) never gets the
+    // structured repair path, degrading to field-level salvage with heavy loss.
+    if (!workerConfig.forceJsonRepair) workerConfig.forceJsonRepair = true
     // Dispatch nonce: batch order ids repeat across delegation runs — without
     // this, every run appends to the same worker-batch-N.jsonl (cumulative
     // context + stale artifacts, session 2c1186f5). Same-order retries within
@@ -1424,7 +1441,14 @@ export class DelegationCoordinator {
       this.liveness.tick(order.id)
       upstreamActivity?.(kind, detail)
       try {
-        requestUpstream?.({ workOrderId: order.id, profile: order.profile, authority: order.authority, kind, detail })
+        requestUpstream?.({
+          workOrderId: order.id,
+          profile: order.profile,
+          authority: order.authority,
+          authorityReason: order.authorityReason,
+          kind,
+          detail,
+        })
       } catch { /* UI upstream must never break dispatch */ }
     }
     // WC: 输入直达 — worker 每个工具回合结算时 drain 本 order 的 steer 队列。
@@ -1458,22 +1482,45 @@ export class DelegationCoordinator {
       if (abortSignal.aborted) return Promise.reject(new Error('Delegation aborted: caller signal already fired'))
 
       return new Promise<T>((resolve, reject) => {
+        let settled = false
         const onAbort = () => {
+          if (settled) return
           // Distinguish a stall-sweep abort (per-order controller fired, parent
           // did not) from a caller abort — stalls ARE provider-relevant faults.
           const stallAbort = orderController.signal.aborted && !parentSignal?.aborted
-          reject(new Error(stallAbort
-            ? `Worker ${order.id} stalled: silent past liveness tolerance — aborted by stall sweep`
-            : 'Delegation aborted: caller signal fired'))
+          const stallSecs = (() => {
+            const ms = this.liveness.tolerance(order.id)
+            return ms ? Math.round(ms / 1000) : null
+          })()
+          const abortMsg = stallAbort
+            ? `Worker ${order.id} stalled: no activity for ${stallSecs ?? '?'}s (provider: ${workerConfig.providerName ?? 'unknown'}) — upstream may be slow to first byte rather than dead; aborted by stall sweep`
+            : 'Delegation aborted: caller signal fired'
+
+          // Grace period: give the worker-session a bounded window (5s) to run
+          // its internal salvageAbortedReport before rejecting. Without this,
+          // the immediate reject races ahead of worker-session's wasAborted()
+          // handler, discarding any partial report the worker already produced.
+          // The worker Promise will resolve with the salvaged result if it
+          // finishes within the grace period; otherwise we reject.
+          const graceTimer = setTimeout(() => {
+            if (!settled) {
+              settled = true
+              reject(new Error(abortMsg))
+            }
+          }, WORKER_ABORT_SALVAGE_GRACE_MS)
+          // Allow the Node process to exit even if the grace timer is pending.
+          graceTimer.unref?.()
         }
         abortSignal.addEventListener('abort', onAbort, { once: true })
 
         p.then(
           (result) => {
+            settled = true
             abortSignal.removeEventListener('abort', onAbort)
             resolve(result)
           },
           (err) => {
+            settled = true
             abortSignal.removeEventListener('abort', onAbort)
             reject(err)
           },
@@ -1517,7 +1564,7 @@ export class DelegationCoordinator {
     // A4: arm the stall clock only once dispatch is committed (all early
     // blocked returns above never register, so they can't leak entries).
     this.orderControllers.set(order.id, orderController)
-    this.liveness.register(order.id, this.config.workerStallMs ?? (isWrite ? WRITE_STALL_MS : EXPLORE_STALL_MS))
+    this.liveness.register(order.id, this.config.workerStallMs ?? deriveWorkerStallMs({ providerName: workerConfig.providerName, isWrite }))
     this.ensureStallSweep()
 
     try {
@@ -1646,7 +1693,7 @@ export class DelegationCoordinator {
             break
           }
           // Re-register liveness for the retry attempt
-          this.liveness.register(order.id, this.config.workerStallMs ?? (isWrite ? WRITE_STALL_MS : EXPLORE_STALL_MS))
+          this.liveness.register(order.id, this.config.workerStallMs ?? deriveWorkerStallMs({ providerName: workerConfig.providerName, isWrite }))
           this.orderControllers.set(order.id, orderController)
           try {
             if (role === 'hands') {
@@ -1772,8 +1819,9 @@ export class DelegationCoordinator {
           }
           upgradedConfig.mailbox = this.mailbox
 
-          // Re-register liveness for retry
-          this.liveness.register(order.id, this.config.workerStallMs ?? (isWrite ? WRITE_STALL_MS : EXPLORE_STALL_MS))
+          // Re-register liveness for retry — leash derives from the UPGRADED
+          // provider (escalation may land on a slow-thinking one).
+          this.liveness.register(order.id, this.config.workerStallMs ?? deriveWorkerStallMs({ providerName: upgradedConfig.providerName, isWrite }))
 
           try {
             if (role === 'hands') {
@@ -1874,6 +1922,30 @@ export class DelegationCoordinator {
 
       // If retry didn't happen, return degraded — circuit records failure for tier-locked profiles
       if (!run) {
+        // Abort salvage: wrapAbort's immediate reject can race ahead of
+        // worker-session's internal salvageAbortedReport. Try to recover the
+        // worker's partial output from the abort checkpoint BEFORE returning
+        // an empty failure — the worker may have produced a valid (if unverified)
+        // report that just didn't reach us through the Promise chain.
+        if (isAbort) {
+          const checkpoint = this.abortCheckpoints.get(order.id)
+          if (checkpoint?.partialResult) {
+            const salvaged = salvageWorkerResult(checkpoint.partialResult, order.id)
+            if (salvaged) {
+              const enriched = this.enrichResult(salvaged, selected.model, workerConfig.providerName)
+              return {
+                status: 'completed' as const,
+                order,
+                selectedModel: selected.model,
+                modelTierShadows: [tierShadow],
+                modelTierGatedDecisions: [tierGatedDecision],
+                gatedInfluenceAudits: [gatedInfluenceAudit],
+                results: [enriched],
+                packet: await buildPrimaryWorkerPacket([enriched], this.config.artifactStore),
+              }
+            }
+          }
+        }
         if (!isAbort && profileRegistry.get(order.profile)?.tierLock) this.circuitBreaker.recordFailure(order.profile)
         const degraded = this.enrichResult(workerFailureResult(order, error, { failureReason: classifyWorkerError(error) }), selected.model, workerConfig.providerName)
         return {

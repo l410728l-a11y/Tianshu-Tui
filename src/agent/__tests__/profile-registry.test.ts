@@ -34,10 +34,27 @@ describe('ProfileRegistry', () => {
     assert.match(p.expertisePrompt, /docs say X, current code shows Y/)
   })
 
+  // "证无"任务上廉价模型会反复 grep 空结果仍不收手，直到 budget 超时
+  // （见 docs/analysis/2026-07-17-worker-batch-0-salvage-incident.md §3）。
+  // scout 必须带显式收敛纪律：多样 pattern 无果即报告"已证无"并停止。
+  it('code_scout carries convergence discipline for prove-absence tasks', () => {
+    const p = registry.get('code_scout')!
+    assert.match(p.expertisePrompt, /Convergence discipline/)
+    assert.match(p.expertisePrompt, /prove-absence/)
+    assert.match(p.expertisePrompt, /verified absence/)
+    assert.match(p.expertisePrompt, /absence after diverse patterns is a finding/)
+  })
+
   it('doc_scout marks unverified current-state claims', () => {
     const p = registry.get('doc_scout')!
     assert.match(p.expertisePrompt, /lag behind the code/)
     assert.match(p.expertisePrompt, /unverified against source/)
+  })
+
+  it('doc_scout carries convergence discipline for prove-absence tasks', () => {
+    const p = registry.get('doc_scout')!
+    assert.match(p.expertisePrompt, /Convergence discipline/)
+    assert.match(p.expertisePrompt, /verified absence/)
   })
 
   it('maps code_scout as readonly', async () => {

@@ -9,8 +9,8 @@
  * - 提供 ASCII fallback 兼容。
  */
 
-import chalk from 'chalk'
 import { color } from '../engine/ansi.js'
+import { useAsciiGlyphs } from '../term-caps.js'
 import type { RivetTheme } from '../theme.js'
 import { circleSpinnerFrame } from '../braille-spinner.js'
 
@@ -79,7 +79,7 @@ export interface SpinnerStatusInput {
 
 export function formatSpinnerStatus(input: SpinnerStatusInput, theme: RivetTheme): string | null {
   if (input.phase === 'idle') return null
-  const useAscii = chalk.level < 3
+  const useAscii = useAsciiGlyphs()
   const frame = spinnerFrame(input.tick, useAscii)
   const label = `${verbFor(input.elapsedMs)}…`
   const text = `${frame} ${label} ${formatElapsedHuman(input.elapsedMs)}`
@@ -105,7 +105,7 @@ export function formatTurnWorkSummary(input: {
   inputTokens: number
   outputTokens: number
 }, theme: RivetTheme): string {
-  const useAscii = chalk.level < 3
+  const useAscii = useAsciiGlyphs()
   const glyph = useAscii ? 'Y' : '◆'
   const elapsed = formatElapsedHuman(input.elapsedMs)
   const tokens = `${formatTokenCount(input.inputTokens)}→${formatTokenCount(input.outputTokens)}`

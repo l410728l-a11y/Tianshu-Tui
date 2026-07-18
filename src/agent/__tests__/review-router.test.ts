@@ -339,4 +339,57 @@ describe('routeReviewWorkflow', () => {
     assert.equal(verifierCalls, 1)
     assert.equal(patcherCalls, 1)
   })
+
+  it('forwards options.onActivity to wiring reviewer spawns in auto mode (review-gate UI visibility)', async () => {
+    const onActivity = () => {}
+    const seen: unknown[] = []
+    const outcome = await routeReviewWorkflow(
+      { files: ['src/agent/loop.ts'], crossModule: false, isFix: false },
+      {
+        ...okDeps,
+        spawnWiringReviewer: async (_change, _signal, activity) => {
+          seen.push(activity)
+          return { findings: [] }
+        },
+      },
+      { mode: 'auto', onActivity },
+    )
+
+    assert.equal(outcome.verdict, 'verified')
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0], onActivity)
+  })
+
+  it('forwards options.onActivity to verifier/patcher/squadron spawns in manual mode', async () => {
+    const onActivity = () => {}
+    const seen: Record<string, unknown> = {}
+    let verifyCalls = 0
+    const outcome = await routeReviewWorkflow(fixChange, {
+      spawnVerifier: async (_c, _s, activity) => {
+        verifyCalls++
+        seen.verifier = activity
+        return verifyCalls === 1
+          ? { verdict: 'rejected', evidence: 'broken' }
+          : { verdict: 'verified', evidence: 'ran: ok' }
+      },
+      spawnPatcher: async (_c, _v, _s, activity) => { seen.patcher = activity; return { patched: true } },
+      spawnSquadron: async (_c, _s, activity) => { seen.squadron = activity; return { findings: [] } },
+    }, { onActivity, maxRounds: 2 })
+
+    assert.equal(outcome.verdict, 'verified')
+    assert.equal(seen.verifier, onActivity)
+    assert.equal(seen.patcher, onActivity)
+    assert.equal(seen.squadron, undefined, 'L2 fix must not spawn the squadron')
+
+    const l3 = await routeReviewWorkflow(
+      { files: ['src/agent/approval-risk.ts'], crossModule: false, isFix: true },
+      {
+        ...okDeps,
+        spawnSquadron: async (_c, _s, activity) => { seen.squadron = activity; return { findings: [] } },
+      },
+      { onActivity },
+    )
+    assert.equal(l3.verdict, 'verified')
+    assert.equal(seen.squadron, onActivity)
+  })
 })

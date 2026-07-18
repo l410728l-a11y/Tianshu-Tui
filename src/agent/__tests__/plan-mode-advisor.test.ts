@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, planModeSuggestEnabled, type PlanModeSuggestInput } from '../plan-mode-advisor.js'
+import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestEnabled, type PlanModeSuggestInput, type StructureFlowPlanAdvisoryInput } from '../plan-mode-advisor.js'
 import { extractTaskContract } from '../../context/task-contract.js'
 
 function baseInput(overrides: Partial<PlanModeSuggestInput> = {}): PlanModeSuggestInput {
@@ -66,6 +66,90 @@ describe('buildPlanModeSuggestAdvisory', () => {
     assert.ok(text.includes('直接执行'))
     assert.ok(text.includes('enter_mode'))
     assert.ok(text.includes('system 级改动面'))
+  })
+})
+
+// ─── P2 阴阳调度：structure-flow plan advisory ──────────────────────
+
+describe('buildStructureFlowPlanAdvisory', () => {
+  function sfInput(overrides: Partial<StructureFlowPlanAdvisoryInput> = {}): StructureFlowPlanAdvisoryInput {
+    return {
+      snapshot: { planRecommendation: 'enter', reasons: ['unknown-domain'] },
+      planModeState: 'off',
+      activePlanFile: false,
+      firedKeys: new Set(),
+      ...overrides,
+    }
+  }
+
+  it('未知域首次 enter → 输出建议，键含 recommendation 与首因', () => {
+    const result = buildStructureFlowPlanAdvisory(sfInput())
+    assert.ok(result)
+    assert.equal(result.key, 'structure-flow-plan:enter:unknown-domain')
+    assert.ok(result.content.includes('ask_user_question'))
+    assert.ok(result.content.includes('enter_mode'))
+  })
+
+  it('同 reason 已发过（firedKeys 命中）→ null（one-shot 去重）', () => {
+    const fired = new Set(['structure-flow-plan:enter:unknown-domain'])
+    assert.equal(buildStructureFlowPlanAdvisory(sfInput({ firedKeys: fired })), null)
+  })
+
+  it('firedKeys 清空后（模拟用户干预）→ 允许重新建议', () => {
+    const result = buildStructureFlowPlanAdvisory(sfInput({ firedKeys: new Set() }))
+    assert.ok(result)
+  })
+
+  it('已在 planning 时 enter → null（生命周期优先于自动建议）', () => {
+    assert.equal(buildStructureFlowPlanAdvisory(sfInput({ planModeState: 'planning' })), null)
+  })
+
+  it('已有批准计划文件时 enter → null', () => {
+    assert.equal(buildStructureFlowPlanAdvisory(sfInput({ activePlanFile: true })), null)
+  })
+
+  it('stay → null（不重复输出）', () => {
+    assert.equal(
+      buildStructureFlowPlanAdvisory(sfInput({ snapshot: { planRecommendation: 'stay', reasons: ['unknown-domain'] } })),
+      null,
+    )
+  })
+
+  it('none → null', () => {
+    assert.equal(
+      buildStructureFlowPlanAdvisory(sfInput({ snapshot: { planRecommendation: 'none', reasons: ['stable-execution'] } })),
+      null,
+    )
+  })
+
+  it('exit 只对 planning 态输出（批准计划执行中的健康 flow 不打扰）', () => {
+    const exitSnap = { planRecommendation: 'exit' as const, reasons: ['stable-execution' as const] }
+    const inPlanning = buildStructureFlowPlanAdvisory(sfInput({ snapshot: exitSnap, planModeState: 'planning' }))
+    assert.ok(inPlanning)
+    assert.equal(inPlanning.key, 'structure-flow-plan:exit')
+    assert.ok(inPlanning.content.includes('退出计划模式'))
+
+    const offState = buildStructureFlowPlanAdvisory(sfInput({ snapshot: exitSnap, planModeState: 'off' }))
+    assert.equal(offState, null)
+  })
+
+  it('exit 去重：同 session 第二次 → null', () => {
+    const exitSnap = { planRecommendation: 'exit' as const, reasons: ['stable-execution' as const] }
+    const fired = new Set(['structure-flow-plan:exit'])
+    assert.equal(
+      buildStructureFlowPlanAdvisory(sfInput({ snapshot: exitSnap, planModeState: 'planning', firedKeys: fired })),
+      null,
+    )
+  })
+
+  it('不同首因的 enter 键互不冲突（各自 one-shot）', () => {
+    const fired = new Set(['structure-flow-plan:enter:unknown-domain'])
+    const mixed = buildStructureFlowPlanAdvisory(sfInput({
+      snapshot: { planRecommendation: 'enter', reasons: ['mixed-signals'] },
+      firedKeys: fired,
+    }))
+    assert.ok(mixed)
+    assert.equal(mixed.key, 'structure-flow-plan:enter:mixed-signals')
   })
 })
 

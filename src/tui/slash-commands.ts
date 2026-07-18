@@ -400,11 +400,12 @@ export function resolveAppPromptInput(
   input: string,
   cwd: string,
   isKnownCommand?: (name: string) => boolean,
+  pluginCommands?: { name: string; file: string }[],
 ): ResolvedPromptInput | null {
   if (!input.startsWith('/')) return { prompt: input }
   const workflow = resolveEcosystemWorkflowInput(input)
   if (workflow) return { prompt: workflow.prompt, requiredTools: workflow.requiredTools }
-  const custom = resolveCustomCommand(cwd, input)
+  const custom = resolveCustomCommand(cwd, input, pluginCommands)
   if (custom) return { prompt: custom }
   const skillPrompt = resolveSkillPrompt(input, cwd)
   if (skillPrompt !== null) return { prompt: skillPrompt }
@@ -3550,6 +3551,7 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
         }
         app.commitStatic('✅ 更新已安排：天枢将退出以释放文件占用，安装完成后会自动重新打开。')
         app.commitStatic('   （若未自动打开，请重新运行 rivet；安装约需数十秒）')
+        app.commitStatic('   ⚠️ 若有其他天枢/rivet 会话在运行，请一并退出——否则 npm 覆盖全局包时仍会命中文件占用而失败。')
         app.commitStatic(`   日志：${schedule.logPath}`)
         setTimeout(() => {
           ctx.shutdown()
@@ -3566,6 +3568,11 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
       }
       if (!result.ok) {
         app.commitStatic(`❌ ${result.message}`)
+        // Windows 源码安装：npm install 重建原生模块（better_sqlite3.node）时
+        // 当前进程已加载该文件 → "另一个程序正在使用此文件"。给出定向指引。
+        if (process.platform === 'win32') {
+          app.commitStatic('   Windows 提示：若因文件被占用（EBUSY/EPERM）失败，请退出所有天枢会话后在安装目录手动执行上述更新命令。')
+        }
         return true
       }
 
@@ -3859,7 +3866,7 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
           return true
         }
         app.commitStatic(`Installing plugin from ${arg}...`)
-        installPlugin(arg).then((result) => {
+        installPlugin({ kind: 'local', path: arg }).then((result) => {
           if (result.ok) {
             const perms = result.manifest.permissions
             const permStr = Object.entries(perms).filter(([, v]) => v).map(([k]) => k).join(', ') || 'none'

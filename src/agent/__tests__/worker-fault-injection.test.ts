@@ -98,6 +98,18 @@ describe('worker fault injection — high availability', () => {
       await assert.rejects(runOnceWithTransientRetry(agent, 'go', emptyTranscript()))
       assert.equal(attempts(), 1, 'no retry for non-transient failures')
     })
+
+    it('emits a retry activity on transient failure (feeds liveness — 慢 ≠ 死)', async () => {
+      // API 层内部重试期间没有任何流式事件；retry activity 是 stall sweep
+      // 不把健康重试误判为静默的唯一信号（2026-07-18 四 scout 齐死的补强）。
+      const { agent } = makeScriptedAgent([
+        { error: 'ECONNRESET socket hang up' },
+        { text: VALID_RESULT_JSON },
+      ])
+      const activities: string[] = []
+      await runOnceWithTransientRetry(agent, 'go', emptyTranscript(), (kind) => { activities.push(kind) })
+      assert.ok(activities.includes('retry'), `retry must tick liveness, got: ${activities.join(',')}`)
+    })
   })
 
   describe('runWorkerSession (full path, fault client)', () => {

@@ -751,7 +751,8 @@ export function formatExitSummary(
   const short = sessionId.slice(0, 8)
   const title = (meta?.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 60)
   const head = `会话已保存: ${short} · ${turns}轮${title ? ` · “${title}”` : ''}`
-  return `${head}\n恢复: rivet --continue（最近会话）或 rivet --resume ${short}`
+  // 告别行在前、事实在后：退出时刻也是品牌触点（✦ = 天枢启明星）。
+  return `✦ 后会有期 — 星轨已存档\n${head}\n恢复: rivet --continue（最近会话）或 rivet --resume ${short}`
 }
 
 /** Compact relative time for session lists, e.g. "刚刚" / "5分钟前" / "3天前". */

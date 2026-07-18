@@ -90,6 +90,9 @@ function request(input: {
   objective: string
   kind: WorkOrderKind
   profile: WorkerProfile
+  /** Live worker activity upstream — feeds the subagent panel (review-gate UI
+   *  visibility). Absent → review workers run silent in the UI. */
+  onActivity?: DelegationRequest['onActivity']
 }): DelegationRequest {
   const reviewDepth = childReviewDepth(input.options)
   return {
@@ -103,6 +106,7 @@ function request(input: {
     profile: input.profile,
     scope: scope(input.change),
     reviewDepth,
+    ...(input.onActivity ? { onActivity: input.onActivity } : {}),
   }
 }
 
@@ -333,13 +337,14 @@ function inspectorObjective(inspector: typeof INSPECTORS[number], change: Change
   ].join('\n')
 }
 
-function squadronRequests(change: ChangeSet, options: CoordinatorReviewDepsOptions): DelegationRequest[] {
+function squadronRequests(change: ChangeSet, options: CoordinatorReviewDepsOptions, onActivity?: DelegationRequest['onActivity']): DelegationRequest[] {
   return INSPECTORS.map(inspector => request({
     change,
     options,
     kind: 'review',
     profile: 'reviewer',
     objective: inspectorObjective(inspector, change),
+    onActivity,
   }))
 }
 
@@ -372,37 +377,39 @@ export function createCoordinatorReviewDeps(
   options: CoordinatorReviewDepsOptions = {},
 ): ReviewRouterDeps {
   return {
-    spawnVerifier: async (change) => {
+    spawnVerifier: async (change, _signal, onActivity) => {
       const run = await coordinator.delegate(request({
         change,
         options,
         kind: 'verify',
         profile: 'adversarial_verifier',
         objective: verifierObjective(change),
+        onActivity,
       }), options.abortSignal)
       return verifierResult(run)
     },
 
-    spawnPatcher: async (change, verifier) => {
+    spawnPatcher: async (change, verifier, _signal, onActivity) => {
       const run = await coordinator.delegate(request({
         change,
         options,
         kind: 'patch_proposal',
         profile: 'patcher',
         objective: patcherObjective(change, verifier),
+        onActivity,
       }), options.abortSignal)
       return patcherResult(run)
     },
 
-    spawnSquadron: async (change): Promise<SquadronResult> => {
-      const requests = squadronRequests(change, options)
+    spawnSquadron: async (change, _signal, onActivity): Promise<SquadronResult> => {
+      const requests = squadronRequests(change, options, onActivity)
       const run = coordinator.delegateBatch
         ? await coordinator.delegateBatch(requests, 'all_required', options.abortSignal)
         : await runSquadronSerially(coordinator, requests, options.abortSignal)
       return { findings: mapSquadronFindings(run), infraFailures: mapSquadronInfraFailures(run) }
     },
 
-    spawnWiringReviewer: async (change): Promise<SquadronResult> => {
+    spawnWiringReviewer: async (change, _signal, onActivity): Promise<SquadronResult> => {
       // Auto review: 2 inspectors in parallel (Wiring + Silence).
       // Wiring catches "built ≠ wired ≠ effective", Silence catches
       // swallowed errors, false green claims, and counterexample gaps.
@@ -419,6 +426,7 @@ export function createCoordinatorReviewDeps(
             inspectorObjective(inspector, change),
             `Time budget is tight (~${Math.round(AUTO_WIRING_WORKER_TIMEOUT_MS / 1000)}s): review the DIFF of the listed files first (git diff/read targeted ranges), do not read whole files or explore beyond scope. Report what you covered.`,
           ].join('\n'),
+          onActivity,
         }),
         budget: { timeoutMs: AUTO_WIRING_WORKER_TIMEOUT_MS, maxTurns: AUTO_WIRING_WORKER_MAX_TURNS },
       }))

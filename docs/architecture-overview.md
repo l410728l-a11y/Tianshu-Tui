@@ -97,7 +97,7 @@ System = static.ts（会话内冻结） + volatile（动态区） + appendixDelt
 
 | 机制 | 作用 |
 |------|------|
-| `/domain` + 自动路由 | 切换 11 星域的提示词后缀 / 决策风格 / 勇气阈值 |
+| `/domain` + 自动路由 | 切换 12 星域的提示词后缀 / 决策风格 / 勇气阈值 |
 | Plan Mode | 调研 → 结构化计划 → 审批 → 分波执行（wave-gate） |
 | `/team` | 多 worker 并行，文件冲突感知调度 |
 | `/council` | 多席位审查，可选反驳轮 |

@@ -22,13 +22,13 @@ export interface CockpitSnapshotSources {
 /**
  * Human-readable star-domain label for the cockpit Model panel.
  *  - object    → pinned domain name (e.g. 破军)
- *  - undefined → Auto with the keyword fallback in parens (Auto(天枢))
+ *  - undefined → Auto (keyword routing off → 开阳) shown as Auto(开阳)
  *  - null      → STAR_SOUL kill switch (no persona at all)
  */
 function describeStarDomain(domain: import('../../agent/star-domain.js').ActiveStarDomain | null | undefined): string {
   if (domain) return domain.name
   if (domain === null) return '关闭(环境)'
-  const fallback = STAR_DOMAINS.tianshu?.name ?? '天枢'
+  const fallback = STAR_DOMAINS.kaiyang?.name ?? '开阳'
   return `Auto(${fallback})`
 }
 

@@ -42,6 +42,7 @@ docs/superpowers/specs/*.md
 .rivet/artifacts/
 .rivet/sessions/
 .rivet/cache-log.jsonl
+.rivet/frames.jsonl
 .rivet/tool-stream.jsonl
 .rivet/meridian.db*
 .rivet/playbook.jsonl
@@ -60,6 +61,8 @@ docs/superpowers/specs/*.md
 .rivet/skills/_drafts/
 .rivet/Tianshu/
 .rivet/plans/draft-*.md
+
+.zcode/
 
 # AI agent temp files
 .tmp/
@@ -80,7 +83,12 @@ docs/superpowers/specs/*.md
 .rivet/presence.json
 .rivet/constellation.json
 # 其它无策展内容的工具目录，整目录忽略
-.cursor/
+# .cursor/ 目录下 plans 文件为重要设计文档，需保留；只忽略 Cursor 的 settings/rules/workspace-state
+.cursor/settings.json
+.cursor/rules
+.cursor/mcp.json
+.cursor/workspace-state
+.cursor/tasks
 .od-skills/
 # 误产生的空文件
 /js
@@ -99,6 +107,11 @@ tianshu-agent-v1.*.json
 # 运行时插件 / scratch 目录
 .rivet/plugin-*/
 .rivet/scratch/
+# 本地 launcher / 项目级覆盖配置（勿入仓）
+.rivet/config.json
+
+# 品牌源素材草稿（成品图标走 desktop/src-tauri/icons；勿把 brand-src 打进发版树）
+desktop/brand-src/
 
 # macOS 本地应用数据
 Library/
@@ -107,4 +120,4 @@ Library/
 _test-docx.html
 docs/*.html
 docs/*.docx
-.rivet/
+

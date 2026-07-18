@@ -449,10 +449,17 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // adapted to the manager's ManagedAgent surface (run/abort + artifacts). The
   // manager's session id is threaded into buildAgentLoop so the agent's stores
   // align with the session. Agent assembly is dynamically imported (Wave C) so
+  // ... (goal handles resolver captured on first load — see createAgent below).
+  let goalHandlesResolve: typeof import('./serve-agent.js').resolveGoalHandles | null = null
   // cold /health does not pay for tools/Meridian/council.
   const sessions = new RuntimeSessionManager({
     createAgent: async (cwd, sessionId, approvalMode, modelId) => {
       const agentMod = await loadServeAgent()
+      // Capture the goal-handles resolver on first load (dynamic import is
+      // cached, so this runs once). Used by resolveGoalHandles below.
+      if (!goalHandlesResolve && typeof agentMod.resolveGoalHandles === 'function') {
+        goalHandlesResolve = agentMod.resolveGoalHandles
+      }
       return agentMod.buildManagedAgent(
         ctx,
         cwd ?? process.cwd(),
@@ -468,6 +475,16 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     persistence,
     // R1 — late-bound getter: registry resolves async after server start.
     getSessionRegistry: () => sessionRegistry,
+    // Goal mode — late-bound per-session goal handles (refs + sessionDir +
+    // cheap-client profile). Delegates to serve-agent's stores registry.
+    // The resolver reference is captured on the first createAgent call (when
+    // serve-agent is dynamically imported); before that, returns undefined
+    // (a session with no agent built yet has no goal state anyway).
+    resolveGoalHandles: (sessionId) => {
+      if (!goalHandlesResolve) return undefined
+      const liveCtx = specReload ? specReload() : ctx
+      return goalHandlesResolve(sessionId, liveCtx.config)
+    },
     // PlusMenu — provider model source + default for the model picker.
     // Reload-aware: picks up providers configured after startup (no restart).
     listModels: () => listAllModelsWithReload(ctx),
@@ -568,10 +585,15 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
       return { status: 400, body: { error: 'Missing path' } }
     }
     const reveal = (body as Record<string, unknown>)?.reveal === true
+    const bodyCwd = (body as Record<string, unknown>)?.cwd
     // 路径存在性检查——不静默吞错（之前 spawn error 被 () => {} 吞掉，用户看不到失败）。
     const { existsSync } = require('node:fs') as typeof import('node:fs')
     const { resolve: resolvePath } = require('node:path') as typeof import('node:path')
-    const resolved = resolvePath(filePath)
+    // 用请求体里的 cwd（=项目目录）解析相对路径，而非 sidecar 的 process.cwd()
+    // （=home 目录）——否则 Windows 下相对路径解析到错误位置 → existsSync 404。
+    const resolved = typeof bodyCwd === 'string' && bodyCwd
+      ? resolvePath(bodyCwd, filePath)
+      : resolvePath(filePath)
     if (!existsSync(resolved)) {
       return { status: 404, body: { error: `Path not found: ${resolved}` } }
     }

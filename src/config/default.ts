@@ -20,8 +20,16 @@ export const DEFAULT_CONFIG: Config = {
           prefixCompletion: false,
         },
         thinking: 'enabled',
-        maxTokens: 64000,
+        maxTokens: 131072,
         models: [
+          {
+            id: 'k3',
+            alias: 'k3',
+            contextWindow: 1_000_000,
+            maxTokens: 131072,
+            reasoningEffort: 'max',
+            tier: 'strong',
+          },
           {
             id: 'kimi-for-coding',
             alias: 'kimi',
@@ -92,7 +100,8 @@ export const DEFAULT_CONFIG: Config = {
     maxTurns: 200,
     mode: 'code',
     autoReasoning: true,
-    defaultDomain: 'tianquan',
+    defaultDomain: 'kaiyang',
+    domainKeywordRouting: false,
     verificationSnapshot: 'auto',
     songlineEnabled: false,
     desktopTools: false,

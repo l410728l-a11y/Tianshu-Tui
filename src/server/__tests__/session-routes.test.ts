@@ -773,7 +773,9 @@ function setupPlus() {
 
 test('GET /models lists provider models with current flag', async () => {
   const { router } = setupPlus()
-  const s = await router('POST', '/sessions', {}, AUTH)
+  // 显式 model —— 空 body 时起始模型由项目配置默认 provider 决定（a976167f），
+  // 在本机真实 ~/.rivet 配置下不可预测，current 标记断言需要确定起点。
+  const s = await router('POST', '/sessions', { model: 'model-a' }, AUTH)
   const id = (s.body as { id: string }).id
   const res = await router('GET', `/sessions/${id}/models`, {}, AUTH)
   assert.equal(res.status, 200)

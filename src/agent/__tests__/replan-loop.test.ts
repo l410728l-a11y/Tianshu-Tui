@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   correctPlan,
   injectReplanContext,
+  type ReplanPalContext,
 } from '../replan-loop.js'
 import {
   createTrace,
@@ -119,5 +120,61 @@ describe('injectReplanContext', () => {
     const ctx = injectReplanContext(makeDeviation('replanned'), [])
     assert.equal(ctx.text, '')
     assert.equal(ctx.deviationType, 'replanned')
+  })
+})
+
+// ─── W2：replan 单向读 PAL（④c 的正确形态）─────────────────────────
+
+describe('replan × PAL 只读上下文（W2）', () => {
+  const pal: ReplanPalContext = { caseId: 'case-abc123', nextProbe: 'probe-x1（grep→src/auth.ts）' }
+
+  it('blocked + 活跃案件 → 修正步骤与注入文案引用 caseId 和下一探针', () => {
+    const trace = createTrace('c1', 'unit', [makeStep('step-1')])
+    const { addedSteps } = correctPlan(trace, makeDeviation('blocked', { affectedStepId: 'step-1' }), pal)
+    assert.match(addedSteps[0]!.description, /case-abc123/)
+    assert.match(addedSteps[0]!.description, /probe-x1/)
+    const ctx = injectReplanContext(makeDeviation('blocked'), addedSteps, pal)
+    assert.match(ctx.text, /攻坚案件: case-abc123/)
+    assert.match(ctx.text, /下一判别探针建议: probe-x1/)
+  })
+
+  it('stalled + 活跃案件（无可选型探针）→ 引导 status 复盘而非虚构探针', () => {
+    const trace = createTrace('c1', 'unit', [makeStep('step-1')])
+    const noProbe: ReplanPalContext = { caseId: 'case-abc123', nextProbe: null }
+    const { addedSteps } = correctPlan(trace, makeDeviation('stalled'), noProbe)
+    assert.match(addedSteps[0]!.description, /case-abc123/)
+    assert.match(addedSteps[0]!.description, /attack_case status/)
+    const ctx = injectReplanContext(makeDeviation('stalled'), addedSteps, noProbe)
+    assert.match(ctx.text, /无可选型探针/)
+  })
+
+  it('反证：无案件（pal 缺省/null）→ 文案保持原行为，零 PAL 痕迹', () => {
+    const trace = createTrace('c1', 'unit', [makeStep('step-1')])
+    for (const palArg of [undefined, null] as const) {
+      const { addedSteps } = correctPlan(trace, makeDeviation('blocked', { affectedStepId: 'step-1' }), palArg)
+      assert.equal(addedSteps[0]!.description, '诊断阻塞原因 — test blocked')
+      const ctx = injectReplanContext(makeDeviation('blocked'), addedSteps, palArg)
+      assert.ok(!ctx.text.includes('攻坚案件'))
+    }
+  })
+
+  it('反证（双声源）：replan 文案绝不建议开案——不含 attack_case open', () => {
+    const trace = createTrace('c1', 'unit', [makeStep('step-1')])
+    for (const type of ['blocked', 'stalled'] as const) {
+      const withPal = correctPlan(trace, makeDeviation(type), pal)
+      const ctx = injectReplanContext(makeDeviation(type), withPal.addedSteps, pal)
+      assert.ok(!ctx.text.includes('attack_case open'), `${type} 文案不得建议开案（CV3 单声道职责）`)
+      const without = injectReplanContext(makeDeviation(type), correctPlan(trace, makeDeviation(type)).addedSteps)
+      assert.ok(!without.text.includes('attack_case open'))
+    }
+  })
+
+  it('反证：非 blocked/stalled 偏差（deviated/stray）不注入 PAL 行', () => {
+    const trace = createTrace('c1', 'unit', [makeStep('step-1')])
+    for (const type of ['deviated', 'stray'] as const) {
+      const { addedSteps } = correctPlan(trace, makeDeviation(type), pal)
+      const ctx = injectReplanContext(makeDeviation(type), addedSteps, pal)
+      assert.ok(!ctx.text.includes('攻坚案件'), `${type} 不引用案件`)
+    }
   })
 })

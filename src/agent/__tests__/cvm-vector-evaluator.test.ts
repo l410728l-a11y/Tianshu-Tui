@@ -16,6 +16,7 @@ import {
   type CvmVectorInput,
 } from '../hooks/cognitive-capsule-router.js'
 import { emptyObligationStore, type EvidenceObligation, type ObligationStore } from '../evidence-obligation.js'
+import type { CaseOpenSignal } from '../case-open-signals.js'
 
 function obligation(partial: Partial<EvidenceObligation>): EvidenceObligation {
   return {
@@ -254,5 +255,237 @@ describe('CVM-vector 冷却与确定性', () => {
     const snapshot = JSON.parse(JSON.stringify(input)) as unknown
     createCvmVectorEvaluator().evaluate(input)
     assert.deepEqual(JSON.parse(JSON.stringify(input)), snapshot)
+  })
+})
+
+describe('CV3 攻坚层规则（PAL 计划 v2 Wave P3）', () => {
+  it('案件 needs_user → CV3 候选（天机，expect attack_case）', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      attack: { activeCases: 1, anyNeedsUser: true, anyStalled: false },
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.classification?.kind, 'attack-stalled')
+    assert.equal(d.candidate?.ruleId, 'CV3')
+    assert.equal(d.candidate?.star, '天机')
+    assert.equal(d.candidate?.entry.key, 'cvm-vector-天机-CV3')
+    assert.deepEqual(d.candidate?.entry.expect, { kind: 'tool_appears', tools: ['attack_case'], withinTurns: 3 })
+  })
+
+  it('案件 stalled（连续探针不出信息）→ CV3 候选', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: true },
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV3')
+  })
+
+  it('P3 阶梯：有 planned 探针 + 深度空转 → execute-planned 变体（引导 observe，不催新方向）', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      convergence: { score: 0.3, level: 2, textRepetitionPenalty: 0.2, oscillationPenalty: 1.0 },
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: false, hasPlannedProbes: true },
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV3')
+    assert.equal(d.classification?.facts.variant, 'execute-planned')
+    assert.match(d.candidate?.entry.content ?? '', /planned 探针/)
+    assert.match(d.candidate?.entry.content ?? '', /observe/)
+  })
+
+  it('反证：有 planned 探针但没在空转 → CV3 沉默（回执 L0 建议已覆盖，不重复发声）', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: false, hasPlannedProbes: true },
+      attackLayerEnabled: true,
+    }))
+    assert.notEqual(d.classification?.kind, 'attack-stalled')
+    assert.notEqual(d.candidate?.ruleId, 'CV3')
+  })
+
+  it('反证：浅空转（level 1）不触发 execute-planned（阈值与 CV3-open 同构）', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      convergence: { score: 0.5, level: 1, textRepetitionPenalty: 0.2, oscillationPenalty: 1.0 },
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: false, hasPlannedProbes: true },
+      attackLayerEnabled: true,
+    }))
+    assert.notEqual(d.classification?.facts?.variant, 'execute-planned')
+  })
+
+  it('无案件 + 深度空转（level≥2 重复）+ 层启用 → CV3-open 建议开案', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      convergence: { score: 0.3, level: 2, textRepetitionPenalty: 0.2, oscillationPenalty: 1.0 },
+      attack: null,
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV3-open')
+    assert.match(d.candidate?.entry.content ?? '', /attack_case open/)
+  })
+
+  it('反证：层未启用（RIVET_PAL=off）→ CV3-open 不触发，回落 CV2', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      convergence: { score: 0.3, level: 2, textRepetitionPenalty: 0.2, oscillationPenalty: 1.0 },
+      attack: null,
+      attackLayerEnabled: false,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV2', 'PAL 关闭时深度空转仍由 CV2 兜底')
+  })
+
+  it('反证：level 1 浅空转不建议开案（留给 CV2），level 2 才升级', () => {
+    const d = createCvmVectorEvaluator().evaluate(stuckInput({
+      attack: null,
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV2')
+  })
+
+  it('让位矩阵对 CV3 同样生效：gate 在场 → gate-blocked 不发声', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      attack: { activeCases: 1, anyNeedsUser: true, anyStalled: false },
+      attackLayerEnabled: true,
+      obligations: storeWith(obligation({ risk: 'high', state: 'open' })),
+    }))
+    assert.equal(d.classification?.kind, 'gate-blocked')
+    assert.equal(d.candidate, null)
+  })
+
+  it('让位矩阵：专用 hook pending → CV3 让位记录', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: true },
+      attackLayerEnabled: true,
+      pendingAdvisoryKeys: ['convergence'],
+    }))
+    assert.equal(d.candidate, null)
+    assert.deepEqual(d.yielded, { ruleId: 'CV3', to: 'convergence' })
+  })
+
+  it('CV3 优先于 CV2（案件级信号更尖锐）', () => {
+    const d = createCvmVectorEvaluator().evaluate(stuckInput({
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: true },
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV3')
+  })
+
+  it('CV3 冷却：期内只分类不候选', () => {
+    const ev = createCvmVectorEvaluator()
+    const attackInput = (turn: number) => healthyInput({
+      turn,
+      attack: { activeCases: 1, anyNeedsUser: true, anyStalled: false },
+      attackLayerEnabled: true,
+    })
+    assert.equal(ev.evaluate(attackInput(10)).candidate?.ruleId, 'CV3')
+    const cooled = ev.evaluate(attackInput(11))
+    assert.equal(cooled.candidate, null)
+    assert.equal(cooled.classification?.kind, 'attack-stalled')
+    assert.equal(ev.evaluate(attackInput(10 + CVM_VECTOR_RULE_COOLDOWN_TURNS)).candidate?.ruleId, 'CV3')
+  })
+
+  it('反证：健康案件（无 stalled/needs_user）零发声，CV1/CV2 正常评估', () => {
+    const d = createCvmVectorEvaluator().evaluate(debtInput({
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: false },
+      attackLayerEnabled: true,
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV1', '案件健康时不抢占，验证债正常触发')
+  })
+})
+
+// ─── W1 开案信号扩展（PAL 第四波）─────────────────────────────────
+
+function openSignal(ref = 'regression-bisect'): CaseOpenSignal {
+  return {
+    anchor: { kind: 'failure_pattern', ref },
+    source: 'regression-bisect',
+    summary: '回归语义 + 只读诊断空转',
+  }
+}
+
+/** L2 停滞但重复 penalty 中性（缺重复证据）——原 CV3-open 条件不满足。 */
+function stagnantNoRepetition(overrides: Partial<CvmVectorInput> = {}): CvmVectorInput {
+  return healthyInput({
+    convergence: { score: 0.4, level: 2, textRepetitionPenalty: 1.0, oscillationPenalty: 1.0 },
+    attack: null,
+    attackLayerEnabled: true,
+    ...overrides,
+  })
+}
+
+describe('CV3-open 开案信号扩展（W1）', () => {
+  it('带锚信号 + L2 停滞（无重复证据）→ CV3-open 触发，文案含锚与 open 骨架', () => {
+    const d = createCvmVectorEvaluator().evaluate(stagnantNoRepetition({
+      caseOpenSignals: [openSignal()],
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV3-open')
+    assert.match(d.candidate?.entry.content ?? '', /failure_pattern:regression-bisect/)
+    assert.match(d.candidate?.entry.content ?? '', /attack_case open \{"anchor"/)
+    assert.equal(d.classification?.facts?.caseOpenSignals, 1)
+    assert.equal(d.classification?.facts?.firstSignalSource, 'regression-bisect')
+  })
+
+  it('反证：无信号且无重复证据 → CV3-open 不触发（不降低原阈值）', () => {
+    const d = createCvmVectorEvaluator().evaluate(stagnantNoRepetition())
+    assert.notEqual(d.candidate?.ruleId, 'CV3-open')
+  })
+
+  it('反证：信号在场但 convergence level < 2 → 不触发（信号不降低 convergence 门）', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      convergence: { score: 0.8, level: 1, textRepetitionPenalty: 1.0, oscillationPenalty: 1.0 },
+      attack: null,
+      attackLayerEnabled: true,
+      caseOpenSignals: [openSignal()],
+    }))
+    assert.notEqual(d.candidate?.ruleId, 'CV3-open')
+  })
+
+  it('反证：gate 在场时信号也到不了 CV3（让位矩阵第一层先行）', () => {
+    const d = createCvmVectorEvaluator().evaluate(stagnantNoRepetition({
+      caseOpenSignals: [openSignal()],
+      obligations: storeWith(obligation({ risk: 'high', state: 'open' })),
+    }))
+    assert.equal(d.classification?.kind, 'gate-blocked')
+    assert.equal(d.candidate, null)
+  })
+
+  it('反证：有活跃健康案件时信号不触发开案（open 只服务无案件场景）', () => {
+    const d = createCvmVectorEvaluator().evaluate(stagnantNoRepetition({
+      attack: { activeCases: 1, anyNeedsUser: false, anyStalled: false },
+      caseOpenSignals: [openSignal()],
+    }))
+    assert.notEqual(d.candidate?.ruleId, 'CV3-open')
+  })
+
+  it('二次送达：同锚跨冷却第二发挂 observe（到期强制送达）；首发即时', () => {
+    const ev = createCvmVectorEvaluator()
+    const first = ev.evaluate(stagnantNoRepetition({ turn: 10, caseOpenSignals: [openSignal()] }))
+    assert.equal(first.candidate?.ruleId, 'CV3-open')
+    assert.equal(first.candidate?.entry.observe, undefined)
+    assert.equal(first.classification?.facts?.secondChallenge, undefined)
+    const second = ev.evaluate(stagnantNoRepetition({
+      turn: 10 + CVM_VECTOR_RULE_COOLDOWN_TURNS,
+      caseOpenSignals: [openSignal()],
+    }))
+    assert.equal(second.candidate?.ruleId, 'CV3-open')
+    assert.deepEqual(second.candidate?.entry.observe, { turns: 2 })
+    assert.equal(second.classification?.facts?.secondChallenge, true)
+  })
+
+  it('反证：换锚的第二发不是 second challenge（per-anchor 语义）', () => {
+    const ev = createCvmVectorEvaluator()
+    ev.evaluate(stagnantNoRepetition({ turn: 10, caseOpenSignals: [openSignal('a')] }))
+    const second = ev.evaluate(stagnantNoRepetition({
+      turn: 10 + CVM_VECTOR_RULE_COOLDOWN_TURNS,
+      caseOpenSignals: [openSignal('b')],
+    }))
+    assert.equal(second.candidate?.ruleId, 'CV3-open')
+    assert.equal(second.candidate?.entry.observe, undefined)
+  })
+
+  it('无信号的纯重复 CV3-open 保持原文案（无锚骨架，不带 observe）', () => {
+    const d = createCvmVectorEvaluator().evaluate(healthyInput({
+      convergence: { score: 0.3, level: 2, textRepetitionPenalty: 0.2, oscillationPenalty: 1.0 },
+      attack: null,
+      attackLayerEnabled: true,
+      caseOpenSignals: [],
+    }))
+    assert.equal(d.candidate?.ruleId, 'CV3-open')
+    assert.match(d.candidate?.entry.content ?? '', /深度空转/)
+    assert.equal(d.candidate?.entry.observe, undefined)
   })
 })

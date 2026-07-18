@@ -62,6 +62,18 @@ export interface ConvergenceInput {
      *  multi-wave turns are the legitimate shape of this work — widen the
      *  nLow/nMid/nHigh turn thresholds by 1.5×. */
     activePlan: boolean
+    /** P1 心流保护：Sensorium 原始快照字段。工具成功率与推进因子由
+     *  detector 内部按 tier.signalWindow 计算（窗口与其它信号一致，
+     *  避免调用方自带第二个窗口常量）。缺席 = Sensorium 不存在 →
+     *  不进入保护态，旧行为不变。 */
+    flowInputs?: FlowInputs
+    /** P2 阴阳调度：structure-flow 控制器输出的软阈值偏移量 [0, 0.25]。
+     *  与 flowInputs **互斥**（同一 flow 信号绝不计两次）：本字段存在时
+     *  优先生效并忽略 flowInputs（单声源仲裁——两者同传视为装配错误）。
+     *  0 也是有效值：P2 hardTighten（PAL 未决/验证债务/用户干预）时传 0，
+     *  正确压过 P1 的放宽。只触 nLow/nMid/nHigh，不碰 no-tool 熔断、
+     *  score-abort grace 与 signalWindow/maxTurns。 */
+    structureRelaxation?: number
   }
   /** W3：会话活动模式（classifyActivityMode 的结果，由调用方传入）。
    *  diagnostic 时收敛文案分流为"先核实断言再收束"。 */
@@ -87,6 +99,79 @@ export interface ConvergenceInput {
  *  且零改动（日志排查/根因分析类）。此类会话被催收敛时的正确处方是
  *  "先核实断言再收束"，而不是"输出结论"——后者直接诱发脑补。 */
 export type ActivityMode = 'diagnostic' | 'build'
+
+// ─── P1 心流保护：正向推进证据（flow beacon）────────────────────────
+//
+// 健康执行流（工具连续成功、动量/稳定性高、任务推进）不该被轨迹形状
+// 启发式当成停滞（incident 20b9714e：健康 plan run 收到 32 条 0 采纳的
+// 收敛 advisory）。flow beacon 以连续、有界的方式延后 score-based 软阈值；
+// no-tool 硬熔断、productive stagnation、score-abort 双护栏均不受影响。
+
+/** 调用方透传的 Sensorium 原始快照字段（loop 侧三行透传，无计算）。 */
+export interface FlowInputs {
+  /** Sensorium.momentum 直接值（预测准确率滑动窗口成功率）。 */
+  momentum: number
+  /** quality.momentum !== 'no-data'——窗口为空的 0 回退不算"低心流"证据。 */
+  momentumHasData: boolean
+  /** Sensorium.stability 直接值。 */
+  stability: number
+}
+
+export interface FlowBeacon {
+  /** 0..1 心流分数；权重固定可审计（见 computeFlowBeacon）。 */
+  score: number
+  /** 窗口内已结算（success|failed）工具样本数——running 在途样本从
+   *  分子分母同时剔除，否则并行 background 工具在途的健康轮会被压分。 */
+  sampleCount: number
+}
+
+export interface FlowBeaconInput extends FlowInputs {
+  recentToolHistory: ReadonlyArray<Pick<ToolHistoryEntry, 'status'>>
+  todoCompletedDelta: number
+  signalWindow: number
+}
+
+/** 保护态最小已结算样本数——低于此不放宽任何阈值（缺数据 ≠ 好数据）。 */
+export const FLOW_MIN_SAMPLES = 4
+/** flow=1 时的最大阈值放宽倍率增量（1.0×–1.3× 连续映射）。 */
+export const FLOW_MAX_BONUS = 0.3
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0
+  return v < 0 ? 0 : v > 1 ? 1 : v
+}
+
+/**
+ * 纯函数：从当前窗口快照计算 flow beacon。无 IO、无时钟、无随机——
+ * 同输入同输出。
+ *
+ * 固定权重（经验起点，Wave 3 回放后校准；校准前不得被其它子系统引用）：
+ *   0.4 工具成功率（唯一逐调用实测的行为信号）
+ * + 0.3 momentum（Sensorium 聚合，自带平滑）
+ * + 0.2 stability（同上）
+ * + 0.1 todo 推进（已有独立 L1 veto 兜底，此处仅轻微加成避免双重计权）
+ *
+ * momentumHasData=false 时 momentum 因子记 0，且消费方的资格门会整体
+ * 拦截——这里的 0 只是防御性下限，不承担"缺数据 = 低心流"语义。
+ */
+export function computeFlowBeacon(input: FlowBeaconInput): FlowBeacon {
+  const window = input.recentToolHistory.slice(-Math.max(1, input.signalWindow))
+  const settled = window.filter(h => h.status === 'success' || h.status === 'failed')
+  const sampleCount = settled.length
+  const toolSuccessRatio = sampleCount > 0
+    ? settled.filter(h => h.status === 'success').length / sampleCount
+    : 0
+  const momentumFactor = input.momentumHasData ? clamp01(input.momentum) : 0
+  const stabilityFactor = clamp01(input.stability)
+  const todoFactor = clamp01(input.todoCompletedDelta / 2)
+  const score = clamp01(
+    0.4 * toolSuccessRatio
+    + 0.3 * momentumFactor
+    + 0.2 * stabilityFactor
+    + 0.1 * todoFactor,
+  )
+  return { score, sampleCount }
+}
 
 /** 诊断态判定窗口（近 N 条工具调用） */
 const ACTIVITY_MODE_WINDOW = 8
@@ -883,6 +968,44 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
       nLow: Math.round(tier.nLow * 1.5),
       nMid: Math.round(tier.nMid * 1.5),
       nHigh: Math.round(tier.nHigh * 1.5),
+    }
+  } else if (typeof input.progressBeacons?.structureRelaxation === 'number') {
+    // P2 阴阳调度单声源：snapshot 的 relaxation 存在时接管软阈值调节，
+    // flowInputs 即使同传也被忽略（同一 flow 信号绝不计两次）。
+    // relaxation=0（hardTighten）→ 倍率 1.0，即收紧语义正确压过 P1 放宽。
+    const relax = Math.min(0.25, Math.max(0, input.progressBeacons.structureRelaxation))
+    if (Number.isFinite(relax) && relax > 0) {
+      const multiplier = 1 + relax
+      tier = {
+        ...tier,
+        nLow: Math.round(tier.nLow * multiplier),
+        nMid: Math.round(tier.nMid * multiplier),
+        nHigh: Math.round(tier.nHigh * multiplier),
+      }
+    }
+  } else if (input.progressBeacons?.flowInputs) {
+    // P1 心流保护：与 activePlan 互斥（activePlan 已有 1.5× 上下文级保护，
+    // 叠加会产生接近 2× 的不可审计延迟）。资格门：momentum 有实测数据 +
+    // 窗口内已结算样本 ≥ FLOW_MIN_SAMPLES——证据不足完全保持旧行为。
+    // 倍率只触 nLow/nMid/nHigh 三个字段（显式展开，不遍历 tier 键）：
+    // signalWindow/maxTurns 是 score-abort 护栏与全部信号的公共窗口，
+    // 乘它们等于借倍率之手改写硬护栏。
+    const flow = computeFlowBeacon({
+      ...input.progressBeacons.flowInputs,
+      recentToolHistory: input.recentToolHistory,
+      todoCompletedDelta: input.progressBeacons.todoCompletedDelta,
+      signalWindow: tier.signalWindow,
+    })
+    const eligible = input.progressBeacons.flowInputs.momentumHasData
+      && flow.sampleCount >= FLOW_MIN_SAMPLES
+    if (eligible && flow.score > 0) {
+      const multiplier = 1 + FLOW_MAX_BONUS * flow.score
+      tier = {
+        ...tier,
+        nLow: Math.round(tier.nLow * multiplier),
+        nMid: Math.round(tier.nMid * multiplier),
+        nHigh: Math.round(tier.nHigh * multiplier),
+      }
     }
   }
   const weights = PHASE_WEIGHTS[input.phaseClass]

@@ -88,6 +88,7 @@ import { buildSearchBackends } from './tools/web-search.js'
 import { buildFetchOptions } from './tools/web-fetch/build-options.js'
 import { APPLY_PATCH_TOOL } from './tools/apply-patch.js'
 import { createSessionVitalsTool } from './tools/session-vitals.js'
+import { createAttackCaseTool } from './tools/attack-case.js'
 import { createPlanTaskTool } from './tools/plan-task.js'
 import { createMemoryTool } from './tools/memory.js'
 import { MeridianIndexer } from './repo/meridian-indexer.js'
@@ -145,6 +146,13 @@ export interface RuntimeRefs {
   /** Mutable ref to the current GoalTracker. Set by slash-commands /goal,
    *  read by deliver_task B1Context for auto-review gating. */
   goalTrackerRef: { current: import('./agent/goal-tracker.js').GoalTracker | null }
+  /** Plugin-contributed hooks (absolute script paths). initializePlugins fills
+   *  this; the user-hooks bridge reads it at fire time so plugin hooks are
+   *  picked up even though plugins load after agent assembly. */
+  pluginHooks: import('./plugins/plugin-loader.js').PluginHookEntry[]
+  /** Plugin-contributed slash commands (absolute .md paths). Same lazy-binding
+   *  pattern as pluginHooks — read by resolveCustomCommand at input time. */
+  pluginCommands: import('./plugins/plugin-loader.js').PluginCommandEntry[]
   /** 层3 回归契约：当前主控任务契约 getter（agent 创建后回填）。
    *  deliver_task 用它取 regressionInventory / objective 做重构回归核验。 */
   getTaskContract?: () => import('./context/task-contract.js').TaskContract | undefined
@@ -154,6 +162,12 @@ export interface RuntimeRefs {
   /** W5 清醒认知闭环：session_vitals 数据源（agent 创建后回填）。
    *  模型写"系统状态"类结论前的取证入口，全部运行时内存态实测。 */
   getSessionVitals?: () => import('./tools/session-vitals.js').SessionVitalsData
+  /** PAL 攻坚层：会话级案件容器（agent 创建后回填）。attack_case 工具经此
+   *  与 problem-attack-hook 共享同一 store。 */
+  getProblemAttackStore?: () => import('./agent/problem-attack-loop.js').ProblemAttackStore
+  /** H2 证据验真器（agent 创建后回填）：对 recentToolHistory / ObligationStore
+   *  验真 evidence_ref，不建第二套注册表。 */
+  getAttackEvidenceVerifier?: () => import('./tools/attack-case.js').AttackEvidenceVerifier
   /** 多会话隔离：本会话独立的 todo 清单 store。后端所有读/写（todo 工具、plan_task
    *  回灌、turn-end 任务进度注入、todo-reminder 快照）统一走它。TUI 复用全局
    *  defaultStore（保持 setTodoSession/loadTodos 持久化与会话切换语义），server 每会话 new。
@@ -412,6 +426,7 @@ export function createInteractiveToolRegistry(
     },
     () => refs.claimStore ?? undefined,
     () => refs.sessionId ?? undefined,
+    () => refs.getProblemAttackStore?.() ?? null,
   ))
 
   // undo
@@ -427,6 +442,7 @@ export function createInteractiveToolRegistry(
     },
     () => refs.claimStore ?? undefined,
     () => refs.sessionId ?? undefined,
+    () => refs.getProblemAttackStore?.() ?? null,
   ))
 
   // Shared plan-execution kernel deps: team_orchestrate and plan_task(execute:true)
@@ -533,6 +549,14 @@ export function createInteractiveToolRegistry(
   // 只读自查工具——模型写"系统状态"类结论前的取证入口（incident 20b9714e）。
   // 工具定义跟版本发布上车（新定义 = 前缀一次性 miss，绝不热更）。
   reg.register(createSessionVitalsTool(() => refs.getSessionVitals?.() ?? null))
+  // PAL attack_case: CORE 常驻（kernel 26→27）。攻坚案件账本——竞争假设 +
+  // 判别探针 + 证据结算；回执即鼓励通道（有效动作加分）。绝不中途挂载：
+  // 改 tool fingerprint = 200K 前缀全量重建（V4 创建成本不可接受）。
+  reg.register(createAttackCaseTool({
+    getStore: () => refs.getProblemAttackStore?.() ?? null,
+    getVerifier: () => refs.getAttackEvidenceVerifier?.() ?? null,
+  }))
+
   // web_search is now in the kernel default-registry (CORE layer).
   // Remove the interactive registration to avoid double-registration.
   // PLAN_MODE_ALLOWED_TOOLS already references web_search alongside recall.
@@ -615,6 +639,11 @@ export function createInteractiveToolRegistry(
     meridianIndexer: refs.meridianIndexer,
     getTaskContract: () => refs.getTaskContract?.(),
     getImpactedTests: () => refs.getImpactedTests?.() ?? [],
+    // P4 收束闸：PAL 收敛案件快照（闭包现读 store——B1Context 每次调用现构造，
+    // hook 无法"写入"它；这是与其他 getter 一致的既有注入模式）
+    getPalConvergedCases: () => refs.getProblemAttackStore?.()?.convergedCasesSnapshot() ?? [],
+    // 遗产回收 W-A1：needs_user 案件披露（minimalQuestion 由 store 预计算）
+    getPalNeedsUserCases: () => refs.getProblemAttackStore?.()?.needsUserCasesSnapshot() ?? [],
   })))
 
   // update_goal — model-driven goal lifecycle control (paused/blocked/complete)
@@ -1096,6 +1125,14 @@ export function createAgentRuntime(deps: {
     parentApprovalMode: config.agent.approval as import('./agent/loop-types.js').ApprovalMode,
   })
 
+  // H4-D3 恢复半边：session meta 里有 PAL 快照就原地恢复（覆盖 resume、
+  // 模型切换重建、会话切换三条 agent 重建路径——都经本函数）。快照缺席或
+  // schemaVersion 未知 → 保持空 store（fail-closed，不半恢复）。
+  try {
+    const palSnapshot = persist.loadMetadata()?.palSnapshot
+    if (palSnapshot) agent.problemAttack.restoreSnapshot(palSnapshot)
+  } catch { /* best-effort：恢复失败不阻断 agent 创建 */ }
+
   return { agent }
 }
 
@@ -1205,6 +1242,28 @@ export async function createSessionInfrastructure(): Promise<{
 }
 
 // ── Shutdown Handler ───────────────────────────────────────────
+
+/** H2 瘦身版证据验真器：对既有账本（recentToolHistory / ObligationStore）
+ *  验真 attack_case 的 evidence_ref，不建第二套事件注册表。
+ *  tool: 引用按工具名 + 目标提示对最近历史窗口匹配（窗口淘汰 = unverified
+ *  零分，不算伪造）；obligation: 对义务账本查 id。 */
+function makeAttackEvidenceVerifier(agent: AgentLoop): import('./tools/attack-case.js').AttackEvidenceVerifier {
+  return {
+    toolRan: (name, targetHint) => agent.recentToolHistory.some(e => {
+      if (e.tool !== name) return false
+      if (!targetHint || !e.target) return true
+      return e.target.includes(targetHint) || targetHint.includes(e.target)
+    }),
+    obligationExists: id => agent.obligations.getStore().obligations.some(o => o.id === id),
+    // H4-D4：worker 引用验真——该 orderId 必须已完成（不是仅"会话曾委派"）
+    workerCompleted: orderId => agent.problemAttack.hasWorkerCompleted(orderId),
+    // P4 收束闸：close(converged) 回执的"先核销再交付"提示数据源
+    openObligationIdsForTargets: targets => agent.obligations.getStore().obligations
+      .filter(o => (o.state === 'open' || o.state === 'attempted')
+        && o.targets.some(t => targets.some(ht => t.includes(ht) || ht.includes(t))))
+      .map(o => o.id),
+  }
+}
 
 export function createShutdownHandler(ctx: BootstrapContext): () => void {
   let isShuttingDown = false
@@ -1324,6 +1383,8 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
     ctx.refs.getTaskContract = () => agent.getTaskContract()
     ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
     ctx.refs.getSessionVitals = () => agent.getSessionVitals()
+    ctx.refs.getProblemAttackStore = () => agent.problemAttack
+    ctx.refs.getAttackEvidenceVerifier = () => makeAttackEvidenceVerifier(agent)
     ctx.provider = provider
     ctx.apiKey = apiKey
     ctx.auth = auth
@@ -1425,6 +1486,8 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
   ctx.refs.getTaskContract = () => agent.getTaskContract()
   ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
   ctx.refs.getSessionVitals = () => agent.getSessionVitals()
+  ctx.refs.getProblemAttackStore = () => agent.problemAttack
+  ctx.refs.getAttackEvidenceVerifier = () => makeAttackEvidenceVerifier(agent)
 
   // 同一身份判等防御：装配实际替换 coordinator 才关旧的。
   if (oldCoordinator && oldCoordinator !== ctx.refs.coordinator) {
@@ -1649,6 +1712,8 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     banditState: null,
     promptEngine: null,
     goalTrackerRef: { current: null },
+    pluginHooks: [],
+    pluginCommands: [],
     // TUI 单会话：复用全局 defaultStore，沿用其 setTodoSession/loadTodos 持久化与
     // 会话切换语义（行为零变化），仅把后端读取入口统一到 refs.todoStore。
     todoStore: defaultTodoStore,
@@ -1675,6 +1740,8 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   refs.getTaskContract = () => agent.getTaskContract()
   refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
   refs.getSessionVitals = () => agent.getSessionVitals()
+  refs.getProblemAttackStore = () => agent.problemAttack
+  refs.getAttackEvidenceVerifier = () => makeAttackEvidenceVerifier(agent)
 
   // 12b. Restore goal tracker from persisted state (if session was resumed).
   // normalizeAfterResume: active → paused (the process that wrote active is gone).
@@ -1700,6 +1767,8 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
       agent.updateTools()
     }).catch(() => {})
     initializePlugins(config.plugins, toolRegistry, cwd).then((result) => {
+      refs.pluginHooks = result.hooks
+      refs.pluginCommands = result.commands
       for (const name of result.suppressTools) {
         toolRegistry.remove(name)
       }
@@ -1723,6 +1792,11 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     await initializeMcp(config, toolRegistry, refs)
     agent.updateTools()
     const pluginResult = await initializePlugins(config.plugins, toolRegistry, cwd)
+    // Expose plugin hooks/commands via refs so the user-hooks bridge and the
+    // slash-command resolver pick them up (lazy binding — plugins load after
+    // agent assembly, refs are read at fire/input time).
+    refs.pluginHooks = pluginResult.hooks
+    refs.pluginCommands = pluginResult.commands
     for (const name of pluginResult.suppressTools) {
       toolRegistry.remove(name)
     }

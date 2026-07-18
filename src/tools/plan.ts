@@ -9,6 +9,7 @@
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { writePlan, slugify, stripPlanStatusMarkers, insertPlanStatusMarker, insertPlanModelMarker, isDraftSlug, type PlanOption } from '../plan/plan-store.js'
 import { checkPlanFactAnchors, formatAnchorDrifts, extractPlanAnchors } from '../plan/plan-fact-anchors.js'
+import { detectPointerPlaceholder, POINTER_GUARD_ERROR_MARKER } from './pointer-guard.js'
 import { inferModelTierFromName } from '../agent/model-tier-policy.js'
 import { readFile, stat, rm } from 'node:fs/promises'
 import { join, basename } from 'node:path'
@@ -227,6 +228,14 @@ Submit a completed implementation plan for user approval. The plan is persisted 
 
 The \`plan\` field must be a concrete, ready-to-implement design document. Do NOT submit outlines, skeletons, or placeholder text such as "TODO", "FIXME", "TBD", "待补充", or section headers with no content. Plans that are mostly placeholders will be rejected and you will be asked to continue planning.
 
+Submit gates — self-check BEFORE submitting; all unmet gates are reported in ONE rejection, fix then resubmit with the same title (each soft gate blocks only once):
+1. At least one \`\`\`mermaid diagram (architecture / data flow).
+2. A heading-level 反证/复现 section — a \`##\` heading containing "反证" or "复现" (mentioning it in a list does not count) with plan-time evidence for key claims.
+3. Scale: >8 checkbox tasks or >15 referenced files requires \`### Wave N\` wave structure + a verification command per wave.
+4. No placeholder clusters / empty sections / dots-only paragraphs (hard gate — resubmit does NOT bypass it).
+5. Cited file:line anchors must match the current working tree (mark genuinely new files as 新增).
+Never pass a "[plan persisted to …]" pointer copied from message history as \`plan\` — it is a display placeholder, not content, and does NOT mean the plan was saved. It will be rejected.
+
 Omit \`plan\` to submit from the active plan file (plan mode draft). Write the plan incrementally with write_file/edit_file first.
 
 When the plan contains multiple approaches, pass \`options\` (up to 3) so the user can choose at approval time.
@@ -330,7 +339,7 @@ function planEnterModeExecute(params: ToolCallParams): ToolResult {
         '1. Research first: for multi-module tasks, dispatch 2-4 read-only code_scout workers in parallel via delegate_batch (split by module/file domain), then synthesize the findings.',
         '2. Write the plan incrementally to the draft file with write_file/edit_file.',
         '3. 瑶光反证 (required section, submit-gated): reproduce key claims AT PLAN TIME — re-read cited code AFTER the design is drafted, run_tests for RED evidence on bugfixes, or delegate profile=adversarial_verifier authority=yaoguang. Unreproducible inferences go in as 待验证假设, not conclusions.',
-        '4. Submit with plan action=submit for user approval. Exiting plan mode is user-only.',
+        '4. Submit with plan action=submit (omit the plan field to submit from the draft). Submit gates: a ```mermaid diagram, a heading-level 反证/复现 section, and ### Wave N structure when >8 tasks/>15 files — all unmet gates are reported in one rejection. Exiting plan mode is user-only.',
       ].filter(Boolean).join('\n'),
     }
   } catch (err) {
@@ -385,119 +394,134 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
     submittedFromDraft = draftPath
   }
 
+  // 指针回传门禁（硬性，先于一切软门禁）：arg post-processor 会把历史里的
+  // plan 字段改写成 "[plan persisted to …]" 显示指针——包括被门禁拒绝、实际
+  // 并未落盘的提交。模型复用该指针重提时（2026-07-18 事故：两份计划文件被写
+  // 成指针、正文只留在草稿里），必须在这里拦下。write_file/edit_file/hash_edit
+  // 同款防线；plan 工具此前漏接（pointer-guard.ts 里 PLAN_POINTER_PREFIX 早已
+  // 注册，本函数从未调用）。
+  const matchedPointer = detectPointerPlaceholder(planContent as string)
+  if (matchedPointer) {
+    return {
+      content: [
+        `错误：plan 字段的内容是 ${POINTER_GUARD_ERROR_MARKER}（"${matchedPointer} …"），不是真实的计划正文。`,
+        `这类占位符只在你的历史消息中出现——提交后参数会被替换成显示指针（包括被门禁拒绝、并未落盘的提交），它们不是合法输入，也不代表计划已保存。`,
+        `修复：在 plan 字段写出完整计划正文；或省略 plan 字段同 title 重提（从活动计划文件读取）。如需旧版本，先 read_file 目标计划文件或活动计划文件。`,
+      ].join(' '),
+      isError: true,
+    }
+  }
+
   // 剥离历史 approve/reject 状态标记 — 驳回修订后从活动计划文件整读重提交时,
   // 残留的 "> **Status: REJECTED**" 会让新提交被误判为 rejected,从待批准列表消失。
   const planBody = stripPlanStatusMarkers(planContent as string)
 
   const slug = slugify(title)
 
-  if (!MERMAID_FENCE.test(planBody) && !warnedSlugs.has(slug)) {
-    warnedSlugs.add(slug)
-    return {
-      content: [
-        `⚠️ Plan not yet saved — it has no Mermaid diagram.`,
-        '',
-        `用 edit_file 在活动计划文件里补一张架构/数据流图（哪怕核心 3–5 个节点），然后同 title 重提。骨架：`,
-        '',
-        MISSING_DIAGRAM_SKELETON,
-        '',
-        `Shapes: (rounded)=input/user · [[subroutine]]=agent · {{hexagon}}=LLM · [(cylinder)]=store · {rhombus}=decision.`,
-        '',
-        `不要把整份计划贴回对话。若图确实不必要，同 title 原样重提即可放行。`,
-      ].join('\n'),
-      isError: true,
-    }
-  }
-
   const fullContent = planBody.trim().startsWith('# ')
     ? `${planBody.trim()}\n`
     : `# ${title.trim()}\n\n${planBody.trim()}\n`
 
+  // 硬拦（每次命中都拦，非 one-shot）：占位符簇/空章节/纯省略号段落。
   const placeholderCheck = checkPlanForPlaceholders(fullContent)
   if (!placeholderCheck.ok) {
     return {
       content: [
         `⚠️ Plan not yet saved — ${placeholderCheck.reason}`,
         '',
-        '用 edit_file 完善活动计划文件：根因、每文件 diff/伪代码、取舍表、验证清单等。不要在聊天里重打全文；补完后同 title 重提。',
+        '用 edit_file 完善活动计划文件：根因、每文件 diff/伪代码、取舍表、验证清单等。不要在聊天里重打全文；补完后同 title 重提（省略 plan 字段可从活动计划文件读取）。',
       ].join('\n'),
       isError: true,
     }
+  }
+
+  // 软门禁聚合：全部检查一次跑完，一次拒绝列全所有缺口。串行 early-return
+  // 曾让一份计划被逐条拦 4 轮（规模→mermaid→反证），每轮拒绝还在历史里多留
+  // 一个谎称"已持久化"的指针（见上方指针门禁）。one-shot 软拦语义不变：每项
+  // 按 slug 只拦一次，同 title 重提即放行（模型自判不适用场景，永不死锁——
+  // 91840816 教训）。
+  const blocks: string[] = []
+
+  if (!MERMAID_FENCE.test(planBody) && !warnedSlugs.has(slug)) {
+    warnedSlugs.add(slug)
+    blocks.push([
+      `缺 Mermaid 图（it has no Mermaid diagram）——用 edit_file 在活动计划文件里补一张架构/数据流图（哪怕核心 3–5 个节点）。骨架：`,
+      '',
+      MISSING_DIAGRAM_SKELETON,
+      '',
+      `Shapes: (rounded)=input/user · [[subroutine]]=agent · {{hexagon}}=LLM · [(cylinder)]=store · {rhombus}=decision.`,
+    ].join('\n'))
   }
 
   // 瑶光反证门禁：计划期复现，不是执行期才验。快思考事故（49fd1dfd 一族）的
   // 根源是设计阶段发明的断言（"deltaStable 会生效""块名是 cognitive-mirror"）
-  // 从未回到代码/运行时复现。one-shot 软拦：首拦列出章节要求；同 title 重提放行
-  // （模型自判不适用场景，永不死锁——91840816 教训）。
+  // 从未回到代码/运行时复现。
   if (!FALSIFICATION_HEADING_RE.test(fullContent) && !falsificationWarnedSlugs.has(slug)) {
     falsificationWarnedSlugs.add(slug)
-    return {
-      content: [
-        `⚠️ Plan not yet saved — 计划缺少「瑶光反证」章节（标题含"反证"或"复现"）。`,
-        '',
-        '用 edit_file 在活动计划文件补该章节（证据摘要 + file:line，不要贴逐步 shell 菜谱）：',
-        '- **关键断言清单**：每条断言 + 计划期证据（定稿后 read/grep 到 file:line、run_tests 输出摘要、或 adversarial_verifier 结论）',
-        '- **原缺陷复现**（bugfix）：复现结果摘要（RED），非完整命令教程',
-        '- **待验证假设**：计划期无法复现的推论 + 执行期如何验证',
-        '',
-        '补完后同 title 重提。不要在聊天重贴整份计划。无可复现断言时可原样重提放行。',
-      ].join('\n'),
-      isError: true,
-    }
+    blocks.push([
+      '缺「瑶光反证」章节——需要一个标题含"反证"或"复现"的 ## 级章节（正文/列表里提到不算）。用 edit_file 在活动计划文件补该章节（证据摘要 + file:line，不要贴逐步 shell 菜谱）：',
+      '- **关键断言清单**：每条断言 + 计划期证据（定稿后 read/grep 到 file:line、run_tests 输出摘要、或 adversarial_verifier 结论）',
+      '- **原缺陷复现**（bugfix）：复现结果摘要（RED），非完整命令教程',
+      '- **待验证假设**：计划期无法复现的推论 + 执行期如何验证',
+    ].join('\n'))
   }
 
   // Fact-anchor verification: file paths / line anchors cited by the plan must
-  // match the current working tree. One-shot soft block — first offense returns
-  // the drift list, resubmitting the same title passes (with drift note kept).
+  // match the current working tree. One-shot soft block, aggregated with the
+  // other gates; on pass-through the residual drift note is kept.
   let anchorDriftNote = ''
   try {
     const anchorReport = await checkPlanFactAnchors(fullContent, params.cwd)
     if (anchorReport.drifts.length > 0) {
       if (!anchorWarnedSlugs.has(slug)) {
         anchorWarnedSlugs.add(slug)
-        return {
-          content: [
-            `⚠️ Plan not yet saved — ${anchorReport.drifts.length} 个事实锚点与当前项目不符：`,
-            '',
-            formatAnchorDrifts(anchorReport.drifts),
-            '',
-            '用 read/grep 核实后 edit_file 修正活动计划文件中的引用；确认新建则标注「新增」。不要在聊天重贴全文。同 title 重提；误报可原样重提。',
-          ].join('\n'),
-          isError: true,
-        }
+        blocks.push([
+          `${anchorReport.drifts.length} 个事实锚点与当前项目不符：`,
+          '',
+          formatAnchorDrifts(anchorReport.drifts),
+          '',
+          '用 read/grep 核实后 edit_file 修正活动计划文件中的引用；确认新建则标注「新增」。',
+        ].join('\n'))
+      } else {
+        anchorDriftNote = `\n⚠ 锚点残留提示：${anchorReport.drifts.length} 个引用仍与当前工作区不符（已放行）。执行时以现实为准并在交付报告留痕。`
       }
-      anchorDriftNote = `\n⚠ 锚点残留提示：${anchorReport.drifts.length} 个引用仍与当前工作区不符（已放行）。执行时以现实为准并在交付报告留痕。`
     }
   } catch {
     // Anchor verification is best-effort — never let the guard itself block a submit.
   }
 
   // 规模门禁：大计划（任务 > 8 或文件 > 15）必须显式分波 + 每波验证命令。
-  // one-shot 软拦——首拦给出改法，同 title 重提交放行（带留痕 note）。
   let scaleNote = ''
   try {
     const scale = checkPlanScale(fullContent)
     if (scale.oversized && !scale.hasWaveStructure) {
       if (!scaleWarnedSlugs.has(slug)) {
         scaleWarnedSlugs.add(slug)
-        return {
-          content: [
-            `⚠️ Plan not yet saved — 计划规模超阈值（任务 ${scale.taskCount} 个 / 涉及文件 ${scale.fileCount} 个，阈值 ${PLAN_SCALE_TASK_THRESHOLD}/${PLAN_SCALE_FILE_THRESHOLD}），但没有分波结构。`,
-            '',
-            '用 edit_file 在活动计划文件补充「分波执行」章节（不要在聊天重贴全文）：',
-            '- 用 `### Wave 1 / Wave 2 / …` 标题把任务切成 2-4 个可独立验证的波次',
-            '- 每波末尾声明验证要点（typecheck / 测试），波间硬门禁会真实执行它们',
-            '- 波的边界放在功能可自证的位置（一波结束 = 可编译可测试）',
-            '',
-            '补完后同 title 重提。若确实不可分波，可原样重提放行。',
-          ].join('\n'),
-          isError: true,
-        }
+        blocks.push([
+          `计划规模超阈值（任务 ${scale.taskCount} 个 / 涉及文件 ${scale.fileCount} 个，阈值 ${PLAN_SCALE_TASK_THRESHOLD}/${PLAN_SCALE_FILE_THRESHOLD}），但没有分波结构。用 edit_file 在活动计划文件补充「分波执行」章节：`,
+          '- 用 `### Wave 1 / Wave 2 / …` 标题把任务切成 2-4 个可独立验证的波次',
+          '- 每波末尾声明验证要点（typecheck / 测试），波间硬门禁会真实执行它们',
+          '- 波的边界放在功能可自证的位置（一波结束 = 可编译可测试）',
+        ].join('\n'))
+      } else {
+        scaleNote = `\n⚠ 规模留痕：计划超阈值（任务 ${scale.taskCount} / 文件 ${scale.fileCount}）且无分波结构（已放行）。执行时建议手动分批 + 阶段性验证。`
       }
-      scaleNote = `\n⚠ 规模留痕：计划超阈值（任务 ${scale.taskCount} / 文件 ${scale.fileCount}）且无分波结构（已放行）。执行时建议手动分批 + 阶段性验证。`
     }
   } catch {
     // Scale gate is best-effort — never let the guard itself block a submit.
+  }
+
+  if (blocks.length > 0) {
+    return {
+      content: [
+        `⚠️ Plan not yet saved — 共 ${blocks.length} 项缺口（一次列全，免去逐条往返）：`,
+        '',
+        ...blocks.map((block, i) => `${i + 1}. ${block}`),
+        '',
+        '逐条补完后同 title 重提（省略 plan 字段可从活动计划文件读取；不要在聊天重贴全文，历史里的 "[plan persisted to …]" 是显示指针不是内容）。每项只拦一次——确认某项不适用时原样重提即放行。',
+      ].join('\n'),
+      isError: true,
+    }
   }
 
   // 产出模型留痕：记录本计划由哪个模型写出（H1 前标记行，PlanDocument 解析为

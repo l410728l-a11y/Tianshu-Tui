@@ -35,11 +35,17 @@ export interface OverlayEngineOptions {
   stdout: WriteStream
   /** 当前终端尺寸获取函数（每次渲染时调用） */
   getSize: () => { cols: number; rows: number }
+  /** 进入 alt screen（overlay 激活）时触发——调用方据此暂停主屏污染检测。 */
+  onEnterAltScreen?: () => void
+  /** 退出 alt screen（overlay 关闭）时触发——调用方据此恢复主屏污染检测。 */
+  onExitAltScreen?: () => void
 }
 
 export class OverlayEngine {
   private stdout: WriteStream
   private getSize: () => { cols: number; rows: number }
+  private onEnterAltScreen?: () => void
+  private onExitAltScreen?: () => void
   private active: OverlayId | null = null
   private renderers = new Map<OverlayId, OverlayRenderer>()
   private inAltScreen = false
@@ -51,6 +57,8 @@ export class OverlayEngine {
   constructor(options: OverlayEngineOptions) {
     this.stdout = options.stdout
     this.getSize = options.getSize
+    this.onEnterAltScreen = options.onEnterAltScreen
+    this.onExitAltScreen = options.onExitAltScreen
   }
 
   /**
@@ -121,6 +129,10 @@ export class OverlayEngine {
     this.stdout.write(ANSI.ALT_SCREEN_ON)
     this.stdout.write(ANSI.HIDE_CURSOR)
     this.inAltScreen = true
+    // 通知调用方：已进入 alt screen，主屏 live region 的光标位置/污染检测应暂停，
+    // 否则 CPR 探针会把"光标在 overlay 里"误判为主屏污染，触发 renderLive 把
+    // 主屏帧写进 alt screen（picker 残影泄漏回主会话的根因）。
+    this.onEnterAltScreen?.()
   }
 
   private exitAltScreen(): void {
@@ -128,6 +140,8 @@ export class OverlayEngine {
     this.stdout.write(ANSI.SHOW_CURSOR)
     this.stdout.write(ANSI.ALT_SCREEN_OFF)
     this.inAltScreen = false
+    // 通知调用方：已退出 alt screen 回到主屏，恢复污染检测。
+    this.onExitAltScreen?.()
   }
 
   private deactivateInternal(): void {

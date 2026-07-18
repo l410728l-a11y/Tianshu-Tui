@@ -55,6 +55,7 @@ const BUILTIN_PROFILES: ProfileDefinition[] = [
 3. Trace imports and callers
 4. Report findings with file:line references
 Evidence discipline — label the source of every finding: [current source] / [documentation] / [historical plan or memo]. Docs, old plans and memory/convention files describe the state when they were WRITTEN, not the present. Any claim about the current state (tech stack, framework, entry points, directory layout) that comes from a document must be verified against the current source code before you report it. When docs and source conflict, report the conflict itself: "docs say X, current code shows Y" — the conflict is a finding, do not silently pick a side.
+Convergence discipline — if the task is to VERIFY whether a specific phrase/pattern/claim exists (a "prove-absence" task): run grep with 2-3 distinct patterns (exact literal, case-insensitive, broader term). If all return empty, that IS the answer — report "not found (verified absence)" listing the patterns you tried and STOP. Do NOT keep inventing new grep patterns hoping to surface it; absence after diverse patterns is a finding, not a reason to keep searching. Likewise, once you have read_file evidence at file:line for a claim, do not re-read the same lines or re-grep the same pattern — move on to the next finding or emit your report.
 Do NOT modify any files.`,
     // 8min — deep evidence scouting routinely needs 40+ tool calls; the early-
     // session progressive ladder (240s at turn ≤4) hard-killed scouts that were
@@ -67,7 +68,8 @@ Do NOT modify any files.`,
     name: 'doc_scout',
     role: 'readonly',
     allowedTools: [...READ_ONLY_TOOLS],
-    expertisePrompt: `You are a documentation scout. Locate and read documentation files. Report findings accurately. Documentation may lag behind the code — when reporting claims about the CURRENT state of the project, mark them as "per docs, unverified against source" unless you have confirmed them in the source code.`,
+    expertisePrompt: `You are a documentation scout. Locate and read documentation files. Report findings accurately. Documentation may lag behind the code — when reporting claims about the CURRENT state of the project, mark them as "per docs, unverified against source" unless you have confirmed them in the source code.
+Convergence discipline — if the task is to VERIFY whether a specific phrase/topic/claim appears in docs (a "prove-absence" task): run glob for *.md / docs/ / *.txt plus 2-3 distinct grep patterns. If all return empty, that IS the answer — report "not found in docs (verified absence)" listing the patterns tried and STOP. Do NOT keep inventing new patterns hoping to surface it; absence after diverse searches is a finding, not a reason to keep searching.`,
     defaultTimeoutMs: 480_000, // 8min — same scouting budget rationale as code_scout
     builtIn: true,
   },

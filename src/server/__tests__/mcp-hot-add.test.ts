@@ -109,3 +109,34 @@ test('GET /mcp/status reports managerReady', async () => {
   const res2 = await routesReady['GET /mcp/status']!({}, undefined, { authorization: 'Bearer tok' }, undefined)
   assert.equal((res2.body as { managerReady: boolean }).managerReady, true)
 })
+
+test('POST /mcp/servers rejects a relative cwd (sidecar CWD is not fixed)', async () => {
+  await withTempHome(async () => {
+    const routes = buildMcpRoutes({ getMcpManager: () => null, apiToken: 'tok' })
+    const res = await routes['POST /mcp/servers']!(
+      { serverId: 'rel-cwd', command: 'npx', args: ['-y', 'some-mcp'], cwd: 'relative/dir' },
+      undefined,
+      { authorization: 'Bearer tok' },
+      undefined,
+    )
+    assert.equal(res.status, 400)
+    const body = res.body as { error: string }
+    assert.ok(body.error.includes('absolute'), `got: ${body.error}`)
+
+    const { loadConfig } = await import('../../config/manager.js')
+    assert.ok(!loadConfig().mcp.servers['rel-cwd'], 'rejected server must not persist')
+  })
+})
+
+test('POST /mcp/servers accepts an absolute cwd', async () => {
+  await withTempHome(async (home) => {
+    const routes = buildMcpRoutes({ getMcpManager: () => null, apiToken: 'tok' })
+    const res = await routes['POST /mcp/servers']!(
+      { serverId: 'abs-cwd', command: 'npx', args: ['-y', 'some-mcp'], cwd: home },
+      undefined,
+      { authorization: 'Bearer tok' },
+      undefined,
+    )
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+  })
+})

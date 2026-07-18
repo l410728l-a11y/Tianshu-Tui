@@ -79,6 +79,37 @@ describe('parseManifest', () => {
     assert.ok(!result.ok)
   })
 
+  it('accepts manifest with optional hooks array', () => {
+    const result = parseManifest({
+      ...VALID_MANIFEST,
+      hooks: [{ event: 'preTurn', script: 'hooks/pre.sh' }, { event: 'postTool', script: 'hooks/post.sh', timeoutMs: 3000 }],
+    })
+    assert.ok(result.ok)
+    if (result.ok) {
+      assert.equal(result.manifest.hooks?.length, 2)
+      assert.equal(result.manifest.hooks?.[0]?.event, 'preTurn')
+      assert.equal(result.manifest.hooks?.[1]?.timeoutMs, 3000)
+    }
+  })
+
+  it('rejects manifest with invalid hook event', () => {
+    const result = parseManifest({ ...VALID_MANIFEST, hooks: [{ event: 'bogusEvent', script: 'x.sh' }] })
+    assert.ok(!result.ok)
+  })
+
+  it('rejects manifest with hook missing script', () => {
+    const result = parseManifest({ ...VALID_MANIFEST, hooks: [{ event: 'preTurn' }] } as Record<string, unknown>)
+    assert.ok(!result.ok)
+  })
+
+  it('accepts manifest with optional commands array', () => {
+    const result = parseManifest({ ...VALID_MANIFEST, commands: ['commands/deploy.md', 'commands/'] })
+    assert.ok(result.ok)
+    if (result.ok) {
+      assert.deepEqual(result.manifest.commands, ['commands/deploy.md', 'commands/'])
+    }
+  })
+
   it('rejects null/undefined input', () => {
     assert.ok(!parseManifest(null).ok)
     assert.ok(!parseManifest(undefined).ok)

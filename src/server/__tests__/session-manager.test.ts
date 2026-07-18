@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 /** Flush enough event-loop iterations to cover setImmediate + setTimeout(0)
  *  (watchdog auto-continue's two-stage timer chain). Old settle(5) was too
@@ -674,6 +677,37 @@ test('T4: onDelegationActivity emits per-worker delegation with progress + elaps
   assert.equal(evs[1]!.data.status, 'passed')
 })
 
+test('T4: delegation events pass through counters, event mirror + failureReason', async () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  cb.onDelegationActivity!({
+    workOrderId: 'wo:T2',
+    parentToolId: 'tool-1',
+    profile: 'patcher',
+    status: 'running',
+    progressLine: '⚙ edit_file',
+    toolUseCount: 3,
+    tokenCount: 1200,
+    eventKind: 'tool_use',
+    eventDetail: 'edit_file',
+  })
+  cb.onDelegationActivity!({
+    workOrderId: 'wo:T2',
+    parentToolId: 'tool-1',
+    status: 'blocked',
+    progressLine: 'timed out',
+    failureReason: 'timeout',
+  })
+  const evs = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'delegation')
+  assert.equal(evs.length, 2)
+  assert.equal(evs[0]!.data.toolUseCount, 3)
+  assert.equal(evs[0]!.data.tokenCount, 1200)
+  assert.equal(evs[0]!.data.eventKind, 'tool_use')
+  assert.equal(evs[0]!.data.eventDetail, 'edit_file')
+  assert.equal(evs[1]!.data.failureReason, 'timeout')
+})
+
 // ── PlusMenu: model / star-domain / skills ──────────────────────────
 
 /** Richer fake exposing the optional PlusMenu surface for wiring assertions. */
@@ -751,7 +785,10 @@ test('PlusMenu: domain selection applies to a lazily-built agent', async () => {
 
 test('PlusMenu: listModels flags current; switchModel updates record + emits', async () => {
   const { manager } = makePlusManager()
-  const s = manager.createSession({})
+  // 显式 input.model（新建会话对话框同路径，优先级最高）。a976167f 起空输入
+  // 会被项目配置默认 provider 的首模型覆盖注入的 defaultModelId——本机会解析
+  // 到真实 ~/.rivet 配置，起始模型不确定，断言必须钉在显式输入上。
+  const s = manager.createSession({ model: 'model-a' })
   const before = manager.listModels(s.id)!
   assert.equal(before.find((m) => m.id === 'model-a')!.current, true)
 
@@ -761,6 +798,53 @@ test('PlusMenu: listModels flags current; switchModel updates record + emits', a
   assert.equal(after.find((m) => m.id === 'model-b')!.current, true)
   const ev = manager.getEvents(s.id, 0)!.events.find((e) => e.type === 'model_switched')!
   assert.equal(ev.data.modelId, 'model-b')
+})
+
+// a976167f 新建会话模型优先级：显式 input.model > 项目配置默认 provider 首模型
+// > 注入的 defaultModelId。该特性此前无测试覆盖——上方 listModels 测试正因
+// 优先级改动在本机真实配置下静默失效。
+test('PlusMenu: createSession model precedence — project config beats injected default, explicit input beats project', async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), 'rivet-plus-proj-'))
+  try {
+    writeFileSync(join(projectDir, '.rivet-config.json'), JSON.stringify({
+      provider: {
+        default: 'p',
+        providers: {
+          p: {
+            name: 'p',
+            baseUrl: 'https://example.com/v1',
+            models: [
+              { id: 'proj-model', contextWindow: 128000, maxTokens: 8192 },
+              { id: 'model-a', contextWindow: 128000, maxTokens: 8192 },
+            ],
+          },
+        },
+      },
+    }, null, 2))
+
+    const models: ModelOption[] = [
+      { id: 'proj-model', alias: 'Proj Model', provider: 'p', contextWindow: 128000 },
+      { id: 'model-a', alias: 'Model A', provider: 'p', contextWindow: 128000 },
+    ]
+    const manager = new RuntimeSessionManager({
+      createAgent: () => new PlusFakeAgent(),
+      defaultCwd: projectDir,
+      listModels: () => models,
+      defaultModelId: 'model-a',
+    })
+
+    // 项目配置默认 provider 的首模型 > 注入的 defaultModelId
+    const s1 = manager.createSession({})
+    assert.equal(manager.getSession(s1.id)!.model, 'proj-model')
+    const flagged = manager.listModels(s1.id)!
+    assert.equal(flagged.find((m) => m.id === 'proj-model')!.current, true)
+
+    // 显式 input.model（新建会话对话框同路径）> 项目配置
+    const s2 = manager.createSession({ model: 'model-a' })
+    assert.equal(manager.getSession(s2.id)!.model, 'model-a')
+  } finally {
+    rmSync(projectDir, { recursive: true, force: true })
+  }
 })
 
 test('PlusMenu: switchModel rejects unknown id and refuses while running', async () => {
@@ -877,6 +961,26 @@ test('delegate: onActivity terminal update carries summary + origin', async () =
   assert.equal(terminal.data.summary, '改了 2 个文件')
   assert.equal(terminal.data.origin, 'user')
   assert.deepEqual(terminal.data.changedFiles, ['a.ts', 'b.ts'])
+})
+
+test('delegate: onActivity carries authority + authorityReason to the desktop mirror', async () => {
+  // 桌面舰队面板要显示 worker 星域与命中理由——emitDelegationActivity 必须把
+  // 两个字段都转发进 delegation 事件（此前 authority 接收后未转发）。
+  const { manager, agents } = makeDelegateManager()
+  const s = manager.createSession({})
+  const res = await manager.delegate(s.id, { objective: 'go' })
+  assert.ok(res.ok)
+  const workerId = res.ok ? res.workerId : ''
+  agents[0]!.lastOpts!.onActivity({
+    workOrderId: workerId,
+    status: 'running',
+    authority: 'tianfu',
+    authorityReason: '命中: 重构+优化',
+  })
+  const evs = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'delegation')
+  const last = evs[evs.length - 1]!
+  assert.equal(last.data.authority, 'tianfu')
+  assert.equal(last.data.authorityReason, '命中: 重构+优化')
 })
 
 test('delegate: empty objective is rejected', async () => {

@@ -243,4 +243,34 @@ describe('createCoordinatorReviewDeps', () => {
     assert.equal(result.infraFailures?.[0]?.kind, 'json')
     assert.match(result.infraFailures?.[0]?.claim ?? '', /JSON object/)
   })
+
+  it('threads onActivity into DelegationRequest for all four spawns (review-gate UI visibility)', async () => {
+    const captured: DelegationRequest[] = []
+    const coordinator: ReviewCoordinator = {
+      delegate: async request => { captured.push(request); return run([worker()]) },
+      delegateBatch: async requests => { captured.push(...requests); return run(requests.map(() => worker())) },
+    }
+    const onActivity = () => {}
+    const deps = createCoordinatorReviewDeps(coordinator)
+    const change = { files: ['src/a.ts'], crossModule: false, isFix: true }
+
+    await deps.spawnVerifier(change, undefined, onActivity)
+    await deps.spawnPatcher(change, { verdict: 'rejected', evidence: 'x' }, undefined, onActivity)
+    await deps.spawnSquadron(change, undefined, onActivity)
+    await deps.spawnWiringReviewer!(change, undefined, onActivity)
+
+    // 1 verifier + 1 patcher + 5 squadron inspectors + 2 auto inspectors
+    assert.equal(captured.length, 9)
+    for (const req of captured) assert.equal(req.onActivity, onActivity)
+  })
+
+  it('omits onActivity from DelegationRequest when not provided (serialization hygiene)', async () => {
+    let captured: DelegationRequest | undefined
+    const coordinator: ReviewCoordinator = {
+      delegate: async request => { captured = request; return run([worker()]) },
+    }
+    const deps = createCoordinatorReviewDeps(coordinator)
+    await deps.spawnVerifier({ files: ['src/a.ts'], crossModule: false, isFix: true })
+    assert.equal(captured !== undefined && 'onActivity' in captured, false)
+  })
 })

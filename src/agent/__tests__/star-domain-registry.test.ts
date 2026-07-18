@@ -10,9 +10,9 @@ import { makeTestDir, cleanupTestDir } from '../../tui/__tests__/_test-tmp.js'
 const _require = createRequire(import.meta.url)
 
 describe('StarDomainRegistry — built-in domains', () => {
-  test('has all 11 built-in domains', async () => {
+  test('has all 12 built-in domains', async () => {
     const reg = new StarDomainRegistry()
-    assert.equal(reg.getDomainIds().length, 11)
+    assert.equal(reg.getDomainIds().length, 12)
     for (const id of Object.keys(STAR_DOMAINS) as Array<keyof typeof STAR_DOMAINS>) {
       assert.ok(reg.has(id), `missing built-in domain: ${id}`)
       assert.equal(reg.get(id)!.isCustom, false)
@@ -63,9 +63,47 @@ describe('StarDomainRegistry — built-in domains', () => {
     assert.equal(reg.matchDomain('这个方案'), null)
   })
 
+  test('matchDomainDetailed — hit exposes keywords in domain-definition order', async () => {
+    const reg = new StarDomainRegistry()
+    const detail = reg.matchDomainDetailed('重构优化性能')
+    assert.equal(detail.verdict, 'hit')
+    assert.equal(detail.id, 'tianfu')
+    assert.ok(detail.matchedKeywords.includes('重构'))
+    assert.ok(detail.matchedKeywords.includes('优化'))
+    assert.ok(detail.matchedKeywords.includes('性能'))
+    // Domain-definition order: keywords appear in STAR_DOMAINS.tianfu.keywords order
+    const defOrder = STAR_DOMAINS.tianfu.keywords.filter(k => detail.matchedKeywords.includes(k))
+    assert.deepEqual(detail.matchedKeywords, defOrder)
+    // Thin projection stays byte-equivalent
+    assert.equal(reg.matchDomain('重构优化性能'), detail.id)
+  })
+
+  test('matchDomainDetailed — tie and no-match preserve matchDomain null', async () => {
+    const reg = new StarDomainRegistry()
+    const tie = reg.matchDomainDetailed('这个方案')
+    assert.equal(tie.verdict, 'tie')
+    assert.equal(tie.id, null)
+    assert.ok(tie.tiedIds && tie.tiedIds.length >= 2)
+    assert.deepEqual(tie.tiedIds, [...tie.tiedIds].sort())
+    assert.equal(reg.matchDomain('这个方案'), null)
+
+    const miss = reg.matchDomainDetailed('hello world xyz')
+    assert.equal(miss.verdict, 'no-match')
+    assert.equal(miss.id, null)
+    assert.deepEqual(miss.matchedKeywords, [])
+    assert.equal(reg.matchDomain('hello world xyz'), null)
+  })
+
+  test('matchDomainDetailed — deterministic for same input', async () => {
+    const reg = new StarDomainRegistry()
+    const a = reg.matchDomainDetailed('审查这个方案')
+    const b = reg.matchDomainDetailed('审查这个方案')
+    assert.deepEqual(a, b)
+  })
+
   test('list() returns all domains', async () => {
     const reg = new StarDomainRegistry()
-    assert.equal(reg.list().length, 11)
+    assert.equal(reg.list().length, 12)
   })
 })
 
@@ -305,8 +343,8 @@ describe('starDomainRegistry singleton', () => {
     assert.ok(starDomainRegistry instanceof StarDomainRegistry)
   })
 
-  test('has the 11 built-in domains', async () => {
-    assert.equal(starDomainRegistry.getDomainIds().length, 11)
+  test('has the 12 built-in domains', async () => {
+    assert.equal(starDomainRegistry.getDomainIds().length, 12)
   })
 })
 

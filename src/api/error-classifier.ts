@@ -17,6 +17,7 @@ export type ErrorCategory =
   | 'auth_error'
   | 'client_error'
   | 'context_overflow'
+  | 'image_strip'
   | 'stream_parse'
   | 'unknown'
 
@@ -27,6 +28,9 @@ export interface ClassifiedError {
   category: ErrorCategory
   userMessage: string
   maxRetries: number
+  /** When true, the retry engine should strip image_url content from
+   * messages before retrying. Does not consume retry budget (first strip only). */
+  stripImages?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +57,17 @@ function extractStatus(error: unknown): number | null {
     if (m) return parseInt(m[1]!, 10)
   }
 
+  return null
+}
+
+/** Extract human-readable message from various error shapes. */
+function extractMessage(error: unknown): string | null {
+  if (error != null && typeof error === 'object') {
+    const obj = error as Record<string, unknown>
+    if (typeof obj.message === 'string') return obj.message
+  }
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string') return error
   return null
 }
 
@@ -118,15 +133,20 @@ function classifyByStatus(status: number): ClassifiedError | null {
     }
   }
 
-  // Context overflow
+  // 413 Payload Too Large — two scenarios:
+  //   a) Image-heavy payload: strip images and retry (doesn't consume budget)
+  //   b) Genuine context overflow: not retryable
+  // We default to image_strip because the retry engine upgrades to Fatal
+  // if no images are found to strip (see retry-engine.ts).
   if (status === 413) {
     return {
-      retryable: false,
+      retryable: true,
       retryDelayMs: 0,
       shouldReconnect: false,
-      category: 'context_overflow',
-      userMessage: 'Request too large — context overflow.',
-      maxRetries: 0,
+      category: 'image_strip',
+      userMessage: 'Payload too large — stripping images and retrying.',
+      maxRetries: 1,
+      stripImages: true,
     }
   }
 
@@ -328,8 +348,29 @@ function extractRetryAfter(error: unknown): number | undefined {
  * Priority: status code → error name → message pattern → fallback.
  */
 export function classifyApiError(error: unknown): ClassifiedError {
-  // 1. Try status-code based classification first
+  // 0. Image processing errors (400/500 wrapping image rejection):
+  //    Check before status-code classification so these bypass generic 4xx/5xx.
+  //    Pattern source: grok-build retry.rs — "Could not process image" (400),
+  //    "upstream: 400 ... image" (500 wrap)
   const status = extractStatus(error)
+  const msg = extractMessage(error)
+  if (
+    status !== null && (status === 400 || status === 500) &&
+    msg !== null &&
+    /could not process image|image processing|unsupported image|invalid image format/i.test(msg)
+  ) {
+    return {
+      retryable: true,
+      retryDelayMs: 0,
+      shouldReconnect: false,
+      category: 'image_strip',
+      userMessage: 'Image processing error — stripping images and retrying.',
+      maxRetries: 1,
+      stripImages: true,
+    }
+  }
+
+  // 1. Try status-code based classification first
   if (status !== null) {
     const result = classifyByStatus(status)
     if (result) {

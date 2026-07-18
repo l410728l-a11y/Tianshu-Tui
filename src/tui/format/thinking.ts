@@ -4,8 +4,8 @@
  * 纯函数，从 `thinking.tsx` 的渲染逻辑提取。
  */
 
-import chalk from 'chalk'
 import { ANSI, color } from '../engine/ansi.js'
+import { useAsciiGlyphs } from '../term-caps.js'
 import type { RivetTheme } from '../theme.js'
 
 export interface FormatThinkingInput {
@@ -40,7 +40,7 @@ export function formatThinking(input: FormatThinkingInput, theme: RivetTheme): s
 
   const lines: string[] = []
   const textLines = input.text.split('\n').filter(l => l.trim().length > 0)
-  const useAscii = chalk.level < 3
+  const useAscii = useAsciiGlyphs()
 
   // ── Header line ─────────────────────────────────────────────
   if (input.header !== false) {

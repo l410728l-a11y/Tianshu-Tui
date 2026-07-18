@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyActivityMode, evaluateConvergence } from '../convergence-detector.js'
-import type { ConvergenceInput, ConvergenceSignals, PhaseClass } from '../convergence-detector.js'
+import { classifyActivityMode, computeFlowBeacon, evaluateConvergence } from '../convergence-detector.js'
+import type { ConvergenceInput, ConvergenceSignals, FlowBeaconInput, PhaseClass } from '../convergence-detector.js'
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -2002,5 +2002,315 @@ describe('evaluateConvergence', () => {
       // Old behavior preserved: stagnation can fire at L1+ when phaseRelativeTurn is absent
       assert.ok(result.level >= 1, `absent phaseRelativeTurn → no cooldown → level >= 1, got L${result.level}`)
     })
+  })
+})
+
+// ─── P1 心流保护 Wave 1：computeFlowBeacon 纯函数契约 ────────────────
+
+describe('computeFlowBeacon (P1 Wave 1)', () => {
+  function flowInput(overrides: Partial<FlowBeaconInput> = {}): FlowBeaconInput {
+    return {
+      momentum: 0.8,
+      momentumHasData: true,
+      stability: 0.7,
+      recentToolHistory: [],
+      todoCompletedDelta: 0,
+      signalWindow: 6,
+      ...overrides,
+    }
+  }
+
+  const settled = (statuses: Array<'success' | 'failed' | 'running'>) =>
+    statuses.map(status => ({ status }))
+
+  it('全量实测样本得到 [0,1] 分数（各因子线性加权）', () => {
+    const b = computeFlowBeacon(flowInput({
+      momentum: 1, stability: 1, todoCompletedDelta: 2,
+      recentToolHistory: settled(['success', 'success', 'success', 'success']),
+    }))
+    assert.equal(b.sampleCount, 4)
+    assert.ok(Math.abs(b.score - 1) < 1e-9, `全因子满格 → ≈1.0，got ${b.score}`)
+  })
+
+  it('权重固定断言：单因子拉满/清零时 score 符合 0.4/0.3/0.2/0.1 线性预期', () => {
+    const zeroBase = { momentum: 0, momentumHasData: true, stability: 0, todoCompletedDelta: 0 }
+    const allFail = settled(['failed', 'failed', 'failed', 'failed'])
+    const allPass = settled(['success', 'success', 'success', 'success'])
+    // 只有工具成功率满格 → 0.4
+    assert.equal(computeFlowBeacon(flowInput({ ...zeroBase, recentToolHistory: allPass })).score, 0.4)
+    // 只有 momentum 满格 → 0.3
+    assert.equal(computeFlowBeacon(flowInput({ ...zeroBase, momentum: 1, recentToolHistory: allFail })).score, 0.3)
+    // 只有 stability 满格 → 0.2
+    assert.equal(computeFlowBeacon(flowInput({ ...zeroBase, stability: 1, recentToolHistory: allFail })).score, 0.2)
+    // 只有 todo 推进满格（delta≥2）→ 0.1（四舍五入到浮点容差）
+    const todoOnly = computeFlowBeacon(flowInput({ ...zeroBase, todoCompletedDelta: 5, recentToolHistory: allFail }))
+    assert.ok(Math.abs(todoOnly.score - 0.1) < 1e-9)
+  })
+
+  it('running 在途样本从分子分母同时剔除；窗口内全 running → sampleCount=0', () => {
+    const mixed = computeFlowBeacon(flowInput({
+      recentToolHistory: settled(['success', 'running', 'success', 'running', 'failed']),
+    }))
+    assert.equal(mixed.sampleCount, 3, '只计已结算样本')
+    const allRunning = computeFlowBeacon(flowInput({
+      recentToolHistory: settled(['running', 'running', 'running', 'running', 'running']),
+    }))
+    assert.equal(allRunning.sampleCount, 0)
+  })
+
+  it('无工具样本 → sampleCount=0（成功率因子记 0，不把缺数据当好数据）', () => {
+    const b = computeFlowBeacon(flowInput({ momentum: 1, stability: 1, recentToolHistory: [] }))
+    assert.equal(b.sampleCount, 0)
+    assert.ok(b.score <= 0.6, '无实测行为样本时 score 不含成功率分量')
+  })
+
+  it('momentumHasData=false 时 momentum 因子记 0（no-data ≠ 低心流）', () => {
+    const withData = computeFlowBeacon(flowInput({ momentum: 1, momentumHasData: true }))
+    const noData = computeFlowBeacon(flowInput({ momentum: 1, momentumHasData: false }))
+    assert.ok(Math.abs(withData.score - noData.score - 0.3) < 1e-9, 'no-data 恰好少 0.3 权重分量')
+  })
+
+  it('窗口裁剪：只看最近 signalWindow 条历史', () => {
+    const history = [
+      ...settled(['failed', 'failed', 'failed', 'failed', 'failed', 'failed']),
+      ...settled(['success', 'success', 'success', 'success', 'success', 'success']),
+    ]
+    const b = computeFlowBeacon(flowInput({ recentToolHistory: history, signalWindow: 6 }))
+    assert.equal(b.sampleCount, 6)
+    // 窗口内全 success → 成功率因子满格
+    const allFailWindow = computeFlowBeacon(flowInput({
+      recentToolHistory: history.slice(0, 6), signalWindow: 6,
+    }))
+    assert.ok(b.score > allFailWindow.score)
+  })
+
+  it('非法/越界输入被 clamp：NaN/Infinity/负值不产生越界 score', () => {
+    const cases: FlowBeaconInput[] = [
+      flowInput({ momentum: Number.NaN, stability: Number.POSITIVE_INFINITY, todoCompletedDelta: -3 }),
+      flowInput({ momentum: -5, stability: 99, todoCompletedDelta: Number.NaN }),
+      flowInput({ signalWindow: 0, recentToolHistory: settled(['success']) }),
+    ]
+    for (const c of cases) {
+      const b = computeFlowBeacon(c)
+      assert.ok(Number.isFinite(b.score), 'score 有限')
+      assert.ok(b.score >= 0 && b.score <= 1, `score 在 [0,1]，got ${b.score}`)
+      assert.ok(Number.isInteger(b.sampleCount) && b.sampleCount >= 0)
+    }
+  })
+
+  it('确定性：同一输入两次结果完全一致', () => {
+    const input = flowInput({
+      momentum: 0.63, stability: 0.41, todoCompletedDelta: 1,
+      recentToolHistory: settled(['success', 'failed', 'success', 'running', 'success']),
+    })
+    assert.deepEqual(computeFlowBeacon(input), computeFlowBeacon(input))
+  })
+})
+
+// ─── P1 心流保护 Wave 2：detector 软阈值消费 ─────────────────────────
+
+describe('evaluateConvergence — flow 软阈值（P1 Wave 2）', () => {
+  /** 基线：6× 同目标全 success 读 → turn 8 (=nLow) 低分 L1（既有用例形状）。 */
+  const lowScoreHistory = () => makeHistory(
+    Array.from({ length: 6 }, () => ({ tool: 'read_file', target: 'a.ts' })),
+  )
+  const highFlow = { momentum: 1, momentumHasData: true, stability: 1 }
+
+  it('高 flow 延后 score-based nLow：turn 8 从 L1 变 L0，turn 10 仍会到达 L1', () => {
+    const base = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false },
+    }))
+    assert.equal(base.level, 1, '基线 L1')
+
+    // flow = 0.4(成功率) + 0.3(momentum) + 0.2(stability) = 0.9 → 1.27× → nLow 8→10
+    const flowed = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.equal(flowed.level, 0, '高 flow 下 turn 8 < 调整后 nLow → L0')
+
+    const delayed = evaluateConvergence(baseInput({
+      turn: 10, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.equal(delayed.level, 1, '延后不是免除：turn 10 仍到达 L1')
+  })
+
+  it('连续倍率非二元跳变：中间 flow 值产生中间阈值', () => {
+    // 中 flow = 0.4 + 0.3*0.5 = 0.55 → 1.165× → nLow 8→9
+    const midFlow = { momentum: 0.5, momentumHasData: true, stability: 0 }
+    const atNine = evaluateConvergence(baseInput({
+      turn: 9, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: midFlow },
+    }))
+    assert.equal(atNine.level, 1, '中 flow：turn 9 = 调整后 nLow → L1')
+    const highAtNine = evaluateConvergence(baseInput({
+      turn: 9, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.equal(highAtNine.level, 0, '高 flow：turn 9 < 调整后 nLow(10) → L0——高低 flow 在同 turn 分化')
+  })
+
+  it('flow=0 与不传 flowInputs 行为一致（全 failed 样本 → score 0 → 无调整）', () => {
+    const allFailed = makeHistory(
+      Array.from({ length: 6 }, () => ({ tool: 'read_file', status: 'failed' as const, target: 'a.ts' })),
+    )
+    const withoutFlow = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: allFailed,
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false },
+    }))
+    const zeroFlow = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: allFailed,
+      progressBeacons: {
+        todoCompletedDelta: 0, activePlan: false,
+        flowInputs: { momentum: 0, momentumHasData: true, stability: 0 },
+      },
+    }))
+    assert.equal(zeroFlow.level, withoutFlow.level)
+    assert.equal(zeroFlow.shouldAbort, withoutFlow.shouldAbort)
+    assert.equal(zeroFlow.score, withoutFlow.score)
+  })
+
+  it('资格门：样本不足（<4 已结算）不改变行为', () => {
+    const three = makeHistory(
+      Array.from({ length: 3 }, () => ({ tool: 'read_file', target: 'a.ts' })),
+    )
+    const base = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: three,
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false },
+    }))
+    const gated = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: three,
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.equal(gated.level, base.level, '样本不足 → 旧行为')
+    assert.equal(gated.score, base.score)
+  })
+
+  it('资格门：momentum no-data 不进入保护态（即使成功率满格）', () => {
+    const noData = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: {
+        todoCompletedDelta: 0, activePlan: false,
+        flowInputs: { momentum: 1, momentumHasData: false, stability: 1 },
+      },
+    }))
+    assert.equal(noData.level, 1, 'no-data → 资格门拦截 → 基线 L1 不变')
+  })
+
+  it('activePlan 与 flow 互斥不叠加：activePlan 时 nLow=12（1.5×），不是 15+（1.5×1.27）', () => {
+    const result = evaluateConvergence(baseInput({
+      turn: 13, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: true, flowInputs: highFlow },
+    }))
+    assert.equal(result.level, 1, 'turn 13 ≥ activePlan 调整后 nLow(12) → L1；若叠加为 15 则应是 L0')
+  })
+
+  // ─── P2 阴阳调度：structureRelaxation 单声源 ──────────────────────
+
+  it('P2 structureRelaxation=0.25 延后 nLow：turn 8 L1→L0，turn 10 仍到达 L1', () => {
+    const relaxed = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, structureRelaxation: 0.25 },
+    }))
+    assert.equal(relaxed.level, 0, '1.25× → nLow 8→10 → turn 8 L0')
+    const delayed = evaluateConvergence(baseInput({
+      turn: 10, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, structureRelaxation: 0.25 },
+    }))
+    assert.equal(delayed.level, 1, '延后不是免除')
+  })
+
+  it('P2 单声源仲裁：structureRelaxation=0 时忽略同传的高 flowInputs（hardTighten 压过 P1 放宽）', () => {
+    const base = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false },
+    }))
+    assert.equal(base.level, 1, '基线 L1')
+    const arbitrated = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: {
+        todoCompletedDelta: 0, activePlan: false,
+        structureRelaxation: 0, flowInputs: highFlow,
+      },
+    }))
+    assert.equal(arbitrated.level, 1, 'relaxation=0 有效且屏蔽 flowInputs → 基线 L1（若 flowInputs 生效则为 L0）')
+  })
+
+  it('P2 relaxation 越界被 clamp：5 → 等同 0.25；负值 → 等同 0', () => {
+    const over = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, structureRelaxation: 5 },
+    }))
+    const capped = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, structureRelaxation: 0.25 },
+    }))
+    assert.equal(over.level, capped.level)
+    const negative = evaluateConvergence(baseInput({
+      turn: 8, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, structureRelaxation: -1 },
+    }))
+    assert.equal(negative.level, 1, '负值 → 无放松 → 基线 L1')
+  })
+
+  it('P2 与 activePlan 互斥不叠加：activePlan 的 1.5× 优先', () => {
+    const result = evaluateConvergence(baseInput({
+      turn: 13, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
+      progressBeacons: { todoCompletedDelta: 0, activePlan: true, structureRelaxation: 0.25 },
+    }))
+    assert.equal(result.level, 1, 'turn 13 ≥ activePlan 调整后 nLow(12) → L1；若叠加 1.5×1.25 则应 L0')
+  })
+
+  it('P2 高 relaxation 不能救 no-tool 硬熔断', () => {
+    const result = evaluateConvergence(baseInput({
+      turn: 12, phaseClass: 'execute', recentToolHistory: lowScoreHistory(),
+      noToolTurnCount: 5,
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, structureRelaxation: 0.25 },
+    }))
+    assert.equal(result.shouldAbort, true)
+    assert.equal(result.abortCause, 'no-tool')
+  })
+
+  it('no-tool 硬熔断不被高 flow 阻止（abortCause 保持 no-tool）', () => {
+    const result = evaluateConvergence(baseInput({
+      turn: 12, phaseClass: 'execute', recentToolHistory: lowScoreHistory(),
+      noToolTurnCount: 5,
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.equal(result.shouldAbort, true, '高 flow 不能救 no-tool 硬熔断')
+    assert.equal(result.abortCause, 'no-tool')
+  })
+
+  it('score-abort 双护栏在高 flow 下保持原语义（也间接证明 signalWindow 未被乘）', () => {
+    // 复用既有 micro-bounce abort 用例形状 + 高 flow。turn 35 ≥ 调整后
+    // nHigh(25) → L3 仍到达；scoreDeclining 要求 scoreHistory.length >=
+    // signalWindow(6)——若 flow 误乘了 signalWindow，此断言会失败。
+    const history = makeHistory(
+      Array.from({ length: 12 }, () => ({ tool: 'read_file', target: 'same.ts' })),
+    )
+    const result = evaluateConvergence(baseInput({
+      turn: 35, phaseClass: 'deliver', recentToolHistory: history,
+      toolFingerprints: ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B'],
+      scoreHistory: [0.50, 0.42, 0.44, 0.31, 0.22, 0.04],
+      repeatCount: 2,
+      priorWarningAtL2Plus: true,
+      progressBeacons: { todoCompletedDelta: 0, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.equal(result.shouldAbort, true, '高 flow 不能关闭 score-abort')
+    assert.equal(result.abortCause, 'score')
+  })
+
+  it('todoCompletedDelta veto 与 flow 共存不回归（veto 仍在 level 判定后生效）', () => {
+    // 构造 L2 形状（execute + nMid 后低分），todo 推进 → veto 到 L1
+    const history = makeHistory(
+      Array.from({ length: 8 }, () => ({ tool: 'read_file', target: 'a.ts' })),
+    )
+    const result = evaluateConvergence(baseInput({
+      turn: 20, phaseClass: 'execute', recentToolHistory: history,
+      progressBeacons: { todoCompletedDelta: 1, activePlan: false, flowInputs: highFlow },
+    }))
+    assert.ok(result.level <= 1, `todo veto 仍 cap 到 ≤L1，got L${result.level}`)
   })
 })

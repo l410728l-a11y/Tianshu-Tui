@@ -540,6 +540,7 @@ function getDominantDimValue(rule: RouteRule, state: RouteState): number {
 //     中性，不会假阳性）；不自建停滞计数。
 
 import type { ObligationStore } from '../evidence-obligation.js'
+import type { CaseOpenSignal } from '../case-open-signals.js'
 
 export type CvmVectorMode = 'off' | 'shadow' | 'active'
 
@@ -557,6 +558,7 @@ export type CvmDifficultyKind =
   | 'context-pressure'
   | 'perspective-locked'
   | 'verification-debt'
+  | 'attack-stalled'
 
 export interface CvmVectorInput {
   turn: number
@@ -590,6 +592,14 @@ export interface CvmVectorInput {
   scoutOwned: boolean
   /** 上一轮 ControlPlane frame 是否有 decision-gate（worker/ownership 等）。 */
   hasDecisionGates: boolean
+  /** PAL 攻坚层快照（ProblemAttackStore.snapshotForCvm）。null = 无存活案件。 */
+  attack?: { activeCases: number; anyNeedsUser: boolean; anyStalled: boolean; hasPlannedProbes?: boolean } | null
+  /** PAL 层是否启用（RIVET_PAL !== 'off'）——CV3-open 的前置条件。 */
+  attackLayerEnabled?: boolean
+  /** 开案信号聚合（collectCaseOpenSignals 纯输出）——带稳定锚的"卡住形状"
+   *  事实。第四波 W1：CV3-open 触发面从「仅深度重复」扩展为
+   *  「convergence 门 ∧（重复 ∨ 带锚信号）」。缺省视为空。 */
+  caseOpenSignals?: readonly CaseOpenSignal[]
 }
 
 export interface CvmVectorDecision {
@@ -651,6 +661,11 @@ function hasHighRiskObligationGate(store: ObligationStore): boolean {
  */
 export function createCvmVectorEvaluator(): { evaluate(input: CvmVectorInput): CvmVectorDecision } {
   const lastFiredTurn = new Map<string, number>()
+  // W1 二次送达（two-challenge 的降级实现，不自建 tier 升级状态机）：
+  // 记录 CV3-open 已发过的锚。同锚信号持续到第二发（冷却已过 = 至少 6 轮
+  // 后）说明首发未被采纳——第二发挂 observe 短暂观察，到期由 bus 强制
+  // 送达（corroborate 自愈可提前撤销）。bus 没有 "escalate 文案" 机制。
+  const openFiredAnchors = new Set<string>()
 
   function cooled(ruleId: string, turn: number): boolean {
     const last = lastFiredTurn.get(ruleId)
@@ -695,6 +710,123 @@ export function createCvmVectorEvaluator(): { evaluate(input: CvmVectorInput): C
             },
           },
           candidate: null,
+          yielded: null,
+        }
+      }
+
+      // ── CV3 攻坚层（PAL 计划 v2）→ 天机 ──
+      // 案件级信号比通用视角锁定更尖锐：有存活案件时先评案件状态；
+      // 无案件但深度空转（level≥2 重复）且 PAL 启用时建议开案。
+      // 让位链与 CV2 同构：convergence 发射相邻轮 / scout / 专用 key / 同星 CCR。
+      const attack = input.attack ?? null
+      const conv0 = input.convergence
+      const openSignals = input.caseOpenSignals ?? []
+      const cv3Situation: { variant: 'needs-user' | 'stalled' | 'execute-planned' | 'open'; content: string; anchorKey?: string } | null = (() => {
+        if (attack) {
+          if (attack.anyNeedsUser) {
+            return {
+              variant: 'needs-user',
+              content: '【天机】攻坚案件假设空间已清空或预算耗尽。下一动作：attack_case status 复盘证据链，补充新解释（hypothesize）或带证据向用户求证后 close。本提醒不重复。',
+            }
+          }
+          // P3 修订：anyStalled 语义已收紧为"连续 uninformative 且无 planned
+          // 剩余"——真卡死才催换谓词。还有 planned 探针但主控深度空转
+          // （level≥2 重复）→ 引导回去执行已计划的判别探针，不催开新方向。
+          if (attack.anyStalled) {
+            return {
+              variant: 'stalled',
+              content: '【天机】攻坚案件连续探针不出信息且无备用探针——判别方向可能选错。下一动作：attack_case status 看假设板，换一个能区分存活假设的谓词（不同文件/不同测试/基线对照）。低风险只读探针可 delegate_task 并行验证。本提醒不重复。',
+            }
+          }
+          if (
+            attack.hasPlannedProbes === true
+            && conv0 !== null
+            && conv0.level >= 2
+            && (conv0.textRepetitionPenalty <= CVM_REPETITION_THRESHOLD || conv0.oscillationPenalty <= CVM_REPETITION_THRESHOLD)
+          ) {
+            return {
+              variant: 'execute-planned',
+              content: '【天机】案件里还有已计划未执行的判别探针，而你在重复无新证据的动作。下一动作：attack_case status 看板上 planned 探针，执行它并用 observe 结算谓词——先收割已计划的区分力，再考虑新方向。本提醒不重复。',
+            }
+          }
+          return null
+        }
+        // W1：触发面 = convergence 门（L2+）∧（深度重复 ∨ 带锚开案信号）。
+        // 信号扩大的是"何时建议"，不降低 convergence 门——没有停滞证据时
+        // 即使信号在场也不发声（信号只是形状，停滞才是时机）。
+        const repetitionHit0 = conv0 !== null
+          && (conv0.textRepetitionPenalty <= CVM_REPETITION_THRESHOLD || conv0.oscillationPenalty <= CVM_REPETITION_THRESHOLD)
+        if (
+          input.attackLayerEnabled === true
+          && conv0 !== null
+          && conv0.level >= 2
+          && (repetitionHit0 || openSignals.length > 0)
+          && input.turn >= 4
+        ) {
+          const sig = openSignals[0]
+          if (sig) {
+            const skeleton = JSON.stringify({ anchor: sig.anchor, problem: sig.summary })
+            return {
+              variant: 'open',
+              anchorKey: `${sig.anchor.kind}:${sig.anchor.ref}`,
+              content: `【天机】卡住形状已带锚事实（${sig.source}: ${sig.anchor.kind}:${sig.anchor.ref}——${sig.summary}）。这是攻坚案件的形状——直接开案：attack_case open ${skeleton}（problem 可改写为你的一句话问题），提出 ≥2 条竞争假设，用判别探针淘汰。有效探针/排除/复现都会计分。本提醒不重复。`,
+            }
+          }
+          return {
+            variant: 'open',
+            content: '【天机】深度空转：多轮重复未产生新证据。这是攻坚案件的形状——用 attack_case open 绑定锚事实（失败签名/义务/用户原话），提出 ≥2 条竞争假设，用判别探针淘汰。有效探针/排除/复现都会计分。本提醒不重复。',
+          }
+        }
+        return null
+      })()
+      if (cv3Situation) {
+        const facts: Record<string, number | string | boolean> = {
+          variant: cv3Situation.variant,
+          activeCases: attack?.activeCases ?? 0,
+          hasPlannedProbes: attack?.hasPlannedProbes ?? false,
+          caseOpenSignals: openSignals.length,
+          turn: input.turn,
+        }
+        if (openSignals[0]) facts.firstSignalSource = openSignals[0].source
+        if (input.convergenceEmittedRecently) {
+          return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: { ruleId: 'CV3', to: 'convergence-emit' } }
+        }
+        if (input.scoutOwned) {
+          return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: { ruleId: 'CV3', to: 'anchor-break-scout' } }
+        }
+        const pendingSpecial = PERSPECTIVE_YIELD_KEYS.find(k => input.pendingAdvisoryKeys.includes(k))
+        if (pendingSpecial) {
+          return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: { ruleId: 'CV3', to: pendingSpecial } }
+        }
+        const sameStar = sameStarCcrPending(input.pendingAdvisoryKeys, '天机')
+        if (sameStar) {
+          return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: { ruleId: 'CV3', to: sameStar } }
+        }
+        if (!cooled('CV3', input.turn)) {
+          return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: null }
+        }
+        lastFiredTurn.set('CV3', input.turn)
+        // W1 二次送达：同锚信号跨过冷却仍在场（首发未被采纳）→ 第二发挂
+        // observe 短暂观察，到期由 bus 强制送达；首发保持即时投递。
+        const anchorKey = cv3Situation.anchorKey
+        const isSecondChallenge = anchorKey !== undefined && openFiredAnchors.has(anchorKey)
+        if (anchorKey !== undefined) openFiredAnchors.add(anchorKey)
+        if (isSecondChallenge) facts.secondChallenge = true
+        return {
+          classification: { kind: 'attack-stalled', ruleId: 'CV3', facts },
+          candidate: {
+            ruleId: cv3Situation.variant === 'open' ? 'CV3-open' : 'CV3',
+            star: '天机',
+            entry: {
+              key: 'cvm-vector-天机-CV3',
+              priority: 0.5,
+              category: 'star_domain',
+              content: cv3Situation.content,
+              ttl: 1,
+              expect: { kind: 'tool_appears', tools: ['attack_case'], withinTurns: 3 },
+              ...(isSecondChallenge ? { observe: { turns: 2 } } : {}),
+            },
+          },
           yielded: null,
         }
       }

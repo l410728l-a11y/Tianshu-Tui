@@ -139,9 +139,21 @@ export interface DelegateActivityUpdate {
   parentToolId?: string
   profile?: string
   authority?: string
+  /** Why this authority was chosen（worker 命中理由，桌面镜像用）。 */
+  authorityReason?: string
   objective?: string
   status: string
   progressLine?: string
+  /** 该 worker 累计工具调用次数（运行中实时递增）。 */
+  toolUseCount?: number
+  /** 该 worker 累计 token 总数（turn 事件携带的累计快照）。 */
+  tokenCount?: number
+  /** 原始活动事件种类（桌面端 worker 活动镜像用；terminal 事件缺省）。 */
+  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+  /** 原始事件内容：text/thinking 为 delta，tool_use/tool_result 为工具名。 */
+  eventDetail?: string
+  /** Terminal failure classification (blocked/failed 终态事件携带)。 */
+  failureReason?: string
   model?: string
   provider?: string
   usage?: DelegationActivity['usage']
@@ -225,6 +237,25 @@ export interface ManagedAgent {
   getReasoningEffort?(): string | undefined
   /** Set the reasoning effort level (off/low/medium/high/max) or return to auto. */
   setReasoningEffort?(effort: import('../agent/auto-reasoning.js').ReasoningEffort | 'auto'): void
+  /**
+   * Goal mode — attach/clear an autonomous-goal tracker. The tracker drives
+   * cross-turn continuation via GoalContinuationController (assembled in
+   * loop-factory). Mirrors AgentLoop.setGoalTracker. Optional for lightweight
+   * doubles. Note: the caller MUST also update refs.goalTrackerRef.current so
+   * the update_goal / deliver_task tool closures (which read refs, not the
+   * agent field) stay in sync — see RuntimeSessionManagerOptions.resolveGoalHandles.
+   */
+  setGoalTracker?(tracker: import('../agent/goal-tracker.js').GoalTracker | null): void
+  /** Current goal tracker (null when no goal is active). Mirrors AgentLoop.getGoalTracker. */
+  getGoalTracker?(): import('../agent/goal-tracker.js').GoalTracker | null
+  /**
+   * Cockpit snapshot — aggregated runtime state (safety/verify/context/model/
+   * advisory) for the desktop cockpit panel. Built by the pure function
+   * buildCockpitSnapshot (tui/cockpit/state.ts) reading agent in-memory state.
+   * Returns null when the agent isn't built yet (idle/rehydrated session) or
+   * the snapshot assembly throws (transient agent rebuild window).
+   */
+  getCockpitSnapshot?(): import('../tui/cockpit/types.js').CockpitSnapshot | null
   /** Rewind: return the current message list (for listing rewind points). */
   getMessages(): OaiMessage[]
   /**
@@ -330,6 +361,47 @@ export type AgentFactory = (
    */
   modelId?: string,
 ) => ManagedAgent | Promise<ManagedAgent>
+
+/**
+ * Per-session goal handles, resolved lazily by serve-agent's SessionStores.
+ * The manager needs both the RuntimeRefs.goalTrackerRef (read by tool closures)
+ * and the sessionDir (for save/restore/delete of goal state) to wire goal mode.
+ */
+export interface GoalHandles {
+  /** The RuntimeRefs.goalTrackerRef — same object the update_goal and
+   *  deliver_task tool closures close over. Mutating .current here keeps the
+   *  tools in sync with the agent's own tracker field. */
+  goalTrackerRef: { current: import('../agent/goal-tracker.js').GoalTracker | null }
+  /** Directory where goal state is persisted (<sessionDir>/<sessionId>.goal.json). */
+  sessionDir: string
+  /** Configured cheap-worker profile for success-criteria extraction, if any. */
+  cheapProfile?: { provider: string; model: string }
+  /** All provider configs (for buildCheapClient). undefined when not resolvable. */
+  allProviders?: Record<string, unknown>
+}
+
+/** Read-only view of a goal tracker's state. Returned by goal endpoints / SSE. */
+export interface GoalSnapshot {
+  goalId: string
+  goal: string
+  status: 'active' | 'paused' | 'blocked' | 'complete'
+  iteration: number
+  maxIterations: number
+  wallClockElapsedMs: number
+  wallClockBudgetMs?: number
+  terminalReason?: string
+  successCriteria: string[]
+  /** Last completion-judge verdict (null until the first judge run). Shape
+   *  mirrors StoredGoalJudgeVerdict from goal-tracker (kept as a structural
+   *  type here to avoid a static import — the field is pass-through only). */
+  lastVerdict?: {
+    overall: 'verified' | 'rejected' | 'inconclusive'
+    criteriaMet: number
+    criteriaUnmet: number
+    criteriaTotal: number
+    summary: string
+  }
+}
 
 export interface CreateSessionInput {
   cwd?: string
@@ -449,6 +521,16 @@ export interface RuntimeSessionManagerOptions {
    * server starts. Returns undefined when concurrency features are disabled.
    */
   getSessionRegistry?: () => SessionRegistry | undefined
+  /**
+   * Goal mode — late-bound accessor for the per-session goal handles (the
+   * RuntimeRefs.goalTrackerRef that update_goal / deliver_task tool closures
+   * read, plus the session dir for goal state persistence). A getter (not a
+   * value) because the handles live in serve-agent's SessionStores, which are
+   * built lazily per session and invisible to this generic manager. Returns
+   * undefined for sessions without a sidecar-backed store (test doubles). When
+   * absent, the goal methods on this manager degrade to "feature unavailable".
+   */
+  resolveGoalHandles?: (sessionId: string) => GoalHandles | undefined
   /**
    * PlusMenu (model) — enumerate selectable models across all configured
    * providers. Injected by serve.ts (which owns the provider config). Absent in
@@ -776,6 +858,8 @@ export class RuntimeSessionManager {
   private readonly defaultDomain?: string
   private readonly resumeFallbackModel?: string
   private readonly idleAgentTtlMs: number
+  /** Goal mode — late-bound per-session goal handles (refs + sessionDir). */
+  private readonly resolveGoalHandles?: (sessionId: string) => GoalHandles | undefined
   private readonly toolResultScheduler: {
     setTimeout(callback: () => void, ms: number): unknown
     clearTimeout(handle: unknown): void
@@ -802,6 +886,7 @@ export class RuntimeSessionManager {
     this.defaultModelId = opts.defaultModelId
     this.resumeFallbackModel = opts.resumeFallbackModel
     this.idleAgentTtlMs = opts.idleAgentTtlMs ?? 30 * 60_000
+    this.resolveGoalHandles = opts.resolveGoalHandles
     this.toolResultScheduler = opts.toolResultScheduler ?? {
       setTimeout: (callback, ms) => setTimeout(callback, ms),
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -2054,6 +2139,152 @@ export class RuntimeSessionManager {
     return true
   }
 
+  // ── Goal mode (autonomous cross-turn goal pursuit) ──────────────────
+  // Mirrors the CLI/headless goal flow (main.ts:357-416). The tracker drives
+  // cross-turn continuation via GoalContinuationController (assembled in
+  // loop-factory); update_goal / deliver_task tools read refs.goalTrackerRef,
+  // so both the agent field AND refs.current MUST stay in sync.
+  /**
+   * Create + attach a goal tracker. Resolves success criteria asynchronously
+   * (fail-open — defaults to a generic template). Returns the initial state, or
+   * null when the session has no goal handles wired (test doubles / legacy
+   * sidecar) or the session is missing.
+   */
+  async setGoal(id: string, opts: {
+    goal: string
+    maxIterations: number
+    contextWindow: number
+    wallClockMs?: number
+    successCriteria?: string[]
+    maxJudgeRuns?: number
+  }): Promise<GoalSnapshot | null> {
+    const session = this.sessions.get(id)
+    if (!session) return null
+    const handles = this.resolveGoalHandles?.(id)
+    if (!handles) return null
+    const { GoalTracker } = await import('../agent/goal-tracker.js')
+    const { saveGoalState } = await import('../agent/goal-persist.js')
+    const tracker = new GoalTracker({
+      goal: opts.goal,
+      maxIterations: opts.maxIterations,
+      contextWindow: opts.contextWindow,
+      ...(opts.wallClockMs !== undefined ? { wallClockMs: opts.wallClockMs } : {}),
+      ...(opts.successCriteria ? { successCriteria: opts.successCriteria } : {}),
+      ...(opts.maxJudgeRuns !== undefined ? { maxJudgeRuns: opts.maxJudgeRuns } : {}),
+    })
+    // Sync BOTH the agent field (drives GoalContinuationController) AND the refs
+    // slot (read by update_goal / deliver_task tool closures). Out of sync →
+    // tools see null while continuation runs, or vice versa.
+    try { session.agent?.setGoalTracker?.(tracker) } catch { /* non-fatal */ }
+    handles.goalTrackerRef.current = tracker
+    try { saveGoalState(handles.sessionDir, id, tracker) } catch { /* non-fatal */ }
+    this.append(session, 'goal_state', this.snapshotGoal(tracker) as unknown as Record<string, unknown>)
+    // Async criteria extraction (fail-open). Mirrors main.ts:392-414.
+    void this.extractCriteria(id, opts.goal, tracker)
+    return this.snapshotGoal(tracker)
+  }
+
+  /** Pause / resume — mutate tracker state, persist, emit. */
+  pauseGoal(id: string, reason?: string): GoalSnapshot | null {
+    return this.mutateGoal(id, (t) => { t.pause(reason ?? 'user', 'user') })
+  }
+  resumeGoal(id: string): GoalSnapshot | null {
+    return this.mutateGoal(id, (t) => { t.resume('user') })
+  }
+  /**
+   * Cancel is terminal — also clear the agent tracker + refs + persisted
+   * state so a subsequent setGoal starts clean (aligns slash-commands.ts:1107).
+   *
+   * Returns a Promise — the caller MUST await it before issuing setGoal on the
+   * same session. The persisted-state deletion is awaited here (not fire-and-
+   * forget) so a rapid cancel→setGoal sequence cannot race: without awaiting,
+   * the dynamic-import delay + FS buffering could let the delete land AFTER a
+   * new setGoal's saveGoalState, wiping the new goal's state file.
+   */
+  async cancelGoal(id: string): Promise<GoalSnapshot | null> {
+    const session = this.sessions.get(id)
+    if (!session) return null
+    const handles = this.resolveGoalHandles?.(id)
+    const tracker = handles?.goalTrackerRef.current ?? session.agent?.getGoalTracker?.() ?? null
+    if (!tracker) return null
+    tracker.cancel()
+    try { session.agent?.setGoalTracker?.(null) } catch { /* non-fatal */ }
+    if (handles) {
+      handles.goalTrackerRef.current = null
+      // Await the delete so a subsequent setGoal's save cannot be clobbered.
+      try {
+        const { deleteGoalState } = await import('../agent/goal-persist.js')
+        deleteGoalState(handles.sessionDir, id)
+      } catch { /* non-fatal — file may not exist */ }
+    }
+    this.append(session, 'goal_state', this.snapshotGoal(tracker) as unknown as Record<string, unknown>)
+    return this.snapshotGoal(tracker)
+  }
+
+  /** Read-only snapshot for the GET endpoint / SSE events. */
+  getGoalState(id: string): GoalSnapshot | null {
+    const session = this.sessions.get(id)
+    if (!session) return null
+    const handles = this.resolveGoalHandles?.(id)
+    const tracker = handles?.goalTrackerRef.current ?? session.agent?.getGoalTracker?.() ?? null
+    return tracker ? this.snapshotGoal(tracker) : null
+  }
+
+  private mutateGoal(id: string, fn: (t: import('../agent/goal-tracker.js').GoalTracker) => void): GoalSnapshot | null {
+    const session = this.sessions.get(id)
+    if (!session) return null
+    const handles = this.resolveGoalHandles?.(id)
+    const tracker = handles?.goalTrackerRef.current ?? session.agent?.getGoalTracker?.() ?? null
+    if (!tracker) return null
+    try { fn(tracker) } catch { return null }
+    if (handles) {
+      import('../agent/goal-persist.js').then(({ saveGoalState }) => {
+        try { saveGoalState(handles.sessionDir, id, tracker) } catch { /* non-fatal */ }
+      }).catch(() => {})
+    }
+    this.append(session, 'goal_state', this.snapshotGoal(tracker) as unknown as Record<string, unknown>)
+    return this.snapshotGoal(tracker)
+  }
+
+  private snapshotGoal(t: import('../agent/goal-tracker.js').GoalTracker): GoalSnapshot {
+    const terminalReason = t.getTerminalReason()
+    return {
+      goalId: t.getGoalId(),
+      goal: t.getGoal(),
+      status: t.getStatus(),
+      iteration: t.getIteration(),
+      maxIterations: t.getMaxIterations(),
+      wallClockElapsedMs: t.getWallClockElapsedMs(),
+      ...(t.getWallClockBudgetMs() !== undefined ? { wallClockBudgetMs: t.getWallClockBudgetMs() } : {}),
+      ...(terminalReason ? { terminalReason } : {}),
+      successCriteria: t.getSuccessCriteria(),
+      ...(t.getLastVerdict() ? { lastVerdict: t.getLastVerdict()! } : {}),
+    }
+  }
+
+  private async extractCriteria(id: string, goal: string, tracker: import('../agent/goal-tracker.js').GoalTracker): Promise<void> {
+    const handles = this.resolveGoalHandles?.(id)
+    if (!handles) return
+    try {
+      const { extractGoalCriteria, completionFromClient, buildCheapClient } = await import('../agent/goal-criteria.js')
+      const session = this.sessions.get(id)
+      // Prefer dedicated cheap client (mirrors main.ts:396-406); fall back to
+      // the session's own client when no cheap profile is configured.
+      let completion: Parameters<typeof extractGoalCriteria>[1] | null = null
+      if (handles.cheapProfile && handles.allProviders) {
+        const cheap = buildCheapClient(handles.cheapProfile, handles.allProviders as Parameters<typeof buildCheapClient>[1])
+        if (cheap) completion = completionFromClient(cheap.client, cheap.model)
+      }
+      if (!completion) return // no cheap client → leave generic criteria default
+      const criteria = await extractGoalCriteria(goal, completion)
+      tracker.setSuccessCriteria(criteria)
+      const s = this.sessions.get(id)
+      if (s) this.append(s, 'goal_state', this.snapshotGoal(tracker) as unknown as Record<string, unknown>)
+    } catch {
+      // non-fatal — tracker keeps its generic default criteria
+    }
+  }
+
   /**
    * Plan mode — toggle the session between read-only planning and normal
    * execution. Building the agent eagerly here (ensureAgent) so the toggle binds
@@ -3094,9 +3325,11 @@ export class RuntimeSessionManager {
   /**
    * T4 — emit a structured per-worker delegation update to the subagent panel.
    * Extracted from buildCallbacks so the idle user-dispatch path (delegate())
-   * can reuse the exact same mapping/elapsed logic. Carries two extra fields:
-   * `summary` (terminal digest for the "汇入主会话" adopt button) and `origin`
-   * ('user' marks a user-dispatched worker vs an agent auto-delegation).
+   * can reuse the exact same mapping/elapsed logic. Extra fields beyond the
+   * core status: `summary` (terminal digest for the "汇入主会话" adopt button),
+   * `origin` ('user' marks a user-dispatched worker), plus the live-activity
+   * passthrough (toolUseCount/tokenCount/eventKind/eventDetail) and terminal
+   * `failureReason` so the desktop panel can render counters + failure labels.
    */
   private emitDelegationActivity(
     session: InternalSession,
@@ -3105,9 +3338,16 @@ export class RuntimeSessionManager {
       parentToolId?: string
       profile?: string
       authority?: string
+      /** Why this authority was chosen (from DelegationActivity.authorityReason). */
+      authorityReason?: string
       objective?: string
       status: string
       progressLine?: string
+      toolUseCount?: number
+      tokenCount?: number
+      eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+      eventDetail?: string
+      failureReason?: string
       model?: string
       provider?: string
       usage?: DelegationActivity['usage']
@@ -3127,11 +3367,20 @@ export class RuntimeSessionManager {
       workerId: a.workOrderId,
       parentId: a.parentToolId,
       profile: a.profile,
+      // authority 与命中理由一并透传（此前 authority 接收后未转发，桌面端拿不到）；
+      // 桌面舰队面板显示 worker 星域/理由时直接可用。
+      authority: a.authority,
+      authorityReason: a.authorityReason,
       objective: a.objective,
       status: a.status,
       phase: a.status === 'running' ? 'running' : a.status,
       progressLine: a.progressLine ? redactText(a.progressLine) : undefined,
       elapsedMs: this.now() - started,
+      toolUseCount: a.toolUseCount,
+      tokenCount: a.tokenCount,
+      eventKind: a.eventKind,
+      eventDetail: a.eventDetail ? redactText(a.eventDetail) : undefined,
+      failureReason: a.failureReason,
       model: a.model,
       provider: a.provider,
       usage: a.usage,

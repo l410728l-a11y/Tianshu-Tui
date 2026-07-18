@@ -110,19 +110,39 @@ export class StarDomainRegistry {
   /** Match a task description to the best domain by keyword scoring.
    *  Returns null if no domain matches (all scores = 0 or tie). */
   matchDomain(taskDescription: string): string | null {
+    return this.matchDomainDetailed(taskDescription).id
+  }
+
+  /**
+   * Keyword-score match with audit detail: which keywords hit, hit/tie/no-match
+   * verdict, and optional runner-up. `matchDomain` is a thin `.id` projection —
+   * same inputs must keep returning the same id (or null).
+   */
+  matchDomainDetailed(taskDescription: string): DomainMatchDetail {
     this.ensureInit()
-    const lower = taskDescription.toLowerCase()
+    // Cap scan length so pathological objectives cannot explode includes() work.
+    const lower = taskDescription.slice(0, MAX_MATCH_CHARS).toLowerCase()
     const scores = new Map<string, number>()
+    const keywordsByDomain = new Map<string, string[]>()
 
     for (const domain of this.domains.values()) {
       let score = 0
+      const matched: string[] = []
       for (const keyword of domain.keywords) {
-        if (lower.includes(keyword.toLowerCase())) score++
+        if (lower.includes(keyword.toLowerCase())) {
+          score++
+          matched.push(keyword)
+        }
       }
-      if (score > 0) scores.set(domain.id, score)
+      if (score > 0) {
+        scores.set(domain.id, score)
+        keywordsByDomain.set(domain.id, matched)
+      }
     }
 
-    if (scores.size === 0) return null
+    if (scores.size === 0) {
+      return { id: null, matchedKeywords: [], verdict: 'no-match' }
+    }
 
     let max = 0
     for (const s of scores.values()) {
@@ -130,10 +150,52 @@ export class StarDomainRegistry {
     }
 
     const winners = [...scores.entries()].filter(([, s]) => s === max)
-    if (winners.length > 1) return null // tie → no match
+    if (winners.length > 1) {
+      const tiedIds = winners.map(([id]) => id).sort()
+      return {
+        id: null,
+        matchedKeywords: [],
+        verdict: 'tie',
+        tiedIds,
+        runnerUp: tiedIds[1],
+      }
+    }
 
-    return winners[0]![0]
+    const winnerId = winners[0]![0]
+    // Runner-up = next-highest score (any domain strictly below max), if any.
+    let runnerUp: string | undefined
+    let runnerScore = 0
+    for (const [id, s] of scores) {
+      if (id === winnerId) continue
+      if (s > runnerScore) {
+        runnerScore = s
+        runnerUp = id
+      }
+    }
+
+    return {
+      id: winnerId,
+      matchedKeywords: keywordsByDomain.get(winnerId) ?? [],
+      verdict: 'hit',
+      runnerUp,
+    }
   }
+}
+
+/** Cap for keyword scanning — objectives beyond this are truncated for matching. */
+export const MAX_MATCH_CHARS = 500
+
+export type DomainMatchVerdict = 'hit' | 'tie' | 'no-match'
+
+export interface DomainMatchDetail {
+  id: string | null
+  /** Keywords that hit on the winning domain, in domain-definition order. Empty on tie/no-match. */
+  matchedKeywords: string[]
+  verdict: DomainMatchVerdict
+  /** Second-best domain id (hit) or second tied id (tie). */
+  runnerUp?: string
+  /** Sorted tied domain ids when verdict === 'tie'. */
+  tiedIds?: string[]
 }
 
 // ─── Validation helpers ──────────────────────────────────────────

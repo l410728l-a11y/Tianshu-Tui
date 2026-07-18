@@ -93,6 +93,12 @@ export function modeForRecoveryTrigger(
  * degraded mode gives a stuck agent an escape hatch without reopening writes to
  * the workspace proper — the degraded lock-out is otherwise a dead-end when the
  * agent needs to materialise output it cannot otherwise see.
+ *
+ * Also exempts `.rivet/plans/` — plan draft files are the agent's primary
+ * output channel during degraded-mode recovery (compaction thrashing on small
+ * windows can trigger degraded, blocking the plan write and leaving the agent
+ * unable to persist its analysis). Plan files are low-risk: they live in the
+ * project's `.rivet/` metadata dir and don't touch workspace source.
  */
 export function isScratchScopedWrite(toolName: string, input: Record<string, unknown>): boolean {
   if (toolName !== 'write_file') return false
@@ -110,7 +116,8 @@ export function isScratchScopedWrite(toolName: string, input: Record<string, unk
     : (p: string) => p
   const underTmp = cmp(target) === cmp(tmp) || cmp(target).startsWith(cmp(tmp) + sep)
   const underScratch = /[/\\]\.rivet[/\\]scratch(?:[/\\]|$)/.test(target)
-  return underTmp || underScratch
+  const underPlans = /[/\\]\.rivet[/\\]plans(?:[/\\]|$)/.test(target)
+  return underTmp || underScratch || underPlans
 }
 
 export function isToolAllowedInReliabilityMode(

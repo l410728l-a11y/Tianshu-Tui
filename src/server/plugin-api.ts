@@ -12,8 +12,9 @@ import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
 import { loadConfig, saveConfig } from '../config/manager.js'
 import { PLUGIN_PRESETS } from '../plugins/plugin-presets.js'
-import { installPlugin, removePlugin, getInstalledPlugins, isPluginInstalled } from '../plugins/plugin-installer.js'
+import { installPlugin, removePlugin, getInstalledPlugins, isPluginInstalled, type PluginSource } from '../plugins/plugin-installer.js'
 import { parseManifest } from '../plugins/manifest.js'
+import { cloneGitSource, GitCloneError } from '../plugins/git-source.js'
 import { readFileSync, existsSync } from 'node:fs'
 import { join, isAbsolute, dirname, sep, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -98,6 +99,78 @@ export function resolveSourcePath(inputPath: string): string {
   return fromRoot
 }
 
+/** Read a plugin manifest from a source WITHOUT installing. Used by the
+ *  preflight (confirm=false) phase so the UI can show permissions before the
+ *  user commits. Local sources read package.json directly; git sources clone
+ *  to a temp dir, read, then clean up (the install path re-clones).
+ *  For local sources the ok-result carries `resolvedSource` — the path is
+ *  resolved ONCE here and handed to installPlugin, so install never probes a
+ *  second time (and can never drift from what preflight validated). */
+async function readSourceManifest(source: PluginSource): Promise<
+  | { ok: true; manifest: Record<string, unknown>; resolvedSource?: PluginSource }
+  | { ok: false; status: 400 | 502; error: string }
+> {
+  let sourcePath: string
+  let cleanup: (() => void) | null = null
+  let resolvedLocal: PluginSource | undefined
+
+  if (source.kind === 'git') {
+    try {
+      const cloned = await cloneGitSource(source.url, source.ref)
+      sourcePath = cloned.sourcePath
+      cleanup = cloned.cleanup
+    } catch (err) {
+      const msg = err instanceof GitCloneError ? err.message : `Clone failed: ${(err as Error).message}`
+      // 502 = upstream/clone failure (network, auth, repo missing); 400 = bad URL/ref.
+      const status = msg.startsWith('Invalid git') ? 400 : 502
+      return { ok: false, status, error: msg }
+    }
+  } else {
+    sourcePath = resolveSourcePath(source.path)
+    // Resolution fell through to a nonexistent path. In the packaged desktop,
+    // projectRoot() is the install root (no repo tree), so a non-`plugins/`
+    // relative path can never resolve — name the real problem instead of the
+    // downstream "No package.json found" at a meaningless install-root path.
+    if (!existsSync(sourcePath)) {
+      return {
+        ok: false,
+        status: 400,
+        error: isAbsolute(source.path)
+          ? `Plugin path does not exist: ${sourcePath}`
+          : `Cannot resolve relative path "${source.path}" (tried ${sourcePath}). In the packaged desktop app, install from an absolute path or a plugins/<id> preset.`,
+      }
+    }
+    resolvedLocal = { kind: 'local', path: sourcePath }
+  }
+
+  try {
+    const pkgPath = join(sourcePath, 'package.json')
+    if (!existsSync(pkgPath)) {
+      return { ok: false, status: 400, error: `No package.json found at ${sourcePath}` }
+    }
+    let manifest: Record<string, unknown> | undefined
+    try {
+      const raw = JSON.parse(readFileSync(pkgPath, 'utf-8'))
+      if (raw.tianshu && typeof raw.tianshu === 'object') {
+        const parsed = parseManifest(raw.tianshu)
+        if (parsed.ok) {
+          manifest = parsed.manifest as unknown as Record<string, unknown>
+        } else {
+          return { ok: false, status: 400, error: `Invalid plugin manifest: ${parsed.errors.join('; ')}` }
+        }
+      }
+    } catch {
+      return { ok: false, status: 400, error: 'Cannot parse package.json' }
+    }
+    if (!manifest) {
+      return { ok: false, status: 400, error: `No "tianshu" manifest field in package.json — not a Tianshu plugin.` }
+    }
+    return { ok: true, manifest, ...(resolvedLocal ? { resolvedSource: resolvedLocal } : {}) }
+  } finally {
+    cleanup?.()
+  }
+}
+
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
     if (!isAuthorizedRequest({ body, headers }, apiToken)) {
@@ -141,40 +214,39 @@ export function buildPluginRoutes(apiToken?: string): Record<string, RouteHandle
       return { status: 200, body: { plugins: result } }
     }, apiToken),
 
-    // POST /plugins/install — install from local path.
-    // Body: { path: string, confirm: boolean }
+    // POST /plugins/install — install from local path OR git URL.
+    // Body forms (all accepted):
+    //   { path: string, confirm?: boolean }                        — legacy local
+    //   { source: { kind: 'local', path }, confirm?: boolean }    — new local
+    //   { source: { kind: 'git', url, ref? }, confirm?: boolean } — git clone
     // Pre-flight: reads manifest BEFORE install, requires confirm:true to proceed.
-    // Without confirm, returns manifest + permissions for caller-side review.
+    // For git sources, the preflight clones to a temp dir to read the manifest
+    // (the install path re-clones — acceptable: clone is cheap, temp is cleaned).
     'POST /plugins/install': withAuth(async (body) => {
-      const input = body as { path?: string; confirm?: boolean }
-      if (!input.path || typeof input.path !== 'string') {
-        return { status: 400, body: { error: 'Missing required field: path' } }
+      const input = body as { path?: string; source?: PluginSource; confirm?: boolean }
+      // Normalize to PluginSource. Legacy { path } == { kind: 'local', path }.
+      const source: PluginSource | null = input.source
+        ?? (typeof input.path === 'string' ? { kind: 'local', path: input.path } : null)
+      if (!source) {
+        return { status: 400, body: { error: 'Missing required field: source (or legacy path)' } }
+      }
+      if (source.kind !== 'local' && source.kind !== 'git') {
+        return { status: 400, body: { error: `Unknown source kind: ${String((source as { kind?: string }).kind)}` } }
+      }
+      if (source.kind === 'git') {
+        if (!source.url || typeof source.url !== 'string') {
+          return { status: 400, body: { error: 'Missing source.url for git install' } }
+        }
+      } else if (!source.path || typeof source.path !== 'string') {
+        return { status: 400, body: { error: 'Missing source.path for local install' } }
       }
 
-      // Pre-flight: read manifest from source to show permissions before installing
-      const sourcePath = resolveSourcePath(input.path)
-      const pkgPath = join(sourcePath, 'package.json')
-      if (!existsSync(pkgPath)) {
-        return { status: 400, body: { ok: false, error: `No package.json found at ${sourcePath}` } }
-      }
-      let manifest: Record<string, unknown> | undefined
-      try {
-        const raw = JSON.parse(readFileSync(pkgPath, 'utf-8'))
-        if (raw.tianshu && typeof raw.tianshu === 'object') {
-          const parsed = parseManifest(raw.tianshu)
-          if (parsed.ok) {
-            manifest = parsed.manifest as unknown as Record<string, unknown>
-          } else {
-            return { status: 400, body: { ok: false, error: `Invalid plugin manifest: ${parsed.errors.join('; ')}` } }
-          }
-        }
-      } catch {
-        return { status: 400, body: { ok: false, error: 'Cannot parse package.json' } }
-      }
-      // Not a plugin at all (no tianshu manifest) — reject up front instead of
-      // returning a misleading "Confirmation required" with an empty manifest.
-      if (!manifest) {
-        return { status: 400, body: { ok: false, error: `No "tianshu" manifest field in package.json at ${input.path} — not a Tianshu plugin.` } }
+      // Pre-flight: resolve the source to a readable manifest WITHOUT installing.
+      // For local: resolve the path + read package.json directly.
+      // For git: clone to a temp dir, read manifest, cleanup.
+      const preflight = await readSourceManifest(source)
+      if (!preflight.ok) {
+        return { status: preflight.status, body: { ok: false, error: preflight.error } }
       }
 
       if (!input.confirm) {
@@ -183,13 +255,17 @@ export function buildPluginRoutes(apiToken?: string): Record<string, RouteHandle
           body: {
             ok: false,
             error: 'Confirmation required. Review the manifest and permissions, then retry with confirm: true.',
-            manifest,
+            manifest: preflight.manifest,
             hint: 'Set confirm: true to proceed with installation.',
           },
         }
       }
 
-      const result = await installPlugin(sourcePath)
+      // Install from the preflight-resolved source: readSourceManifest
+      // resolved the local path once (and validated it exists); reusing it
+      // avoids a second resolve and any preflight→install drift. Git sources
+      // re-clone by design (preflight's temp clone is already cleaned up).
+      const result = await installPlugin(preflight.resolvedSource ?? source)
       if (result.ok) {
         return {
           status: 200,

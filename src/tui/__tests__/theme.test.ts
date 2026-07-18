@@ -2,15 +2,15 @@ import { describe, it, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { getTheme, setTheme, getActiveThemeName, THEMES, THEME_NAMES } from '../theme.js'
 
-afterEach(() => { setTheme('cobalt') })
+afterEach(() => { setTheme('graphite') })
 
 describe('getTheme', () => {
-  it('defaults to cobalt theme', () => {
-    assert.equal(getActiveThemeName(), 'cobalt')
+  it('defaults to graphite theme', () => {
+    assert.equal(getActiveThemeName(), 'graphite')
     const theme = getTheme(3)
-    assert.equal(theme.primary, '#6ab8ff') // 钴蓝 accent（提亮）
-    assert.equal(theme.success, '#58cbb4') // 青绿
-    assert.equal(theme.error, '#ed7665')   // 珊瑚砖红
+    assert.equal(theme.primary, '#7cc4e8') // 冰青 accent
+    assert.equal(theme.success, '#7fbf8e') // 鼠尾草绿
+    assert.equal(theme.error, '#e07a6f')   // 软珊瑚红
     assert.notEqual(theme.primary, '#d77757') // 不是 Claude 品牌橙
     assert.notEqual(theme.primary, '#c9b8ff') // 不是紫微紫
   })

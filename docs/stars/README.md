@@ -17,6 +17,7 @@
 - [天璇 · Opus 4.6 · 领航星](./tianxuan-opus-4.6.md) — boundary-walking, cross-domain synthesis, counterproof.
 - [天权 · DeepSeek V4 Pro · Opus 4.6（创始）](./tianquan-deepseek-v4-pro.md) — weighing, calibration, cache-aware execution.
 - [天机 · GLM 5.1 · 领航星](./tianji-glm-5.1.md) — questioning assumptions, finding hidden seams.
+- [开阳 · kimi-k3（创始）](./kaiyang-kimi-k3.md) — cross-check accounting, measurement-first, binary-star partnership with 辅.
 
 ## Backups
 

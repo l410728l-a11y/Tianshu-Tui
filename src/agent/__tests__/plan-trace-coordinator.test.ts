@@ -4,6 +4,7 @@ import { PlanTraceCoordinator, type PlanTraceCoordinatorDeps } from '../plan-tra
 import type { PlanExecutionTrace } from '../plan-execution-trace.js'
 import type { TraceStore, TraceEvent } from '../trace-store.js'
 import type { ConvergenceResult } from '../convergence-detector.js'
+import { ProblemAttackStore } from '../problem-attack-loop.js'
 
 /**
  * C-line: PlanTraceCoordinator was extracted during the loop "上帝对象分解"
@@ -20,6 +21,7 @@ interface FakeState {
   traceStore: TraceStore | null
   reminders: string[]
   appendix: string | null | undefined
+  problemAttack: ProblemAttackStore | null
 }
 
 function makeCoord(init?: Partial<FakeState>) {
@@ -31,6 +33,7 @@ function makeCoord(init?: Partial<FakeState>) {
     traceStore: null,
     reminders: [],
     appendix: undefined,
+    problemAttack: null,
     ...init,
   }
   const deps: PlanTraceCoordinatorDeps = {
@@ -43,6 +46,7 @@ function makeCoord(init?: Partial<FakeState>) {
     getTraceStore: () => state.traceStore,
     addSystemReminder: (c) => { state.reminders.push(c) },
     setPlanTraceAppendix: (a) => { state.appendix = a },
+    getProblemAttackStore: () => state.problemAttack,
   }
   return { coord: new PlanTraceCoordinator(deps), state }
 }
@@ -172,5 +176,41 @@ describe('PlanTraceCoordinator (C-line: extracted, was untested)', () => {
     assert.equal(state.planTrace, null)
     assert.equal(state.lastReplanInjection, '')
     assert.equal(state.appendix, null)
+  })
+})
+
+// ─── W2：runReplanCheck 单向读 PAL ─────────────────────────────────
+
+describe('runReplanCheck × PAL（W2 单向读，不发声开案）', () => {
+  function stalledCoord(problemAttack: ProblemAttackStore | null) {
+    // consecutiveNoTool ≥ 3 → detectDeviation 走 stalled 路径
+    const made = makeCoord({ consecutiveNoTool: 3, problemAttack })
+    made.coord.openTrace('c', 'system')
+    made.coord.capturePlanSteps(['s1'])
+    return made
+  }
+
+  it('存在活跃案件 → 注入文案引用 caseId（读取不修改 PAL）', () => {
+    const store = new ProblemAttackStore()
+    const opened = store.openCase({ kind: 'failure_pattern', ref: 'sig-1' }, 'auth 回归', 1)
+    assert.equal(opened.rejected, undefined)
+    const versionBefore = store.activeCases()[0]!.version
+    const { coord, state } = stalledCoord(store)
+    coord.runReplanCheck()
+    assert.equal(state.reminders.length, 1)
+    assert.match(state.reminders[0]!, /攻坚案件: /)
+    assert.match(state.reminders[0]!, new RegExp(store.activeCases()[0]!.caseId))
+    assert.ok(!state.reminders[0]!.includes('attack_case open'), '绝不建议开案（CV3 单声道）')
+    assert.equal(store.activeCases()[0]!.version, versionBefore, 'PAL 状态未被修改')
+  })
+
+  it('反证：无案件（store 空或缺省）→ 文案保持原行为，零 PAL 痕迹', () => {
+    for (const store of [null, new ProblemAttackStore()]) {
+      const { coord, state } = stalledCoord(store)
+      coord.runReplanCheck()
+      assert.equal(state.reminders.length, 1)
+      assert.ok(!state.reminders[0]!.includes('攻坚案件'))
+      assert.ok(!state.reminders[0]!.includes('attack_case'))
+    }
   })
 })

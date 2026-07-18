@@ -16,7 +16,7 @@
 
 import { describe, it, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { crossSessionDisabled, crossSessionMemoryPushEnabled } from '../turn-step-producer.js'
+import { combineMemoryBlocks, crossSessionDisabled, crossSessionMemoryPushEnabled } from '../turn-step-producer.js'
 
 // ── crossSessionDisabled() unit tests ──────────────────────────
 
@@ -147,5 +147,27 @@ describe('crossSessionMemoryPushEnabled — 记忆块推送默认关闭', () => 
   it('env=0 → 推送保持关闭', () => {
     process.env.RIVET_CROSS_SESSION_INJECT = '0'
     assert.equal(crossSessionMemoryPushEnabled(), false)
+  })
+})
+
+// ── 虚空仓库 P0：双路记忆块合并契约 ─────────────────────────────
+// 默认路径（agent-crafted，无条件）+ opt-in 路径（全量，env 门控）
+// 经 combineMemoryBlocks 合并进同一个 setCrossSessionMemoryBlock 槽位。
+
+describe('combineMemoryBlocks — 虚空仓库双路注入合并', () => {
+  it('仅 agent-crafted 块（默认场景：opt-in 关闭）→ 原样注入', () => {
+    assert.equal(combineMemoryBlocks('<crafted/>', null), '<crafted/>')
+  })
+
+  it('仅全量块（无 agent-crafted 知识 + opt-in 开）→ 原样注入', () => {
+    assert.equal(combineMemoryBlocks(null, '<full/>'), '<full/>')
+  })
+
+  it('两路都有 → agent-crafted 在前、换行分隔（字节序确定）', () => {
+    assert.equal(combineMemoryBlocks('<crafted/>', '<full/>'), '<crafted/>\n<full/>')
+  })
+
+  it('两路都空 → null（附录零占用）', () => {
+    assert.equal(combineMemoryBlocks(null, null), null)
   })
 })

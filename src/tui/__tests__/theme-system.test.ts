@@ -177,8 +177,8 @@ describe('auto theme detection helpers', () => {
     assert.equal(parseColorFgBg('junk'), null)
   })
 
-  it('autoThemeFor picks cobalt for dark, paper for light', () => {
-    assert.equal(autoThemeFor('dark'), 'cobalt')
+  it('autoThemeFor picks graphite for dark, paper for light', () => {
+    assert.equal(autoThemeFor('dark'), 'graphite')
     assert.equal(autoThemeFor('light'), 'paper')
   })
 })

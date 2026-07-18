@@ -329,6 +329,51 @@ describe('work-order contract', () => {
     assert.equal(order.domain, 'frontend')
   })
 
+  it('authorityReason: omitted when no authority; hit reason when matches; 显式指定 otherwise', () => {
+    const none = createReadOnlyWorkOrder({
+      id: 'wo_ar_none',
+      parentTurnId: 'turn_1',
+      kind: 'code_search',
+      profile: 'code_scout',
+      objective: '重构优化性能',
+      scope: {},
+    })
+    assert.equal(none.authorityReason, undefined)
+
+    const hit = createWriteWorkOrder({
+      id: 'wo_ar_hit',
+      parentTurnId: 'turn_1',
+      kind: 'patch_proposal',
+      objective: '重构优化性能',
+      scope: { files: ['a.ts'] },
+      authority: 'tianfu',
+    })
+    assert.ok(hit.authorityReason?.startsWith('命中:'), hit.authorityReason)
+
+    const override = createWriteWorkOrder({
+      id: 'wo_ar_ov',
+      parentTurnId: 'turn_1',
+      kind: 'patch_proposal',
+      objective: '重构优化性能',
+      scope: { files: ['a.ts'] },
+      authority: 'tianquan',
+    })
+    assert.equal(override.authorityReason, '显式指定')
+
+    // Fail-closed tools whitelist still applies for unknown authority
+    const unknown = createReadOnlyWorkOrder({
+      id: 'wo_ar_unk',
+      parentTurnId: 'turn_1',
+      kind: 'code_search',
+      profile: 'code_scout',
+      objective: 'scan',
+      scope: {},
+      authority: 'not_a_real_domain',
+    })
+    assert.equal(unknown.authorityReason, '显式指定')
+    assert.deepEqual(unknown.allowedTools, [])
+  })
+
   it('creates write work order with domain field', () => {
     const order = createWriteWorkOrder({
       id: 'wo_write_domain',

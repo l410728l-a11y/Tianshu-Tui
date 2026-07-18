@@ -16,6 +16,7 @@
 
 import { isScratchPath, type TddGateState } from './evidence.js'
 import type { ImmuneContextHint } from './immune-context.js'
+import type { StructureFlowSnapshot } from './structure-flow-controller.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -249,14 +250,29 @@ export function checkTddGate(input: TddGateInput): ImmuneContextHint | null {
 export function buildTddGateHint(
   state: TddGateState,
   config: TddGateConfig,
+  /**
+   * P2 阴阳调度：structure-flow 快照的 advisory 投影。**只**影响提示文案的
+   * 频率——flow 模式且无验证债务时，1-2 次编辑的探索窗口不出提示（降噪）；
+   * `tddRecommendation='suggest'`（验证债务/失败测试）时无论 mode 都保持
+   * 提示。绝不影响 {@link evaluateTddGate} 的 allow/block 判定。缺省 = 旧行为。
+   */
+  structureFlow?: Pick<StructureFlowSnapshot, 'mode' | 'tddRecommendation'> | null,
 ): ImmuneContextHint | null {
   if (!config.enabled) return null
   if (state.filesModified === 0) return null
   // Doc-only edits: no hint needed — there are no tests to run.
   if (!state.hasCodeEdits) return null
 
+  // P2 flow 降噪：健康心流 + 无债务信号 + 编辑数在阈值探索窗口内 → 跳过
+  // 本轮提示（阈值达到后照常提示；hasFailedTests / suggest 推荐恒不降噪）。
+  const flowQuiet = structureFlow?.mode === 'flow'
+    && structureFlow.tddRecommendation === 'neutral'
+    && !state.hasFailedTests
+    && state.editsSinceLastTest < config.threshold
+
   // Zero verifications: edits accumulating without any test run.
   if (state.verifications === 0 && state.editsSinceLastTest > 0) {
+    if (flowQuiet) return null
     return {
       level: 'warning',
       signalKinds: ['tdd_violation'],

@@ -8,6 +8,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { ANTI_INTERACTIVE_ENV } from '../tools/resolved-env.js'
 
 export type HookEvent =
   | 'preTurn'
@@ -59,11 +60,29 @@ export function loadHooksConfig(cwd: string): HooksConfig {
   }
 }
 
-export function runHooksForEvent(cwd: string, ctx: HookContext): HookResult[] {
+/** A hook contributed by a plugin (absolute script path + source plugin name).
+ *  Mirrors PluginHookEntry from plugin-loader but kept structural to avoid the
+ *  hooks layer importing the plugins layer. */
+export interface PluginHook {
+  pluginName: string
+  event: HookEvent
+  /** Absolute path to the script (plugin-loader resolved it). */
+  script: string
+  timeoutMs?: number
+}
+
+export function runHooksForEvent(cwd: string, ctx: HookContext, pluginHooks?: PluginHook[]): HookResult[] {
   const config = loadHooksConfig(cwd)
+  // Merge plugin-contributed hooks (absolute script paths) with project hooks.
+  const projectHooks: HookEntry[] = config.hooks.filter(h => h.event === ctx.event)
+  const pluginEntries: HookEntry[] = (pluginHooks ?? [])
+    .filter(h => h.event === ctx.event)
+    .map(h => ({ event: h.event, script: h.script, timeoutMs: h.timeoutMs }))
+  const entries = [...projectHooks, ...pluginEntries]
   const results: HookResult[] = []
 
-  for (const entry of config.hooks.filter(h => h.event === ctx.event)) {
+  for (const entry of entries) {
+    // Plugin hooks arrive with absolute paths; project hooks may be relative.
     const scriptPath = isAbsolute(entry.script)
       ? entry.script
       : join(cwd, entry.script)
@@ -76,6 +95,7 @@ export function runHooksForEvent(cwd: string, ctx: HookContext): HookResult[] {
     const timeoutMs = entry.timeoutMs ?? 5000
     const env = {
       ...process.env,
+      ...ANTI_INTERACTIVE_ENV,
       RIVET_HOOK_EVENT: ctx.event,
       RIVET_SESSION_ID: ctx.sessionId ?? '',
       RIVET_TURN: String(ctx.turn ?? ''),

@@ -53,6 +53,11 @@ export const CORE_TOOLS = [
   // 浏览器联调与 UI 视觉验证（2026-07-15 从 EXTENDED 升入）：改 UI 不看渲染
   // 是高频失败模式，browser_debug 是渲染验证闭环的主工具，主控必须恒可见。
   'browser_debug',
+  // PAL 攻坚案件账本（2026-07-17 直入 CORE，预算 26→27）：攻坚场景在会话
+  // 中期才出现，EXTENDED 中途挂载 = 改 tool fingerprint = 200K 前缀全量重建
+  // （DeepSeek V4 创建 ¥3/M、高峰 ¥6/M，一次一两块）；早期窗口挂载则等于
+  // 没有这个功能。常驻是唯一缓存零成本方案——schema 字节稳定进冻结前缀。
+  'attack_case',
 ] as const
 
 /**

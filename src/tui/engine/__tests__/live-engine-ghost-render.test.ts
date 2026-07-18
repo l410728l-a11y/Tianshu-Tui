@@ -651,3 +651,55 @@ test('spinner 行含 …· 经 clampLine 不折行（rowsForLine 一致）', () 
   assert.equal(Math.ceil(displayWidth(clamped, { ambiguousAsWide: true }) / cols), 1, 'wide 口径占 1 行')
   assert.equal(Math.ceil(displayWidth(clamped) / cols), 1, 'narrow 口径占 1 行（rowsForLine 不论口径都对）')
 })
+
+
+// ── resize × CPR 污染恢复并发：变窄 reflow 撑高区域后爬升不足的叠屏回归 ─────
+// 用户报告：缩放终端时输入框叠成多份（旧帧顶部 — 顶框+输入行成对残留）。
+// 根因：resize 变窄后旧帧被终端 reflow 撑高（4 行 → 10+ 行），reflow 移动光标
+// 又触发 CPR 污染判定；polluted 恢复路径的 climb = min(lastDisplayRows-1,
+// cprReportRow-1) 直接沿用**旧宽度**的行数计数（4），爬升 3 只擦到底部几行，
+// 旧帧顶部残留进 scrollback = 叠屏。修复：polluted 路径先 reconcileWidth()
+// （按新宽从 lineCache 重算屏上行数），爬升量与 reflow 后屏上实际一致。
+
+test('resize 变窄 × CPR 污染并发：恢复重铺按新宽爬升，不残留旧帧顶部', () => {
+  const color = (s: string, c: string): string => `\x1B[38;5;${c}m${s}\x1B[39m`
+
+  // 1) 110 列下渲染 4 行帧（新输入框形态：顶框标签 + 输入行 + 底框 + 状态行）
+  const term110 = new ScreenTerminal(110, 40)
+  const engine = new LiveEngine({ stdout: asStdout(term110), reservedRows: 0, maxRows: 20 })
+  const top = color(`╭─ 天枢 ${'─'.repeat(100)}╮`, '140')
+  const input = color(`│ ❯ █询问任何事${' '.repeat(95)}│`, '140')
+  const bot = color(`╰${'─'.repeat(106)}╯`, '140')
+  const status = color('  longcat ⚡- 0s  ⏵ yolo (shift+tab)', '140')
+  engine.render(lines(top, input, bot, status))
+  // 建立 CPR 基线：光标在区域末行（4 行帧，1-based row 4）
+  engine.noteCpr(4, 1)
+  term110.flush()
+
+  // 2) 模拟 resize 变窄 110→44：真实终端把旧帧 reflow 撑高。ScreenTerminal 不
+  //    自动 reflow——新建 44 列终端重放旧帧模拟屏上状态（光标落在末行末尾，
+  //    与真实 reflow 后的驻停一致），并把引擎的 stdout 切到 44 列终端。
+  const term44 = new ScreenTerminal(44, 40)
+  term44.write([top, input, bot, status].join('\n'))
+  ;(engine as any).stdout = asStdout(term44)
+
+  // 3) reflow 移动了光标 → 后续 CPR 响应行偏离基线 → 污染判定
+  //    （44 列下旧帧折成 3+3+3+1=10 行，末行 1-based row 10）
+  engine.noteCpr(10, 1)
+
+  // 4) 污染恢复重铺：44 列新帧
+  const top2 = color(`╭─ 天枢 ${'─'.repeat(34)}╮`, '140')
+  const input2 = color(`│ ❯ █询问任何事${' '.repeat(26)}│`, '140')
+  const bot2 = color(`╰${'─'.repeat(40)}╯`, '140')
+  const status2 = color('  longcat ⚡- 0s', '140')
+  engine.render(lines(top2, input2, bot2, status2))
+
+  // 5) 屏上不应残留旧帧任何片段：每个框线元素只剩 1 份
+  const screen = term44.getRowsFrom(0).join('\n')
+  const tulCount = screen.split('╭').length - 1
+  const botCount = screen.split('╰').length - 1
+  const statusCount = (screen.match(/longcat/g) ?? []).length
+  assert.equal(tulCount, 1, `╭ 出现 ${tulCount} 次，预期 1 — 旧帧顶部残留 = resize 叠屏`)
+  assert.equal(botCount, 1, `╰ 出现 ${botCount} 次，预期 1 — 旧底框残留`)
+  assert.equal(statusCount, 1, `状态行出现 ${statusCount} 次，预期 1 — 旧状态行残留`)
+})

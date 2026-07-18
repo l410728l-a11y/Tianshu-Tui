@@ -18,6 +18,8 @@ export interface DelegationActivity {
   profile?: string
   /** 星域 id（星名来源），从 WorkerActivityEvent.authority 透传。 */
   authority?: string
+  /** Why this authority was chosen (from WorkOrder.authorityReason). */
+  authorityReason?: string
   status: 'running' | 'passed' | 'failed' | 'blocked' | 'escalated'
   /** Latest worker activity line (running) or terminal summary. */
   progressLine?: string
@@ -26,9 +28,13 @@ export interface DelegationActivity {
   /** 该 worker 累计 token 总数（input+output，来自 turn 事件的累计快照）。 */
   tokenCount?: number
   /** 原始活动事件种类（worker 消息镜像 store 重建消息流用；terminal 事件缺省）。 */
-  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn'
+  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
   /** 原始事件内容：text/thinking 为 delta，tool_use/tool_result 为工具名。 */
   eventDetail?: string
+  /** Terminal failure classification (WorkerFailureReason in agent/work-order.ts;
+   *  typed as string here to avoid a tools→agent dependency). Present only on
+   *  terminal blocked/failed events. */
+  failureReason?: string
   /** Actual model dispatched for this worker (insights / cost visualization). */
   model?: string
   /** Provider name for this worker (insights / cost visualization). */

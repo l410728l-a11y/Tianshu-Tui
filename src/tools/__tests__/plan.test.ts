@@ -486,6 +486,95 @@ describe('plan tool submit', () => {
     assert.ok(result.content.includes('Plan submitted'))
   })
 
+  // ── 软门禁聚合：一次拒绝列全所有缺口 ──
+  it('reports all unmet soft gates in a single rejection (aggregated gates)', async () => {
+    const tasks = Array.from(
+      { length: PLAN_SCALE_TASK_THRESHOLD + 1 },
+      (_, i) => `- [ ] 任务 ${i + 1} — 修改 \`src/foo.ts\``,
+    )
+    const plan = ['## 根因分析', '范围很大。', '', '## 实现方案', ...tasks].join('\n')
+
+    const first = await execute({ action: 'submit', title: 'Aggregated Gates Plan', plan })
+    assert.equal(first.isError, true)
+    assert.ok(first.content.includes('共 3 项缺口'), first.content)
+    assert.ok(first.content.includes('no Mermaid diagram'), first.content)
+    assert.ok(first.content.includes('瑶光反证'), first.content)
+    assert.ok(first.content.includes('规模超阈值'), first.content)
+    assert.ok(!existsSync(join(dir, '.rivet/plans/aggregated-gates-plan.md')), 'not persisted while gates unmet')
+
+    // one-shot 语义不变：同 title 重提放行（各项已警告过）
+    const second = await execute({ action: 'submit', title: 'Aggregated Gates Plan', plan })
+    assert.ok(!second.isError, second.content)
+    assert.ok(second.content.includes('Plan submitted'))
+  })
+
+  // ── 指针回传门禁（2026-07-18 事故：两份计划文件被写成显示指针）──
+  it('rejects a regurgitated pointer as plan content, even after soft-gate warnings', async () => {
+    const realPlan = [
+      '## 根因分析',
+      '边界条件未重置。',
+      '',
+      '## 实现方案',
+      '修改 `src/foo.ts`。',
+    ].join('\n')
+
+    const first = await execute({ action: 'submit', title: 'Pointer Incident Plan', plan: realPlan })
+    assert.equal(first.isError, true)
+    assert.ok(first.content.includes('no Mermaid diagram'), first.content)
+    assert.ok(first.content.includes('瑶光反证'), first.content)
+
+    // 该提交的 plan 字段在历史里已被 arg processor 改写成显示指针；模型回传指针重提
+    const pointer = '[plan persisted to .rivet/plans/pointer-incident-plan.md — 5 lines, 100 chars. #RIVET-POINTER-DISPLAY-ONLY# Use read_file to review.]'
+    const second = await execute({ action: 'submit', title: 'Pointer Incident Plan', plan: pointer })
+    assert.equal(second.isError, true)
+    assert.ok(second.content.includes('pointer placeholder from message history'), second.content)
+    assert.ok(
+      !existsSync(join(dir, '.rivet/plans/pointer-incident-plan.md')),
+      'pointer must never be persisted as the plan file',
+    )
+  })
+
+  it('rejects plan content with a pointer line embedded mid-text', async () => {
+    const plan = [
+      '## 根因分析',
+      '边界未重置。',
+      '',
+      '[plan persisted to .rivet/plans/mid-pointer-plan.md — 5 lines, 100 chars. #RIVET-POINTER-DISPLAY-ONLY# Use read_file to review.]',
+      '',
+      '## 实现方案',
+      '```mermaid',
+      'flowchart TD',
+      '    A --> B',
+      '```',
+      '',
+      '修改 `src/foo.ts`。',
+    ].join('\n') + FALSIFICATION
+
+    const result = await execute({ action: 'submit', title: 'Mid Pointer Plan', plan })
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('pointer placeholder from message history'), result.content)
+    assert.ok(!existsSync(join(dir, '.rivet/plans/mid-pointer-plan.md')))
+  })
+
+  it('rejects a draft whose content is a pointer placeholder (draft-read path)', async () => {
+    const draftPath = '.rivet/plans/draft-1784354439999.md'
+    const abs = join(dir, draftPath)
+    mkdirSync(dirname(abs), { recursive: true })
+    writeFileSync(
+      abs,
+      '[plan persisted to .rivet/plans/pointer-draft-plan.md — 5 lines, 100 chars. #RIVET-POINTER-DISPLAY-ONLY# Use read_file to review.]\n',
+      'utf-8',
+    )
+
+    const result = await execute(
+      { action: 'submit', title: 'Pointer Draft Plan' },
+      { activePlanFilePath: draftPath },
+    )
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('pointer placeholder from message history'), result.content)
+    assert.ok(!existsSync(join(dir, '.rivet/plans/pointer-draft-plan.md')))
+  })
+
   it('rejects reserved option labels', async () => {
     const plan = [
       '## 根因分析',

@@ -3,7 +3,9 @@ import type { PlanExecutionTrace, StepResult } from './plan-execution-trace.js'
 import type { PlanStepInput } from '../tools/types.js'
 
 type PlanStepLike = PlanStepInput | string
-import { correctPlan, injectReplanContext } from './replan-loop.js'
+import { correctPlan, injectReplanContext, type ReplanPalContext } from './replan-loop.js'
+import { chooseDiscriminator } from './problem-attack-loop.js'
+import type { ProblemAttackStore } from './problem-attack-loop.js'
 import { wrapSystemReminder } from '../prompt/system-reminder.js'
 import type { TaskDepthLayer } from '../context/task-contract.js'
 
@@ -17,6 +19,8 @@ export interface PlanTraceCoordinatorDeps {
   getTraceStore: () => import('./trace-store.js').TraceStore | null
   addSystemReminder: (content: string) => void
   setPlanTraceAppendix: (appendix: string | null) => void
+  /** PAL 第四波 W2：单向只读 PAL store（不修改）。缺省 = replan 不感知案件。 */
+  getProblemAttackStore?: () => ProblemAttackStore | null
 }
 
 export class PlanTraceCoordinator {
@@ -44,6 +48,21 @@ export class PlanTraceCoordinator {
     return { stepId, turnNumber: turn, toolCalls, status: failed ? 'blocked' : 'done' }
   }
 
+  /** W2：从 PAL store 派生只读 replan 上下文（第一个活跃案件 + 下一探针建议）。
+   *  store 缺席 / 无活跃案件 → null（replan 保持原文案）。读取绝不修改 PAL。 */
+  private palContextForReplan(): ReplanPalContext | null {
+    const store = this.deps.getProblemAttackStore?.() ?? null
+    if (!store) return null
+    const active = store.activeCases()
+    const first = active[0]
+    if (!first) return null
+    const probe = chooseDiscriminator(first)
+    return {
+      caseId: first.caseId,
+      nextProbe: probe ? `${probe.id}（${probe.kind}→${probe.target}）` : null,
+    }
+  }
+
   /** U6: turn-boundary deviation check. No-op until trace has steps. */
   runReplanCheck(): void {
     const pt = this.deps.getPlanTrace()
@@ -56,9 +75,10 @@ export class PlanTraceCoordinator {
       this.deps.getConsecutiveNoToolTurns(),
     )
     if (deviation.type !== 'none') {
-      const { trace, addedSteps } = correctPlan(pt, deviation)
+      const pal = this.palContextForReplan()
+      const { trace, addedSteps } = correctPlan(pt, deviation, pal)
       this.deps.setPlanTrace(trace)
-      const ctx = injectReplanContext(deviation, addedSteps)
+      const ctx = injectReplanContext(deviation, addedSteps, pal)
       if (ctx.text && ctx.text !== this.deps.getLastReplanInjection()) {
         this.deps.setLastReplanInjection(ctx.text)
         this.deps.addSystemReminder(ctx.text)

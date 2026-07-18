@@ -13,12 +13,20 @@ import type { ToolErrorClass } from '../tools/types.js'
 import { EvidenceTracker } from './evidence.js'
 import { ObligationTracker } from './obligation-tracker.js'
 import { computeVerifyFailStreak, createCvmVectorEvaluator, cvmVectorMode, type CvmVectorMode } from './hooks/cognitive-capsule-router.js'
+import { ProblemAttackStore } from './problem-attack-loop.js'
 import { TurnHarness } from './turn-harness.js'
 import { TrajectoryRecorder } from './trajectory.js'
 import { createTraceStore, type TraceStore } from './trace-store.js'
 import { getDoomLoopLevel, getClassDoomLoopLevel, combineDoomLoopLevels, getDoomLoopThresholds } from './trace-store.js'
-import { classifyActivityMode, evaluateConvergence, PRODUCTIVE_TOOLS } from './convergence-detector.js'
+import { classifyActivityMode, computeFlowBeacon, evaluateConvergence, FLOW_MIN_SAMPLES, PRODUCTIVE_TOOLS } from './convergence-detector.js'
 import type { PhaseClass, ConvergenceResult } from './convergence-detector.js'
+import { computeStructureFlowControl } from './structure-flow-controller.js'
+import type { StructureFlowSnapshot } from './structure-flow-controller.js'
+import { assembleCognitiveFrame, projectStructureFlowInputs } from './cognitive-frame.js'
+import type { CognitiveFrame } from './cognitive-frame.js'
+import { buildCognitiveFrameRecord, buildCognitiveFrameLiteRecord } from './cognitive-frame-replay.js'
+import { createFrameRecorder } from './frame-telemetry.js'
+import type { FrameRecorder } from './frame-telemetry.js'
 import { emitStopReason, stopReasonAbortTag, type StopReason } from './stop-reason.js'
 import type { PlanExecutionTrace, StepResult } from './plan-execution-trace.js'
 import { buildGateConvergenceHint } from './delivery-gate-v2.js'
@@ -212,6 +220,9 @@ export class AgentLoop {
   askModeState: AskModeState = 'off'
   /** 主动 plan mode 建议的 one-shot 记忆：已建议过的 contract id（选「直接执行」后不复问）。 */
   planModeSuggestedContracts = new Set<string>()
+  /** W3：A 前置对齐 advisory 已触发过的契约 key（collab:align:<contractId>）——
+   *  每契约至多一次，澄清（新契约）后可再次触发。 */
+  collabAlignFiredContracts = new Set<string>()
   /** Plan mode 状态变更通知 — server 层订阅后转发 plan_mode SSE（桌面切 Plan tab）。
    *  覆盖模型自主 enter_mode 的场景：session-manager 自己触发的切换它已经知道，
    *  工具触发的切换只能靠这条回调出圈。agent 创建后由外部回填。 */
@@ -251,6 +262,17 @@ export class AgentLoop {
   /** U6: most recent convergence-detector result — consumed by the replan loop's
    *  detectDeviation (blocked/stalled signals). Null until first convergence check. */
   latestConvergenceResult: ConvergenceResult | null = null
+  /** P2 阴阳调度：本 turn 的 structure-flow 控制快照（EFE 就绪时每次
+   *  runConvergenceCheck 重算；EFE 缺失 = null → 一切消费方走旧行为）。
+   *  只读事实，供 convergence 软阈值 / plan advisory / tdd 投影消费。 */
+  latestStructureFlow: StructureFlowSnapshot | null = null
+  /** P3 认知帧：本 turn 边界的只读事实帧（每次 runConvergenceCheck 重装配，
+   *  恒产出——EFE 缺失时以 quality 标记而非置 null）。structure-flow 输入
+   *  由它投影导出（单一装配点）；Wave 3 起同时作为回放遥测的记录源。 */
+  latestCognitiveFrame: CognitiveFrame | null = null
+  /** P2 plan advisory 去重键（session 级 one-shot）。用户干预与 plan
+   *  生命周期（enter/exit）时清空，允许在新语境下重新建议。 */
+  readonly structureFlowPlanAdvisoryKeys = new Set<string>()
   /** Most recent structured stop-reason (why the last turn loop ended). */
   latestStopReason: StopReason | null = null
   /** Fix 1 — convergence emission cooldown with backoff. The L2 side-effects
@@ -311,6 +333,9 @@ export class AgentLoop {
   /** anchor-break-scout 已在本 session 派发过视角侦察（CV2 让位判据）。
    *  scout 是 opt-in（antiAnchoring），默认会话恒 false。 */
   anchorScoutOwned = false
+  /** PAL 攻坚层（计划 v2）：会话级案件容器。attack_case 工具与
+   *  problem-attack-hook 共享同一实例；所有状态迁移经纯 reducer 单入口。 */
+  readonly problemAttack = new ProblemAttackStore()
   /** Phase 0 观测 — guardian（CCR / 改道 / kick）触发计数。会话内累计，
    *  随遥测与 session meta 落盘，让"守护链路被静音"从体感问题变成数据问题。 */
   readonly guardianActivity: {
@@ -524,6 +549,8 @@ export class AgentLoop {
   lastSeenEventId = 0
   gitChangeRate = 0
   telemetryWriter: TelemetryWriter
+  /** P3-D：frame 全量记录的独立落盘通道（frames.jsonl，默认开）。 */
+  frameRecorder: FrameRecorder
   baselineFingerprint: PrefixFingerprint | null = null
   sensoriumSnapshots: SensoriumEntry[] = []
   taskContract?: TaskContract
@@ -676,6 +703,7 @@ export class AgentLoop {
     this.resourceSensor = new ResourceSensor(this.config.resourceSensorOptions)
     this.fsWatcher = this.config.fsWatcherEnabled === false ? null : createFsWatcher({ cwd: this.cwd })
     this.telemetryWriter = createTelemetryWriter(this.cwd, this.config.sessionId)
+    this.frameRecorder = createFrameRecorder(this.cwd, this.config.sessionId)
     const sessionDir = join(getSessionDir(this.cwd), this.config.sessionId ?? 'anon')
     const pheromonesPath = join(sessionDir, 'pheromones.json')
     this.stigmergyStore = new StigmergyStore(pheromonesPath)
@@ -976,7 +1004,12 @@ export class AgentLoop {
 
   bindSessionDomain(taskDescription: string): void {
     if (this.sessionDomain !== undefined) return
-    this.sessionDomain = isStarSoulEnabled() ? buildActiveDomain(taskDescription) : null
+    // domainKeywordRouting 默认 false：Auto 固定开阳，不按消息 matchDomain。
+    this.sessionDomain = isStarSoulEnabled()
+      ? buildActiveDomain(taskDescription, {
+          keywordRouting: this.config.domainKeywordRouting === true,
+        })
+      : null
     this.config.promptEngine.setActiveDomain(this.withDomainKnowledge(this.sessionDomain))
   }
 
@@ -1494,6 +1527,8 @@ export class AgentLoop {
       try { this.onAskModeChange?.('off') } catch { /* non-fatal */ }
     }
     this.planModeState = 'planning'
+    // P2 plan advisory 去重键随生命周期清空——新的 planning 语境允许新建议。
+    this.structureFlowPlanAdvisoryKeys.clear()
     // Re-entering cancels any pending exit reminder from a prior exit.
     this.config.promptEngine.setPlanExitReminderPending(false)
     this.config.promptEngine.setActivePlan(null)
@@ -1532,6 +1567,8 @@ export class AgentLoop {
   /** Exit plan mode — user approved, all tools allowed */
   exitPlanMode(): void {
     this.planModeState = 'off'
+    // P2 plan advisory 去重键随生命周期清空。
+    this.structureFlowPlanAdvisoryKeys.clear()
     this.config.promptEngine.setPlanExitReminderPending(true)
     this.releasePlanModeArtifacts()
     this.syncPlanModeToConfig()
@@ -2004,6 +2041,78 @@ export class AgentLoop {
     return this.reasoningEffort.applyDelta(baseEffort)
   }
 
+  /**
+   * P3 认知帧：turn 边界的**单一装配点**——loop 控制路径上唯一直读
+   * sensorium / latestPolicySignals / PAL / evidence 做控制用途的位置。
+   * 全部事实先进 frame（含质量语义），控制器输入由 frame 投影导出。
+   * frame 恒产出（EFE 缺失时 quality.efe='missing'）；纯组装，无 IO。
+   */
+  private assembleBoundaryFrame(
+    turn: number,
+    phaseClass: string,
+    todoCompletedDelta: number,
+    userMessageConsumed: boolean,
+  ): CognitiveFrame {
+    // flow 信号复用 P1 的 computeFlowBeacon。窗口取整个保留历史（容量 5，
+    // ≤ 各 tier signalWindow），与 detector 内部 slice(-signalWindow) 对
+    // 5 条历史的结果一致——不引入第二个窗口语义。
+    const momentumHasData = this.sensorium
+      ? (this.sensorium.quality?.momentum ?? 'measured') !== 'no-data'
+      : false
+    const beacon = this.sensorium && momentumHasData
+      ? computeFlowBeacon({
+        momentum: this.sensorium.momentum,
+        momentumHasData,
+        stability: this.sensorium.stability,
+        recentToolHistory: this.recentToolHistory,
+        todoCompletedDelta,
+        signalWindow: Math.max(1, this.recentToolHistory.length),
+      })
+      : null
+
+    // 连续失败：工具历史尾部连续 failed（running 在途样本跳过不断链，
+    // 与 P1 flow beacon 的 settled-only 口径一致）。
+    let consecutiveFailures = 0
+    for (let i = this.recentToolHistory.length - 1; i >= 0; i--) {
+      const status = this.recentToolHistory[i]!.status
+      if (status === 'failed') consecutiveFailures++
+      else if (status === 'success') break
+    }
+
+    // 验证债务 = 验证实际失败过，或未验证编辑积累到 TDD gate 硬闸阈值（3）。
+    // 不用「存在任何未验证编辑」——正常的编辑→验证节奏会瞬时经过该状态，
+    // 拿它 hardTighten 等于取消 P1 对健康构建流的保护。
+    const gateState = this.evidence.getGateState()
+    const hasVerificationDebt = this.evidence.getState().deliveryStatus === 'failed'
+      || gateState.editsSinceLastTest >= 3
+
+    return assembleCognitiveFrame({
+      turn,
+      phaseClass,
+      efe: this.latestPolicySignals?.efe ?? null,
+      sensorium: this.sensorium
+        ? { momentum: this.sensorium.momentum, momentumHasData, stability: this.sensorium.stability }
+        : null,
+      flow: {
+        score: beacon?.score ?? null,
+        sampleCount: beacon?.sampleCount ?? 0,
+        requiredSamples: FLOW_MIN_SAMPLES,
+      },
+      pal: this.problemAttack.snapshotForCvm(),
+      evidence: {
+        hasVerificationDebt,
+        deliveryStatus: this.evidence.getState().deliveryStatus,
+        consecutiveFailures,
+      },
+      user: { intervened: userMessageConsumed },
+      // 控制器语义的「活跃计划上下文」在投影层展开为 activePlanFile ||
+      // planning（projectStructureFlowInputs）；detector 的
+      // progressBeacons.activePlan 保持只看批准计划文件，两个语义不混用。
+      plan: { activePlanFile: this.activePlanFilePath !== null, planModeState: this.planModeState },
+      progress: { todoCompletedDelta },
+    })
+  }
+
   async runConvergenceCheck(
     turn: number,
     phaseClass: string,
@@ -2022,6 +2131,8 @@ export class AgentLoop {
       this.consecutiveNoToolTurns = 0
       // 缺口 C 意图锚点:steer 注入 = 用户刚重申过意图,stale 计时重置
       this.lastUserInputRunTurn = turn
+      // P2 plan advisory：用户刚说话 = 新语境，允许重新建议（去重键清空）。
+      this.structureFlowPlanAdvisoryKeys.clear()
     }
 
     // W1 — 阶段相对轮数：phase 切换即重置基线，文案与判定引用的是"本阶段"
@@ -2057,6 +2168,21 @@ export class AgentLoop {
     const warnedInEarlierTurn = this.lastConvergenceEmitLevel >= 2
       && this.lastConvergenceEmitTurn < turn
 
+    // P3 认知帧：先装配 turn 边界事实帧（单一装配点），再投影出 P2 控制器
+    // 输入。EFE 质量非 measured → 投影 null → latestStructureFlow=null，
+    // 与 P2「EFE 缺失 → 旧行为」路径逐字节一致。
+    // P2 阴阳调度：互斥仲裁——快照合格（非 missing-data）时只传
+    // structureRelaxation、不传 flowInputs（同一 flow 信号绝不计两次）。
+    this.latestCognitiveFrame = this.assembleBoundaryFrame(turn, phaseClass, todoCompletedDelta, userMessageConsumed)
+    const structureFlowInputs = projectStructureFlowInputs(this.latestCognitiveFrame)
+    this.latestStructureFlow = structureFlowInputs
+      ? computeStructureFlowControl(structureFlowInputs)
+      : null
+    const structureRelaxation = this.latestStructureFlow !== null
+      && !this.latestStructureFlow.reasons.includes('missing-data')
+      ? this.latestStructureFlow.relaxation
+      : null
+
     const convergenceCheck = evaluateConvergence({
       turn,
       phaseClass: phaseClass as PhaseClass,
@@ -2075,10 +2201,28 @@ export class AgentLoop {
       progressBeacons: {
         todoCompletedDelta,
         activePlan: this.activePlanFilePath !== null,
+        // P2 快照合格 → 单声源接管软阈值；否则 P1 心流保护：Sensorium 原始
+        // 快照三字段透传——工具成功率与推进因子由 detector 内部按
+        // tier.signalWindow 计算（窗口与其它信号一致）。Sensorium 缺失 →
+        // 不传 → 不进入保护态，旧行为不变。P3 起从认知帧投影取数（单一
+        // 装配点），字段与旧直读逐位一致。
+        ...(structureRelaxation !== null ? { structureRelaxation } : (this.latestCognitiveFrame?.facts.sensorium ? {
+          flowInputs: { ...this.latestCognitiveFrame.facts.sensorium },
+        } : {})),
       },
       activityMode,
     })
     this.latestConvergenceResult = convergenceCheck
+    // P3 Wave 3 / P3-D：认知帧回放遥测。full 记录（facts 全量，可回放重算）
+    // 默认落会话目录 frames.jsonl（独立通道，RIVET_FRAME_TELEMETRY=0 可关）；
+    // lite 摘要（<200B）继续走 sensorium.jsonl。recorder 关闭时连记录构建
+    // 也跳过。写失败绝不阻断 loop。
+    try {
+      if (this.frameRecorder.enabled) {
+        this.frameRecorder.write(buildCognitiveFrameRecord(this.latestCognitiveFrame, this.latestStructureFlow, convergenceCheck))
+      }
+      this.telemetryWriter.write(buildCognitiveFrameLiteRecord(this.latestCognitiveFrame, this.latestStructureFlow, convergenceCheck))
+    } catch { /* telemetry is diagnostics-only */ }
     // Maintain rolling score history for L3 decline-trend detection (sliding window ≤ 20)
     this.convergenceScoreHistory.push(convergenceCheck.score)
     if (this.convergenceScoreHistory.length > 20) this.convergenceScoreHistory.shift()

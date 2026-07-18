@@ -33,6 +33,18 @@ export interface TaskListOptions {
   showProgressBar?: boolean
 }
 
+/**
+ * 任务面板显隐门禁。run 空闲且所有条目已完成时隐藏——审查/执行结束后面板
+ * 应立即消失，而不是常驻到进程退出（此前 state.todos 无任何清除路径，面板
+ * 永久渲染，并作为 chrome 首元素在超屏/行宽少算时被反复挤入 scrollback，
+ * 形成同一块的多份副本）。运行中或仍有未完成项时显示。
+ */
+export function shouldShowTaskPanel(items: readonly TodoItem[], phase: string): boolean {
+  if (items.length === 0) return false
+  if (phase === 'idle' && items.every(t => t.status === 'completed')) return false
+  return true
+}
+
 /** 三态字形（与 Claude Code 对齐）。 */
 function glyphFor(status: TodoItem['status']): string {
   switch (status) {
@@ -88,7 +100,10 @@ export function formatTaskList(items: TodoItem[], theme: RivetTheme, opts: TaskL
   const width = opts.width ?? 80
   const maxRows = Math.max(3, opts.maxRows ?? 6)
   const showProgressBar = opts.showProgressBar === true
-  const maxContentWidth = Math.max(8, width - 4)
+  // 留 1 列安全边距（对齐 app.ts clampLine 的 maxWidth-1）：满列行在 CJK 终端
+  // 触发 wrap-pending，屏上折成 2 行而 rowsForLine 只按 1 行爬升——旧帧顶部
+  // （面板恰是 chrome 首元素）残留并被挤入 scrollback，形成面板副本。
+  const maxContentWidth = Math.max(8, width - 5)
 
   const lines: string[] = []
   const completed = items.filter(t => t.status === 'completed')

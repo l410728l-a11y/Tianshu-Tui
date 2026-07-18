@@ -119,11 +119,16 @@ describe('formatMarkdown', () => {
     assert.ok(line.includes('world'))
   })
 
-  it('renders code blocks with borders', () => {
+  it('renders code blocks without copy-blocking borders', () => {
     const lines = formatMarkdown({ text: '```\ncode\n```', columns: 80 }, theme)
-    assert.ok(lines.some(l => stripAnsi(l).includes('┌')))
-    assert.ok(lines.some(l => stripAnsi(l).includes('code')))
-    assert.ok(lines.some(l => stripAnsi(l).includes('└')))
+    const plain = lines.map(l => stripAnsi(l))
+    // 语言标签 + 代码内容仍在
+    assert.ok(plain.some(l => l.includes('code')), 'code content present')
+    assert.ok(plain.some(l => /code/.test(l)), 'language label present')
+    // 不含会污染选区复制的 box-drawing 边框字符
+    assert.ok(!plain.some(l => l.includes('┌')), 'no top-left border')
+    assert.ok(!plain.some(l => l.includes('└')), 'no bottom-left border')
+    assert.ok(!plain.some(l => /^│/.test(l)), 'no left vertical bar on code lines')
   })
 
   it('renders headers with glyphs', () => {

@@ -41,6 +41,7 @@ import { createEditToolAdvisoryHook } from './hooks/edit-tool-advisory-hook.js'
 import { createEditFailureRecoveryHook } from './hooks/edit-failure-recovery-hook.js'
 import { createLossyObservationHook } from './hooks/lossy-observation-hook.js'
 import { createCompactionAmnesiaHook, type CompactionAmnesiaHookDeps } from './hooks/compaction-amnesia-hook.js'
+import { createSearchPodHook, type SearchPodHookDeps } from './hooks/search-pod-hook.js'
 import { createPointerRegurgitationHook } from './hooks/pointer-regurgitation-hook.js'
 import { createErrorDiagnosisHook } from './hooks/error-diagnosis-hook.js'
 import { createProbeTrackingHook } from './hooks/probe-tracking-hook.js'
@@ -79,6 +80,7 @@ import type { DomainVoiceId } from './domain-voice.js'
 import type { ContextClaim } from '../context/claims.js'
 import type { MeridianIndexer } from '../repo/meridian-indexer.js'
 import type { PhysarumShadowStats } from '../repo/physarum-shadow-stats.js'
+import { createProblemAttackHooks, palMode } from './hooks/problem-attack-hook.js'
 
 export interface RuntimeHookDeps {
   stigmergyDeposit: (deposit: any) => Promise<void>
@@ -226,6 +228,10 @@ export interface RuntimeHookDeps {
   onCcrTrigger?: (event: CcrTriggerEvent) => void
   /** P1a 核销闭环：advisory 采纳核销器（loop.advisoryReadback）。缺省 → 不装核销 hook。 */
   advisoryReadback?: import('./advisory-readback.js').AdvisoryReadback
+  /** PAL 攻坚层（计划 v2）：会话级案件容器（loop.problemAttack）。缺省 → 不装 PAL hooks。 */
+  problemAttackStore?: import('./problem-attack-loop.js').ProblemAttackStore
+  /** H4-D3 保存半边：postTurn 有攻坚活动时把 PAL 快照写进 session meta。 */
+  persistPalSnapshot?: (snapshot: import('./problem-attack-loop.js').PalSnapshot) => void
   /** P1a：核销判定后的会话累计回调（guardian meta 接线） */
   onAdvisoryOutcomes?: (totals: { adopted: number; ignored: number }) => void
   /** Phase 3 异步副驾：cheap model 情境合成。缺省 → 不装副驾 hook。 */
@@ -290,6 +296,11 @@ export interface RuntimeHookDeps {
   // ── W3-C1 压缩失忆 shadow 账本 ──
   /** Shadow-only：不注入 prompt、不改行为，仅落行供离线分析。缺省不装 hook。 */
   compactionAmnesia?: CompactionAmnesiaHookDeps
+
+  // ── 遗产回收 W-B 检索 POD shadow 观察 ──
+  /** Shadow-only：检索工具空结果/低质量结果按检出力分类落 telemetry，
+   *  零 prompt 注入。缺省不装 hook。 */
+  searchPod?: SearchPodHookDeps
 }
 
 export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] {
@@ -555,6 +566,13 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     hooks.push(createCompactionAmnesiaHook(deps.compactionAmnesia))
   }
 
+  // 遗产回收 W-B Search POD (shadow): postTool hook — 检索工具空结果/低质量
+  // 结果按查询检出力分类落 telemetry（"搜过 ≠ 排除"）。零 prompt 注入。
+  // Gated by RIVET_SEARCH_POD (default on; set to '0' to disable).
+  if (deps.searchPod && process.env.RIVET_SEARCH_POD !== '0') {
+    hooks.push(createSearchPodHook(deps.searchPod))
+  }
+
   // Pointer-Regurgitation: postTool hook — counts pointer-guard rejections
   // (model echoing "[file written to …]"-style placeholders as real content)
   // session-wide and escalates to a constitutional advisory from the 2nd
@@ -674,6 +692,23 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       writeTelemetry: deps.telemetryWriter ? (r) => deps.telemetryWriter!.write(r) : undefined,
       onOutcomes: deps.onAdvisoryOutcomes,
     }))
+  }
+
+  // PAL 攻坚层双半边（计划 v2 Wave P2）：postTool 保守谓词自动结算 + 委派窗口
+  // 标记；postTurn 事件留痕落盘 + 自动结算加分的聚合鼓励（active 才 submit，
+  // shadow 零发声）。store 只在模型经 attack_case 开案后才有内容——空案零开销。
+  if (deps.advisoryBus && deps.problemAttackStore && palMode() !== 'off') {
+    const pal = createProblemAttackHooks({
+      store: deps.problemAttackStore,
+      advisoryBus: deps.advisoryBus,
+      mode: palMode(),
+      writeTelemetry: deps.telemetryWriter ? (r) => deps.telemetryWriter!.write(r) : () => {},
+      persistSnapshot: deps.persistPalSnapshot,
+      // 虚空仓库 P0：收敛案件自动收割目的地 + 溯源 sessionId
+      cwd: deps.cwd,
+      sessionId: deps.sessionId,
+    })
+    hooks.push(pal.postTool, pal.postTurn)
   }
 
   // Virtue-Settlement: postTurn 效用核销 — 美德信号两段式

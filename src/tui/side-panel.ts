@@ -13,7 +13,7 @@ import type { FleetWorkerView } from './fleet-registry.js'
 import type { PlanExecutionTrace, PlanStep } from '../agent/plan-execution-trace.js'
 import { color } from './engine/ansi.js'
 import { formatTokenProgressBar, type GoalStateSnapshot } from './format/glance-bar.js'
-import { formatTaskList } from './format/task-list.js'
+import { formatTaskList, shouldShowTaskPanel } from './format/task-list.js'
 import { formatWorkerRow } from './format/worker-fleet.js'
 import { displayWidth, truncateToDisplayWidth } from './width.js'
 
@@ -40,6 +40,8 @@ export interface SidePanelInput {
   planTrace?: PlanExecutionTrace | null
   /** 当前目标状态快照，可选 */
   goal?: GoalStateSnapshot
+  /** 运行相位（'idle' 且 todo 全完成时任务区按空态渲染，与主区面板同门禁）。 */
+  phase?: string
 }
 
 /** 最多展示的 worker 行数（超出截断）。 */
@@ -124,9 +126,11 @@ export function renderSidePanel(input: SidePanelInput, theme: RivetTheme): strin
     lines.push(...formatGoalSection(input.goal, contentW, theme))
   }
 
-  // ── Section: 任务列表（复用 formatTaskList）──
+  // ── Section: 任务列表（复用 formatTaskList；idle+全完成时按空态，同主区门禁）──
   lines.push(sectionDivider())
-  const taskLines = formatTaskList(input.todos, theme, { width: contentW, maxRows: MAX_TASK_ROWS, showProgressBar: false })
+  const taskLines = shouldShowTaskPanel(input.todos, input.phase ?? '')
+    ? formatTaskList(input.todos, theme, { width: contentW, maxRows: MAX_TASK_ROWS, showProgressBar: false })
+    : []
   if (taskLines.length > 0) {
     for (const taskLine of taskLines) {
       lines.push(line(taskLine))

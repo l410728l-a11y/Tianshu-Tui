@@ -70,6 +70,16 @@ test('renderFleetDetail: shows authority/star domain if present', () => {
   assert.ok(plain.includes('tianquan') || plain.includes('天权'), 'authority visible')
 })
 
+test('renderFleetDetail: shows authority reason when present', () => {
+  const lines = renderFleetDetail(mkWorker({
+    authority: 'pojun',
+    authorityReason: '命中: 重构+回归',
+  }), 60, 20, theme)
+  const plain = lines.map(stripAnsi).join('\n')
+  assert.ok(plain.includes('破军') || plain.includes('pojun'), 'star name or id visible')
+  assert.ok(plain.includes('命中: 重构+回归'), 'reason visible')
+})
+
 test('renderFleetDetail: shows Esc hint to close', () => {
   const lines = renderFleetDetail(mkWorker(), 60, 20, theme)
   const plain = lines.map(stripAnsi).join('\n')

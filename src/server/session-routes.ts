@@ -297,6 +297,56 @@ export function buildSessionRoutes(
       return { status: 200, body: { id, askMode: data.state } }
     }, apiToken),
 
+    // ── Goal mode (autonomous cross-turn goal pursuit) ───────────────
+    // Desktop equivalent of the CLI `/goal` command. The tracker drives
+    // continuation via GoalContinuationController (assembled in loop-factory);
+    // update_goal / deliver_task tools read refs.goalTrackerRef, kept in sync
+    // by the manager. State changes emit `goal_state` events (SSE).
+    'POST /sessions/:id/goal': withAuth(async (body, params) => {
+      const id = params!.id!
+      const data = (body ?? {}) as { goal?: unknown; maxIterations?: unknown; wallClockMs?: unknown; successCriteria?: unknown; contextWindow?: unknown }
+      if (typeof data.goal !== 'string' || data.goal.trim().length === 0) {
+        return { status: 400, body: { error: 'Missing or empty "goal"' } }
+      }
+      const maxIter = typeof data.maxIterations === 'number' && data.maxIterations > 0 ? Math.floor(data.maxIterations) : 100
+      const ctxWindow = typeof data.contextWindow === 'number' && data.contextWindow > 0 ? data.contextWindow : 64000
+      const opts = {
+        goal: data.goal,
+        maxIterations: maxIter,
+        contextWindow: ctxWindow,
+        ...(typeof data.wallClockMs === 'number' && data.wallClockMs > 0 ? { wallClockMs: data.wallClockMs } : {}),
+        ...(Array.isArray(data.successCriteria) ? { successCriteria: data.successCriteria.filter((c): c is string => typeof c === 'string') } : {}),
+      }
+      const snap = await manager.setGoal(id, opts)
+      if (!snap) return { status: 503, body: { error: 'Goal mode unavailable (session not found or sidecar not goal-capable)' } }
+      return { status: 200, body: snap }
+    }, apiToken),
+
+    'GET /sessions/:id/goal': withAuth((_body, params) => {
+      const snap = manager.getGoalState(params!.id!)
+      if (!snap) return { status: 404, body: { error: 'No active goal for this session' } }
+      return { status: 200, body: snap }
+    }, apiToken),
+
+    'POST /sessions/:id/goal/pause': withAuth((body, params) => {
+      const data = (body ?? {}) as { reason?: unknown }
+      const snap = manager.pauseGoal(params!.id!, typeof data.reason === 'string' ? data.reason : undefined)
+      if (!snap) return { status: 404, body: { error: 'No active goal for this session' } }
+      return { status: 200, body: snap }
+    }, apiToken),
+
+    'POST /sessions/:id/goal/resume': withAuth((_body, params) => {
+      const snap = manager.resumeGoal(params!.id!)
+      if (!snap) return { status: 404, body: { error: 'No paused goal to resume' } }
+      return { status: 200, body: snap }
+    }, apiToken),
+
+    'POST /sessions/:id/goal/cancel': withAuth(async (_body, params) => {
+      const snap = await manager.cancelGoal(params!.id!)
+      if (!snap) return { status: 404, body: { error: 'No active goal for this session' } }
+      return { status: 200, body: snap }
+    }, apiToken),
+
     // Plan list — this session's plans (newest first), summary only (no content).
     'GET /sessions/:id/plans': withAuth(async (_body, params) => {
       const plans = await manager.listPlans(params!.id!)
@@ -665,6 +715,17 @@ export function buildSessionRoutes(
 
     // Insights — aggregated token usage, cost, and per-worker/model/provider
     // breakdowns derived from delegation events. Bearer-gated.
+    // Cockpit snapshot — aggregated runtime state (safety/verify/context/model)
+    // for the desktop cockpit panel. Reads agent in-memory state via the pure
+    // buildCockpitSnapshot function (same source as the TUI /cockpit command).
+    'GET /sessions/:id/cockpit': withAuth((_body, params) => {
+      const agent = manager.getAgentForSession(params!.id!)
+      if (!agent) return { status: 404, body: { error: 'Session agent not built yet' } }
+      const snap = agent.getCockpitSnapshot?.()
+      if (!snap) return { status: 503, body: { error: 'Cockpit unavailable (agent mid-rebuild?)' } }
+      return { status: 200, body: snap }
+    }, apiToken),
+
     'GET /sessions/:id/insights': withAuth((_body, params) => {
       const id = params!.id!
       const rec = manager.getSession(id)
