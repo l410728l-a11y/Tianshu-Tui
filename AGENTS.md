@@ -1,6 +1,6 @@
 # 天枢 (Tiānshū) — Architecture Map
 
-> v2.19.3 · 顶层目录索引 + 能力全景。文件级细节用工具 `repo_map` / `repo_graph` 按需获取。
+> v2.19.6 · 顶层目录索引 + 能力全景。文件级细节用工具 `repo_map` / `repo_graph` 按需获取。
 > 更深架构说明见 [`docs/architecture-overview.md`](docs/architecture-overview.md)；星图叙事见 [`star.md`](star.md)。
 
 ## 项目定位
@@ -19,7 +19,7 @@
 |--------|------|------|
 | Agent 主循环 | `src/agent/` | loop / turn 编排 / 证据门禁 / 交付 / 投机解码 |
 | Runtime Hooks | `src/agent/hooks/` + `create-runtime-hooks.ts` | 5 阶段；条件装配，默认会话激活 ~18+ |
-| 工具 | `src/tools/` | kernel ≤26；EXTENDED 层含 office / browser / computer_use |
+| 工具 | `src/tools/` | preset 三档（minimal 30 / frontend 31 / full 44，`RIVET_TOOL_PRESET` 或 `tools.preset`）；EXTENDED 层含 office / browser / computer_use |
 | 提示词 | `src/prompt/` | static 冻结锚 + volatile + appendixDelta |
 | 压缩 | `src/compact/` + boundary coordinator | 仅 `turn===0` 重写历史 |
 | 前缀缓存 | `src/cache/` + `api/request-freezer.ts` | advisor / recall / 审计 CLI |

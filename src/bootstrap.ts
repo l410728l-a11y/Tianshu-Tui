@@ -35,6 +35,7 @@ import { createWriteEvidenceProbe } from './context/write-evidence-probe.js'
 import { FileHistory } from './agent/file-history.js'
 import { PromptEngine } from './prompt/engine.js'
 import { createDefaultToolRegistry } from './tools/default-registry.js'
+import { presetIncludes, resolveToolPreset } from './tools/tool-preset.js'
 import { BROWSER_DEBUG_TOOL } from './tools/browser-debug/tool.js'
 import { defaultStore as defaultTodoStore } from './tools/todo.js'
 import { TodoStore } from './tools/todo-store.js'
@@ -403,7 +404,9 @@ export function createInteractiveToolRegistry(
   config: Config,
   cwd: string,
 ): { registry: ReturnType<typeof createDefaultToolRegistry> } {
+  const toolPreset = resolveToolPreset(cwd)
   const reg = createDefaultToolRegistry([], {
+    preset: toolPreset,
     desktopTools: config.agent.desktopTools,
     todoStore: refs.todoStore,
     // Computer Use（桌面 GUI 自动化）：EXTENDED 层，注册≠主控可见（tool gating
@@ -429,8 +432,10 @@ export function createInteractiveToolRegistry(
     () => refs.getProblemAttackStore?.() ?? null,
   ))
 
-  // undo
-  reg.register(createUndoTool(() => refs.fileHistory ?? undefined))
+  // undo — preset full 才含（全会话零使用）。
+  if (presetIncludes(toolPreset, 'undo')) {
+    reg.register(createUndoTool(() => refs.fileHistory ?? undefined))
+  }
 
   // delegate_batch
   reg.register(createDelegateBatchTool(
@@ -498,50 +503,60 @@ export function createInteractiveToolRegistry(
     // 满载机器 tsc 超时曾被记成 passed 放行（2026-07-07）。
     getTypecheckRunner: () => (cwd: string) => runTypeCheck(cwd, '*', GATE_TSC_TIMEOUT_MS),
   }
-  reg.register(createTeamOrchestrateTool(planExecutorDeps, {
-    defaultMaxParallel: config.agent.maxTeamParallel,
-    // Pro gate（双层模式）：桌面端由 Rust 验签后注入 RIVET_PRO=1；CLI 保持软 gate。
-    teamMaxEnabled: isProFeatureEnabled(config, 'teamMax'),
-  }))
+  if (presetIncludes(toolPreset, 'team_orchestrate')) {
+    reg.register(createTeamOrchestrateTool(planExecutorDeps, {
+      defaultMaxParallel: config.agent.maxTeamParallel,
+      // Pro gate（双层模式）：桌面端由 Rust 验签后注入 RIVET_PRO=1；CLI 保持软 gate。
+      teamMaxEnabled: isProFeatureEnabled(config, 'teamMax'),
+    }))
+  }
 
   // council_convene — 单轮多星域会诊出计划（与 team_orchestrate 解耦，默认绝不派执行；
   // autoExecute 经 executor 走完整 executePlan 闭环，与 team_orchestrate 同路径）。
-  reg.register(createCouncilConveneTool({
-    delegateBatch: async (requests, policy, abortSignal, onProgress) => {
-      if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
-      return refs.coordinator.delegateBatch(requests, policy, abortSignal, onProgress)
-    },
-    getSessionId: () => refs.sessionId ?? undefined,
-    recordRoutingShadow: event => persistCouncilRoutingShadow(refs.meridianIndexer?.getDb(), event),
-    recordCouncilSession: event => recordCouncilSession(refs.meridianIndexer?.getDb(), event),
-    executor: planExecutorDeps,
-  }, config.agent.council.seats.length > 0 ? config.agent.council.seats : undefined, {
-    multiRoundEnabled: isProFeatureEnabled(config, 'councilMultiRound'),
-  }))
+  if (presetIncludes(toolPreset, 'council_convene')) {
+    reg.register(createCouncilConveneTool({
+      delegateBatch: async (requests, policy, abortSignal, onProgress) => {
+        if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
+        return refs.coordinator.delegateBatch(requests, policy, abortSignal, onProgress)
+      },
+      getSessionId: () => refs.sessionId ?? undefined,
+      recordRoutingShadow: event => persistCouncilRoutingShadow(refs.meridianIndexer?.getDb(), event),
+      recordCouncilSession: event => recordCouncilSession(refs.meridianIndexer?.getDb(), event),
+      executor: planExecutorDeps,
+    }, config.agent.council.seats.length > 0 ? config.agent.council.seats : undefined, {
+      multiRoundEnabled: isProFeatureEnabled(config, 'councilMultiRound'),
+    }))
+  }
 
   // recall_capsule
   reg.register(createRecallCapsuleTool(() => cwd))
 
   // 将星账本（B1/B2）：recall_general 读战绩，record_general_finding 追加战绩。
-  // 胶囊 = 方法论基因，账本 = 跨会话战绩记忆。
-  reg.register(createRecallGeneralTool(() => cwd))
-  reg.register(createRecordGeneralFindingTool(() => cwd))
+  // 胶囊 = 方法论基因，账本 = 跨会话战绩记忆。preset full 才含。
+  if (presetIncludes(toolPreset, 'recall_general')) reg.register(createRecallGeneralTool(() => cwd))
+  if (presetIncludes(toolPreset, 'record_general_finding')) reg.register(createRecordGeneralFindingTool(() => cwd))
 
   // ask_user_question
   reg.register(ASK_USER_QUESTION_TOOL)
 
   // browser_debug — persistent browser for local frontend/backend联调 (CDP route).
-  // CORE tier since 2026-07-15（UI 渲染验证闭环主工具，主控恒可见）。
-  // Shared here so both TUI and desktop sidecar get the same tool + data flow.
-  reg.register(BROWSER_DEBUG_TOOL)
+  // preset frontend/full 含；RIVET_BROWSER_DEBUG=1 强制开启。
+  // render-verify-hook 有能力降级分支。
+  if (presetIncludes(toolPreset, 'browser_debug') || process.env.RIVET_BROWSER_DEBUG === '1') {
+    reg.register(BROWSER_DEBUG_TOOL)
+  }
 
-  // repo_graph
-  reg.register(createRepoGraphTool(() => refs.meridianIndexer))
+  // repo_graph — meridian 图查询。preset full 含；RIVET_REPO_GRAPH=1 强制开启。
+  if (presetIncludes(toolPreset, 'repo_graph') || process.env.RIVET_REPO_GRAPH === '1') {
+    reg.register(createRepoGraphTool(() => refs.meridianIndexer))
+  }
 
   // related_tests — override the no-indexer default with a meridian-aware factory
-  reg.register(createRelatedTestsTool(() => refs.meridianIndexer))
+  if (presetIncludes(toolPreset, 'related_tests')) {
+    reg.register(createRelatedTestsTool(() => refs.meridianIndexer))
+  }
 
-  reg.register(SEMANTIC_SEARCH_TOOL)
+  if (presetIncludes(toolPreset, 'semantic_search')) reg.register(SEMANTIC_SEARCH_TOOL)
   // APPLY_PATCH: EXTENDED layer — overlap with hash_edit covers >90% of
   // use cases; kept here (interactive) for edge cases (e.g. git-format patches).
   reg.register(APPLY_PATCH_TOOL)
@@ -549,13 +564,14 @@ export function createInteractiveToolRegistry(
   // 只读自查工具——模型写"系统状态"类结论前的取证入口（incident 20b9714e）。
   // 工具定义跟版本发布上车（新定义 = 前缀一次性 miss，绝不热更）。
   reg.register(createSessionVitalsTool(() => refs.getSessionVitals?.() ?? null))
-  // PAL attack_case: CORE 常驻（kernel 26→27）。攻坚案件账本——竞争假设 +
-  // 判别探针 + 证据结算；回执即鼓励通道（有效动作加分）。绝不中途挂载：
-  // 改 tool fingerprint = 200K 前缀全量重建（V4 创建成本不可接受）。
-  reg.register(createAttackCaseTool({
-    getStore: () => refs.getProblemAttackStore?.() ?? null,
-    getVerifier: () => refs.getAttackEvidenceVerifier?.() ?? null,
-  }))
+  // PAL attack_case：攻坚案件账本——竞争假设 + 判别探针 + 证据结算。
+  // preset full 才含（零使用率的重工具，2026-07-19 工具审计降级）。
+  if (presetIncludes(toolPreset, 'attack_case')) {
+    reg.register(createAttackCaseTool({
+      getStore: () => refs.getProblemAttackStore?.() ?? null,
+      getVerifier: () => refs.getAttackEvidenceVerifier?.() ?? null,
+    }))
+  }
 
   // web_search is now in the kernel default-registry (CORE layer).
   // Remove the interactive registration to avoid double-registration.

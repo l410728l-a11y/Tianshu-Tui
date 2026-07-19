@@ -378,7 +378,7 @@ describe('checkTddGate task-start guidance', () => {
     const hint = checkTddGate({
       filesRead: new Set(['src/repo/project-fingerprint.ts']),
       filesModified: new Set(),
-      isActionable: true,
+      requiresCodeVerification: true,
     })
     assert.ok(hint, 'task-start hint must fire before the first edit')
     assert.equal(hint!.signalKinds[0], 'tdd_violation')
@@ -389,7 +389,7 @@ describe('checkTddGate task-start guidance', () => {
     const hint = checkTddGate({
       filesRead: new Set(['src/agent/__tests__/tdd-gate.test.ts']),
       filesModified: new Set(),
-      isActionable: true,
+      requiresCodeVerification: true,
     })
     assert.equal(hint, null)
   })
@@ -398,7 +398,7 @@ describe('checkTddGate task-start guidance', () => {
     const hint = checkTddGate({
       filesRead: new Set(),
       filesModified: new Set(),
-      isActionable: false,
+      requiresCodeVerification: false,
     })
     assert.equal(hint, null)
   })
@@ -407,7 +407,7 @@ describe('checkTddGate task-start guidance', () => {
     const hint = checkTddGate({
       filesRead: new Set(['src/foo.ts']),
       filesModified: new Set(['src/foo.ts']),
-      isActionable: true,
+      requiresCodeVerification: true,
     })
     assert.ok(hint)
     assert.equal(hint!.signalKinds[0], 'tdd_violation')

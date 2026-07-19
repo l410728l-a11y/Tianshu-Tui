@@ -41,7 +41,7 @@ import { recordAutoReviewRun } from './review-health.js'
 import { detectWroteButNeverRead, formatWroteButNeverRead, detectReadButNeverProduced, formatReadButNeverProduced } from './wiring-nudge.js'
 import { readUnacknowledged, acknowledgeAll, type RecoveryEntry } from './recovery-journal.js'
 import { analyzeImpact } from '../repo/meridian-impact.js'
-import { runChangedFilesTypecheckMemo, runDeclaredCheck, typecheckGateEnabled } from './typecheck-gate.js'
+import { runChangedFilesTypecheckMemo, runDeclaredCheck, runVerifyRoutes, typecheckGateEnabled } from './typecheck-gate.js'
 import { evaluateTestPresence, testPresenceGateEnabled } from './test-presence.js'
 import { auditDeliveryClaims, claimAuditEnabled } from './claim-audit.js'
 import { scanFilesForProbes, formatProbeHits, type ProbeHit } from './probe-detector.js'
@@ -1040,6 +1040,24 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                 })
               }
             }
+            // A3: path-routed verify commands — sub-projects the root tsc
+            // cannot see (desktop/ has its own tsconfig). Runs regardless of
+            // the tsc/declared outcome; failures escalate and record evidence
+            // the same way as the declared-check backstop above.
+            const rr = await runVerifyRoutes(params.cwd, change.files, ctx.declaredCheckRunner)
+            if (rr) {
+              change.forceLevel = 'L3'
+              const note = `Verify routes — ${rr.summary}`
+              change.focusHint = change.focusHint ? `${note} | ${change.focusHint}` : note
+              for (const f of rr.failures) {
+                ctx.taskLedger.record({
+                  type: 'verification',
+                  command: f.command.slice(0, 200),
+                  status: 'failed',
+                  meta: { scope: 'full', declared: true, kind: f.kind, route: f.match },
+                })
+              }
+            }
           } catch { /* advisory: typecheck gate must never fail delivery */ }
         }
 
@@ -1151,9 +1169,47 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                   const reviewDeps = ctx.reviewDeps
                   // 审查门 UI 可见性：复用会话级 DelegationActivity 通道把审查
                   // worker 进度上行到子代理面板（tool 完成后该回调仍有效）。
-                  const activityMapper = params.onWorkerActivity
-                    ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity)
+                  // 真实审查 worker（wo_<uuid>）只经 mapper 发 running、没有任何
+                  // 终态事件源（phantom review-gate-* 行才有）——记录本轮出现过
+                  // 的真实 worker id，审查 round 结束时逐个补发终态，否则它们
+                  // 永远挂在子代理面板 running（deliver_task 非委派工具，走不到
+                  // clearGroup）。
+                  const seenReviewWorkerIds = new Set<string>()
+                  const trackedUpstream = params.onWorkerActivity
+                    ? (a: DelegationActivity) => {
+                        seenReviewWorkerIds.add(a.workOrderId)
+                        params.onWorkerActivity!(a)
+                      }
                     : undefined
+                  const activityMapper = trackedUpstream
+                    ? createDelegationActivityMapper(params.toolUseId, trackedUpstream)
+                    : undefined
+                  const reviewTerminalOf = (outcome: ReviewOutcome) => {
+                    const terminalStatus: DelegationActivity['status'] =
+                      outcome.verdict === 'verified' || outcome.verdict === 'nudge' ? 'passed' : 'failed'
+                    const failureReason = outcome.verdict === 'rejected' ? 'review-findings'
+                      : outcome.verdict === 'inconclusive' ? 'review-infra' : undefined
+                    const lines0 = formatReviewOutcomeLines(outcome)
+                    const progressLine = outcome.verdict === 'nudge'
+                      ? '审查门完成 (nudge)：变更琐碎，免深审'
+                      : (lines0[0]?.slice(0, 120) ?? `审查门完成 (${outcome.verdict})`)
+                    return { terminalStatus, failureReason, progressLine }
+                  }
+                  const settleReviewWorkers = (outcome: ReviewOutcome): void => {
+                    if (!params.onWorkerActivity || seenReviewWorkerIds.size === 0) return
+                    const { terminalStatus, failureReason, progressLine } = reviewTerminalOf(outcome)
+                    for (const wid of seenReviewWorkerIds) {
+                      params.onWorkerActivity({
+                        workOrderId: wid,
+                        parentToolId: params.toolUseId,
+                        profile: 'reviewer',
+                        status: terminalStatus,
+                        progressLine,
+                        ...(failureReason ? { failureReason } : {}),
+                      })
+                    }
+                    seenReviewWorkerIds.clear()
+                  }
                   const runReviewOnce = async (
                     targetChange: ChangeSet,
                     runMode: ReviewMode,
@@ -1231,16 +1287,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                         verdict: outcome.verdict,
                         tier: String(outcome.tier),
                       })
-                      const outcomeLines = formatReviewOutcomeLines(outcome)
-                      const terminalStatus: DelegationActivity['status'] =
-                        outcome.verdict === 'verified' || outcome.verdict === 'nudge' ? 'passed' : 'failed'
-                      const failureReason = outcome.verdict === 'rejected' ? 'review-findings'
-                        : outcome.verdict === 'inconclusive' ? 'review-infra' : undefined
-                      // nudge 的 outcomeLines 是给模型看的纪律提醒，面板改用一句
-                      // 人话回退文案；其余 verdict 取首行作为终态摘要。
-                      const progressLine = outcome.verdict === 'nudge'
-                        ? '审查门完成 (nudge)：变更琐碎，免深审'
-                        : (outcomeLines[0]?.slice(0, 120) ?? `审查门完成 (${outcome.verdict})`)
+                      const { terminalStatus, failureReason, progressLine } = reviewTerminalOf(outcome)
                       params.onWorkerActivity?.({
                         workOrderId: reviewRunId,
                         parentToolId: params.toolUseId,
@@ -1249,6 +1296,9 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                         progressLine,
                         ...(failureReason ? { failureReason } : {}),
                       })
+                      // 真实审查 worker（wo_<uuid>）补终态——它们只发过 running，
+                      // 不补会永远挂在子代理面板（deliver_task 不走 clearGroup）。
+                      settleReviewWorkers(outcome)
                     }).catch(() => { /* runReviewOnce never rejects; double guard */ }).finally(() => {
                       postCommitReviewInFlight = false
                       if (params.abortSignal?.aborted) return
@@ -1280,6 +1330,8 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                     const outcome = await runReviewOnce(reviewChange, reviewMode, REVIEW_TIMEOUT_MS, reviewAbort)
                     const outcomeLines = formatReviewOutcomeLines(outcome)
                     if (outcomeLines.length > 0) lines.push('', ...outcomeLines)
+                    // 同步路径同样补真实审查 worker 终态（泄漏修复）。
+                    settleReviewWorkers(outcome)
                   } else {
                     // System-triggered review (auto wiring inspector / typecheck-
                     // escalated L3 / goal-achieved L3): detach. The 240s-timeout

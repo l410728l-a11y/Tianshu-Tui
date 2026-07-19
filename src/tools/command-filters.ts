@@ -9,6 +9,11 @@
  * - 小输出返回 null（无收益零风险）；
  * - 只删不编（除合成摘要/截断标记外不改写原文行），丢内容必留 [+N omitted] 标记；
  * - 模型只看过滤结果，原文始终经 rawPath/ArtifactStore 可恢复。
+ * - 内容优先于 exit code：exit 0 但输出含失败签名（error TS / not ok / FAIL /
+ *   N failed）时按失败处理——管道会洗白 exit code（incident 2026-07-19：
+ *   `tsc --noEmit | head` 的 exit 是 head 的 0，filterTsc 曾因此输出
+ *   "✓ typecheck passed" 吞掉 10 个真实错误）。
+ * - 含管道的命令一律不过滤：exit code 不可信，原始输出比错误摘要安全。
  */
 export function applyCommandFilter(
   command: string,
@@ -17,14 +22,20 @@ export function applyCommandFilter(
 ): string | null {
   const cmd = command.trim()
 
+  // 管道命令 exit code 是最后一环的，对 tsc/test 不可信——放行原始输出。
+  if (cmd.includes('|')) return null
+
+  // exit 0 但内容含失败签名 → 按失败处理（内容优先于 exit code）。
+  const effectiveExit = exitCode === 0 && hasFailureSignature(stdout) ? 1 : exitCode
+
   // tsc --noEmit
   if (/\btsc\b/.test(cmd) && cmd.includes('--noEmit')) {
-    return filterTsc(stdout, exitCode)
+    return filterTsc(stdout, effectiveExit)
   }
 
   // node:test / tsx --test
   if (/\b(node|tsx|npx\s+tsx)\b/.test(cmd) && cmd.includes('--test')) {
-    return filterNodeTest(stdout, exitCode)
+    return filterNodeTest(stdout, effectiveExit)
   }
 
   // git status
@@ -44,10 +55,19 @@ export function applyCommandFilter(
 
   // npm/pnpm/yarn/bun test、vitest/jest 直跑
   if (isTestRunCommand(cmd)) {
-    return filterTestRun(stdout, exitCode)
+    return filterTestRun(stdout, effectiveExit)
   }
 
   return null
+}
+
+/** 失败签名：exit code 不可信时的内容判据。要求显式非零失败计数，
+ *  "0 failed"/"fail 0" 不误判。 */
+const FAILURE_SIGNATURE_RE =
+  /\berror\s+TS\d+:|^not ok\b|\bAssertionError\b|^FAIL\s|^\s*[×✖✗]\s|\b[1-9]\d*\s+failed\b|ℹ\s*fail\s+[1-9]/m
+
+function hasFailureSignature(stdout: string): boolean {
+  return FAILURE_SIGNATURE_RE.test(stdout)
 }
 
 // ── shared helpers ─────────────────────────────────────────────
@@ -76,11 +96,10 @@ function filterTsc(stdout: string, exitCode: number): string {
 
   for (const line of lines) {
     const trimmed = line.trim()
-    // Keep lines that contain "error TS" (the actual diagnostics)
+    // Keep the full diagnostic line (file:line:col + error TS…) — 位置信息是
+    // 修复的第一素材，剥掉前缀的"美化"曾让 agent 拿着错误找不到现场。
     if (/\berror\s+TS\d+:/i.test(trimmed)) {
-      // Strip path prefix: everything before "error TS"
-      const errStart = trimmed.search(/\berror\s+TS\d+:/i)
-      kept.push(errStart > 0 ? trimmed.slice(errStart) : trimmed)
+      kept.push(trimmed)
     }
     // Keep the summary footer: "Found N error(s)."
     if (/^Found\s+\d+\s+error/i.test(trimmed)) {

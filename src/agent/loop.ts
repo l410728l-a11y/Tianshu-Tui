@@ -569,6 +569,7 @@ export class AgentLoop {
   currentSeasonIntensity: number | null = null
   lastCompactTurn: number | null = null
   _lastRetrievalRoute: import('./intent-retrieval-route.js').RetrievalRoute | null = null
+  _lastEligibility: import('./discipline-eligibility.js').DisciplineEligibility | null = null
   _taskDepthLayer: TaskDepthLayer | undefined = undefined
   _planMethodology: PlanMethodology | undefined = undefined
   _prevPhaseHint: string | undefined = undefined
@@ -1546,8 +1547,10 @@ export class AgentLoop {
     this.markSkillInvoked(WRITING_PLANS_SKILL)
     // 主动 plan mode 链路：带活跃任务契约进入时，注入一次性并行调研 advisory。
     // 主控自主决定切分（不硬派）——advisory 只给方法与素材（scope 文件分组提示）。
-    if (this.taskContract?.isActionable) {
-      const files = this.taskContract.scope.mentionedFiles
+    // 优先使用 DisciplineEligibility.requiresEngineeringDiscipline，回退到 isActionable。
+    const isEngineeringTask = this.latestCognitiveSnapshot?.requiresEngineeringDiscipline ?? this.taskContract?.isActionable
+    if (isEngineeringTask) {
+      const files = this.taskContract?.scope.mentionedFiles ?? []
       const fileHint = files.length > 0
         ? `契约 scope 内已提到的文件（可按此分组）：${files.slice(0, 12).join(', ')}${files.length > 12 ? ` …（共 ${files.length} 个）` : ''}。`
         : ''

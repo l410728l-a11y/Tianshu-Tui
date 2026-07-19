@@ -184,6 +184,65 @@ export function formatWorkerFleet(
 }
 
 /**
+ * 渲染完成沉淀卡（settle card）：委派组整体终态后，以与 live 树同构的
+ * 树形静态卡「落」进 scrollback（spatial consistency——形态恒定）。
+ *
+ * 与 live 树的差异：无活动续行，每 worker 一行附带终态摘要尾（≤50 字符）；
+ * 头行聚合全组统计（通过数/总工具/总 token/最长耗时）。超过 maxRows 折叠
+ * 为 `…(+N)`。workers 应为同一委派组的终态视图（FleetRegistry.clearGroup
+ * 的返回值）。
+ *
+ * 头行配色：全部通过 → success；任一失败/受阻 → warning。
+ */
+export function formatWorkerFleetSettled(
+  workers: FleetWorkerView[],
+  theme: RivetTheme,
+  width = 80,
+  maxRows = 8,
+): string[] {
+  if (workers.length === 0) return []
+  const rule = Math.min(Math.max(40, width), 80)
+  const passed = workers.filter(w => w.status === 'passed').length
+  const totalTools = workers.reduce((n, w) => n + w.toolUseCount, 0)
+  const totalTokens = workers.reduce((n, w) => n + w.tokenCount, 0)
+  const maxElapsed = workers.reduce((n, w) => Math.max(n, w.elapsedMs), 0)
+
+  const headParts = [`${passed}/${workers.length} 通过`]
+  if (totalTools > 0) headParts.push(`${totalTools} 工具`)
+  if (totalTokens > 0) headParts.push(`${fmtTokens(totalTokens)} tok`)
+  const maxElapsedStr = formatElapsed(maxElapsed)
+  if (maxElapsedStr) headParts.push(maxElapsedStr)
+  const allPassed = passed === workers.length
+  const header = color(` ◆ 子代理组 · ${headParts.join(' · ')}`, allPassed ? theme.success : theme.warning)
+
+  const lines: string[] = [header]
+  const visible = workers.slice(0, maxRows)
+  const overflow = workers.length - visible.length
+  const labels = assignLabels(visible)
+  for (let i = 0; i < visible.length; i++) {
+    const w = visible[i]!
+    const isLast = i === visible.length - 1 && overflow <= 0
+    const branch = isLast ? '└─' : '├─'
+    const glyph = statusGlyph(w.status)
+    const stats: string[] = []
+    if (w.toolUseCount > 0) stats.push(`${w.toolUseCount} 工具`)
+    if (w.tokenCount > 0) stats.push(`${fmtTokens(w.tokenCount)} tok`)
+    const statsStr = stats.length > 0 ? ` · ${stats.join(' · ')}` : ''
+    const elapsed = formatElapsed(w.elapsedMs)
+    const tail = elapsed ? `  ${elapsed}` : ''
+    const plain = ` ${branch} ${glyph} ${labels[i]!}${statsStr}${tail}`
+    const summary = w.activity ? ` — ${w.activity}` : ''
+    const budget = Math.max(0, rule - plain.length - 1)
+    const text = summary ? `${plain}${truncate(summary, budget)}` : plain
+    lines.push(color(text, theme[statusColorKey(w.status)] as string))
+  }
+  if (overflow > 0) {
+    lines.push(color(` └─ …(+${overflow})`, theme.muted))
+  }
+  return lines
+}
+
+/**
  * 渲染单个 worker 行（带色 ANSI）—— 主区与侧栏共用，保证宽窄屏切换时字段不突变。
  *
  * 字段顺序与 formatWorkerFleet 单行一致：`glyph label [activity] elapsed`

@@ -38,6 +38,8 @@ import {
   setShellConfig,
   getCheckpointConfig,
   setCheckpointConfig,
+  getToolPresetConfig,
+  setToolPresetConfig,
   getNetworkConfig,
   setNetworkConfig,
   getMirrorConfig,
@@ -307,6 +309,23 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
             gitExists: next.gitPath ? existsSync(next.gitPath) : null,
           },
         }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // 工具档位 preset（minimal/frontend/full）——下个会话生效。
+    'GET /config/tool-preset': withAuth(() => {
+      return { status: 200, body: getToolPresetConfig() }
+    }, apiToken),
+
+    'PUT /config/tool-preset': withAuth((body) => {
+      const { preset } = (body ?? {}) as { preset?: unknown }
+      if (preset === undefined) {
+        return { status: 400, body: { error: 'preset is required' } }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setToolPresetConfig({ preset }) } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }

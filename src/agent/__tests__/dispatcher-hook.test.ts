@@ -4,6 +4,7 @@ import { createRuntimeHookContext } from '../runtime-hooks.js'
 import { createDispatcherHook } from '../hooks/dispatcher-hook.js'
 import type { TaskContract } from '../../context/task-contract.js'
 import type { Sensorium } from '../sensorium.js'
+import type { DisciplineEligibility } from '../discipline-eligibility.js'
 import type { AdvisoryBus, AdvisoryEntry } from '../advisory-bus.js'
 
 function makeContract(overrides: Partial<TaskContract> = {}): TaskContract {
@@ -47,6 +48,7 @@ function runHook(options: {
   contract?: TaskContract | null
   sensorium?: Sensorium | null
   complexityThreshold?: number
+  eligibility?: DisciplineEligibility
 }) {
   const phases: Array<{ phase: string; reason?: string; suggestion?: string }> = []
   const { bus, entries } = makeBus()
@@ -68,11 +70,26 @@ function runHook(options: {
   const hook = createDispatcherHook({
     getTaskContract: () => options.contract ?? undefined,
     getSensorium: () => options.sensorium ?? null,
+    getEligibility: () => options.eligibility,
     advisoryBus: bus,
     complexityThreshold: options.complexityThreshold,
   })
 
   return { hook, ctx, phases, entries }
+}
+
+/** bdebf600 后派发只看 eligibility.canDispatch——期望产生 advisory 的用例
+ *  必须显式给出可派发资格（缺省 fail-closed）。 */
+function dispatchableEligibility(): DisciplineEligibility {
+  return {
+    responseActionable: true,
+    requiresEngineeringDiscipline: true,
+    requiresCodeVerification: true,
+    allowsEvidenceReview: false,
+    canSuggestPlan: true,
+    canDispatch: true,
+    projectionMode: 'engineering',
+  }
 }
 
 describe('createDispatcherHook (delegation advisor)', () => {
@@ -86,6 +103,8 @@ describe('createDispatcherHook (delegation advisor)', () => {
   it('does nothing when contract is not actionable', async () => {
     const { hook, ctx, phases, entries } = runHook({
       contract: makeContract({ isActionable: false }),
+      // bdebf600 后 hook 只读 eligibility.canDispatch，不再读 contract.isActionable
+      eligibility: { ...dispatchableEligibility(), canDispatch: false },
     })
     await hook.run(ctx)
     assert.equal(phases.length, 0)
@@ -117,6 +136,7 @@ describe('createDispatcherHook (delegation advisor)', () => {
     const { hook, ctx, phases, entries } = runHook({
       contract: makeContract(),
       sensorium: makeSensorium(0.5),
+      eligibility: dispatchableEligibility(),
     })
     await hook.run(ctx)
     assert.ok(phases.some(p => p.phase === 'task-decomposed'))
@@ -134,6 +154,7 @@ describe('createDispatcherHook (delegation advisor)', () => {
         scope: { mentionedFiles: ['src/agent/auth.ts', 'src/agent/__tests__/auth.test.ts'] },
       }),
       sensorium: makeSensorium(0.5),
+      eligibility: dispatchableEligibility(),
     })
     await hook.run(ctx)
     assert.equal(entries.length, 1)
@@ -147,6 +168,7 @@ describe('createDispatcherHook (delegation advisor)', () => {
     const { hook, ctx, entries } = runHook({
       contract: makeContract(),
       sensorium: makeSensorium(0.5),
+      eligibility: dispatchableEligibility(),
     })
     await hook.run(ctx)
     assert.equal(entries.length, 1)
@@ -164,6 +186,7 @@ describe('createDispatcherHook (delegation advisor)', () => {
         scope: { mentionedFiles: ['src/agent/auth.ts', 'src/tui/login.tsx'] },
       }),
       sensorium: makeSensorium(0.5),
+      eligibility: dispatchableEligibility(),
     })
     await hook.run(ctx)
     assert.equal(entries.length, 1)
@@ -179,6 +202,7 @@ describe('createDispatcherHook (delegation advisor)', () => {
     const { hook, ctx, entries } = runHook({
       contract: makeContract(),
       sensorium: makeSensorium(0.5),
+      eligibility: dispatchableEligibility(),
     })
     await hook.run(ctx)
     await hook.run(ctx)
@@ -190,6 +214,7 @@ describe('createDispatcherHook (delegation advisor)', () => {
     const { hook, ctx, phases } = runHook({
       contract: makeContract(),
       sensorium: makeSensorium(0.5),
+      eligibility: dispatchableEligibility(),
     })
     await hook.run(ctx)
     const decomposed = phases.find(p => p.phase === 'task-decomposed')

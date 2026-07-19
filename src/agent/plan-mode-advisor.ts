@@ -11,6 +11,8 @@
  */
 
 import type { TaskContract, TaskDepthLayer, PlanMethodology, TurnMode } from '../context/task-contract.js'
+import type { DisciplineEligibility } from './discipline-eligibility.js'
+import { noteEligibilityMissing } from './discipline-eligibility.js'
 import type { PlanModeState } from './plan-mode.js'
 import type { StructureFlowSnapshot } from './structure-flow-controller.js'
 
@@ -22,6 +24,8 @@ export interface PlanModeSuggestInput {
   planModeState: PlanModeState
   /** 本会话已建议过的 contract id 集合（one-shot 记忆）。 */
   suggestedContractIds: ReadonlySet<string>
+  /** 统一资格对象——为 null/undefined 时显式降级为不可建议（不回退 isActionable）。 */
+  eligibility?: DisciplineEligibility
 }
 
 export interface PlanModeSuggestion {
@@ -36,8 +40,10 @@ export function planModeSuggestEnabled(): boolean {
 
 /** 纯函数：是否建议进入 plan mode。命中条件全部满足才建议。 */
 export function shouldSuggestPlanMode(input: PlanModeSuggestInput): PlanModeSuggestion {
-  const { contract } = input
-  if (input.turnMode !== 'task' || !contract?.isActionable) {
+  const { contract, eligibility } = input
+  if (!eligibility) noteEligibilityMissing('plan-mode-advisor')
+  const actionable = eligibility?.canSuggestPlan ?? false
+  if (input.turnMode !== 'task' || !actionable) {
     return { suggest: false, reason: 'not a new actionable task' }
   }
   if (input.planModeState !== 'off') {
@@ -46,16 +52,16 @@ export function shouldSuggestPlanMode(input: PlanModeSuggestInput): PlanModeSugg
   if (input.methodology !== 'full') {
     return { suggest: false, reason: 'lightweight methodology — plan overhead not justified' }
   }
-  if (input.suggestedContractIds.has(contract.id)) {
+  if (contract && input.suggestedContractIds.has(contract.id)) {
     return { suggest: false, reason: 'already suggested for this contract' }
   }
 
   const parts: string[] = []
   if (input.depthLayer === 'system') parts.push('system 级改动面')
   else if (input.depthLayer === 'wiring') parts.push('跨模块接线')
-  const fileCount = contract.scope.mentionedFiles.length
+  const fileCount = contract?.scope.mentionedFiles.length ?? 0
   if (fileCount >= 2) parts.push(`${fileCount} 个文件在 scope`)
-  if (/\b(refactor|rewrite|migrat)/i.test(contract.objective) || /重构|重写|迁移/.test(contract.objective)) {
+  if (contract && (/\b(refactor|rewrite|migrat)/i.test(contract.objective) || /重构|重写|迁移/.test(contract.objective))) {
     parts.push('重构信号')
   }
   const reason = parts.length > 0 ? parts.join(' · ') : 'full 方法论命中（多门/安全关键信号）'

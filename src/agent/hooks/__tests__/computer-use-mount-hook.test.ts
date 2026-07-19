@@ -54,6 +54,14 @@ describe('detectDesktopIntent', () => {
     assert.equal(detectDesktopIntent('桌面应用自动化测试'), true)
   })
 
+  it('matches browser-as-native-app intents (Edge/Chrome launched on desktop)', () => {
+    // 浏览器作为原生 GUI 程序操作时需 computer_use (browser_debug 只能驱动 localhost)
+    assert.equal(detectDesktopIntent('用 computer_use 打开 Edge 浏览器访问 baidu.com'), true)
+    assert.equal(detectDesktopIntent('打开 Edge 访问百度搜索天气'), true)
+    assert.equal(detectDesktopIntent('启动 Chrome 浏览器打开网页'), true)
+    assert.equal(detectDesktopIntent('用 Firefox 打开这个网站'), true)
+  })
+
   it('matches English desktop GUI intents', () => {
     assert.equal(detectDesktopIntent('automate the desktop app for me'), true)
     assert.equal(detectDesktopIntent('click the Save button in the app window'), true)

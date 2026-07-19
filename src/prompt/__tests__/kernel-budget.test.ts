@@ -115,5 +115,21 @@ describe('Kernel Budget — structural guards against trained-mode degradation',
         assert.ok(registry.has(name), `core tool missing: ${name}`)
       }
     })
+
+    it('minimal 完整装配（kernel + bootstrap）≤ 32——漂移棘轮', () => {
+      // 2026-07-19 工具审计：会话实测进 44 个工具而本预算只盯 kernel 26——
+      // 闸门看错了门。preset 三档落地后，minimal 完整装配钉死在 ≤32
+      // （当前 30）。抬阈必须在 commit message 写明理由（同 job 抬阈先例）。
+      const kernel = createDefaultToolRegistry().getAll().length
+      const bootstrapMinimal = [
+        'delegate_task', 'delegate_batch', 'ask_user_question', 'apply_patch',
+        'deliver_task', 'plan_task', 'recall_capsule', 'session_vitals', 'update_goal',
+      ]
+      assert.ok(
+        kernel + bootstrapMinimal.length <= 32,
+        `minimal full assembly = ${kernel + bootstrapMinimal.length} (limit: 32). ` +
+          `See tool-preset.ts — 增长要过档位评审，不许悄悄漂移。`,
+      )
+    })
   })
 })

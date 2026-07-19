@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestEnabled, type PlanModeSuggestInput, type StructureFlowPlanAdvisoryInput } from '../plan-mode-advisor.js'
+import type { DisciplineEligibility } from '../discipline-eligibility.js'
 import { extractTaskContract } from '../../context/task-contract.js'
 
 function baseInput(overrides: Partial<PlanModeSuggestInput> = {}): PlanModeSuggestInput {
@@ -17,8 +18,18 @@ function baseInput(overrides: Partial<PlanModeSuggestInput> = {}): PlanModeSugge
 }
 
 describe('shouldSuggestPlanMode', () => {
+  const yesEligibility: DisciplineEligibility = {
+    responseActionable: true,
+    requiresEngineeringDiscipline: true,
+    requiresCodeVerification: true,
+    allowsEvidenceReview: true,
+    canSuggestPlan: true,
+    canDispatch: true,
+    projectionMode: 'engineering',
+  }
+
   it('suggests for a full-methodology task with plan mode off', () => {
-    const result = shouldSuggestPlanMode(baseInput())
+    const result = shouldSuggestPlanMode(baseInput({ eligibility: yesEligibility }))
     assert.equal(result.suggest, true)
     assert.ok(result.reason.length > 0)
   })
@@ -43,8 +54,28 @@ describe('shouldSuggestPlanMode', () => {
     assert.equal(result.suggest, false)
   })
 
+  it('uses eligibility?.canSuggestPlan as second gate when provided', () => {
+    const noEligibility: DisciplineEligibility = { ...yesEligibility, canSuggestPlan: false }
+
+    // canSuggestPlan=true → full-methodology task should pass
+    const shouldPass = shouldSuggestPlanMode(baseInput({ eligibility: yesEligibility }))
+    assert.equal(shouldPass.suggest, true)
+
+    // canSuggestPlan=false → blocked regardless of contract
+    const shouldBlock = shouldSuggestPlanMode(baseInput({ eligibility: noEligibility }))
+    assert.equal(shouldBlock.suggest, false)
+    assert.equal(shouldBlock.reason, 'not a new actionable task')
+  })
+
+  it('defaults to non-actionable when eligibility is absent', () => {
+    // eligibility 已稳定存在，回退到 contract.isActionable 的旧语义已移除。
+    // 无 eligibility 时 shouldSuggestPlanMode 保守降级为不 actionable。
+    const withoutEligibility = shouldSuggestPlanMode(baseInput({ eligibility: undefined }))
+    assert.equal(withoutEligibility.suggest, false)
+  })
+
   it('is one-shot per contract id', () => {
-    const input = baseInput()
+    const input = baseInput({ eligibility: yesEligibility })
     const first = shouldSuggestPlanMode(input)
     assert.equal(first.suggest, true)
     const seen = new Set([input.contract!.id])
@@ -53,7 +84,7 @@ describe('shouldSuggestPlanMode', () => {
   })
 
   it('reason mentions the hit signals (depth / files / refactor)', () => {
-    const result = shouldSuggestPlanMode(baseInput())
+    const result = shouldSuggestPlanMode(baseInput({ eligibility: yesEligibility }))
     assert.ok(/system|文件|重构/.test(result.reason), `reason should carry signals, got: ${result.reason}`)
   })
 })

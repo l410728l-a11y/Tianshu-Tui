@@ -113,6 +113,12 @@ export interface GlanceBarInput {
   density?: 'compact' | 'full'
   /** 当前切入的 worker 视图徽章（例如 "◐ T1"）——非空时显示在左区。 */
   workerBadge?: string
+  /** 在跑子代理数（FleetRegistry 读模型）——>0 时右区显示 `◐ N`。 */
+  fleetRunning?: number
+  /** 终态未读子代理数——无在跑时右区显示 `✓ N`（通知徽章，查看后清除）。 */
+  fleetUnread?: number
+  /** team 编队当前波次——team 运行中右区显示 `◆ w2/3`。 */
+  teamWave?: { current: number; total: number }
 }
 
 export function formatGlanceLeft(input: GlanceBarInput, theme: RivetTheme): string {
@@ -137,6 +143,16 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
 
   // 权限/计划模式已收敛到输入框下方的常驻权限行（formatPermissionModeLine），
   // GlanceBar 不再重复显示 badge——单一事实来源。
+
+  // 编排状态徽章（team 波次 / 子代理舰队）——瞬态信息放右区最左，最先被读到。
+  // 优先级：team 波次 > 在跑 worker > 终态未读（通知徽章，查看后清除）。
+  if (input.teamWave) {
+    parts.push(color(`◆ w${input.teamWave.current}/${input.teamWave.total}`, theme.secondary))
+  } else if (input.fleetRunning !== undefined && input.fleetRunning > 0) {
+    parts.push(color(`◐ ${input.fleetRunning}`, theme.primary))
+  } else if (input.fleetUnread !== undefined && input.fleetUnread > 0) {
+    parts.push(color(`✓ ${input.fleetUnread}`, theme.success))
+  }
 
   // ── compact 档：模型 + effort + cache% + 上下文% + 耗时 ──
   if (compact) {

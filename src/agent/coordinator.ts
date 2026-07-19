@@ -2062,6 +2062,13 @@ export class DelegationCoordinator {
     policy: AggregationPolicy = 'primary_decides',
     abortSignal?: AbortSignal,
     onProgress?: (completed: number, total: number) => void,
+    /**
+     * Per-worker settle hook — fires the moment EACH worker reaches its final
+     * result (success / failure / blocked-dependency sweep), instead of waiting
+     * for the whole batch. Consumers: TUI fleet panel terminal glyphs (a fast
+     * worker must not show ◐ running while a slow sibling is still going).
+     */
+    onWorkerSettled?: (result: WorkerResult) => void,
   ): Promise<CoordinatorRun> {
     // Per-call abort signal override
     const savedSignal = this.config.abortSignal
@@ -2178,9 +2185,12 @@ export class DelegationCoordinator {
           workerModels.push({ workOrderId: order.id, model: run.selectedModel })
         }
         queue.markCompleted(order)
+        for (const r of run.results) onWorkerSettled?.(r)
       } catch (error) {
-        allResults.push(workerFailureResult(order, error, { failureReason: classifyWorkerError(error) }))
+        const failure = workerFailureResult(order, error, { failureReason: classifyWorkerError(error) })
+        allResults.push(failure)
         queue.markFailed(order)
+        onWorkerSettled?.(failure)
       }
       completedCount++
       onProgress?.(completedCount, orders.length)
@@ -2200,8 +2210,10 @@ export class DelegationCoordinator {
     for (const order of queue.pending()) {
       const unmet = order.dependencies.filter(d => !queue.isCompleted(d))
       const failedDeps = unmet.filter(d => queue.hasFailed(d))
-      allResults.push(blockedDependencyResult(order, unmet, failedDeps))
+      const blocked = blockedDependencyResult(order, unmet, failedDeps)
+      allResults.push(blocked)
       queue.markFailed(order)
+      onWorkerSettled?.(blocked)
     }
 
     const profileMap = new Map(orders.map(o => [o.id, o.profile] as const))

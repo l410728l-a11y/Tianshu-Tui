@@ -48,7 +48,7 @@ import { STAR_DOMAINS } from '../../agent/star-domain.js'
 import { formatTaskList, shouldShowTaskPanel } from '../format/task-list.js'
 import type { TodoItem } from '../../tools/todo-store.js'
 import { formatTeamPanel } from '../format/team-panel.js'
-import { formatWorkerFleet } from '../format/worker-fleet.js'
+import { formatWorkerFleet, formatWorkerFleetSettled } from '../format/worker-fleet.js'
 import { decodeTeamPanelModel, overlayFleetStatus, TEAM_PANEL_UI_PREFIX, type TeamPanelModel } from '../team-panel-model.js'
 import { buildWorkerDetailContent } from '../worker-detail.js'
 import { renderSidePanel, resolveSidePanelWidth, SIDE_PANEL_MIN_COLUMNS, type SidePanelInput } from '../side-panel.js'
@@ -351,6 +351,10 @@ export class TuiApp {
   /** team_orchestrate 运行中的实时 TeamPanel（计划 DAG，运行态由 fleet 叠加）。
    *  从流式块中拦截的初始编码面板解码而来；终态委派到 scrollback 后清空。 */
   private liveTeamModel: TeamPanelModel | null = null
+  /** 已提交时间线的 team 波次序号（防止 wave 完成行重复 commit）。 */
+  private lastCommittedTeamWave = 0
+  /** 当前 wave 的首次观测时间（wave 完成行的耗时来源）。 */
+  private teamWaveStartedAt = 0
   /** 当前在 pager overlay 中查看的 worker detail workerId；null 表示查看主 scrollback。 */
   private workerDetailWorkerId: string | null = null
   /** kill 指定 worker 的回调（main.ts 接线到 per-worker AbortController）。
@@ -425,6 +429,8 @@ export class TuiApp {
   choicePanelKind: 'effort' | 'permission' | 'permission-yolo-confirm' | 'plan-approval' | 'ask-user-question' = 'effort'
   /** 当前待审批计划信息（plan-approval 面板使用）。 */
   pendingPlanApproval: PlanSubmittedInfo | undefined = undefined
+  /** 待审批计划正文预览摘要（开面板时一次性提取；随面板关闭/重开更新）。 */
+  planApprovalExcerpt: string | undefined = undefined
   /**
    * ask_user_question 多题流：当前题索引 + drafts。
    * `pendingAskUserQuestion` 仍暴露当前题，兼容旧回调路径。
@@ -1316,9 +1322,10 @@ export class TuiApp {
   }
 
   /** 打开计划审批选择面板（plan action=submit 成功后自动调用）。 */
-  openPlanApprovalPanel(info: PlanSubmittedInfo): void {
+  openPlanApprovalPanel(info: PlanSubmittedInfo, excerpt?: string): void {
     this.choicePanelKind = 'plan-approval'
     this.pendingPlanApproval = info
+    this.planApprovalExcerpt = excerpt
     this.choicePanelSubMode = 'select'
     this.choicePanelInputBuffer = ''
     this.choicePanelInputFor = undefined
@@ -2190,6 +2197,20 @@ export class TuiApp {
         if (choices.length > 0) { this.overlayController.nav().choicePanelIndex = (cur - 1 + choices.length) % choices.length; this.overlay.rerender() }
         return true
       }
+      // 数字键快选（1-9 → 第 N 个条目）：桥接老用户「输数字」的肌肉记忆，
+      // 也是面板打开成功的可发现性信号。多选题的可切换项等价空格切换，
+      // 其余（单选 / __skip__ / __other__ / 审批类面板）等价回车确认。
+      if (/^[1-9]$/.test(c) && choices.length > 0) {
+        const idx = Number(c) - 1
+        if (idx >= choices.length) return true
+        this.overlayController.nav().choicePanelIndex = idx
+        const q = this.choicePanelKind === 'ask-user-question' ? this.pendingAskUserQuestion : undefined
+        const entry = choices[idx]
+        const toggleable = q?.allowMultiple && entry && entry.id !== '__skip__' && entry.id !== '__other__'
+        return toggleable
+          ? this.handleOverlayKey({ name: 'space', char: ' ' })
+          : this.handleOverlayKey({ name: 'return', char: '\r' })
+      }
       // Multi-select toggle (space) for ask-user-question
       if (c === ' ' && this.choicePanelKind === 'ask-user-question') {
         const entry = choices[cur]
@@ -2930,6 +2951,41 @@ export class TuiApp {
     return overlayFleetStatus(model, this.fleet.getWorkers())
   }
 
+  /**
+   * team wave 推进时提交一行完成时间线（`✓ wave 1/3 完成 · 4/4 任务 · 12m30s`）。
+   * 长跑 team（30min+）在终态面板落地前 scrollback 零反馈——本方法是中段唯一
+   * 路标。currentWave 是 0-based 活动波索引（buildTeamPanelModel 口径），故已
+   * 完成波次（1-based）恰为 1..currentWave；重复推送由 lastCommittedTeamWave
+   * 去重；耗时只附在最近一波上（跨波跳变时前几波耗时不可知，不伪造）。
+   * 最后一波的完成行不走这里（currentWave 不会越过末波）——由终态面板承载。
+   */
+  private commitTeamWaveTransitions(model: TeamPanelModel): void {
+    if (this.teamWaveStartedAt === 0) this.teamWaveStartedAt = Date.now()
+    const completedThrough = model.currentWave
+    if (completedThrough <= this.lastCommittedTeamWave) return
+    for (let w = this.lastCommittedTeamWave + 1; w <= completedThrough; w++) {
+      const wave = model.waves[w - 1]
+      if (!wave) continue
+      const waveTasks = model.tasks.filter(t => wave.taskIds.includes(t.id))
+      const done = waveTasks.filter(t => t.status === 'done').length
+      const failed = waveTasks.filter(t => t.status === 'failed' || t.status === 'blocked').length
+      const stats = [`${done}/${waveTasks.length} 任务`]
+      if (failed > 0) stats.push(`✗ ${failed}`)
+      if (w === completedThrough) {
+        const elapsed = formatElapsed(Date.now() - this.teamWaveStartedAt)
+        if (elapsed) stats.push(elapsed)
+      }
+      const ok = failed === 0
+      this.commitStatic(color(
+        ` ${ok ? '✓' : '⚠'} wave ${w}/${model.totalWaves} 完成 · ${stats.join(' · ')}`,
+        ok ? this.theme.success : this.theme.warning,
+      ))
+    }
+    this.lastCommittedTeamWave = completedThrough
+    // 新一波从此时计时。
+    this.teamWaveStartedAt = Date.now()
+  }
+
   private handleToolResult(id: string, name: string, result: string, isError?: boolean, rawPath?: string, uiContent?: string): void {
     // DEBUG: unconditional trace for TUI rendering-loss investigation.
     // Log output goes to stderr when RIVET_DEBUG=1.
@@ -2949,6 +3005,7 @@ export class TuiApp {
         const model = decodeTeamPanelModel(result)
         if (model) {
           this.liveTeamModel = model
+          this.commitTeamWaveTransitions(model)
           this.markActivity()
           this.writeBatcher.schedule()
           return
@@ -2976,10 +3033,19 @@ export class TuiApp {
     this.toolGroupController.deleteAccumulated(id)
     const meta = this.toolGroupController.getPending(id)
     this.toolGroupController.deletePending(id)
-    // 委派工具终态：清理该组在舰队读模型中的 worker 记录（终态摘要已通过
+    // 委派工具终态：该组 worker 移入舰队归档区（终态摘要已通过
     // onDelegationActivity 到达，面板转入 scrollback 后无需常驻 live 区）。
+    // 归档视图渲染为「完成沉淀卡」入 scrollback——与 live 树同构的静态组级
+    // 摘要，让长跑委派在时间线上留下完整痕迹而非只剩一行 N/M passed。
     if (meta && isDelegationTool(meta.name)) {
-      this.fleet.clearGroup(id)
+      const settled = this.fleet.clearGroup(id)
+      if (settled.length > 0) {
+        const card = formatWorkerFleetSettled(settled, this.theme, this.columns)
+        this.commitAbove(() => {
+          this.commit.write({ text: card.join('\n'), trailingNewline: true })
+          this.state.committedCount++
+        })
+      }
     }
     const finalContent = toolAcc ? toolAcc + displayContent : displayContent
 
@@ -3012,6 +3078,8 @@ export class TuiApp {
     if (name === 'team_orchestrate') {
       // Live panel is being committed to scrollback — drop the in-flight overlay.
       this.liveTeamModel = null
+      this.lastCommittedTeamWave = 0
+      this.teamWaveStartedAt = 0
       const model = decodeTeamPanelModel(finalContent.trim())
       if (model) {
         const panel = formatTeamPanel(model, this.theme, this.columns)
@@ -3247,6 +3315,8 @@ export class TuiApp {
     this.toolGroupController.clear()
     this.fleet.clear()
     this.liveTeamModel = null
+    this.lastCommittedTeamWave = 0
+    this.teamWaveStartedAt = 0
   }
 
   /**
@@ -3855,6 +3925,13 @@ export class TuiApp {
         goal: goalSnapshot,
         todoSummary,
         density: this.glanceDensity,
+        // 编排徽章：team 波次 / 在跑子代理 / 终态未读（glance-bar 内按优先级取一）
+        // currentWave 是 0-based 活动波索引（team-panel.ts 同款 +1 显示）。
+        teamWave: this.liveTeamModel
+          ? { current: Math.min(this.liveTeamModel.currentWave + 1, this.liveTeamModel.totalWaves), total: this.liveTeamModel.totalWaves }
+          : undefined,
+        fleetRunning: this.fleet.getActiveWorkers().length,
+        fleetUnread: this.fleet.unreadCount(),
       }, this.theme)
 
       // 用 wide 上界度量标签串宽度：CJK/Windows 终端把 East-Asian Ambiguous 符号
@@ -3990,6 +4067,7 @@ export class TuiApp {
         todos: this.state.todos,
         phase: this.state.phase,
         workers: this.fleet.getActiveWorkers(),
+        teamModel: this.liveTeamModel ? this.teamModelWithLiveStatus(this.liveTeamModel) : null,
         currentTool,
         modelName: this.state.modelName,
         domainGlyph: this.state.domainGlyph,

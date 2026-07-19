@@ -16,6 +16,7 @@ export interface DelegateBatchCoordinator {
     policy?: AggregationPolicy,
     abortSignal?: AbortSignal,
     onProgress?: (completed: number, total: number) => void,
+    onWorkerSettled?: (result: import('../agent/work-order.js').WorkerResult) => void,
   ): Promise<CoordinatorRun>
 }
 
@@ -245,6 +246,28 @@ export function createDelegateBatchTool(
         trimmedNote = `\n\n[batch trimmed] Session is early (turn ${params.sessionTurnCount ?? '?'}). Dispatched ${cap}/${requests.length} tasks. Deferred: ${dropped.map(o => `"${o.slice(0, 60)}"`).join(', ')}. Re-dispatch later tasks in a subsequent turn if needed.`
       }
 
+      // T4: per-worker terminal status for the subagent panel. Emitted TWICE by
+      // design: once per worker the moment it settles (onWorkerSettled — a fast
+      // worker must flip to ✓/✗ immediately instead of waiting for the slowest
+      // sibling), and once more below after the batch resolves as a backstop
+      // (FleetRegistry dedupes terminal→terminal replays, freezing elapsed).
+      const emitTerminal = params.onWorkerActivity
+        ? (r: import('../agent/work-order.js').WorkerResult) => {
+            params.onWorkerActivity!({
+              workOrderId: r.workOrderId,
+              parentToolId: params.toolUseId,
+              status: r.status,
+              progressLine: r.summary.slice(0, 80),
+              failureReason: r.failureReason,
+              model: r.model,
+              provider: r.provider,
+              usage: r.usage,
+              artifactId: r.diffArtifactId,
+              changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
+            })
+          }
+        : undefined
+
       let progressReported = 0
       let run: CoordinatorRun
       try {
@@ -258,6 +281,7 @@ export function createDelegateBatchTool(
               params.onOutput?.(`⏳ batch progress: ${completed}/${total} workers done\n`)
             }
           },
+          emitTerminal ?? undefined,
         )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -295,22 +319,10 @@ export function createDelegateBatchTool(
         }
       }
 
-      // T4: terminal per-worker status for the subagent panel.
-      if (params.onWorkerActivity) {
-        for (const r of run.results) {
-          params.onWorkerActivity({
-            workOrderId: r.workOrderId,
-            parentToolId: params.toolUseId,
-            status: r.status,
-            progressLine: r.summary.slice(0, 80),
-            failureReason: r.failureReason,
-            model: r.model,
-            provider: r.provider,
-            usage: r.usage,
-            artifactId: r.diffArtifactId,
-            changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
-          })
-        }
+      // T4: terminal per-worker status for the subagent panel (backstop loop —
+      // per-worker settle events were already emitted via onWorkerSettled).
+      if (emitTerminal) {
+        for (const r of run.results) emitTerminal(r)
       }
 
       const passed = run.results.filter(r => r.status === 'passed').length

@@ -6,6 +6,7 @@ import { configSchema, reviewConfigSchema, workersSchema, councilConfigSchema, e
 import { DEFAULT_CONFIG } from './default.js'
 import { userConfigPath } from './paths.js'
 import { cloneProviderPreset, findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './provider-presets.js'
+import { invalidateToolPreset } from '../tools/tool-preset.js'
 
 const APPROVAL_MODES = ['auto-safe', 'manual', 'auto-accept', 'dangerously-skip-permissions'] as const
 type ApprovalModeConfig = typeof APPROVAL_MODES[number]
@@ -460,6 +461,38 @@ export function setCheckpointConfig(input: {
   }
   saveConfig(cfg)
   return { checkpointEveryTurns: cfg.agent.checkpointEveryTurns }
+}
+
+// --- Tool preset (minimal/frontend/full, session-start assembly tier) ---
+
+export interface ToolPresetConfigSnapshot {
+  preset: 'minimal' | 'frontend' | 'full'
+}
+
+const TOOL_PRESETS = new Set(['minimal', 'frontend', 'full'])
+
+/** Snapshot of the tool preset for the desktop/TUI settings UI. */
+export function getToolPresetConfig(): ToolPresetConfigSnapshot {
+  return { preset: loadConfig().tools.preset ?? 'minimal' }
+}
+
+/**
+ * Persist the tool preset. Takes effect at the NEXT session — tool
+ * definitions are frozen for a session's lifetime (mid-session fingerprint
+ * change = full prefix-cache rebuild, never worth it).
+ */
+export function setToolPresetConfig(input: { preset?: unknown }): ToolPresetConfigSnapshot {
+  const cfg = loadConfig()
+  if (input.preset !== undefined) {
+    if (typeof input.preset !== 'string' || !TOOL_PRESETS.has(input.preset)) {
+      throw new Error(`preset must be one of: minimal | frontend | full`)
+    }
+    cfg.tools.preset = input.preset as ToolPresetConfigSnapshot['preset']
+  }
+  saveConfig(cfg)
+  // 长驻进程（desktop sidecar）内 memo 必须失效，否则新会话拿到旧档位。
+  invalidateToolPreset()
+  return { preset: cfg.tools.preset ?? 'minimal' }
 }
 
 // --- Vision model bridge (multimodal image recognition) ---

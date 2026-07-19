@@ -353,7 +353,7 @@ describe('kaiyang（开阳·对账者，2026-07-17 第十二域）', () => {
     assert.ok(k)
     assert.equal(k.id, 'kaiyang')
     assert.equal(k.name, '开阳')
-    assert.equal(k.motto, '双星互证，实测为凭')
+    assert.equal(k.motto, '功名只向马上取，真是英雄一丈夫')
     assert.equal(k.decisionStyle, 'methodical')
     assert.equal(k.courageThreshold, 0.55)
     assert.equal(k.isCustom, false)

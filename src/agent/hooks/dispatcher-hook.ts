@@ -2,11 +2,17 @@ import type { AfterPerceptionRuntimeHook } from '../runtime-hooks.js'
 import type { TaskContract } from '../../context/task-contract.js'
 import type { Sensorium } from '../sensorium.js'
 import type { AdvisoryBus } from '../advisory-bus.js'
+import type { DisciplineEligibility } from '../discipline-eligibility.js'
+import { noteEligibilityMissing } from '../discipline-eligibility.js'
 import { decomposeByDataContract } from '../dispatcher.js'
 
 export interface DispatcherHookDeps {
   getTaskContract: () => TaskContract | undefined
   getSensorium: () => Sensorium | null
+  /** Optional eligibility getter. When available, uses canDispatch instead
+   *  of the coarser contract.isActionable check. TODO: wire from agent loop
+   *  once eligibility is exposed there. */
+  getEligibility?: () => DisciplineEligibility | undefined
   /** Unified advisory bus — the delegation suggestion is routed here (prefix-cache safe).
    *  Without it the hook only emits the UI phase-change signal. */
   advisoryBus?: AdvisoryBus
@@ -47,7 +53,14 @@ export function createDispatcherHook(deps: DispatcherHookDeps): AfterPerceptionR
       if (ctx.snapshot.turn - lastAdvisoryTurn < cooldown) return
 
       const contract = deps.getTaskContract()
-      if (!contract || !contract.isActionable) return
+      if (!contract) return
+
+      // canDispatch 只看 DisciplineEligibility；缺省即 fail-closed（不派发），
+      // 并记一条缺省遥测（RIVET_DEBUG 可见，未接线的消费点不再静默）。
+      const eligibility = deps.getEligibility?.()
+      if (!eligibility) noteEligibilityMissing('dispatcher-hook')
+      const actionable = eligibility?.canDispatch ?? false
+      if (!actionable) return
 
       // Per-contract.id dedup: each contract is advised at most once
       if (advisedIds.has(contract.id)) return

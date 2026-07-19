@@ -41,3 +41,70 @@ cp docs/prompt-changelog/static.ts.pre-beliefs-motto-refactor.bak src/prompt/sta
 ### 用户意图
 
 > "按照你的感受来。我希望在你们能可以平衡的方式来调整。所以改。但是要备份存到一个目录下。然后记录中文意义标题的文档记录我们改了什么。"
+
+---
+
+## 2026-07-19 — 删除"交给新会话"的全部无条件出口
+
+### 改了什么
+
+**`src/prompt/static.ts`** — 两处：
+
+1. 交付契约 ③ 拆解段，删除：
+   > 上下文压力接近窗口上限、或规划已完整但实施工作量大时，主动建议将实施交给新会话——规划在这里完成，落地在那里精准交付。等待其他会话完成后审查实现，是收束闭环的方式。
+
+   保留其后的"不要在上下文紧张时强行实施"及 ≥70% 实测限定。
+
+2. `<delivery-contract>` 不自我设限条**整条删除**（原为"不要铺垫上下文快满了…是合法的协作建议…挡箭牌"）——前半句"资源盘算"说教与后半句的交接出口一并移除，该话题不再出现在交付契约中。
+
+3. `<delegation>` 段删除随附注记「建议用户在新会话继续实施 ≠ delegate_task 委派…」——该注记把"建议新会话"当作合法概念引用，与交付契约的移除方向矛盾。
+
+### 为什么
+
+- "规划已完整但实施工作量大时"**没有实测条件**，模型在每个 wave 边界都援引它建议新会话（session 14237cea 实测：ctx 10–20% 时 4 次建议交接，全部引用此出口）；110 行的"合法协作建议"条款是第二个出口——模型自己承认"已被规则禁止但仍在执行"，实际是规则留的口子互相掩护。
+- ≥70% 实测限定只修饰"上下文紧张"措辞，管不到"任务交接"话术；`wrapup-anxiety-guard` hook 词表也覆盖不全（"执行/推进"等变体漏检），软 advisory 兜不住，改由提示词硬关闭。
+- "等待其他会话完成后审查实现"随主句删除——脱离交接语境后是悬空引用。
+
+### 备份
+
+- `docs/prompt-changelog/static.ts.pre-remove-handoff-clause.bak` — 变更前完整文件
+
+### 回退方式
+
+```bash
+cp docs/prompt-changelog/static.ts.pre-remove-handoff-clause.bak src/prompt/static.ts
+```
+
+---
+
+## 2026-07-19 — browser_debug 提示降级为 EXTENDED 条件语义
+
+### 改了什么
+
+- `src/prompt/static.ts` 工具清单与 ⑤ 验证段的 browser_debug 描述：从"恒载主工具"改为"EXTENDED（RIVET_BROWSER_DEBUG=1 开启），不在工具列表时提示用户开启；不可用时显式说明渲染未验证"。
+
+### 为什么
+
+- browser_debug 默认关闭（定义 4.5KB 最重 + WebView2/CDP 环境问题），提示词不能指引模型调用不存在的工具（unknown-tool 错误）。
+- 配套：`bootstrap.ts` 注册加 `RIVET_BROWSER_DEBUG=1` 门；同批 repo_graph/leave_mark/import_resource 默认关闭（全会话零使用）。
+
+### 备份
+
+- `docs/prompt-changelog/static.ts.pre-tool-demotion.bak`
+
+---
+
+## 2026-07-19 — 工具三档 preset 配套提示词调整
+
+### 改了什么
+
+- `static.ts` 探索工具行：minimal 档不含的 inspect_project / semantic_search 标注为"full 档工具，在列表时优先用"。
+- 配套（非提示词文件）：`collab-branch-advisories.ts` 瑶光诊断 advisory 的 attack_case 提及加"在工具列表时"条件。
+
+### 为什么
+
+- 工具装配改为三档 preset（minimal 默认 30 / frontend 31 / full 44，`RIVET_TOOL_PRESET` 或 `tools.preset` 配置），默认档不含的工具不能让提示词当恒载指引。
+
+### 备份
+
+- `docs/prompt-changelog/static.ts.pre-tool-preset.bak`

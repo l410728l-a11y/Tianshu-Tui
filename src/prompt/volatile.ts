@@ -12,6 +12,7 @@ import type { PlaybookBullet } from '../agent/playbook.js'
 import type { WorktreeReality } from '../agent/worktree-reality.js'
 import type { TaskDepthLayer } from '../context/task-contract.js'
 import { loadDeclaredVerify } from '../config/verify-config.js'
+import type { VerifyConfig } from '../config/schema.js'
 import { detectRuntimeEnvBlock } from './runtime-env.js'
 
 const DEPTH_ADVISORY: Record<Exclude<TaskDepthLayer, 'unit'>, string> = {
@@ -369,7 +370,7 @@ function readRivetMd(cwd: string): string | undefined {
  *  LLM always sees what the gates actually run, even when the md's free text
  *  is stale. Returns null when nothing is declared (most projects). */
 function renderDeclaredVerify(cwd: string): string | null {
-  let verify: Record<string, string | undefined>
+  let verify: VerifyConfig
   try {
     verify = loadDeclaredVerify(cwd)
   } catch {
@@ -378,6 +379,10 @@ function renderDeclaredVerify(cwd: string): string | null {
   const lines = (['test', 'build', 'typecheck', 'lint'] as const)
     .filter(k => verify[k]?.trim())
     .map(k => `${k}: ${verify[k]!.trim()}`)
+  // Path-routed checks (A3) — the deliver gate runs these on matching files.
+  for (const r of verify.routes ?? []) {
+    lines.push(`${r.kind} [${r.match}]: ${r.run}`)
+  }
   if (lines.length === 0) return null
   return `<verify-commands source=".rivet-config.json">\n${escapeXml(lines.join('\n'))}\n</verify-commands>`
 }

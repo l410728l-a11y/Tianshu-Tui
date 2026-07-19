@@ -1,9 +1,11 @@
 import type { RiskLevel } from '../agent/approval-risk.js'
-import type { EvidenceState } from '../agent/evidence.js'
+import type { DeliveryVerificationStatus, EvidenceState } from '../agent/evidence.js'
 import type { TraceStore } from '../agent/trace-store.js'
 import type { CognitiveSeason } from '../agent/cognitive-season.js'
 import type { Sensorium, StrategyProfile } from '../agent/sensorium.js'
 import type { VigorState } from '../agent/vigor.js'
+import type { DisciplineEligibility } from '../agent/discipline-eligibility.js'
+import { noteEligibilityMissing } from '../agent/discipline-eligibility.js'
 import { renderContractProjection, type TaskContract } from './task-contract.js'
 import { buildUncertaintyFraming } from '../agent/uncertainty-framing.js'
 
@@ -37,6 +39,8 @@ export interface CognitiveLedgerInput {
    *  非空时替代泛化的 verification-gap 文案——当前断言、证据状态、下一动作
    *  一目了然；空/缺省时回退旧 verification-gap 行为（无义务 ≠ 无验证缺口）。 */
   obligationBlock?: string | null
+  /** 行为资格（来自 DisciplineEligibility），用于 requiresEngineeringDiscipline 等字段 */
+  eligibility?: DisciplineEligibility
 }
 
 export interface CognitiveLedger {
@@ -56,6 +60,8 @@ export interface CognitiveLedger {
   ctxWindow?: number
   virtue?: string | null
   obligationBlock?: string | null
+  /** 资格对象（来自 DisciplineEligibility 推导层） */
+  eligibility?: DisciplineEligibility
 }
 
 export interface CognitivePhaseSnapshot {
@@ -63,8 +69,10 @@ export interface CognitivePhaseSnapshot {
   objective?: string
   scopeFileCount: number
   isActionableTask: boolean
+  /** 是否需要工程纪律（来自 DisciplineEligibility），isActionable 的超集语义 */
+  requiresEngineeringDiscipline: boolean
   hasVerificationGap: boolean
-  deliveryStatus: string
+  deliveryStatus: DeliveryVerificationStatus
 }
 
 export function createCognitiveLedger(input: CognitiveLedgerInput): CognitiveLedger {
@@ -85,13 +93,20 @@ export function createCognitiveLedger(input: CognitiveLedgerInput): CognitiveLed
     ctxWindow: input.ctxWindow,
     virtue: input.virtue ?? null,
     obligationBlock: input.obligationBlock ?? null,
+    eligibility: input.eligibility ?? undefined,
   }
 }
 
 export function buildVerificationGapProjection(ledger: CognitiveLedger): string {
   const modifiedCount = ledger.evidence.filesModified.size
   if (modifiedCount === 0) return ''
-  if (ledger.evidence.deliveryStatus !== 'unverified') return ''
+  const deliveryOk = ledger.evidence.deliveryStatus === 'unverified'
+  if (!deliveryOk) return ''
+  // 交付验证分层：非工程任务（解释/分析/社交）修改了文件也不强制验证。
+  // eligibility === undefined 时保守触发（fail-closed），并记缺省遥测。
+  if (!ledger.eligibility) noteEligibilityMissing('cognitive-ledger:verification-gap')
+  const requiresVerification = ledger.eligibility?.requiresEngineeringDiscipline ?? true
+  if (!requiresVerification) return ''
   return `<verification-gap status="unverified" modified="${modifiedCount}">Run relevant verification before claiming done.</verification-gap>`
 }
 
@@ -135,8 +150,8 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
   // model should perceive, so byte-diff on coarse labels ≡ "notify on transition".
   // The special literals below stay exact: they're already constant and
   // semantically precise (none / 0.00 honest-warning / 1.00 fully-verified).
-  const filesModifiedCount = ledger.evidence?.filesModified?.size ?? 0
-  const verificationRuns = ledger.evidence?.verifications?.length ?? 0
+  const filesModifiedCount = ledger.evidence.filesModified.size
+  const verificationRuns = ledger.evidence.verifications.length
   let confLabel: string
   if (verificationRuns === 0) {
     confLabel = filesModifiedCount === 0 ? 'none' : '0.00'
@@ -145,7 +160,7 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
   }
   const parts: string[] = [`verification_coverage="${confLabel}"`]
 
-  parts.push(`files_modified="${ledger.evidence.filesModified.size}"`)
+  parts.push(`files_modified="${filesModifiedCount}"`)
 
   if (s.complexity !== undefined) {
     parts.push(`complexity="${coarseLabel(s.complexity)}"`)
@@ -181,7 +196,6 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
   }
 
   if (ledger.convergencePrecision !== undefined) parts.push(`convergence_precision="${coarseLabel(ledger.convergencePrecision)}"`)
-  if (ledger.convergencePrecision !== undefined) parts.push(`convergence_precision="${coarseLabel(ledger.convergencePrecision)}"`)
   if (ledger.outputEfficiency !== undefined) parts.push(`output_efficiency="${coarseLabel(ledger.outputEfficiency)}"`)
 
   // W4（incident 20b9714e）：常驻上下文占用硬数据。pressure 复合值仍是
@@ -199,12 +213,16 @@ export function buildCognitiveMirror(ledger: CognitiveLedger): string {
 
 /** Context-window label: 1_000_000 → "1M", 200_000 → "200K". Constant per session. */
 function formatWindowLabel(tokens: number): string {
+  if (tokens <= 0) return '?'
   if (tokens >= 1_000_000) return `${Math.round(tokens / 1_000_000)}M`
   return `${Math.round(tokens / 1_000)}K`
 }
 
 /** Coarse-grain a 0–1 value to low/mid/high for early-turn false-precision avoidance. */
 function coarseLabel(value: number): string {
+  // Defend against invalid numeric values: NaN and ±Infinity silently pass
+  // all < comparisons → 'high'. Default to the safest bucket.
+  if (!Number.isFinite(value)) return 'low'
   if (value < 0.34) return 'low'
   if (value < 0.67) return 'mid'
   return 'high'
@@ -280,8 +298,9 @@ export function getCognitivePhaseSnapshot(ledger: CognitiveLedger): CognitivePha
   return {
     contractStatus: ledger.contract?.status,
     objective: ledger.contract?.objective,
-    scopeFileCount: ledger.contract?.scope.mentionedFiles.length ?? 0,
+    scopeFileCount: ledger.contract?.scope?.mentionedFiles?.length ?? 0,
     isActionableTask: ledger.contract?.isActionable ?? false,
+    requiresEngineeringDiscipline: ledger.eligibility?.requiresEngineeringDiscipline ?? true,
     hasVerificationGap: buildVerificationGapProjection(ledger).length > 0,
     deliveryStatus: ledger.evidence.deliveryStatus,
   }

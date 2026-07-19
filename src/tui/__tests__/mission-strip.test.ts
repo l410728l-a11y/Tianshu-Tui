@@ -9,6 +9,7 @@ function makeSnapshot(overrides: Partial<CognitivePhaseSnapshot> = {}): Cognitiv
     objective: 'fix auth bug in src/auth.ts',
     scopeFileCount: 1,
     isActionableTask: true,
+    requiresEngineeringDiscipline: true,
     hasVerificationGap: true,
     deliveryStatus: 'unverified',
     ...overrides,

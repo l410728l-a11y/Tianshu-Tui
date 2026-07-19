@@ -237,6 +237,26 @@ export function createTeamOrchestrateTool(
           }
         : undefined
 
+      // T4: per-worker terminal status for the subagent panel. Same dual-emission
+      // contract as delegate_batch: settle-time via onWorkerSettled (fast worker
+      // flips to ✓ immediately), batch-end loop below as backstop (fleet dedupes).
+      const emitTerminal = params.onWorkerActivity
+        ? (r: import('../agent/work-order.js').WorkerResult) => {
+            params.onWorkerActivity!({
+              workOrderId: r.workOrderId,
+              parentToolId: params.toolUseId,
+              status: r.status,
+              progressLine: r.summary.slice(0, 80),
+              failureReason: r.failureReason,
+              model: r.model,
+              provider: r.provider,
+              usage: r.usage,
+              artifactId: r.diffArtifactId,
+              changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
+            })
+          }
+        : undefined
+
       const effectiveFromWave = fromWave ?? 0
 
       let run: PlanExecutorRun
@@ -271,6 +291,7 @@ export function createTeamOrchestrateTool(
                   params.onOutput!(`✦ team progress: ${done}/${total} workers done\n`)
                 }
               : undefined,
+            onWorkerSettled: emitTerminal ?? undefined,
           },
           coordinator,
         )
@@ -281,22 +302,12 @@ export function createTeamOrchestrateTool(
 
       const { summary, reviewVerdict, notes } = run
 
-      // T4: terminal per-worker status for the subagent panel.
-      if (params.onWorkerActivity && summary.run) {
+      // T4: terminal per-worker status for the subagent panel (backstop loop —
+      // per-worker settle events were already emitted via onWorkerSettled).
+      if (emitTerminal && summary.run) {
         const attackStore = getAttackStore?.() ?? null
         for (const r of summary.run.results) {
-          params.onWorkerActivity({
-            workOrderId: r.workOrderId,
-            parentToolId: params.toolUseId,
-            status: r.status,
-            progressLine: r.summary.slice(0, 80),
-            failureReason: r.failureReason,
-            model: r.model,
-            provider: r.provider,
-            usage: r.usage,
-            artifactId: r.diffArtifactId,
-            changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
-          })
+          emitTerminal(r)
           // H4-D4：标记已完成 worker，供 PAL worker: 引用验真
           if (r.status === 'passed' && attackStore) {
             attackStore.markWorkerCompleted(r.workOrderId)

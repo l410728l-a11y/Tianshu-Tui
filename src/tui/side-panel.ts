@@ -10,6 +10,7 @@
 import type { RivetTheme } from './theme.js'
 import type { TodoItem } from '../tools/todo-store.js'
 import type { FleetWorkerView } from './fleet-registry.js'
+import type { TeamPanelModel } from './team-panel-model.js'
 import type { PlanExecutionTrace, PlanStep } from '../agent/plan-execution-trace.js'
 import { color } from './engine/ansi.js'
 import { formatTokenProgressBar, type GoalStateSnapshot } from './format/glance-bar.js'
@@ -34,6 +35,8 @@ export interface SidePanelInput {
   cost?: number
   /** 当前已批准计划指针（XML 字符串），可选 */
   activePlan?: string
+  /** team 编队运行态模型（team_orchestrate 进行中非空，已叠加 fleet 实时状态）。 */
+  teamModel?: TeamPanelModel | null
   /** Plan Mode 活动草稿路径 + 字节数（起草中可见性） */
   planDraft?: { path: string; bytes?: number } | null
   /** 当前计划执行轨迹，可选 */
@@ -152,6 +155,39 @@ export function renderSidePanel(input: SidePanelInput, theme: RivetTheme): strin
     }
     if (input.workers.length > MAX_WORKERS) {
       lines.push(line(muted(`... +${input.workers.length - MAX_WORKERS} more`)))
+    }
+  }
+
+  // ── Section: Team 编队（team_orchestrate 运行中；wave 级视图，与上方
+  //    Worker 舰队的 per-worker 视图互补：一个看波次推进，一个看个体活动）──
+  if (input.teamModel) {
+    const tm = input.teamModel
+    const tasksById = new Map(tm.tasks.map(t => [t.id, t]))
+    lines.push(sectionDivider())
+    const modeColor = tm.mode === 'max' ? theme.warning : theme.secondary
+    lines.push(line(`${color('◆ 团队', theme.secondary, { bold: true })} ${color(`/team ${tm.mode}`, modeColor)}`))
+    const total = tm.tasks.length
+    const doneAll = tm.tasks.filter(t => t.status === 'done').length
+    const anyFailed = tm.tasks.some(t => t.status === 'failed' || t.status === 'blocked')
+    // 8 格进度条与主区 TeamPanel 同风格（█/░ + 语义色）。
+    const filled = Math.round((total > 0 ? doneAll / total : 0) * 8)
+    const barStr = '█'.repeat(filled) + '░'.repeat(Math.max(0, 8 - filled))
+    const barColor = total > 0 && doneAll === total ? theme.success : anyFailed ? theme.warning : theme.primary
+    const waveLabel = tm.totalWaves > 0 ? `wave ${Math.min(tm.currentWave + 1, tm.totalWaves)}/${tm.totalWaves}` : ''
+    lines.push(line(`${color(barStr, barColor)} ${muted(`${doneAll}/${total}${waveLabel ? ` · ${waveLabel}` : ''}`)}`))
+    const MAX_WAVES = 4
+    const shown = tm.waves.slice(0, MAX_WAVES)
+    for (const [i, w] of shown.entries()) {
+      const wTasks = w.taskIds.map(tid => tasksById.get(tid)).filter((t): t is NonNullable<typeof t> => Boolean(t))
+      const wDone = wTasks.filter(t => t.status === 'done').length
+      const complete = wTasks.length > 0 && wDone === wTasks.length
+      const active = i === tm.currentWave && !complete
+      const glyph = complete ? '✓' : active ? '◐' : '◌'
+      const gColor = complete ? theme.success : active ? theme.primary : theme.dim
+      lines.push(line(`${color(glyph, gColor)} ${w.id} ${muted(`${wDone}/${wTasks.length}`)}`))
+    }
+    if (tm.waves.length > MAX_WAVES) {
+      lines.push(line(muted(`... +${tm.waves.length - MAX_WAVES} waves`)))
     }
   }
 

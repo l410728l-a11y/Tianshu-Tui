@@ -75,9 +75,7 @@ docs/superpowers/specs/*.md
 .test-tmp/
 
 # === Agent / tool 运行态（生成物，非源码）===
-# 公开仓：整树忽略 knowledge（内部调试/复盘/竞品笔记）；仅保留 .rivet/SELF
-.rivet/knowledge/
-# 开发仓策展子目录策略见私有仓；此处仅忽略纯运行态
+# .rivet: 策展子目录(knowledge/skills/plans/agents/...)保持跟踪，仅忽略纯运行态
 .rivet/backups/
 .rivet/vsw/
 .rivet/semantic-index.json
@@ -123,3 +121,6 @@ _test-docx.html
 docs/*.html
 docs/*.docx
 
+
+# 公开仓：禁止 knowledge 回灌（私有仓策略不同；仅保留 .rivet/SELF）
+.rivet/knowledge/

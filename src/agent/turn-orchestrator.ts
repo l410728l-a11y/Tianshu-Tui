@@ -138,7 +138,6 @@ export interface TurnOrchestratorDeps {
   initializeRun: (userInput: string, callbacks: AgentCallbacks, images?: string[]) => Promise<{
     heartbeat: TurnHeartbeat
     wrappedCallbacks: AgentCallbacks
-    actionable: boolean
     turnMode: TurnMode
   }>
   stopFsWatcher: () => void
@@ -177,7 +176,7 @@ export interface TurnOrchestratorDeps {
     shouldAbort: boolean
     userMessageConsumed: boolean
   }>
-  runPerception: (turn: number, estTokens: number, actionable: boolean, callbacks: AgentCallbacks) => Promise<{
+  runPerception: (turn: number, estTokens: number, callbacks: AgentCallbacks) => Promise<{
     sensorium: Sensorium
     strategy: StrategyProfile
     phaseClass: string
@@ -387,7 +386,7 @@ export class TurnOrchestrator {
    * preserved. All AgentLoop field accesses routed through deps.
    */
   async execute(userInput: string, callbacks: AgentCallbacks, images?: string[]): Promise<void> {
-    const { heartbeat, wrappedCallbacks, actionable, turnMode } = await this.deps.initializeRun(userInput, callbacks, images)
+    const { heartbeat, wrappedCallbacks, turnMode } = await this.deps.initializeRun(userInput, callbacks, images)
     callbacks = wrappedCallbacks
 
     let checkpointCreatedThisTurn = false
@@ -521,7 +520,7 @@ export class TurnOrchestrator {
         // Step 6c: run perception (sensorium, season, phase class, contract)
         this.deps.getHeartbeat()?.tick('perception')
         const { sensorium: currentSensorium, strategy: currentStrategy, phaseClass, pressureResult } = await rejectOnAbort(
-          this.deps.runPerception(turn, estTokens, actionable, callbacks),
+          this.deps.runPerception(turn, estTokens, callbacks),
           signal!,
           'perception',
         )

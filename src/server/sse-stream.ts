@@ -26,6 +26,14 @@ export class SseStream {
       // plain GETs (which DO get CORS via the router) keep working.
       'Access-Control-Allow-Origin': '*',
     })
+    // Force the response headers out immediately. Without this, Node buffers the
+    // 200 + headers until the first res.write() — but a freshly-caught-up idle
+    // session has nothing to write (no replay events, no live events until the
+    // next run). The frontend's `await fetch(...)` then blocks waiting for the
+    // response head, the SSE `onOpen` never fires, streamStatus stays
+    // 'connecting', and the skeleton placeholder shows until its 6s timeout.
+    // flushHeaders() sends the head now so the client knows the stream is live.
+    res.flushHeaders()
   }
 
   send(event: string, data: unknown): void {

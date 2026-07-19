@@ -130,6 +130,13 @@ export class FleetRegistry {
     }
 
     if (existing) {
+      // 终态重放（settle 即时事件 + 批末兜底循环双发是设计使然）：冻结终态
+      // 时刻与状态——不重算 elapsed、不重复标 unread，只补缺 model/usage。
+      if (existing.terminal && terminal) {
+        if (activity.model && !existing.model) existing.model = activity.model
+        if (activity.usage && !existing.usage) existing.usage = activity.usage
+        return
+      }
       // running → terminal 转变时标记 unread（用户尚未查看终态结果）
       if (terminal && !existing.terminal) existing.unread = true
       existing.status = activity.status
@@ -242,14 +249,23 @@ export class FleetRegistry {
     return ids
   }
 
-  /** 委派工具终态时把该组 worker 移入归档区，而不是删除。 */
-  clearGroup(parentToolId: string): void {
+  /**
+   * 委派工具终态时把该组 worker 移入归档区，而不是删除。
+   * 返回本组刚归档的 worker 视图（按首见时间升序）——供完成沉淀卡渲染；
+   * 该组无记录时返回空数组。
+   */
+  clearGroup(parentToolId: string, now: number = Date.now()): FleetWorkerView[] {
+    const settled: FleetRecord[] = []
     for (const [id, r] of this.records) {
       if (r.parentToolId === parentToolId) {
         this.records.delete(id)
         this.terminalRecords.set(id, r)
+        settled.push(r)
       }
     }
+    return settled
+      .sort((a, b) => a.startedAt - b.startedAt)
+      .map(r => this.toView(r, now))
   }
 
   /** 按 id 查找 worker（active 优先，其次归档区）。 */

@@ -2594,3 +2594,125 @@ describe('deliver_task abort — post-abort commit attribution', () => {
     }
   })
 })
+
+
+// ── TDD gate suggest → tool-result annotation ───────────────────────────────
+// tool 层 suggest 此前是 no-op；现在达到阈值的 suggest 会附加到编辑成功结果
+// 尾部（追加在对话末尾，不动前缀缓存）。探索窗口与 RED 步骤保持安静。
+describe('TDD gate suggest annotation', () => {
+  const annotateNoopCallbacks = {
+    onTextDelta: () => {},
+    onThinkingDelta: () => {},
+    onToolUse: () => {},
+    onToolResult: () => {},
+    onTurnComplete: () => {},
+    onError: () => {},
+    onAbort: () => {},
+    onApprovalRequired: async () => false,
+    onCheckpoint: () => {},
+  }
+
+  function tddDeps(gateState: {
+    editsSinceLastTest: number
+    hasFailedTests?: boolean
+    verifications?: number
+  }): ToolPipelineDeps {
+    return {
+      config: {
+        toolRegistry: {
+          execute: async () => ({ content: 'ok', isError: false }),
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+          resolveName: (n: string) => n,
+        },
+        hooks: null,
+        lspEnabled: false,
+        fileHistory: undefined,
+        contextClaimStore: undefined,
+        sessionId: 'test-session',
+        promptEngine: { markGitDirty: () => {}, getModel: () => 'test-model' },
+      } as any,
+      cwd: '/tmp/test',
+      harness: {
+        executeTool: async ({ execute }: any) => {
+          const r = await execute()
+          return { content: r.content, isError: r.isError ?? false, retried: false }
+        },
+      } as any,
+      prewarm: { get: () => null, invalidate: () => {} } as any,
+      evidence: {
+        ...mockEvidence,
+        getGateState: () => ({
+          filesModified: gateState.editsSinceLastTest,
+          verifications: gateState.verifications ?? 0,
+          editsSinceLastTest: gateState.editsSinceLastTest,
+          hasFailedTests: gateState.hasFailedTests ?? false,
+          hasCodeEdits: true,
+          hasReadTestFiles: true,
+        }),
+      },
+      traceStore: { events: [], toolFingerprints: [] } as any,
+      repairHintTracker: { recordSuccess: () => {}, recordFailure: () => {} } as any,
+      repairPipeline: { run: (input: any) => ({ output: input, telemetry: [] }) } as any,
+      importGraph: null,
+      lastConflictCheckCount: 0,
+      trajectory: { getEntries: () => [] } as any,
+      getDoomLoopLevel: () => 'none' as const,
+      latestRisk: { level: 'none' as const, reasons: [], suggestedAction: '' },
+      sessionTurnCount: 1,
+      sessionId: 'test-session',
+      recordToolHistory: () => {},
+      turnBudget: createTurnBudget(0),
+    }
+  }
+
+  it('appends [TDD] note to a successful edit once edits cross the threshold (suggest mode)', async () => {
+    const result = await executeToolUse(
+      { id: 'tu-tdd1', name: 'edit_file', input: { file_path: 'src/foo.ts' } },
+      tddDeps({ editsSinceLastTest: 3 }), annotateNoopCallbacks as any, 1, false,
+    )
+    const tr = result.toolResult as any
+    assert.equal(tr.is_error, false, 'suggest must not block the edit')
+    assert.ok(tr.content.includes('[TDD]'), 'threshold-crossing suggest annotates the result')
+    assert.ok(tr.content.includes('0 verifications'), 'carries the gate message')
+  })
+
+  it('stays silent inside the exploration window (< threshold)', async () => {
+    const result = await executeToolUse(
+      { id: 'tu-tdd2', name: 'edit_file', input: { file_path: 'src/foo.ts' } },
+      tddDeps({ editsSinceLastTest: 1 }), annotateNoopCallbacks as any, 1, false,
+    )
+    const tr = result.toolResult as any
+    assert.equal(tr.is_error, false)
+    assert.ok(!tr.content.includes('[TDD]'), 'exploration window must not be annotated')
+  })
+
+  it('annotates when previously-run tests are failing', async () => {
+    const result = await executeToolUse(
+      { id: 'tu-tdd3', name: 'edit_file', input: { file_path: 'src/foo.ts' } },
+      tddDeps({ editsSinceLastTest: 1, hasFailedTests: true, verifications: 2 }),
+      annotateNoopCallbacks as any, 1, false,
+    )
+    const tr = result.toolResult as any
+    assert.equal(tr.is_error, false)
+    assert.ok(tr.content.includes('[TDD]'), 'failing tests annotate even below the edit threshold')
+    assert.ok(tr.content.includes('failed'), 'carries the failing-tests message')
+  })
+
+  it('does not annotate a failed edit result', async () => {
+    const deps = tddDeps({ editsSinceLastTest: 3 })
+    ;(deps.config as any).toolRegistry = {
+      execute: async () => ({ content: 'edit failed', isError: true }),
+      get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+      needsApproval: () => false,
+      resolveName: (n: string) => n,
+    }
+    const result = await executeToolUse(
+      { id: 'tu-tdd4', name: 'edit_file', input: { file_path: 'src/foo.ts' } },
+      deps, annotateNoopCallbacks as any, 1, false,
+    )
+    const tr = result.toolResult as any
+    assert.equal(tr.is_error, true)
+    assert.ok(!tr.content.includes('[TDD]'), 'failed edit result is not annotated')
+  })
+})

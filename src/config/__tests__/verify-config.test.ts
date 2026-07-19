@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { loadDeclaredVerify, classifyDeclaredCommand, invalidateVerifyConfig } from '../verify-config.js'
+import { loadDeclaredVerify, classifyDeclaredCommand, matchVerifyRoutes, invalidateVerifyConfig } from '../verify-config.js'
 
 describe('verify-config (A1/A2)', () => {
   let dir: string
@@ -63,5 +63,50 @@ describe('verify-config (A1/A2)', () => {
     assert.equal(classifyDeclaredCommand('cargo testx', verify), undefined)
     assert.equal(classifyDeclaredCommand('npm test', verify), undefined)
     assert.equal(classifyDeclaredCommand('anything', {}), undefined)
+  })
+})
+
+
+describe('matchVerifyRoutes (A3)', () => {
+  const routes = [
+    { match: 'desktop/src/**', run: 'tsc -p desktop', kind: 'typecheck' as const },
+    { match: '**/*.css', run: 'check-css', kind: 'lint' as const },
+    { match: 'desktop/src/**', run: 'tsc -p desktop', kind: 'typecheck' as const }, // dup
+  ]
+
+  it('matches ** across segments and * within one segment', () => {
+    const hit = matchVerifyRoutes(['desktop/src/app.tsx'], routes)
+    assert.deepEqual(hit.map(r => r.run), ['tsc -p desktop'])
+    // **/*.css matches nested and root-level css
+    assert.deepEqual(matchVerifyRoutes(['a/b/c.css'], routes).map(r => r.run), ['check-css'])
+    assert.deepEqual(matchVerifyRoutes(['c.css'], routes).map(r => r.run), ['check-css'])
+    // desktop/srcx is not desktop/src/**
+    assert.equal(matchVerifyRoutes(['desktop/srcx/a.ts'], routes).length, 0)
+  })
+
+  it('dedupes identical routes and returns empty on no match / no files', () => {
+    const hit = matchVerifyRoutes(['desktop/src/a.ts', 'desktop/src/b.ts'], routes)
+    assert.equal(hit.length, 1)
+    assert.deepEqual(matchVerifyRoutes(['README.md'], routes), [])
+    assert.deepEqual(matchVerifyRoutes([], routes), [])
+    assert.deepEqual(matchVerifyRoutes(['desktop/src/a.ts'], undefined), [])
+    // absolute paths are skipped
+    assert.deepEqual(matchVerifyRoutes(['/abs/desktop/src/a.ts'], routes), [])
+  })
+
+  it('loads routes from .rivet-config.json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'verify-routes-cfg-'))
+    try {
+      writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({
+        verify: { routes: [{ match: 'desktop/src/**', run: 'tsc -p desktop', kind: 'typecheck' }] },
+      }))
+      invalidateVerifyConfig()
+      const v = loadDeclaredVerify(dir)
+      assert.equal(v.routes?.length, 1)
+      assert.equal(v.routes?.[0]?.kind, 'typecheck')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      invalidateVerifyConfig()
+    }
   })
 })

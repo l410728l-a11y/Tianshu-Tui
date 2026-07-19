@@ -12,6 +12,7 @@ import { advanceContractStatus, extractTaskContract, type TaskContract } from '.
 import type { EvidenceState } from '../../agent/evidence.js'
 import type { TraceStore } from '../../agent/trace-store.js'
 import type { Sensorium } from '../../agent/sensorium.js'
+import type { DisciplineEligibility } from '../../agent/discipline-eligibility.js'
 
 function makeEvidence(overrides: Partial<EvidenceState> = {}): EvidenceState {
   return {
@@ -96,8 +97,22 @@ describe('CognitiveLedger read model', () => {
     assert.equal(snapshot.contractStatus, 'executing')
     assert.equal(snapshot.scopeFileCount, 1)
     assert.equal(snapshot.isActionableTask, true)
+    assert.equal(snapshot.requiresEngineeringDiscipline, true, '缺省 fail-closed: 无 eligibility 时保守假定需要工程纪律')
     assert.equal(snapshot.hasVerificationGap, true)
     assert.equal(snapshot.deliveryStatus, 'unverified')
+  })
+
+  it('getCognitivePhaseSnapshot reflects requiresEngineeringDiscipline from eligibility', () => {
+    const ledger = createCognitiveLedger({
+      contract: makeContract(),
+      evidence: makeEvidence(),
+      trace: makeTrace(),
+      turn: 5,
+      eligibility: { requiresEngineeringDiscipline: true } as import('../../agent/discipline-eligibility.js').DisciplineEligibility,
+    })
+    const snapshot = getCognitivePhaseSnapshot(ledger)
+    assert.equal(snapshot.isActionableTask, true, 'isActionableTask still reflects contract.isActionable')
+    assert.equal(snapshot.requiresEngineeringDiscipline, true, 'requiresEngineeringDiscipline comes from eligibility')
   })
 
   it('getCognitivePhaseSnapshot omits doom-level and turn (pruned fields)', () => {
@@ -117,6 +132,7 @@ describe('CognitiveLedger read model', () => {
     assert.equal(snapshot.contractStatus, undefined)
     assert.equal(snapshot.scopeFileCount, 0)
     assert.equal(snapshot.isActionableTask, false)
+    assert.equal(snapshot.requiresEngineeringDiscipline, true, '缺省 fail-closed: 无 eligibility 时保守假定需要工程纪律')
     assert.equal(snapshot.hasVerificationGap, true)
     assert.match(buildCognitivePromptProjection(ledger), /<verification-gap/)
   })
@@ -165,6 +181,59 @@ describe('verification gap projection', () => {
       turn: 1,
     })
     assert.equal(buildVerificationGapProjection(ledger), '')
+  })
+
+  // ── 交付验证分层：非工程任务不强制验证 ──
+  const engEligibility: DisciplineEligibility = {
+    responseActionable: true,
+    requiresEngineeringDiscipline: true,
+    requiresCodeVerification: true,
+    allowsEvidenceReview: true,
+    canSuggestPlan: true,
+    canDispatch: true,
+    projectionMode: 'engineering',
+  }
+  const lightEligibility: DisciplineEligibility = {
+    responseActionable: true,
+    requiresEngineeringDiscipline: false,
+    requiresCodeVerification: false,
+    allowsEvidenceReview: false,
+    canSuggestPlan: false,
+    canDispatch: false,
+    projectionMode: 'light',
+  }
+
+  it('suppresses gap for non-engineering tasks even with modified files', () => {
+    const ledger = createCognitiveLedger({
+      evidence: makeEvidence(),
+      trace: makeTrace(),
+      turn: 1,
+      eligibility: lightEligibility,
+    })
+    assert.equal(buildVerificationGapProjection(ledger), '',
+      '解释/分析任务修改了文件也不强制验证')
+  })
+
+  it('keeps gap for engineering tasks with modified files', () => {
+    const ledger = createCognitiveLedger({
+      evidence: makeEvidence(),
+      trace: makeTrace(),
+      turn: 1,
+      eligibility: engEligibility,
+    })
+    const gap = buildVerificationGapProjection(ledger)
+    assert.match(gap, /<verification-gap/)
+  })
+
+  it('fail-closed: triggers gap when eligibility is absent', () => {
+    const ledger = createCognitiveLedger({
+      evidence: makeEvidence(),
+      trace: makeTrace(),
+      turn: 1,
+      // eligibility absent → 保守触发验证
+    })
+    const gap = buildVerificationGapProjection(ledger)
+    assert.match(gap, /<verification-gap/)
   })
 })
 

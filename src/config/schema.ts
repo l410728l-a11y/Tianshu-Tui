@@ -568,6 +568,15 @@ export const verifySchema = z.object({
    *  Declared-only for now: no dedicated lint gate consumes it yet (deferred);
    *  bash verification annotation recognizes it. */
   lint: z.string().optional(),
+  /** Path-routed check commands (A3): when a changed file matches `match`
+   *  (glob, repo-relative POSIX, supports `**`/`*`), the deliver review gate
+   *  runs `run` and escalates on non-zero exit. Covers sub-projects the root
+   *  typecheck cannot see (e.g. desktop/ has its own tsconfig). */
+  routes: z.array(z.object({
+    match: z.string(),
+    run: z.string(),
+    kind: z.enum(['test', 'build', 'typecheck', 'lint']),
+  })).optional(),
 }).default({})
 
 export const proSchema = z.object({
@@ -613,6 +622,11 @@ export const configSchema = z.object({
   env: envSchema,
   ui: uiSchema,
   verify: verifySchema,
+  /** 工具装配档位：minimal（默认）/ frontend / full。会话启动期解析，
+   *  会话内冻结（前缀缓存安全）；RIVET_TOOL_PRESET env 优先于此配置。 */
+  tools: z.object({
+    preset: z.enum(['minimal', 'frontend', 'full']).optional(),
+  }).default({}),
   pro: proSchema,
   plugins: z.object({
     enabled: z.record(z.boolean()).default({}),
@@ -635,6 +649,7 @@ export type Config = {
   env: EnvConfig
   ui: UiConfig
   verify: VerifyConfig
+  tools: { preset?: 'minimal' | 'frontend' | 'full' | undefined }
   pro: ProConfig
   plugins: { enabled: Record<string, boolean> }
 }

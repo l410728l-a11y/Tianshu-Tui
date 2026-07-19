@@ -1,4 +1,5 @@
 import type { TaskContract } from '../context/task-contract.js'
+import type { DisciplineEligibility } from './discipline-eligibility.js'
 import type { IntentTaskKind } from './intent-retrieval-route.js'
 
 /** 协作流分支：A 对齐、B 守门、C 安全、D 诊断、E 勘探。 */
@@ -10,6 +11,8 @@ export interface CollabBranchInput {
   readonly sanitizedText: string
   readonly confidence: number
   readonly taskContract?: TaskContract
+  /** 统一资格对象——为 undefined 时回退到 taskContract?.isActionable */
+  readonly eligibility?: DisciplineEligibility
 }
 
 export interface CollabBranchResult {
@@ -53,7 +56,12 @@ export function normalizeCollabBranches(value: unknown): CollabBranch[] {
 }
 
 export function deriveCollabBranches(input: CollabBranchInput): CollabBranchResult {
-  if (input.taskKinds.includes('social_idle') || input.taskContract?.isActionable === false) {
+  // eligibility.canDispatch === false 时显式抑制；缺省则回退启发式——路由构建
+  // 期 eligibility 尚不存在（它由 route.taskKinds 推导，是 egg-before-hen），
+  // 缺省 fail-closed 会杀死全部启发式分支。真正的派发愿门禁在 dispatcher-hook
+  // （有 eligibility，fail-closed + 缺省遥测）。
+  const nonActionable = input.eligibility?.canDispatch === false
+  if (input.taskKinds.includes('social_idle') || nonActionable) {
     return { branches: [], reasons: [] }
   }
 

@@ -39,6 +39,10 @@ describe('output-store', () => {
   })
 
   describe('buildModelOutput', () => {
+    // 通用分支（complete / error-aware / head+tail / recovery）必须用**非过滤命令**
+    // 驱动——2940d097 起 'npm test' 失败输出先经 filterTestRun（无识别行时只留
+    // 尾部 15 行），本组断言针对的是 buildModelOutput 自身的截断语义。
+    const unfilteredMeta = { command: 'npm run build', exitCode: 0, durationMs: 1500 }
     it('includes header with command, exit code, duration, line count', () => {
       const result = buildModelOutput('line1\nline2\n', meta)
       assert.ok(result.startsWith('[npm test] exit=0 time=1.5s lines=2'))
@@ -67,8 +71,8 @@ describe('output-store', () => {
 
     it('preserves failed output instead of success-suppressing it', () => {
       const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n')
-      const result = buildModelOutput(lines, { ...meta, exitCode: 1 })
-      assert.ok(result.startsWith('[npm test] exit=1'))
+      const result = buildModelOutput(lines, { ...unfilteredMeta, exitCode: 1 })
+      assert.ok(result.startsWith('[npm run build] exit=1'))
       assert.ok(result.includes('line 0'))
       assert.ok(result.includes('line 49'))
       assert.ok(!result.includes('success output suppressed'))
@@ -76,9 +80,9 @@ describe('output-store', () => {
 
     it('truncates very large failed output with head/tail by lines', () => {
       const lines = Array.from({ length: 500 }, (_, i) => `line ${i}`).join('\n')
-      const result = buildModelOutput(lines, { ...meta, exitCode: 1 })
+      const result = buildModelOutput(lines, { ...unfilteredMeta, exitCode: 1 })
       assert.ok(result.includes('lines omitted'))
-      assert.ok(result.startsWith('[npm test] exit=1'))
+      assert.ok(result.startsWith('[npm run build] exit=1'))
     })
 
     it('error-aware: failed output over threshold surfaces error lines to the model', () => {
@@ -86,7 +90,7 @@ describe('output-store', () => {
       for (let i = 1; i <= 45; i++) lines.push(`info: noise line ${i}`)
       lines.push('error TS2345: type mismatch at src/foo.ts:42')
       lines.push('  expected string, got number')
-      const result = buildModelOutput(lines.join('\n'), { ...meta, exitCode: 1 })
+      const result = buildModelOutput(lines.join('\n'), { ...unfilteredMeta, exitCode: 1 })
       assert.ok(result.includes('error TS2345') || result.includes('expected string'),
         'model output should surface the diagnostic line, not just head/tail noise')
       assert.ok(result.includes('error-aware'), 'should mark error-aware truncation')
@@ -129,7 +133,7 @@ describe('output-store', () => {
 
     it('large failed-output truncation footer includes rawPath recovery hint', () => {
       const lines = Array.from({ length: 500 }, (_, i) => `line ${i}`).join('\n')
-      const result = buildModelOutput(lines, { ...meta, exitCode: 1, rawPath: '/tmp/rivet-raw/def.raw' })
+      const result = buildModelOutput(lines, { ...unfilteredMeta, exitCode: 1, rawPath: '/tmp/rivet-raw/def.raw' })
       assert.ok(result.includes('full output: read_file /tmp/rivet-raw/def.raw'))
     })
 

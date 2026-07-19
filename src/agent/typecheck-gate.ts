@@ -2,7 +2,7 @@ import { isAbsolute, relative, join } from 'node:path'
 import { statSync, readFileSync } from 'node:fs'
 import { runTypeCheck, type LspCheckResult } from '../lsp/client.js'
 import type { Diagnostic } from '../lsp/diagnostics.js'
-import { loadDeclaredVerify } from '../config/verify-config.js'
+import { loadDeclaredVerify, matchVerifyRoutes } from '../config/verify-config.js'
 import { spawnHidden } from '../tools/spawn-hidden.js'
 
 /**
@@ -293,6 +293,7 @@ export async function runChangedFilesTypecheckMemo(
 export function __clearTypecheckMemo(): void {
   memoByCwd.clear()
   declaredMemoByCwd.clear()
+  routesMemoByCwd.clear()
 }
 
 // ── Declared-command backstop for non-TS projects (A2) ─────────────────────
@@ -398,5 +399,77 @@ export async function runDeclaredCheck(
     : null
 
   if (sig) declaredMemoByCwd.set(cwd, { sig, result })
+  return result
+}
+
+// ── Path-routed verify commands (A3) ───────────────────────────────────────
+// verify.routes declare per-glob check commands for sub-projects the root
+// typecheck cannot see (desktop/ has its own tsconfig; a Go module under
+// server/; etc.). The deliver review gate runs every route whose glob hits a
+// changed file. Same semantics as the declared check: exit>0 escalates with
+// an output tail, could-not-run (-1) fails open, no per-toolchain parsers.
+
+export interface VerifyRouteFailure {
+  match: string
+  command: string
+  kind: 'test' | 'build' | 'typecheck' | 'lint'
+  exitCode: number
+  /** Output tail for the focus note. */
+  tail: string
+}
+
+export interface VerifyRoutesResult {
+  failures: VerifyRouteFailure[]
+  /** Single-line summary for focusHint / advisory. */
+  summary: string
+}
+
+const routesMemoByCwd = new Map<string, { sig: string; result: VerifyRoutesResult | null }>()
+
+/**
+ * Run every verify.routes entry whose glob matches a changed file.
+ * Returns null when no route matches or all matched commands pass / could
+ * not run (fail-open). Only failures (exit > 0) are reported.
+ */
+export async function runVerifyRoutes(
+  cwd: string,
+  changedFiles: readonly string[],
+  run: DeclaredCommandRunner = defaultDeclaredRunner,
+): Promise<VerifyRoutesResult | null> {
+  if (changedFiles.length === 0) return null
+  const routes = matchVerifyRoutes(changedFiles, loadDeclaredVerify(cwd).routes)
+  if (routes.length === 0) return null
+
+  const sig = allFilesSignature(cwd, changedFiles)
+  if (sig) {
+    const hit = routesMemoByCwd.get(cwd)
+    if (hit && hit.sig === sig) return hit.result
+  }
+
+  const failures: VerifyRouteFailure[] = []
+  for (const route of routes) {
+    const { exitCode, output } = await run(cwd, route.run)
+    // -1 = could not run to completion → fail-open like the tsc path.
+    if (exitCode > 0) {
+      failures.push({
+        match: route.match,
+        command: route.run,
+        kind: route.kind,
+        exitCode,
+        tail: output.slice(-OUTPUT_TAIL_CHARS).trim().split('\n').slice(-6).join(' | '),
+      })
+    }
+  }
+
+  const result: VerifyRoutesResult | null = failures.length > 0
+    ? {
+        failures,
+        summary: failures
+          .map(f => `${f.kind} failed for ${f.match} (\`${f.command}\`, exit ${f.exitCode}) — ${f.tail}`)
+          .join(' || '),
+      }
+    : null
+
+  if (sig) routesMemoByCwd.set(cwd, { sig, result })
   return result
 }

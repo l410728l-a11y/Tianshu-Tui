@@ -33,6 +33,27 @@ describe('applyCommandFilter', () => {
       assert.ok(result)
       assert.ok(!result.includes('Compiling'))
     })
+
+    it('keeps file:line:col locations in tsc diagnostics', () => {
+      const input = 'src/agent/loop.ts(1553,21): error TS2532: Object is possibly undefined.'
+      const result = applyCommandFilter('npx tsc --noEmit', input, 2)
+      assert.ok(result)
+      assert.match(result, /src\/agent\/loop\.ts\(1553,21\): error TS2532/, '文件位置必须保留')
+    })
+
+    it('exit 0 with tsc errors in output → failure branch (pipe exit-code laundering)', () => {
+      const input = 'src/tools/foo.ts(10,5): error TS2322: Type mismatch.'
+      const result = applyCommandFilter('npx tsc --noEmit', input, 0)
+      assert.ok(result)
+      assert.ok(!result.includes('✓ typecheck passed'), '含错误输出时不得合成成功')
+      assert.match(result, /error TS2322/)
+    })
+
+    it('piped commands bypass the filter entirely (exit code untrustworthy)', () => {
+      const input = 'src/tools/foo.ts(10,5): error TS2322: Type mismatch.'
+      const result = applyCommandFilter('node_modules/.bin/tsc --noEmit 2>&1 | head -5', input, 0)
+      assert.equal(result, null, '管道命令返回 null，由调用方回退原始输出')
+    })
   })
 
   describe('node:test filter', () => {
@@ -56,6 +77,13 @@ describe('applyCommandFilter', () => {
       assert.match(result, /not ok 2/)
       assert.match(result, /AssertionError/)
       assert.ok(!result.includes('✓ passing test'))
+    })
+
+    it('exit 0 with not ok in output → failure branch', () => {
+      const input = '✓ ok test\nnot ok 2 - failing test\n1 passed, 1 failed'
+      const result = applyCommandFilter('npx tsx --test src/foo.test.ts', input, 0)
+      assert.ok(result)
+      assert.match(result, /not ok 2/, '内容含 not ok 时按失败处理')
     })
   })
 
@@ -198,15 +226,29 @@ describe('applyCommandFilter', () => {
         '',
         ...Array.from({ length: 14 }, (_, i) => `✔ test ${i} (1ms)`),
         'ℹ tests 5451',
+        'ℹ pass 5451',
+        'ℹ fail 0',
+      ].join('\n')
+      const result = applyCommandFilter('npm test', input, 0)
+      assert.ok(result)
+      assert.ok(!result.includes('> tianshu-tui@'), '生命周期头应被剥除')
+      assert.match(result, /✓ 5451 passed/)
+      assert.match(result, /ℹ tests 5451/)
+      assert.ok(!result.includes('✔ test one'), '通过项细节应被丢弃')
+    })
+
+    it('exit 0 but content says fail=2 → treated as failure (content over exit code)', () => {
+      const input = [
+        ...Array.from({ length: 14 }, (_, i) => `✔ test ${i} (1ms)`),
+        '✖ test broken (2ms)',
+        'ℹ tests 5451',
         'ℹ pass 5449',
         'ℹ fail 2',
       ].join('\n')
       const result = applyCommandFilter('npm test', input, 0)
       assert.ok(result)
-      assert.ok(!result.includes('> tianshu-tui@'), '生命周期头应被剥除')
-      assert.match(result, /✓ 5449 passed/)
-      assert.match(result, /ℹ tests 5451/)
-      assert.ok(!result.includes('✔ test one'), '通过项细节应被丢弃')
+      assert.ok(!result.includes('✓ 5449 passed'), '内容含失败签名时不得合成成功头')
+      assert.match(result, /ℹ fail 2/, '失败计数必须保留')
     })
 
     it('pnpm WARN lines are stripped', () => {

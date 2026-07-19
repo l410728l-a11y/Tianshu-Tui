@@ -119,7 +119,7 @@ describe('buildSystemPrompt', () => {
     assert.ok(prompt.includes('0 passed 当成功'), '诚实门禁内核（未运行=未验证）必须有落点')
     assert.ok(prompt.includes('涉及文件'), '收束必须包含commit+文件信息')
     assert.ok(prompt.includes('没什么可说就跳过'), '收束不强制填表——无内容可跳过')
-    assert.ok(prompt.includes('自我设限'), 'NEVER narrate session limits 必须有落点')
+    assert.ok(!prompt.includes('自我设限'), '"NEVER narrate session limits"条已于 2026-07-19 应用户要求整条移除')
   })
 
   it('wraps security in <security> tags', () => {
@@ -190,7 +190,8 @@ describe('buildSystemPrompt', () => {
     assert.ok(prompt.includes('不是默认推进方式'), '应声明委派非默认推进方式')
     assert.ok(prompt.includes('用户说不要委派时'), '应含禁用委派条件')
     assert.ok(prompt.includes('继续内联执行'), '应含降级内联执行')
-    assert.ok(prompt.includes('delegate_task 委派——前者是上下文压力下的协作建议'), '应区分建议新会话与 delegate_task')
+    assert.ok(!prompt.includes('是合法的协作建议'), '不再保留"新会话交接合法"出口')
+    assert.ok(!prompt.includes('不自我设限'), '不自我设限条已整条移除')
   })
 
   it('applies behavioral calibration without exposing model identity', () => {

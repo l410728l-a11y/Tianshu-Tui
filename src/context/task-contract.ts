@@ -275,7 +275,8 @@ export function contractStatusFromPhaseClass(phaseClass: string): ContractStatus
   }
 }
 
-export function renderContractProjection(contract: TaskContract): string {
+export function renderContractProjection(contract: TaskContract, projectionMode?: ProjectionMode): string {
+  if (projectionMode === 'none' || projectionMode === 'light') return ''
   if (!contract.isActionable) return ''
 
   const parts = [`<task-contract id="${escapeXml(contract.id)}" status="${contract.status}">`]
@@ -314,7 +315,8 @@ export interface TaskAnchorProgress {
  * It is appended at the TAIL of the message list (never the frozen prefix), so
  * re-injecting it every compaction is prefix-cache safe.
  */
-export function renderTaskAnchor(contract: TaskContract, progress: TaskAnchorProgress = {}): string {
+export function renderTaskAnchor(contract: TaskContract, progress: TaskAnchorProgress = {}, projectionMode?: ProjectionMode): string {
+  if (projectionMode === 'none' || projectionMode === 'light') return ''
   if (!contract.isActionable) return ''
 
   const lines: string[] = [
@@ -352,6 +354,17 @@ export function isActionableTurn(userMessage: string): boolean {
   const contract = extractTaskContract(userMessage)
   return contract.isActionable
 }
+
+// ── Projection Mode ────────────────────────────────────────────────
+
+/**
+ * Controls how contract projection/anchor is rendered.
+ * - 'none' or 'light': skip rendering entirely (return '')
+ * - 'evidence' or 'engineering' or undefined: use isActionable check (current behavior)
+ *
+ * Canonical definition — re-exported by agent/discipline-eligibility.ts.
+ */
+export type ProjectionMode = 'none' | 'light' | 'evidence' | 'engineering'
 
 // ── Task Depth Layer ────────────────────────────────────────────────
 

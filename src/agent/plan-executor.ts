@@ -52,6 +52,7 @@ export interface PlanExecutorDeps {
     policy?: AggregationPolicy,
     abortSignal?: AbortSignal,
     onProgress?: (completed: number, total: number) => void,
+    onWorkerSettled?: (result: import('./work-order.js').WorkerResult) => void,
   ): Promise<CoordinatorRun>
   delegate?(request: DelegationRequest, abortSignal?: AbortSignal): Promise<CoordinatorRun>
   recordTeamWaveTelemetry?(event: TeamWaveTelemetry): void
@@ -90,6 +91,9 @@ export interface PlanExecutorOptions {
   onPlanReady?: (summary: TeamRunSummary, fromWave: number) => void
   /** Per-wave progress passthrough (completed/total), for live tool output. */
   onProgress?: (completed: number, total: number) => void
+  /** Per-worker settle passthrough (final result the moment each worker settles),
+   *  for the subagent fleet panel terminal glyphs. */
+  onWorkerSettled?: (result: import('./work-order.js').WorkerResult) => void
 }
 
 export interface PlanExecutorRun {
@@ -251,11 +255,11 @@ export async function executePlan(opts: PlanExecutorOptions, deps: PlanExecutorD
       onPlanReady: opts.onPlanReady,
     },
     {
-      delegateBatch: (requests, policy, abortSignal, onProgress) =>
+      delegateBatch: (requests, policy, abortSignal, onProgress, onWorkerSettled) =>
         deps.delegateBatch(requests, policy, abortSignal, (completed, total) => {
           onProgress?.(completed, total)
           opts.onProgress?.(completed, total)
-        }),
+        }, onWorkerSettled ?? opts.onWorkerSettled),
       recordTeamWaveTelemetry: event => {
         telemetryEvent = event
         deps.recordTeamWaveTelemetry?.(event)

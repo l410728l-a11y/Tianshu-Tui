@@ -28,6 +28,7 @@ import { classifySeason } from './cognitive-season.js'
 import { renderToolContext, type AffordanceState, adaptAffordanceFromHistory, computeAffordanceScores } from './affordance.js'
 import { selectPolicy } from './policy-selection.js'
 import { checkTddGate, buildTddGateHint } from './tdd-gate.js'
+import { deriveDisciplineEligibility, detectExplicitNoMutation, detectProblemSignal } from './discipline-eligibility.js'
 import { EXPLORATION_SIGNAL_RE } from './collab-branches.js'
 import { selectCollabAdvisories } from './collab-branch-advisories.js'
 import { buildCognitiveProjectionParts, createCognitiveLedger, getCognitivePhaseSnapshot } from '../context/cognitive-ledger.js'
@@ -157,6 +158,8 @@ export class TurnStepProducer {
   private lastChargedToolCtx = ''
   /** 本轮实际渲染的 toolContext（runPerception 写入，runCognitivePrep 消费） */
   private lastRenderedToolCtx = ''
+  /** 本轮 TurnMode（initializeRun 写入，runPerception 消费） */
+  private lastTurnMode: TurnMode = 'chat'
   /** 计费基线对应的 compact 轮 — compact 重置 appendix baseline 后块全量
    *  重新入场，计费基线必须同步作废（否则重发字节被漏计）。 */
   private chargeBaselineCompactTurn: number | null = null
@@ -176,7 +179,7 @@ export class TurnStepProducer {
    * Returns the heartbeat (for cleanup) and the wrapped callbacks (which
    * the caller must use for the rest of the run).
    */
-  async initializeRun(userInput: string, callbacks: AgentCallbacks, images?: string[]): Promise<{ heartbeat: TurnHeartbeat, wrappedCallbacks: AgentCallbacks, actionable: boolean, turnMode: TurnMode }> {
+  async initializeRun(userInput: string, callbacks: AgentCallbacks, images?: string[]): Promise<{ heartbeat: TurnHeartbeat, wrappedCallbacks: AgentCallbacks, turnMode: TurnMode }> {
     await this.self.warmupMemories()
     // The controller is created eagerly in run() before any await, so an abort
     // fired during warmup is honored (not discarded). Only create one here if a
@@ -300,6 +303,7 @@ export class TurnStepProducer {
 
     this.self.session.addUserMessage(userInput, images)
     const turnMode = classifyTurnMode(userInput, this.self.taskContract)
+    this.lastTurnMode = turnMode
     const actionable = turnMode !== 'chat'
     this.self.config.promptEngine.setActionableTurn(actionable)
 
@@ -495,7 +499,7 @@ export class TurnStepProducer {
       this.self.config.client.setReasoningEffort?.(banditAdjusted)
       this.self.shadowEffortTelemetry(ruleEffort)
     }
-    return { heartbeat, wrappedCallbacks: callbacks, actionable, turnMode }
+    return { heartbeat, wrappedCallbacks: callbacks, turnMode }
   }
 
   /**
@@ -835,7 +839,7 @@ export class TurnStepProducer {
    */
   private runCognitivePrep(
     turn: number,
-    actionable: boolean,
+    eligibility: import('./discipline-eligibility.js').DisciplineEligibility,
     pressureResult: import('../context/pressure-monitor.js').PressureResult,
   ): void {
     // Delivery 义务（动态）：任务型会话里代码文件被改且尚未验证 → 登记
@@ -846,7 +850,7 @@ export class TurnStepProducer {
     {
       const ev = this.self.evidence.getState()
       const gate = this.self.evidence.getGateState()
-      if (actionable && this.self.taskContract && gate.hasCodeEdits && ev.deliveryStatus === 'unverified') {
+      if (eligibility.requiresEngineeringDiscipline && this.self.taskContract && gate.hasCodeEdits && ev.deliveryStatus === 'unverified') {
         this.self.obligations.upsert({
           family: 'delivery',
           claim: '本任务修改的代码已通过相关验证',
@@ -880,6 +884,7 @@ export class TurnStepProducer {
       virtue: this.self.stanceTally.renderMirror(),
       // 证据义务结构化摘要：非空时替代 verification-gap（同一事实单一声音）。
       obligationBlock: this.self.obligations.renderBlock(),
+      eligibility,
     })
     this.self.latestCognitiveSnapshot = getCognitivePhaseSnapshot(cognitiveLedger)
 
@@ -903,7 +908,7 @@ export class TurnStepProducer {
     const sycophancyHint = this.self.sycophancyTrap.getHint()
     const immuneHint = this.self._lastImmuneHint ? formatImmuneContext(this.self._lastImmuneHint) : undefined
     this.self._lastImmuneHint = undefined // consume once
-    const { stable: projectionStable, ephemeral: projectionEphemeral } = actionable
+    const { stable: projectionStable, ephemeral: projectionEphemeral } = eligibility.projectionMode !== 'none'
       ? buildCognitiveProjectionParts(cognitiveLedger, { sycophancyHint, immuneHint, yaoguangHint })
       : { stable: '', ephemeral: '' }
     this.self.config.promptEngine.setCognitiveProjection(projectionStable, projectionEphemeral)
@@ -915,7 +920,7 @@ export class TurnStepProducer {
     // 计费高估 ~10x，137 轮会话的名义开销必然越过 5%/8% 阈值，长会话
     // 后段镜面被误熄。ephemeral（一次性提示）每轮都是新字节，全额计入。
     // chars / 4 ≈ tokens (crude but fast estimate for overhead ratio)
-    if (actionable) {
+    if (eligibility.projectionMode !== 'none') {
       // compact 后 appendix baseline 重置 → 块全量重发，计费基线同步作废
       if (this.self.lastCompactTurn !== this.chargeBaselineCompactTurn) {
         this.chargeBaselineCompactTurn = this.self.lastCompactTurn
@@ -944,7 +949,6 @@ export class TurnStepProducer {
   async runPerception(
     turn: number,
     estTokens: number,
-    actionable: boolean,
     callbacks: AgentCallbacks,
   ): Promise<{
     sensorium: Sensorium
@@ -954,7 +958,7 @@ export class TurnStepProducer {
   }> {
     // ── StarFlow v2: Sensorium computation ──
     const pressureResult = this.self.pressureMonitor.check(estTokens, this.self.session.getTurnCount())
-    if (!actionable) {
+    if (this.lastTurnMode === 'chat') {
       this.self.config.promptEngine.setCognitiveProjection(null)
       this.self.config.promptEngine.setTaskProgress({ completed: [], current: 'chat-mode', remaining: [], decisions: [] })
     }
@@ -1062,6 +1066,16 @@ export class TurnStepProducer {
     })()
     this.self.config.promptEngine.setPhaseHint(phaseClass)
     const contractStatus = contractStatusFromPhaseClass(phaseClass)
+    // 构造统一资格对象，供 TDD gate 和 cognitive prep 共用
+    const taskKinds = this.self._lastRetrievalRoute?.taskKinds ?? []
+    const explicitNoMutation = detectExplicitNoMutation(this.self.initialUserMessage ?? '')
+    const eligibility = deriveDisciplineEligibility({
+      turnMode: this.lastTurnMode, taskKinds, explicitNoMutation,
+      mentionedCodeFileCount: this.self.taskContract?.scope.mentionedFiles.length,
+      problemSignal: detectProblemSignal(this.self.initialUserMessage ?? ''),
+    })
+    this.self._lastEligibility = eligibility
+
     if (this.self.taskContract && contractStatus) {
       const prevStatus = this.self.taskContract.status
       this.self.taskContract = advanceContractStatus(this.self.taskContract, contractStatus, this.self.session.getTurnCount())
@@ -1074,7 +1088,7 @@ export class TurnStepProducer {
         const tddHint = checkTddGate({
           filesRead: es.filesRead,
           filesModified: es.filesModified,
-          isActionable: this.self.taskContract.isActionable,
+          requiresCodeVerification: eligibility.requiresCodeVerification,
         })
         if (tddHint) this.self._lastImmuneHint = tddHint
 
@@ -1096,7 +1110,8 @@ export class TurnStepProducer {
     // verification-gap + uncertainty + immune hint. Runs last so it sees the
     // freshly-advanced contract status and consumes the TDD-gate immune hint
     // produced above (reproduces the original _runInner step-6e ordering).
-    this.runCognitivePrep(turn, actionable, pressureResult)
+    // eligibility 已在上方 contract 块之前构造（供 TDD gate 与 cognitive prep 共用）。
+    this.runCognitivePrep(turn, eligibility, pressureResult)
 
     return { sensorium: perceptionResult.sensorium, strategy: perceptionResult.strategy, phaseClass, pressureResult }
   }

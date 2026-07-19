@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
 import { findProjectConfig } from './manager.js'
 import { verifySchema, type VerifyConfig } from './schema.js'
+
+/** A path-routed verify route after schema parsing. */
+export type VerifyRoute = NonNullable<VerifyConfig['routes']>[number]
 
 /**
  * Load the project-declared verify commands (A1) directly from the nearest
@@ -52,4 +56,52 @@ export function classifyDeclaredCommand(
     if (declared && (c === declared || c.startsWith(declared + ' '))) return kind
   }
   return undefined
+}
+
+/** Convert a route glob to a RegExp anchored on the full POSIX path:
+ *  `**` spans segments; `**` immediately before a `/` additionally matches
+ *  zero segments (minimatch semantics — `**.css`-style patterns hit files at
+ *  the root too); `*` stays within one segment; `?` matches one char.
+ *  Dependency-free on purpose — no glob lib in the dependency tree.
+ *  (Comment wording avoids the literal double-star-slash sequence, which
+ *  would terminate this block comment early.) */
+function routeGlobToRegex(glob: string): RegExp {
+  const re = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*\//g, '__DSTARSL__')
+    .replace(/\*\*/g, '__DSTAR__')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '[^/]')
+    .replace(/__DSTARSL__/g, '(?:.*/)?')
+    .replace(/__DSTAR__/g, '.*')
+  return new RegExp(`^${re}$`)
+}
+
+/** Return the deduped routes whose `match` glob hits at least one changed
+ *  file. Paths are compared as repo-relative POSIX; absolute paths are
+ *  skipped (same convention as the typecheck gate). */
+export function matchVerifyRoutes(
+  changedFiles: readonly string[],
+  routes: readonly VerifyRoute[] | undefined,
+): VerifyRoute[] {
+  if (!routes || routes.length === 0) return []
+  const files = changedFiles.filter(f => !isAbsolute(f)).map(f => f.split('\\').join('/'))
+  if (files.length === 0) return []
+  const seen = new Set<string>()
+  const out: VerifyRoute[] = []
+  for (const route of routes) {
+    const key = `${route.match}${route.run}`
+    if (seen.has(key)) continue
+    let re: RegExp
+    try {
+      re = routeGlobToRegex(route.match)
+    } catch {
+      continue // malformed glob — skip the route, never throw into the gate
+    }
+    if (files.some(f => re.test(f))) {
+      seen.add(key)
+      out.push(route)
+    }
+  }
+  return out
 }

@@ -20,6 +20,7 @@ export interface TeamOrchestratorDeps {
     policy?: AggregationPolicy,
     abortSignal?: AbortSignal,
     onProgress?: (completed: number, total: number) => void,
+    onWorkerSettled?: (result: import('./work-order.js').WorkerResult) => void,
   ): Promise<CoordinatorRun>
   recordTeamWaveTelemetry?: (event: TeamWaveTelemetry) => void
   recordTeamSchedulerShadow?: (event: TeamSchedulerShadowEvent) => void

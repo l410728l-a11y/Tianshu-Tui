@@ -24,12 +24,14 @@ import type { AdvisoryBus } from '../advisory-bus.js'
 const DESKTOP_INTENT_PATTERNS: RegExp[] = [
   // 中文：桌面/原生应用操作意图
   /桌面(应用|软件|自动化|操作)/,
-  /(打开|操作|点击|控制|自动化).{0,12}(应用|软件|窗口|菜单|系统设置|偏好设置)/,
+  /(打开|操作|点击|控制|自动化|启动).{0,12}(应用|软件|窗口|菜单|浏览器|系统设置|偏好设置)/,
   /(gui|界面).{0,8}(自动化|操作|点击)/i,
   /屏幕(截图|录制|上的)/,
   // 常见原生应用名（明确超出 web/CLI 能力范围的目标）
   /(finder|访达|系统设置|system settings|系统偏好|activity monitor|活动监视器)/i,
-  /(操作|打开|用|控制)\s*(excel|word|powerpoint|keynote|pages|numbers|photoshop|微信|钉钉|飞书)/i,
+  // 浏览器作为原生 GUI 程序操作时 (打开 Edge/Chrome 访问…) 也应触发——
+  // browser_debug 只能驱动 localhost, 外部网站需经 computer_use 操控桌面浏览器。
+  /(操作|打开|用|控制|启动)\s*(edge|chrome|firefox|safari|浏览器|browser|excel|word|powerpoint|keynote|pages|numbers|photoshop|微信|钉钉|飞书|记事本|notepad|资源管理器|explorer)/i,
   // 英文
   /\b(desktop|native)\s+(app|application|automation)\b/i,
   /\b(click|type|operate)\b.{0,24}\b(app|window|menu|dialog)\b/i,

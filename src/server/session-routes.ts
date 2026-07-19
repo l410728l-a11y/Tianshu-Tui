@@ -194,6 +194,11 @@ export function buildSessionRoutes(
 
   const routes: Record<string, RouteHandler> = {
     'POST /sessions': withAuth((body) => {
+      // DEBUG instrumentation (RIVET_DEBUG_RENDER=1): logs createSession latency
+      // so we can tell session-creation bottlenecks (loadConfig, worktree setup)
+      // from SSE/stream issues. See docs/dev/render-debug-playbook.md.
+      const __dbg = process.env.RIVET_DEBUG_RENDER === '1'
+      const __t0 = __dbg ? Date.now() : 0
       const data = (body ?? {}) as { cwd?: string; title?: string; prompt?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string }
       if (data.approvalMode !== undefined && !isApprovalMode(data.approvalMode)) {
         return { status: 400, body: { error: 'Invalid "approvalMode"' } }
@@ -207,6 +212,7 @@ export function buildSessionRoutes(
         model: typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined,
         domain: typeof data.domain === 'string' && data.domain.trim() ? data.domain.trim() : undefined,
       })
+      if (__dbg) console.log(`[createSession] +${Date.now() - __t0}ms id=${rec.id} cwd=${data.cwd}`)
       return { status: 201, body: rec }
     }, apiToken),
 
@@ -1017,10 +1023,16 @@ export function buildSessionRoutes(
       if (!res) return { status: 500, body: { error: 'SSE response stream is unavailable' } }
       const id = params!.id!
       const since = Number(params?.since ?? 0) || 0
+      // DEBUG instrumentation (RIVET_DEBUG_RENDER=1): splits /stream latency into
+      // "history load" vs "headers flushed vs first event". See
+      // docs/dev/render-debug-playbook.md §"骨架屏不消失/会话打开慢".
+      const __dbg = process.env.RIVET_DEBUG_RENDER === '1'
+      const __t0 = __dbg ? Date.now() : 0
       // Reconnect replay is the hot path for large logs — load it without
       // blocking the loop (async read + off-thread parse), so concurrent
       // streams keep their keepalives during someone else's big replay.
       const existing = await manager.getEventsAsync(id, since)
+      if (__dbg) console.log(`[stream] getEventsAsync +${Date.now() - __t0}ms events=${existing?.events.length ?? 0} id=${id}`)
       if (!existing) return { status: 404, body: { error: 'Session not found' } }
 
       // Tear down BOTH on peer death (write throws → onDead) and on the normal

@@ -643,6 +643,7 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     autoDelegate: (self.config.coordinatorRef && self.config.autoDelegateEnabled) ? {
       getTaskContract: () => self.getTaskContract(),
       getSensorium: () => self.sensorium,
+      getEligibility: () => self._lastEligibility ?? undefined,
     } : undefined,
     anchorBreakScout: (() => {
       const aa = normalizeAntiAnchoringConfig(self.config.antiAnchoring)
@@ -1019,7 +1020,7 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
 
     // === Sub-processes (thin wrappers) ===
     runCompaction: (turn, snap) => self.compactBoundaryCoordinator.runCompaction(turn, snap),
-    runPerception: (turn, estTokens, actionable, callbacks) => self.turnStepProducer.runPerception(turn, estTokens, actionable, callbacks),
+    runPerception: (turn, estTokens, callbacks) => self.turnStepProducer.runPerception(turn, estTokens, callbacks),
     runConvergenceCheck: (turn, phaseClass, assistantResponded, userMessageConsumed, callbacks) =>
       self.runConvergenceCheck(turn, phaseClass, assistantResponded, userMessageConsumed, callbacks),
     runReplanCheck: () => { self.planTraceCoordinator.runReplanCheck() },

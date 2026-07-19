@@ -39,11 +39,13 @@ import type { WebFetchOptions } from './web-fetch/tool.js'
 import { WEB_SEARCH_TOOL, createWebSearchTool } from './web-search.js'
 import type { SearchBackend } from './web-search.js'
 import { WRITE_FILE_TOOL } from './write-file.js'
+import { presetIncludes, resolveToolPreset, type ToolPreset } from './tool-preset.js'
 
 export interface DefaultRegistryOptions {
   /** T8 桌面化办公工具（create_document/spreadsheet/image/presentation/pdf + export_file/open_path）。
-   *  默认关闭：工具数必须守住 kernel budget（≤26，2026-07-01 因 `job` 工具由 25 抬到 26），
-   *  超过会触发认知过载退化（见 kernel-budget.test.ts / trained-mode-analysis.md 3.2.B）。 */
+   *  默认关闭：EXTENDED 层（工具预算由 tool-preset 三档控制——minimal 30 /
+   *  frontend 31 / full 44，见 tool-preset.ts；旧"kernel ≤26"口径已被
+   *  2026-07-19 工具审计废止，实测完整装配 44）。 */
   desktopTools?: boolean
   /** N4 桌面浏览器验证工具。默认关闭：新攻击面 + 占 kernel budget，仅桌面 sidecar 开启。 */
   browserTool?: boolean
@@ -61,6 +63,10 @@ export interface DefaultRegistryOptions {
    *  Absent → the DDG-only default WEB_SEARCH_TOOL is registered. The tool
    *  `definition` is byte-identical either way, so prefix cache is unaffected. */
   searchBackends?: SearchBackend[]
+  /** 工具装配档位（minimal/frontend/full）。缺省按 RIVET_TOOL_PRESET env >
+   *  项目 .rivet-config.json tools.preset > 用户配置 > minimal 解析。
+   *  会话内冻结，前缀缓存零影响。 */
+  preset?: ToolPreset
   /** web_fetch options built from config.fetch. Absent → the default
    *  WEB_FETCH_TOOL is registered. The tool `definition` is byte-identical
    *  either way, so prefix cache is unaffected. */
@@ -69,9 +75,14 @@ export interface DefaultRegistryOptions {
 
 export function createDefaultToolRegistry(extraTools: Tool[] = [], options: DefaultRegistryOptions = {}): ToolRegistry {
   const registry = new ToolRegistry()
+  const preset = options.preset ?? resolveToolPreset(process.cwd())
   // apply_patch moved to EXTENDED layer (interactive/bootstrap) — overlap with
   // hash_edit covers >90% of use cases; keep in interactive for edge cases.
-  registry.register(IMPORT_RESOURCE_TOOL)
+  // import_resource / leave_mark 等冷门工具由 preset 控制（full 才含，
+  // RIVET_*=1 可单独强制开启）。
+  if (presetIncludes(preset, 'import_resource') || process.env.RIVET_IMPORT_RESOURCE === '1') {
+    registry.register(IMPORT_RESOURCE_TOOL)
+  }
   registry.register(READ_FILE_TOOL)
   registry.register(WRITE_FILE_TOOL)
   if (options.desktopTools) {
@@ -91,7 +102,7 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   registry.register(HASH_EDIT_TOOL)
   registry.register(GREP_TOOL)
   registry.register(AST_GREP_TOOL)
-  registry.register(AST_EDIT_TOOL)
+  if (presetIncludes(preset, 'ast_edit')) registry.register(AST_EDIT_TOOL)
   registry.register(GLOB_TOOL)
   registry.register(DIFF_TOOL)
   registry.register(RUN_TESTS_TOOL)
@@ -107,14 +118,17 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
       ? createWebSearchTool({ backends: options.searchBackends })
       : WEB_SEARCH_TOOL,
   )
-  registry.register(INSPECT_PROJECT_TOOL)
+  if (presetIncludes(preset, 'inspect_project')) registry.register(INSPECT_PROJECT_TOOL)
   registry.register(REPO_MAP_TOOL)
-  registry.register(RELATED_TESTS_TOOL)
+  if (presetIncludes(preset, 'related_tests')) registry.register(RELATED_TESTS_TOOL)
   registry.register(READ_SECTION_TOOL)
   registry.register(FILE_INFO_TOOL)
   registry.register(REQUEST_PATH_ACCESS_TOOL)
   registry.register(SKILL_TOOL)
-  registry.register(LEAVE_MARK_TOOL)
+  // leave_mark — 星图里程碑。preset full 含；RIVET_LEAVE_MARK=1 强制开启。
+  if (presetIncludes(preset, 'leave_mark') || process.env.RIVET_LEAVE_MARK === '1') {
+    registry.register(LEAVE_MARK_TOOL)
+  }
   if (options.browserTool) {
     registry.register(BROWSER_TOOL)
   }

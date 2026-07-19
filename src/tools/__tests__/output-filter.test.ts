@@ -16,8 +16,8 @@ describe('filterBashOutput (tsc --noEmit)', () => {
     assert.equal(result, 'Found 0 errors.')
   })
 
-  // Condition 2: tsc --noEmit, exit non-zero, errors → only error lines, path stripped
-  it('keeps only error TS lines and strips path prefix on failure', () => {
+  // Condition 2: tsc --noEmit, exit non-zero, errors → only error lines, full location kept
+  it('keeps only error TS lines with full file:line:col on failure', () => {
     const input = [
       'src/tools/bash.ts(123,45): error TS2345: string is not number',
       'src/tools/foo.ts(10,5): error TS2322: Type mismatch.',
@@ -26,21 +26,18 @@ describe('filterBashOutput (tsc --noEmit)', () => {
     ].join('\n')
     const result = applyCommandFilter('npx tsc --noEmit', input, 1)
     assert.ok(result)
-    // Error TS lines are present without path prefix
-    assert.match(result!, /error TS2345: string is not number/)
-    assert.match(result!, /error TS2322: Type mismatch/)
+    // Error lines are present with full location info (剥路径曾让 agent 找不到现场)
+    assert.match(result!, /src\/tools\/bash\.ts\(123,45\): error TS2345/)
+    assert.match(result!, /src\/tools\/foo\.ts\(10,5\): error TS2322/)
     assert.match(result!, /Found 2 errors/)
     // Non-error lines are stripped
     assert.ok(!result!.includes('Compiling'))
-    // No path prefix (src/tools/bash.ts(123,45): ) remains
-    assert.ok(!result!.includes('src/tools/bash.ts'))
-    assert.ok(!result!.includes('src/tools/foo.ts'))
   })
 
-  it('strips path prefix but preserves error message body', () => {
+  it('preserves the full diagnostic line including deep paths', () => {
     const input = 'deep/path/to/module.ts(99,1): error TS2551: Property x does not exist.'
     const result = applyCommandFilter('tsc --noEmit', input, 2)
-    assert.equal(result, 'error TS2551: Property x does not exist.')
+    assert.equal(result, 'deep/path/to/module.ts(99,1): error TS2551: Property x does not exist.')
   })
 
   // Condition 3: non-tsc command → original stdout returned as-is

@@ -193,7 +193,9 @@ export function parseTddGateConfig(): TddGateConfig {
 export interface TddGateInput {
   filesRead: Set<string>
   filesModified: Set<string>
-  isActionable: boolean
+  /** 是否需要代码验证纪律（来自 DisciplineEligibility.requiresCodeVerification）。
+   *  解释/分析/文档任务为 false，工程修复/重构为 true。 */
+  requiresCodeVerification: boolean
 }
 
 function isTestFile(path: string): boolean {
@@ -211,7 +213,7 @@ function isTestFile(path: string): boolean {
  * - **Already editing**: keeps warning until a test file is touched.
  */
 export function checkTddGate(input: TddGateInput): ImmuneContextHint | null {
-  if (!input.isActionable) return null
+  if (!input.requiresCodeVerification) return null
   if ([...input.filesRead].some(isTestFile)) return null
   if (input.filesModified.size === 0) {
     return {

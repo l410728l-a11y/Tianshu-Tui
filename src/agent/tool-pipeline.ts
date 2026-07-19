@@ -763,6 +763,12 @@ export async function executeToolUse(
   // tools so the abort path can report definitively whether a commit landed.
   let preAbortHead: string | null = null
 
+  // TDD gate 的 suggest 决策此前在工具层是 no-op（只有 block 有下游动作），
+  // 提醒只能等 turn 边界的 immune hint。这里把达到阈值的 suggest 提醒附加到
+  // 本次编辑的成功结果尾部——追加在对话末尾，不改写 system prompt / 工具
+  // 定义 / 历史消息，前缀缓存零影响。
+  let tddSuggestNote: string | null = null
+
   try {
     // Cerebellar Loop: read-before-edit gate
     const intervention = deps.getInterventionLevel?.() ?? 'none'
@@ -790,6 +796,15 @@ export async function executeToolUse(
         deps.onTddBlocked?.(editTarget)
         callbacks.onToolResult(tu.id, tu.name, decision.message!, true)
         return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: decision.message!, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+     }
+      // suggest 模式：编辑照跑，但只有进入"enforce 会拦"的区域（编辑数达阈值
+      // 或测试已失败）才附加提醒——探索窗口（<threshold）与测试文件 RED 步骤
+      // 保持安静，避免每次编辑都贴尾巴。
+      if (
+        decision.action === 'suggest' && decision.message
+        && (gateState.hasFailedTests || gateState.editsSinceLastTest >= tddConfig.threshold)
+      ) {
+        tddSuggestNote = decision.message
      }
    }
 
@@ -1500,6 +1515,12 @@ export async function executeToolUse(
        }
      }
    }
+
+    // TDD suggest 提醒附加（编辑成功才贴；失败的编辑结果本身已是反馈）。
+    // 追加在结果尾部 = 对话历史末尾，前缀缓存的已冻结前缀不变。
+    if (tddSuggestNote && !harnessResult.isError) {
+      finalContent = `${finalContent}\n\n[TDD] ${tddSuggestNote}`
+    }
 
     // Normalize isError: tools may omit isError on success (undefined),
     // but the TUI treats undefined as a streaming chunk that never

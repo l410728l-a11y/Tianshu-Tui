@@ -253,6 +253,7 @@ async function main() {
     const { buildSearchBackends } = await import('./tools/web-search.js')
     const { buildFetchOptions } = await import('./tools/web-fetch/build-options.js')
     const registryOptions = {
+      preset: (await import('./tools/tool-preset.js')).resolveToolPreset(process.cwd()),
       desktopTools: cfg.agent.desktopTools,
       computerUse: (process.platform === 'darwin' || process.platform === 'win32') && process.env.RIVET_COMPUTER_USE !== '0',
       proEnabled: isProFeatureEnabled(cfg, 'computerUse'),
@@ -559,7 +560,8 @@ async function main() {
   // Plan submit 成功后自动弹出审批面板（替代手动 /plan-approve）。
   ctx!.agent.onPlanApprovalRequested = (info) => {
     // 工具执行期间直接推 overlay 可能与 turn 收尾渲染冲突，defer 到下一事件循环。
-    setImmediate(() => tuiApp.openPlanApprovalPanel(info))
+    // 预览摘要在开面板时一次性读取（避免渲染路径每帧读盘；修订重提同 slug 也能取到新内容）。
+    setImmediate(() => tuiApp.openPlanApprovalPanel(info, planExcerptFor(info.slug)))
   }
   // ask_user_question 含单选选项时自动弹出选择面板（替代手动输入编号）。
   ctx!.agent.onAskUserQuestionRequested = (info) => {
@@ -648,6 +650,32 @@ async function main() {
         }))
     } catch {
       return []
+    }
+  }
+  // 审批卡片的计划正文预览：剥 frontmatter 与 Status/Model 留痕行后取前 6 行
+  // 非空行（截 76 列）。读不到计划（已删/盘外）返回 undefined，面板退化为纯标题。
+  const planExcerptFor = (slug: string): string | undefined => {
+    try {
+      const doc = listPlansSync(ctx!.agent.cwd).find(p => p.slug === slug)
+      if (!doc) return undefined
+      const rawLines = doc.content.split('\n')
+      // 仅剥开头一处 frontmatter（--- ... ---），正文中的 --- 分隔线保留。
+      let start = 0
+      if (rawLines[0]?.trim() === '---') {
+        const close = rawLines.findIndex((l, i) => i > 0 && l.trim() === '---')
+        if (close > 0) start = close + 1
+      }
+      const out: string[] = []
+      for (const raw of rawLines.slice(start)) {
+        const t = raw.trim()
+        if (!t) continue
+        if (t.startsWith('> **Status:') || t.startsWith('> **Model:')) continue
+        out.push(t.length > 76 ? `${t.slice(0, 75)}…` : t)
+        if (out.length >= 6) break
+      }
+      return out.length > 0 ? out.join('\n') : undefined
+    } catch {
+      return undefined
     }
   }
   tuiApp.registerOverlays({
@@ -850,13 +878,35 @@ async function main() {
       if (tuiApp.choicePanelKind === 'plan-approval') {
         const info = tuiApp.pendingPlanApproval
         const title = info?.title ?? '待审批计划'
-        const entries = [
-          { id: 'approve', label: '批准并执行', description: `执行计划「${title}」`, recommended: true },
+        // 标题区附计划正文预览（开面板时提取，剥掉 frontmatter/留痕行的前 6 行）。
+        const excerpt = tuiApp.planApprovalExcerpt
+        const fullTitle = excerpt
+          ? `计划审批 / Plan Approval\n「${title}」\n──\n${excerpt}`
+          : `计划审批 / Plan Approval\n「${title}」`
+        const entries = []
+        const options = info?.options ?? []
+        if (options.length > 1) {
+          // 多方案计划：每个方案一个「批准并执行」条目，Recommended 带 ★ 并预定位光标。
+          for (const [i, o] of options.entries()) {
+            const recommended = /recommended/i.test(o.label)
+            const cleanLabel = o.label.replace(/\s*[(（]?\s*recommended\s*[)）]?/i, '').trim()
+            entries.push({
+              id: `approve:${i}`,
+              label: `批准并执行 — ${cleanLabel}`,
+              description: o.description || `以方案「${cleanLabel}」执行计划`,
+              recommended,
+            })
+          }
+        } else {
+          entries.push({ id: 'approve', label: '批准并执行', description: `执行计划「${title}」`, recommended: true })
+        }
+        entries.push(
           { id: 'reject', label: '驳回修订', description: '标记为 REJECTED，agent 可继续修改' },
           { id: 'reject-exit', label: '驳回并退出计划模式', description: '驳回计划并退出 plan mode' },
           { id: '__reject_comment__', label: '驳回并填写反馈…', description: '输入反馈后驳回，agent 可继续修订' },
-        ]
-        return { title: '计划审批 / Plan Approval', choices: entries, selectedIndex: 0, inputSubMode: tuiApp.getChoicePanelInputState() }
+        )
+        const recommendedIndex = Math.max(0, entries.findIndex(e => e.recommended))
+        return { title: fullTitle, choices: entries, selectedIndex: recommendedIndex, inputSubMode: tuiApp.getChoicePanelInputState() }
       }
       if (tuiApp.choicePanelKind === 'ask-user-question') {
         return tuiApp.buildAskChoicePanelData()
@@ -1019,10 +1069,11 @@ async function main() {
       return
     }
     if (tuiApp.choicePanelKind === 'plan-approval') {
-      // 计划审批面板回调：approve / reject / reject-exit。
+      // 计划审批面板回调：approve / approve:<idx> / reject / reject-exit。
       const info = tuiApp.pendingPlanApproval
       tuiApp.choicePanelKind = 'effort' // reset
       tuiApp.pendingPlanApproval = undefined
+      tuiApp.planApprovalExcerpt = undefined
       if (!info) return
       const deps = {
         cwd: ctx!.agent.cwd,
@@ -1032,6 +1083,11 @@ async function main() {
       }
       if (id === 'approve') {
         const option = info.options?.find(o => o.label.includes('Recommended')) ?? info.options?.[0]
+        void approvePlanAndKickoff(deps, info.slug, option?.label)
+      } else if (id.startsWith('approve:')) {
+        // 多方案计划：面板内选定的方案（索引编码在条目 id 里）。
+        const idx = Number(id.slice('approve:'.length))
+        const option = Number.isInteger(idx) ? info.options?.[idx] : undefined
         void approvePlanAndKickoff(deps, info.slug, option?.label)
       } else if (id === 'reject') {
         void rejectPlan(ctx!.agent.cwd, info.slug).then(doc => {

@@ -11,6 +11,21 @@ import {
   renderLowConfidenceIntentAdvisory,
 } from '../intent-retrieval-route.js'
 import type { TaskContract } from '../../context/task-contract.js'
+import type { DisciplineEligibility } from '../discipline-eligibility.js'
+
+/** 显式可派发的资格对象——b853616a 移除 isActionable 回退后，eligibility
+ *  缺省即 fail-closed，期望产生分支的用例必须显式传入。 */
+function dispatchableEligibility(): DisciplineEligibility {
+  return {
+    responseActionable: true,
+    requiresEngineeringDiscipline: true,
+    requiresCodeVerification: true,
+    allowsEvidenceReview: false,
+    canSuggestPlan: true,
+    canDispatch: true,
+    projectionMode: 'engineering',
+  }
+}
 
 function contract(overrides: Partial<TaskContract> = {}): TaskContract {
   return {
@@ -31,6 +46,7 @@ describe('deriveCollabBranches', () => {
   it('maps diagnostic, security, architecture, fuzzy, and exploration signals', () => {
     const diagnostic = deriveCollabBranches({
       taskKinds: ['bug_fix'],
+      eligibility: dispatchableEligibility(),
       sanitizedText: '修复登录回归',
       confidence: 0.75,
       taskContract: contract(),
@@ -39,6 +55,7 @@ describe('deriveCollabBranches', () => {
 
     const security = deriveCollabBranches({
       taskKinds: ['security_safety'],
+      eligibility: dispatchableEligibility(),
       sanitizedText: '检查权限边界',
       confidence: 0.75,
       taskContract: contract(),
@@ -47,6 +64,7 @@ describe('deriveCollabBranches', () => {
 
     const architecture = deriveCollabBranches({
       taskKinds: ['architecture_design'],
+      eligibility: dispatchableEligibility(),
       sanitizedText: '设计整体架构',
       confidence: 0.75,
       taskContract: contract({ scope: { mentionedFiles: ['src/agent/a.ts', 'src/agent/b.ts'] } }),
@@ -55,6 +73,7 @@ describe('deriveCollabBranches', () => {
 
     const fuzzy = deriveCollabBranches({
       taskKinds: ['new_feature'],
+      eligibility: dispatchableEligibility(),
       sanitizedText: '看看这个计划，优化一下',
       confidence: 0.55,
       taskContract: contract(),
@@ -63,6 +82,7 @@ describe('deriveCollabBranches', () => {
 
     const exploration = deriveCollabBranches({
       taskKinds: ['codebase_overview'],
+      eligibility: dispatchableEligibility(),
       sanitizedText: '盘点废弃模块',
       confidence: 0.75,
       taskContract: contract(),
@@ -73,6 +93,7 @@ describe('deriveCollabBranches', () => {
   it('does not activate fuzzy, diagnostic, or exploration branches for social idle', () => {
     const result = deriveCollabBranches({
       taskKinds: ['social_idle'],
+      eligibility: dispatchableEligibility(),
       sanitizedText: '你好',
       confidence: 0.3,
       taskContract: contract({ isActionable: false }),
@@ -84,6 +105,7 @@ describe('deriveCollabBranches', () => {
   it('is deterministic and preserves the declared branch order', () => {
     const input = {
       taskKinds: ['security_safety', 'architecture_design'] as const,
+      eligibility: dispatchableEligibility(),
       sanitizedText: '设计安全权限架构并检查风险',
       confidence: 0.65,
       taskContract: contract({ scope: { mentionedFiles: ['src/a.ts', 'src/b.ts'] } }),
@@ -159,5 +181,30 @@ describe('RetrievalRoute collaboration branches', () => {
     }, { userMessage: '优化一下' })
     const rendered = renderLowConfidenceIntentAdvisory(route)
     assert.match(rendered, /协作路径: 骨干\+A/)
+  })
+})
+
+
+describe('deriveCollabBranches — eligibility 缺省语义', () => {
+  it('eligibility 缺省 → 回退启发式（路由构建期的正常路径）', () => {
+    const result = deriveCollabBranches({
+      taskKinds: ['bug_fix'],
+      sanitizedText: '修复登录回归',
+      confidence: 0.75,
+      taskContract: contract(),
+      // 不传 eligibility——路由构建期它尚不存在，启发式分支应照常产出
+    })
+    assert.ok(result.branches.includes('D'))
+  })
+
+  it('eligibility.canDispatch=false → 显式抑制', () => {
+    const result = deriveCollabBranches({
+      taskKinds: ['bug_fix'],
+      eligibility: { ...dispatchableEligibility(), canDispatch: false },
+      sanitizedText: '修复登录回归',
+      confidence: 0.75,
+      taskContract: contract(),
+    })
+    assert.deepEqual(result.branches, [])
   })
 })

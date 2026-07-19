@@ -6,6 +6,7 @@ import {
   runChangedFilesTypecheckOutcome,
   runChangedFilesTypecheckOutcomeMemo,
   runDeclaredCheck,
+  runVerifyRoutes,
   typecheckGateEnabled,
   repoWideEnabled,
   errorSignature,
@@ -333,5 +334,66 @@ test('declared check: null when nothing is declared', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
     invalidateVerifyConfig()
+  }
+})
+
+
+// ── runVerifyRoutes (A3: path-routed verify commands) ──────────────────────
+
+test('verify routes: runs the route whose glob hits a changed file, reports failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'verify-routes-'))
+  try {
+    writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({
+      verify: { routes: [
+        { match: 'desktop/src/**', run: 'tsc --noEmit -p desktop', kind: 'typecheck' },
+        { match: 'server/**', run: 'go build ./server/...', kind: 'build' },
+      ] },
+    }))
+    writeFileSync(join(dir, 'app.tsx'), 'export {}')
+    invalidateVerifyConfig()
+
+    const ran: string[] = []
+    const r = await runVerifyRoutes(dir, ['desktop/src/app.tsx'], async (_cwd, command) => {
+      ran.push(command)
+      return { exitCode: 2, output: 'error TS1117: duplicate key' }
+    })
+    // Only the desktop route fires — server/ glob did not match.
+    assert.deepEqual(ran, ['tsc --noEmit -p desktop'])
+    assert.ok(r)
+    assert.equal(r!.failures.length, 1)
+    assert.equal(r!.failures[0]!.kind, 'typecheck')
+    assert.equal(r!.failures[0]!.match, 'desktop/src/**')
+    assert.match(r!.summary, /desktop\/src\/\*\*/)
+    assert.match(r!.summary, /TS1117/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    invalidateVerifyConfig()
+    __clearTypecheckMemo()
+  }
+})
+
+test('verify routes: null when nothing matches, all pass, or command cannot run', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'verify-routes-'))
+  try {
+    writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({
+      verify: { routes: [{ match: 'desktop/src/**', run: 'tsc -p desktop', kind: 'typecheck' }] },
+    }))
+    writeFileSync(join(dir, 'main.go'), 'package main')
+    invalidateVerifyConfig()
+
+    // no match → runner never called
+    assert.equal(await runVerifyRoutes(dir, ['main.go'], async () => { throw new Error('must not run') }), null)
+
+    // match but exit 0 → no escalation
+    writeFileSync(join(dir, 'x.tsx'), 'export {}')
+    assert.equal(await runVerifyRoutes(dir, ['desktop/src/x.tsx'], async () => ({ exitCode: 0, output: 'ok' })), null)
+    __clearTypecheckMemo()
+
+    // match but could-not-run (-1) → fail-open
+    assert.equal(await runVerifyRoutes(dir, ['desktop/src/x.tsx'], async () => ({ exitCode: -1, output: '' })), null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    invalidateVerifyConfig()
+    __clearTypecheckMemo()
   }
 })

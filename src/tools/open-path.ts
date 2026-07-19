@@ -21,10 +21,12 @@ export function buildOpenPathCommand(path: string, platform: NodeJS.Platform = p
   const target = normalizeOpenTarget(path, platform)
   if (platform === 'win32') {
     // 不用 `cmd.exe /c start`：cmd 对参数做二次解析，路径中的 & | % ^ 等元字符
-    // 会被重新解释（注入面）。改用 PowerShell Start-Process -LiteralPath，并把
-    // 路径包成单引号字面串（单引号内 & | % ^ $ 全不解释，'' 转义内嵌单引号），
-    // -LiteralPath 又禁用通配符。既能正常打开含 & 的合法路径（如 R&D 文件夹），
-    // 又消除元字符注入。
+    // 会被重新解释（注入面）。改用 PowerShell Start-Process，路径作为 -FilePath
+    // 单引号字面串传入（单引号内 & | % ^ $ 全不解释，'' 转义内嵌单引号）。
+    //
+    // 注意: Start-Process 没有 -LiteralPath 参数 (那是 Get-Item 等 Item cmdlet
+    // 的参数)。之前版本误用 -LiteralPath 导致 Windows 下"打开文件/文件夹"
+    // 永远失败报 "找不到与参数名称 LiteralPath 匹配的参数"。
     //
     // explorer/Start-Process 对正斜杠路径不友好（前端 toAbsolute 在 cwd 含 '/'
     // 时会拼出 'C:/Users/...'，explorer 会静默失败），统一转反斜杠。
@@ -32,7 +34,7 @@ export function buildOpenPathCommand(path: string, platform: NodeJS.Platform = p
     const literal = `'${winTarget.replace(/'/g, "''")}'`
     return {
       cmd: 'powershell.exe',
-      args: ['-NoProfile', '-NonInteractive', '-Command', `Start-Process -LiteralPath ${literal}`],
+      args: ['-NoProfile', '-NonInteractive', '-Command', `Start-Process -FilePath ${literal}`],
     }
   }
   if (platform === 'darwin') {

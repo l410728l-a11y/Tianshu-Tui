@@ -1,0 +1,103 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { findProjectConfig } from '../config/manager.js'
+import { defaultRivetHome } from '../config/paths.js'
+
+/**
+ * Tool preset — 会话启动期的工具装配档位（会话内冻结，前缀缓存零影响）。
+ *
+ * 三档语义（2026-07-19 工具审计落地，入口成本实测见 .rivet/scratch/tool-audit.ts）：
+ * - **minimal（默认，30 个）**：日常开发全能力——读写/检索/bash/git/测试/委托/
+ *   交付/plan/web_search/web_fetch。去掉编排（council/team）、browser 系、
+ *   attack_case、semantic_search 等重而冷门的工具。
+ * - **frontend（31）**：minimal + browser_debug（UI 渲染验证闭环）。
+ * - **full（44）**：全集，含 attack_case/council/team/semantic_search/repo_graph/
+ *   undo/recall_general/record_general_finding/ast_edit/related_tests/
+ *   inspect_project/import_resource/leave_mark/browser_debug。
+ *
+ * 解析优先级：`RIVET_TOOL_PRESET` env > 项目 `.rivet-config.json` tools.preset
+ * > 用户 `~/.rivet/config.json` tools.preset > 'minimal'。
+ * 变更只在下个会话生效（会话中途改工具指纹 = 前缀全量重建，反经济）。
+ */
+
+export type ToolPreset = 'minimal' | 'frontend' | 'full'
+
+const VALID = new Set<string>(['minimal', 'frontend', 'full'])
+
+function parsePreset(raw: unknown): ToolPreset | null {
+  return typeof raw === 'string' && VALID.has(raw) ? (raw as ToolPreset) : null
+}
+
+const memo = new Map<string, ToolPreset>()
+
+export function resolveToolPreset(cwd: string): ToolPreset {
+  const cached = memo.get(cwd)
+  if (cached) return cached
+
+  let preset: ToolPreset | null = parsePreset(process.env.RIVET_TOOL_PRESET)
+
+  if (!preset) {
+    const projectPath = findProjectConfig(cwd)
+    if (projectPath && existsSync(projectPath)) {
+      try {
+        const raw = JSON.parse(readFileSync(projectPath, 'utf-8')) as { tools?: { preset?: unknown } }
+        preset = parsePreset(raw.tools?.preset)
+      } catch { /* malformed project config — fall through */ }
+    }
+  }
+
+  if (!preset) {
+    const userPath = join(defaultRivetHome(), 'config.json')
+    if (existsSync(userPath)) {
+      try {
+        const raw = JSON.parse(readFileSync(userPath, 'utf-8')) as { tools?: { preset?: unknown } }
+        preset = parsePreset(raw.tools?.preset)
+      } catch { /* malformed user config — fall through */ }
+    }
+  }
+
+  const resolved = preset ?? 'minimal'
+  memo.set(cwd, resolved)
+  return resolved
+}
+
+/** Drop the per-cwd memo (settings changed / tests) so the next session
+ *  resolves the preset fresh. Long-lived processes (desktop sidecar) must
+ *  call this after persisting a preset change. */
+export function invalidateToolPreset(): void {
+  memo.clear()
+}
+
+/** Test-only: drop the per-cwd memo so env/config edits take effect. */
+export function __resetToolPresetForTest(): void {
+  invalidateToolPreset()
+}
+
+/** minimal 排除名单（kernel + bootstrap 统一）。full 全集；frontend 仅加
+ *  browser_debug。判断逻辑见 presetIncludes。 */
+const MINIMAL_EXCLUDES: ReadonlySet<string> = new Set([
+  // 编排三件套（重 + 日常低频）
+  'council_convene',
+  'team_orchestrate',
+  // browser 系
+  'browser_debug',
+  // 重而冷门 / 零使用（2026-07-19 会话使用率审计）
+  'attack_case',
+  'semantic_search',
+  'repo_graph',
+  'undo',
+  'recall_general',
+  'record_general_finding',
+  'ast_edit',
+  'related_tests',
+  'inspect_project',
+  'import_resource',
+  'leave_mark',
+])
+
+/** 判断某工具在给定档位下是否注册。 */
+export function presetIncludes(preset: ToolPreset, toolName: string): boolean {
+  if (preset === 'full') return true
+  if (preset === 'frontend' && toolName === 'browser_debug') return true
+  return !MINIMAL_EXCLUDES.has(toolName)
+}

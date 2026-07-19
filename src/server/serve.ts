@@ -586,7 +586,6 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     }
     const reveal = (body as Record<string, unknown>)?.reveal === true
     const bodyCwd = (body as Record<string, unknown>)?.cwd
-    // 路径存在性检查——不静默吞错（之前 spawn error 被 () => {} 吞掉，用户看不到失败）。
     const { existsSync } = require('node:fs') as typeof import('node:fs')
     const { resolve: resolvePath } = require('node:path') as typeof import('node:path')
     // 用请求体里的 cwd（=项目目录）解析相对路径，而非 sidecar 的 process.cwd()
@@ -597,23 +596,26 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     if (!existsSync(resolved)) {
       return { status: 404, body: { error: `Path not found: ${resolved}` } }
     }
-    // Pass `resolved` (not raw `filePath`): when cwd is empty the frontend may
-    // send a relative path, which would make explorer /select,<rel> silently
-    // fail. builder 接收绝对路径后，win32 分支还会把正斜杠归一为反斜杠。
     const command = reveal ? buildRevealCommand(resolved) : buildOpenPathCommand(resolved)
-    // Await spawn 的 spawn/error 事件再返回——之前 fire-and-forget 立即返 200，
-    // spawn 失败只进 stderr 日志，前端永远收不到，用户看到"点了没反应"。
-    // detached + unref 保持：不阻塞 sidecar 退出。spawn 通常 <50ms。
+    // Windows 上 reveal=false (打开文件/文件夹) 时绕过 buildOpenPathCommand 的
+    // PowerShell Start-Process——实测 spawned ok 但实际窗口/编辑器不弹 (尤其
+    // 中文/特殊字符路径)。直接 spawn explorer.exe [路径]: explorer 对文件夹
+    // 打开资源管理器, 对文件用关联程序打开 (跟双击一样), 不经 PowerShell 引号
+    // 二次解析, 最可靠。reveal=true 仍走 buildRevealCommand (explorer /select,)。
+    let effectiveCommand = command
+    if (!reveal && process.platform === 'win32') {
+      effectiveCommand = { cmd: 'explorer.exe', args: [resolved.replace(/\//g, '\\')] }
+    }
     try {
       const { spawn } = await import('node:child_process')
       await new Promise<void>((resolve, reject) => {
-        const child = spawn(command.cmd, command.args, { detached: true, stdio: 'ignore' })
+        const child = spawn(effectiveCommand.cmd, effectiveCommand.args, { detached: true, stdio: 'ignore' })
         child.on('error', reject)
         child.on('spawn', () => { child.unref(); resolve() })
       })
       return { status: 200, body: { opened: resolved } }
     } catch (err) {
-      console.error(`[open-file] spawn failed: ${command.cmd} ${command.args.join(' ')} → ${(err as Error).message}`)
+      console.error(`[open-file] spawn failed: ${effectiveCommand.cmd} ${effectiveCommand.args.join(' ')} → ${(err as Error).message}`)
       return { status: 500, body: { error: `启动失败: ${(err as Error).message}` } }
     }
   }

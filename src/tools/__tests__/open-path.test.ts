@@ -3,17 +3,18 @@ import assert from 'node:assert/strict'
 import { buildOpenPathCommand, buildRevealCommand, OPEN_PATH_TOOL } from '../open-path.js'
 
 describe('open_path', () => {
-  it('builds Windows opener via PowerShell Start-Process -LiteralPath (no cmd.exe metachar reinterpretation)', () => {
+  it('builds Windows opener via PowerShell Start-Process -FilePath (no cmd.exe metachar reinterpretation)', () => {
     const target = 'C:\\Users\\Honglin   zhang\\Desktop\\天枢-logo.svg'
     const command = buildOpenPathCommand(target, 'win32')
 
     assert.equal(command.cmd, 'powershell.exe')
-    // 路径作为单引号字面串嵌入 -LiteralPath，不再走 cmd 二次解析。
+    // 路径作为单引号字面串嵌入 -FilePath，不再走 cmd 二次解析。
+    // 注意: Start-Process 没有 -LiteralPath 参数 (那是 Item cmdlet 的)。
     assert.deepEqual(command.args, [
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      `Start-Process -LiteralPath '${target}'`,
+      `Start-Process -FilePath '${target}'`,
     ])
     // cmd.exe 不应再被使用。
     assert.notEqual(command.cmd, 'cmd.exe')
@@ -27,7 +28,7 @@ describe('open_path', () => {
     assert.equal(command.cmd, 'powershell.exe')
     const literalArg = command.args[command.args.length - 1]
     // 单引号字面串：内嵌单引号被双写转义，& | % ^ 原样保留为字面量。
-    assert.equal(literalArg, "Start-Process -LiteralPath 'C:\\R&D\\report|v2\\100%^win\\o''brien.txt'")
+    assert.equal(literalArg, "Start-Process -FilePath 'C:\\R&D\\report|v2\\100%^win\\o''brien.txt'")
   })
 
   it('builds macOS opener with path as a separate argument', () => {
@@ -84,7 +85,7 @@ describe('open_path', () => {
     const command = buildOpenPathCommand(fwdSlash, 'win32')
 
     const literalArg = command.args[command.args.length - 1]
-    assert.equal(literalArg, `Start-Process -LiteralPath '${backslash}'`)
+    assert.equal(literalArg, `Start-Process -FilePath '${backslash}'`)
   })
 
   it('builds macOS reveal command with open -R', () => {

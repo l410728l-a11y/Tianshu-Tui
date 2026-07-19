@@ -57,7 +57,7 @@ export interface CollabAdvisoryInput {
 }
 
 const ALIGN_CONTENT = '【天权·对齐】任务存在模糊信号。按单问约束：先用一句话确认目标、边界与成功标准再展开；或先 recall_capsule("辅") 做意图保存。'
-const DIAGNOSIS_CONTENT = '【瑶光·诊断】入口信号指向诊断类任务：先按成本序取证（读实现→微探针→复现 RED→基线对照）锁定根因再修改；修复后必须 GREEN 回归。可用 attack_case open 开案追踪。'
+const DIAGNOSIS_CONTENT = '【瑶光·诊断】入口信号指向诊断类任务：先按成本序取证（读实现→微探针→复现 RED→基线对照）锁定根因再修改；修复后必须 GREEN 回归。attack_case 在工具列表时可用它开案追踪（full 档工具）。'
 
 function contractKey(prefix: string, contractId: string | undefined): string {
   return `${prefix}:${contractId && contractId.length > 0 ? contractId : '(no-contract)'}`
