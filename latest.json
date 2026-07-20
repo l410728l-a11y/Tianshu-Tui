@@ -1,0 +1,19 @@
+{
+  "version": "2.19.7",
+  "notes": "子代理思维导图 + Plan 模式审批闭环 + 滚动修复 + P-cognitive 四层认知防线 + Bing 搜索 + 首条消息自动标题 + 桌面端标题栏/SSE/文件打开修复",
+  "pub_date": "2026-07-20T03:40:00.000Z",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.19.7/Tianshu_2.19.7_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2FGWlZKZk1OQitNZ3crZ0NWNnpRV0Z5Q2lUSWhGNFhCcmpPTktqNnBaN1o1ZTc1MFpCazNDR2FTYUtJVzR1Z2x0bTRHMUIwRytNYWNKNlJSeUZJMUFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTE4NTMyCWZpbGU6VGlhbnNodV8yLjE5LjdfeDY0LXNldHVwLmV4ZQphdjZZVmJTQzBvUFBtdm53VFlkYlhNTUpVZUxKZDB6TFJybE5ReVlTcmQwaVBpMVZWOWRLQ0wxUEtYT2g0dmMxMlV0S3liQzU1QTBORS9OODVxWEREQT09Cg=="
+    },
+    "darwin-aarch64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.19.6/Tianshu_2.19.6_aarch64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1grS0FRYkJMQWR1QnZiaStYb0hGMVJONWxFMENCRk9EUGcwZElEOXlDVUE0STUva2huSFpPeW14b2FHT0YwNlRpbmU3anFQdWREQkxzZkFack11TkF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDM3MTUxCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkFHamJrNEhmOCtVTEJiV3Y3eTF5NUhiOWF3YVpZRlVnT1NFOGhjUElZWlJ1MWpQRFh2ZUQ3em1UaXlRY2JGb0xlNFBzNVRiQzNUcW0vSE4rUmJmVUNBPT0K"
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.19.6/Tianshu_2.19.6_x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1J0bHRpQWhFRXVMSlZPRUtyMGhYN280cElLdmptQVprSDNiK0d5Wm9pQys5cUpaZXpWWG16ZUVpNjFWeDQ4WlhJMlo1NFFiNi9zdHJBMWRxTVh5TGc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDM3NjE5CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CjdwcHl6SFg4WkM3czJPUjBvS3JvYXVEVmVRZU1lOElOZW9McUpJSnNCcnpWYXpjaGM3c1IyTEkraE5rZTR5dXRnTFlQTDNJa0piY0MvRlJ5QlR5Z0N3PT0K"
+    }
+  }
+}
