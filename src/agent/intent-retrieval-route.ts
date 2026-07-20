@@ -245,12 +245,16 @@ export function normalizeRetrievalRoute(raw: unknown, fallbackInput?: RetrievalR
 }
 
 /**
- * 低置信分类时注入的极简对齐提示——意图最模糊的场景恰恰最需要认知同步，
+ * 低置信分类时注入的认知对齐提示——意图最模糊的场景恰恰最需要认知同步，
  * 沉默（不注入任何路由）会让主模型直接按关键词锚定展开。
  */
 export const LOW_CONFIDENCE_INTENT_ADVISORY = [
   '<intent-retrieval-route advisory="true" scope="current-turn" confidence="low">',
-  '  意图分类不确定：先用一句话向用户同步你对任务的理解（必要时问至多一个澄清问题），检索按实际问题自主展开，不受用户关键词锚定。',
+  '  意图分类不确定。请执行认知对齐：',
+  '  1. 用一句话复述你理解的任务目标（不是执行计划）',
+  '  2. 判断问题属于哪一层：业务目标 / 链路接线 / 代码实现',
+  '  3. 如有歧义，问至多一个问题锁定方向',
+  '  4. 确认理解一致后再进入执行',
   '</intent-retrieval-route>',
 ].join('\n')
 
@@ -259,7 +263,11 @@ export function renderLowConfidenceIntentAdvisory(route: RetrievalRoute): string
   if (branches.length === 0) return LOW_CONFIDENCE_INTENT_ADVISORY
   return [
     '<intent-retrieval-route advisory="true" scope="current-turn" confidence="low">',
-    '  意图分类不确定：先用一句话向用户同步你对任务的理解（必要时问至多一个澄清问题），检索按实际问题自主展开，不受用户关键词锚定。',
+    '  意图分类不确定。请执行认知对齐：',
+    '  1. 用一句话复述你理解的任务目标（不是执行计划）',
+    '  2. 判断问题属于哪一层：业务目标 / 链路接线 / 代码实现',
+    '  3. 如有歧义，问至多一个问题锁定方向',
+    '  4. 确认理解一致后再进入执行',
     `  协作路径: 骨干+${branches.join('+')}`,
     '</intent-retrieval-route>',
   ].join('\n')

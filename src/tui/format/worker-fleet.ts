@@ -34,6 +34,19 @@ function statusGlyph(status: FleetWorkerView['status']): string {
   }
 }
 
+/** 状态词（行尾右对齐，对齐 kimi-code 子代理块的可读状态列）。 */
+function statusWord(status: FleetWorkerView['status']): string {
+  switch (status) {
+    case 'running': return '执行中'
+    case 'passed': return '完成'
+    case 'failed': return '失败'
+    case 'blocked': return '受阻'
+    case 'escalated': return '升级'
+  }
+}
+
+const WIDE = { ambiguousAsWide: true }
+
 /** 状态 → 主题色键：与主区/侧栏共用，保证宽窄屏切换时颜色不突变。 */
 function statusColorKey(status: FleetWorkerView['status']): keyof RivetTheme {
   switch (status) {
@@ -82,14 +95,15 @@ function fmtTokens(n: number): string {
 
 interface FleetLine {
   text: string
-  kind: 'header' | 'worker' | 'activity' | 'overflow'
+  kind: 'header' | 'worker' | 'activity' | 'overflow' | 'hint'
   status?: FleetWorkerView['status']
 }
 
 /**
  * 树形两行结构（CC Task 进度对标）：
- *  分支行 `├─/└─ glyph label · N 工具 · Xk tok · elapsed`
+ *  分支行 `├─/└─ glyph label · N 工具 · Xk tok · elapsed   状态词`
  *  活动行 `│  ⎿ 最新活动`（末支用空白续行；无活动时省略）
+ * 状态词右对齐成一列（对齐到最长分支行 + 2，不贴终端右缘——宽屏下避免悬空）。
  */
 function buildEntries(
   workers: FleetWorkerView[],
@@ -101,6 +115,7 @@ function buildEntries(
   const lines: FleetLine[] = []
 
   const running = summary?.running ?? workers.filter(w => w.status === 'running').length
+  const maxElapsedStr = formatElapsed(workers.reduce((n, w) => Math.max(n, w.elapsedMs), 0))
   if (summary && summary.total > 0) {
     const parts: string[] = []
     if (running > 0) {
@@ -109,14 +124,18 @@ function buildEntries(
     if (summary.done > 0) {
       parts.push(`${summary.done}/${summary.total} 完成`)
     }
+    if (maxElapsedStr) parts.push(maxElapsedStr)
     lines.push({ text: ` ◐ 子代理 · ${parts.join(' · ') || `${summary.total} 个`}`, kind: 'header' })
   } else {
-    lines.push({ text: ` ◐ 子代理 · ${workers.length} 执行中`, kind: 'header' })
+    const suffix = maxElapsedStr ? ` · ${maxElapsedStr}` : ''
+    lines.push({ text: ` ◐ 子代理 · ${workers.length} 执行中${suffix}`, kind: 'header' })
   }
 
   const visible = workers.slice(0, maxRows)
   const overflow = workers.length - visible.length
   const labels = assignLabels(visible)
+  // 先成型分支行，量出最长行宽，再把状态词对齐到同一列
+  const branchRows: { base: string; w: FleetWorkerView; cont: string }[] = []
   for (let i = 0; i < visible.length; i++) {
     const w = visible[i]!
     const isLast = i === visible.length - 1 && overflow <= 0
@@ -132,7 +151,13 @@ function buildEntries(
     if (w.tokenCount > 0) stats.push(`${fmtTokens(w.tokenCount)} tok`)
     const statsStr = stats.length > 0 ? ` · ${stats.join(' · ')}` : ''
     const tail = elapsed ? `  ${elapsed}` : ''
-    lines.push({ text: ` ${branch} ${glyph} ${label}${statsStr}${tail}`, kind: 'worker', status: w.status })
+    branchRows.push({ base: ` ${branch} ${glyph} ${label}${statsStr}${tail}`, w, cont })
+  }
+  const wordCol = branchRows.reduce((n, r) => Math.max(n, displayWidth(r.base, WIDE)), 0) + 2
+  for (const { base, w, cont } of branchRows) {
+    const word = statusWord(w.status)
+    const pad = Math.max(2, wordCol - displayWidth(base, WIDE))
+    lines.push({ text: `${base}${' '.repeat(pad)}${word}`, kind: 'worker', status: w.status })
 
     if (w.activity) {
       const head = ` ${cont}   ⎿ `
@@ -143,6 +168,11 @@ function buildEntries(
 
   if (overflow > 0) {
     lines.push({ text: ` └─ …(+${overflow})`, kind: 'overflow' })
+  }
+
+  // 退路提示（kimi-code 的 Ctrl+B 提示对标）：让管理入口随块可见，不靠记忆
+  if (running > 0) {
+    lines.push({ text: ' ⎿ /tasks 管理面板（↑↓ 选择 · f 切入 · x 停止）', kind: 'hint' })
   }
 
   return lines
@@ -179,6 +209,7 @@ export function formatWorkerFleet(
       if (l.status === 'passed') return color(l.text, theme.success)
       return color(l.text, theme.warning)
     }
+    if (l.kind === 'hint') return color(l.text, theme.dim)
     return color(l.text, theme.muted)
   })
 }

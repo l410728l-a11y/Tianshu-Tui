@@ -45,6 +45,11 @@ export function setReducedMotion(value: boolean): void {
   reducedMotion = value
 }
 
+/** 当前 reducedMotion 状态（其它瞬态动画——如 todo 徽章闪烁——据此降级为静态）。 */
+export function isReducedMotion(): boolean {
+  return reducedMotion
+}
+
 /** 重置为默认（测试用）。 */
 export function resetSpinnerConfig(): void {
   verbPool = DEFAULT_VERBS

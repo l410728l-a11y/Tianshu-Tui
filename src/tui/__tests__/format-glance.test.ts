@@ -173,7 +173,8 @@ describe('formatGlanceRight density（Wave 2 减密分档）', () => {
     assert.ok(plain.includes('◧25%'), `上下文百分比保留: ${plain}`)
     assert.ok(plain.includes('1m5s'), '耗时保留')
     assert.ok(!plain.includes('¥'), 'cost 收起')
-    assert.ok(!plain.includes('☐'), 'todo 收起')
+    assert.ok(plain.includes('◇2/5'), 'todo 徽章（compact 档 ◇done/total）显示')
+    assert.ok(!plain.includes('☐'), '分态计数仅 full 档')
     assert.ok(!plain.includes('50k'), 'token 绝对值收起（只留百分比）')
   })
 
@@ -182,7 +183,7 @@ describe('formatGlanceRight density（Wave 2 减密分档）', () => {
     assert.ok(plain.includes('⚡80%'), 'cache 显示')
     assert.ok(plain.includes('¥1.23'), 'cost 显示')
     assert.ok(plain.includes('◎high'), 'effort 显示')
-    assert.ok(plain.includes('☐ 2/5'), 'todo 显示')
+    assert.ok(plain.includes('◐1 ☐2 ☒2'), 'todo 分态计数徽章显示')
   })
 
   it('compact 档缺 token 数据时不渲染 ◧', () => {

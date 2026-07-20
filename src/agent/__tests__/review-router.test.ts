@@ -320,6 +320,44 @@ describe('routeReviewWorkflow', () => {
       assert.equal(outcome.tier, 'auto')
       assert.equal(outcome.verdict, 'nudge')
     })
+
+    it('auto-L1：小改动（单文件、非核心路径）不 spawn worker', async () => {
+      let wiringCalls = 0
+      const outcome = await routeReviewWorkflow(
+        { files: ['src/utils/format.ts'], crossModule: false, isFix: false },
+        { ...okDeps, spawnWiringReviewer: async () => { wiringCalls++; return { findings: [] } } },
+        { mode: 'auto' },
+      )
+      assert.equal(outcome.verdict, 'nudge')
+      assert.equal(wiringCalls, 0, 'auto-L1 零 worker 成本')
+    })
+
+    it('auto-L2：≥3 文件（非核心路径）仍 spawn wiring reviewer', async () => {
+      let wiringCalls = 0
+      const outcome = await routeReviewWorkflow(
+        { files: ['src/utils/a.ts', 'src/utils/b.ts', 'src/utils/c.ts'], crossModule: false, isFix: false },
+        { ...okDeps, spawnWiringReviewer: async () => { wiringCalls++; return { findings: [], infraFailures: [] } } },
+        { mode: 'auto' },
+      )
+      assert.equal(outcome.verdict, 'verified')
+      assert.equal(wiringCalls, 1)
+    })
+
+    it('budget 失败（max-turns 耗尽）不重试，标签为「审查预算耗尽」', async () => {
+      let calls = 0
+      const outcome = await routeReviewWorkflow(codeChange, {
+        ...okDeps,
+        spawnWiringReviewer: async () => {
+          calls++
+          return { findings: [], infraFailures: [{ kind: 'budget', claim: 'max-turns: exhausted without a final turn' }] }
+        },
+      }, { mode: 'auto' })
+
+      assert.equal(calls, 1, 'budget 是确定性失败，同预算重试必死，不得重试')
+      assert.equal(outcome.verdict, 'inconclusive')
+      assert.match(outcome.evidence ?? '', /审查预算耗尽/)
+      assert.doesNotMatch(outcome.evidence ?? '', /infra failure/)
+    })
   })
 
   it('escalates immediately when patcher reports it did not patch a verifier rejection', async () => {

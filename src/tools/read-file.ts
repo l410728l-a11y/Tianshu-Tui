@@ -454,16 +454,19 @@ export interface ReadFilePayload {
 }
 
 /**
- * The agent's own state dir (`<cwd>/.rivet/`) is exempt from the gitignore
- * read block. Plan drafts (`.rivet/plans/draft-*.md`) are intentionally
- * gitignored, but plan mode makes the draft the ONLY writable file — blocking
- * reads on it deadlocks revision (session 91840816: write ok → submit
- * rejected → read back refused → wedged). The gitignore block exists to keep
- * node_modules/build junk out, not the agent's own working files.
+ * The agent's own state dir (`<cwd>/.rivet/`) and design docs (`<cwd>/docs/superpowers/`)
+ * are exempt from the gitignore read block. Plan drafts, specs, and analysis documents
+ * are intentionally gitignored (to avoid polluting the source tree), but blocking reads
+ * on them deadlocks the agent: write ok → submit rejected → read back refused → wedged
+ * (session 91840816 for .rivet/plans/; session 5268cce4 for docs/superpowers/specs/).
+ * The gitignore block exists to keep node_modules/build junk out, not the agent's
+ * own working files or design documentation.
  */
 function isRivetStatePath(cwd: string, filePath: string): boolean {
   const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
-  return norm(filePath).startsWith(`${norm(cwd)}/.rivet/`)
+  const base = `${norm(cwd)}/`
+  return norm(filePath).startsWith(`${base}.rivet/`) ||
+    norm(filePath).startsWith(`${base}docs/superpowers/`)
 }
 
 /** Centralized safe file read — validates path, checks gitignore, applies offset/limit, truncates for model. */

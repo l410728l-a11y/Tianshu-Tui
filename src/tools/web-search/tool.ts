@@ -1,8 +1,9 @@
 import type { Tool, ToolCallParams, ToolResult } from '../types.js'
+import type { ProxyResolverOptions } from '../net/proxy-resolver.js'
 import type { SearchBackend, SearchFetch } from './types.js'
 import { DuckDuckGoBackend } from './duckduckgo.js'
 import { runBackendChain } from './chain.js'
-import { boundedSearchFetch } from './bounded-fetch.js'
+import { createProxyAwareFetch } from './proxy-fetch.js'
 
 const MAX_RESULTS = 20
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -12,13 +13,24 @@ export interface WebSearchDeps {
   backends?: SearchBackend[]
   /** Per-backend timeout. Defaults to 15s. */
   timeoutMs?: number
-  /** Injectable fetch for the default DDG backend (tests). */
+  /**
+   * Injectable fetch for the default DDG backend (tests). When omitted, the
+   * production fetch becomes proxy-aware via `createProxyAwareFetch`.
+   */
   fetch?: SearchFetch
+  /**
+   * Proxy resolution options sourced from `config.network.{proxy,noProxy}`.
+   * Only consulted when `fetch` is not injected (production path). Lets the
+   * default DuckDuckGo backend honor the same proxy as web_fetch.
+   */
+  proxy?: ProxyResolverOptions
 }
 
 export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
-  // Injected test fetches stay as-is; the real global fetch is body-size capped.
-  const fetchImpl = deps.fetch ?? boundedSearchFetch(globalThis.fetch.bind(globalThis) as SearchFetch)
+  // Injected test fetches stay as-is; the real global fetch is proxy-aware
+  // (config.network.proxy > HTTPS_PROXY/HTTP_PROXY env > direct) and body-size
+  // capped via boundedSearchFetch inside createProxyAwareFetch.
+  const fetchImpl = deps.fetch ?? createProxyAwareFetch(deps.proxy)
   const backends = deps.backends && deps.backends.length > 0
     ? deps.backends
     : [new DuckDuckGoBackend(fetchImpl)]

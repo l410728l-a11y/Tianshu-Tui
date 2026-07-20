@@ -719,6 +719,13 @@ export function buildSessionRoutes(
       return { status: 200, body: result }
     }, apiToken),
 
+    // Worker log — 失败钻取(W2):活动流 + 终态结果 + 转录尾部。
+    'GET /sessions/:id/workers/:workerId/log': withAuth(async (_body, params) => {
+      const log = await manager.getWorkerLog(params!.id!, decodeURIComponent(params!.workerId!))
+      if (!log) return { status: 404, body: { error: 'Session not found' } }
+      return { status: 200, body: log }
+    }, apiToken),
+
     // Insights — aggregated token usage, cost, and per-worker/model/provider
     // breakdowns derived from delegation events. Bearer-gated.
     // Cockpit snapshot — aggregated runtime state (safety/verify/context/model)

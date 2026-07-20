@@ -176,3 +176,84 @@ describe('plan tool close — evidence gate', () => {
     assert.equal(read(), before, 'preview never writes')
   })
 })
+
+describe('plan close — 闭环即解锁(自动退出 plan mode)', () => {
+  let dir = ''
+  const planRel = '.rivet/plans/exit-plan.md'
+
+  const PLAN_BODY = [
+    '# Exit Plan',
+    '',
+    '## 6. Tasks',
+    '',
+    '### Task 1: Do the thing',
+    '- [ ] step one',
+    '',
+  ].join('\n')
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'rivet-plan-exit-'))
+    const abs = join(dir, planRel)
+    mkdirSync(join(dir, '.rivet/plans'), { recursive: true })
+    writeFileSync(abs, PLAN_BODY, 'utf-8')
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function close(input: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+    return PLAN_TOOL.execute({
+      cwd: dir,
+      input: { action: 'close', file_path: planRel, tasks: 'all', ...input },
+      toolUseId: 'test-tool-use',
+      ...extra,
+    } as any)
+  }
+
+  const greenGate = (): { assessDelivery: () => DeliveryGateResult; getVerificationEvidence: () => VerificationSummary } => ({
+    assessDelivery: () => ({
+      state: 'GREEN', canDeliver: true, isBlocked: false, ownedFileCount: 1, externalFileCount: 0,
+      verificationCount: 2, supersededFailures: 0, staleSnapshotDropped: 0, staleFailureCandidates: 0,
+      toolInvocationFailureCandidates: [],
+    }),
+    getVerificationEvidence: () => ({ total: 2, verified: 2, pending: 0, files: [{ path: 'src/foo.ts', level: 'tested' }] }),
+  })
+
+  const redGate = (): { assessDelivery: () => DeliveryGateResult } => ({
+    assessDelivery: () => ({
+      state: 'RED', canDeliver: false, isBlocked: true, ownedFileCount: 1, externalFileCount: 0,
+      verificationCount: 0, supersededFailures: 0, staleSnapshotDropped: 0, staleFailureCandidates: 0,
+      toolInvocationFailureCandidates: [],
+    }),
+  })
+
+  it('闭环(gate-GREEN EXECUTED)调用 exitPlanMode', async () => {
+    let exited = 0
+    const result = await close(
+      { apply: true, deliveryState: 'GREEN', verifiedCommands: ['npm test'] },
+      { ...greenGate(), exitPlanMode: () => { exited++ } },
+    )
+    assert.ok(!result.isError, result.content)
+    assert.equal(exited, 1)
+    assert.ok(result.content.includes('已自动退出计划模式'))
+  })
+
+  it('非闭环(诚实 RED checkpoint)不调用 exitPlanMode', async () => {
+    let exited = 0
+    const result = await close(
+      { apply: true, deliveryState: 'RED' },
+      { ...redGate(), exitPlanMode: () => { exited++ } },
+    )
+    assert.ok(!result.isError, result.content)
+    assert.equal(exited, 0)
+  })
+
+  it('无 exitPlanMode ref(worker 上下文)不报错', async () => {
+    const result = await close(
+      { apply: true, deliveryState: 'GREEN', verifiedCommands: ['npm test'] },
+      greenGate(),
+    )
+    assert.ok(!result.isError, result.content)
+  })
+})

@@ -168,47 +168,44 @@ describe('W2 efficacy 负反馈环 (incident 20b9714e)', () => {
   })
 })
 
-describe('W6 CVM overhead throttle — channel B degradation (incident 20b9714e)', () => {
-  it('throttled: non-exempt entries deliver every other render cycle', () => {
+describe('W6 CVM overhead throttle — Wave 2 统一注入预算', () => {
+  it('throttled: budget = 1, only 1 non-exempt entry per render', () => {
     const bus = new AdvisoryBus()
     bus.setOverheadThrottled(true)
-    const deliveredAt: number[] = []
-    for (let cycle = 1; cycle <= 8; cycle++) {
-      bus.submit({ key: 'noise', priority: 0.6, category: 'discipline', content: '普通提醒' })
-      if (bus.render(undefined, cycle).includes('key="noise"')) deliveredAt.push(cycle)
-    }
-    assert.equal(deliveredAt.length, 4, `alternating delivery: expected 4/8, got ${deliveredAt.length} at ${deliveredAt}`)
-    for (let i = 1; i < deliveredAt.length; i++) {
-      assert.equal(deliveredAt[i]! - deliveredAt[i - 1]!, 2, 'gap between deliveries must be 2 cycles')
-    }
+    // Submit 3 non-exempt entries — budget of 1 should keep only top-priority one
+    bus.submit({ key: 'a', priority: 0.6, category: 'discipline', content: 'A' })
+    bus.submit({ key: 'b', priority: 0.5, category: 'repair', content: 'B' })
+    bus.submit({ key: 'c', priority: 0.4, category: 'mistake', content: 'C' })
+    const out = bus.render(undefined, 1)
+    assert.ok(out.includes('key="a"'), 'top priority non-exempt rendered')
+    assert.ok(!out.includes('key="b"'), 'lower priority pruned by budget')
+    assert.ok(!out.includes('key="c"'), 'lower priority pruned by budget')
   })
 
-  it('throttled: constitutional / immediate / priority>=0.8 are exempt', () => {
+  it('throttled: constitutional / immediate entries exempt from budget', () => {
     const bus = new AdvisoryBus()
     bus.setOverheadThrottled(true)
-    let constitutional = 0
-    let hiPri = 0
-    for (let cycle = 1; cycle <= 6; cycle++) {
-      bus.submit({ key: 'guard', priority: 0.9, category: 'constitutional', tier: 'constitutional', content: '宪法级' })
-      bus.submit({ key: 'hi', priority: 0.85, category: 'repair', content: '高优先级' })
-      const out = bus.render(undefined, cycle)
-      if (out.includes('key="guard"')) constitutional++
-      if (out.includes('key="hi"')) hiPri++
-    }
-    assert.equal(constitutional, 6, 'constitutional never throttled by overhead')
-    assert.equal(hiPri, 6, 'priority >= 0.8 never throttled by overhead')
+    // 1 constitutional + 2 non-exempt → constitutional exempt, 1 non-exempt slot
+    bus.submit({ key: 'guard', priority: 0.9, tier: 'constitutional', category: 'constitutional', content: 'G' })
+    bus.submit({ key: 'a', priority: 0.6, category: 'discipline', content: 'A' })
+    bus.submit({ key: 'b', priority: 0.5, category: 'repair', content: 'B' })
+    const out = bus.render(undefined, 1)
+    assert.ok(out.includes('key="guard"'), 'constitutional exempt from budget')
+    assert.ok(out.includes('key="a"'), 'one non-exempt slot available')
+    assert.ok(!out.includes('key="b"'), 'second non-exempt pruned')
   })
 
-  it('unthrottling resets the skip state — next render delivers', () => {
+  it('unthrottled: budget = 3, all 3 non-exempt entries render', () => {
     const bus = new AdvisoryBus()
-    bus.setOverheadThrottled(true)
-    bus.submit({ key: 'a', priority: 0.6, category: 'discipline', content: 'x' })
-    assert.ok(bus.render(undefined, 1).includes('key="a"'), 'first throttled render delivers')
-    bus.setOverheadThrottled(false)
-    bus.submit({ key: 'a', priority: 0.6, category: 'discipline', content: 'x' })
-    assert.ok(bus.render(undefined, 2).includes('key="a"'), 'unthrottled render always delivers')
-    bus.submit({ key: 'a', priority: 0.6, category: 'discipline', content: 'x' })
-    assert.ok(bus.render(undefined, 3).includes('key="a"'), 'stays delivered while unthrottled')
+    bus.submit({ key: 'a', priority: 0.6, category: 'discipline', content: 'A' })
+    bus.submit({ key: 'b', priority: 0.5, category: 'repair', content: 'B' })
+    bus.submit({ key: 'c', priority: 0.4, category: 'mistake', content: 'C' })
+    bus.submit({ key: 'd', priority: 0.3, category: 'dedup', content: 'D' })
+    const out = bus.render(undefined, 1)
+    assert.ok(out.includes('key="a"'))
+    assert.ok(out.includes('key="b"'))
+    assert.ok(out.includes('key="c"'))
+    assert.ok(!out.includes('key="d"'), '4th entry pruned by Top-3 cap (not budget)')
   })
 })
 
@@ -437,6 +434,64 @@ describe('priority tier (constitutional/operational/informational)', () => {
       bus.submit({ key: 'kept', priority: 0.8, category: 'repair', content: 'KEPT' })
       bus.peekPendingKeys()
       assert.match(bus.render(), /KEPT/)
+    })
+  })
+
+  // ── Wave 1 SR 通道账本修正 ──
+
+  describe('SR channel delivery confirmation (Wave 1)', () => {
+    it('Wave 1: SR entries NOT pre-counted as delivered — require confirm callback', () => {
+      // 同 turn 内提交 2 条不同 key 的 SR
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+      bus.submit({
+        key: 'turn-call-limit', priority: 0.68, category: 'discipline',
+        content: 'API 调用过多', channel: 'system-reminder', immediate: true,
+      })
+
+      bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 2, '2 SR entries should be drained')
+
+      // Wave 1 修正后：render 不再预记 rendered/delivered
+      // SR 在 confirm 回调前不进入 delivered 桶
+      const delivered = bus.drainDelivered()
+      const srDelivered = delivered.filter(d => d.key === 'readonly-spiral' || d.key === 'turn-call-limit')
+      assert.equal(srDelivered.length, 0,
+        'Wave 1 GREEN: SR entries not pre-counted — need confirm callback')
+    })
+
+    it('GREEN: confirmSrDropped removes SR from delivered bucket', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+      bus.submit({
+        key: 'turn-call-limit', priority: 0.68, category: 'discipline',
+        content: 'API 调用过多', channel: 'system-reminder', immediate: true,
+      })
+
+      bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 2)
+
+      // Simulate SessionContext: first SR delivered, second dropped by cap
+      bus.confirmSrDelivered(srs[0]!.key)
+      bus.confirmSrDropped(srs[1]!.key)
+
+      const delivered = bus.drainDelivered()
+      const srDelivered = delivered.filter(d => d.key === 'readonly-spiral' || d.key === 'turn-call-limit')
+      assert.equal(srDelivered.length, 1, 'GREEN: only 1 SR counts as delivered')
+      assert.equal(srDelivered[0]!.key, 'readonly-spiral', 'first SR delivered')
+
+      // srDropped 不出现在 delivered 桶中
+      const ledger = bus.drainLedger()
+      assert.equal(ledger.srSubmitted, 2, '2 SR submitted')
+      assert.equal(ledger.srDropped, 1, '1 SR dropped by SessionContext cap')
     })
   })
 })

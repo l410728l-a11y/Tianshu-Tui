@@ -46,13 +46,24 @@ describe('destructive-gate 决策矩阵', () => {
     assert.equal(gate.evaluate('bash', { command: 'git stash' }).block, false)
   })
 
-  test('blocked 状态不开窗也不关窗', () => {
+  test('blocked 与 failed 等价开窗，且不关窗', () => {
     const gate = createDestructiveGateState()
-    gate.noteVerification('blocked')
-    assert.equal(gate.evaluate('bash', { command: 'git stash' }).block, false)
-    gate.noteVerification('failed')
+    // blocked 开窗——和 failed 一样，agent 感知到验证障碍
     gate.noteVerification('blocked')
     assert.equal(gate.evaluate('bash', { command: 'git stash' }).block, true)
+    // blocked 不关窗：failed 开窗后再 blocked 不关
+    const gate2 = createDestructiveGateState()
+    gate2.noteVerification('failed')
+    gate2.noteVerification('blocked')
+    assert.equal(gate2.evaluate('bash', { command: 'git stash' }).block, true)
+  })
+
+  test('P1: noteAdvisoryPressure 开窗——advisory 被忽略 ≥2 时拦截清场', () => {
+    const gate = createDestructiveGateState()
+    gate.noteAdvisoryPressure()
+    assert.equal(gate.evaluate('bash', { command: 'git checkout -- .' }).block, true)
+    // 首次拦截,原样重发放行
+    assert.equal(gate.evaluate('bash', { command: 'git checkout -- .' }).block, false)
   })
 
   test('窗口按实际执行的工具计数过期(默认 3)', () => {

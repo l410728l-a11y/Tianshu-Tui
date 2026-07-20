@@ -7,6 +7,7 @@
  */
 export { createWebSearchTool, WEB_SEARCH_TOOL, type WebSearchDeps } from './web-search/tool.js'
 export { parseDuckDuckGoResults, decodeHtmlEntities, DuckDuckGoBackend } from './web-search/duckduckgo.js'
+export { BingBackend } from './web-search/bing.js'
 export { BraveBackend } from './web-search/brave.js'
 export { TavilyBackend } from './web-search/tavily.js'
 export { runBackendChain, type ChainResult, type BackendError } from './web-search/chain.js'

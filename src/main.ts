@@ -257,7 +257,14 @@ async function main() {
       desktopTools: cfg.agent.desktopTools,
       computerUse: (process.platform === 'darwin' || process.platform === 'win32') && process.env.RIVET_COMPUTER_USE !== '0',
       proEnabled: isProFeatureEnabled(cfg, 'computerUse'),
-      searchBackends: buildSearchBackends(cfg),
+      // 透传 network.{proxy,noProxy}：headless 模式 web_search 也需走代理，
+      // 与 web_fetch 对齐（详见 bootstrap.ts 同名调用注释）。
+      searchBackends: buildSearchBackends(cfg, {
+        proxy: {
+          ...(cfg.network.proxy ? { proxyUrl: cfg.network.proxy } : {}),
+          ...(cfg.network.noProxy ? { noProxy: cfg.network.noProxy } : {}),
+        },
+      }),
       fetchOptions: buildFetchOptions(cfg),
     }
     const prov = cfg.provider.providers[cfg.provider.default]

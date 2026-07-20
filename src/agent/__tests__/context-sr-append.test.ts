@@ -24,7 +24,8 @@ describe('SessionContext.appendSystemReminder', () => {
     assert.ok(last.content.includes('do task'), 'must preserve original content')
   })
 
-  it('appends multiple SRs to the same last user message', () => {
+  // W3：每轮最多 1 条 system-reminder。第二条静默丢弃。
+  it('W3: silently drops second SR in same turn (per-turn cap)', () => {
     const session = new SessionContext()
     session.addUserMessage('继续')
 
@@ -34,9 +35,32 @@ describe('SessionContext.appendSystemReminder', () => {
     const msgs = session.getMessages()
     assert.equal(msgs.length, 1, 'still only 1 message')
     const content = msgs[0]!.content as string
-    assert.ok(content.includes('kick A'))
-    assert.ok(content.includes('kick B'))
+    assert.ok(content.includes('kick A'), 'first SR should be delivered')
+    assert.ok(!content.includes('kick B'), 'second SR must be silently dropped (per-turn cap)')
     assert.ok(content.includes('继续'))
+  })
+
+  it('W3: resetSrCount allows new SR in next turn', () => {
+    const session = new SessionContext()
+    session.addUserMessage('turn 1')
+
+    session.appendSystemReminder('turn 1 SR')
+    // Second SR in same turn → dropped
+    session.appendSystemReminder('turn 1 SR second')
+    const afterTurn1 = session.getMessages()
+    const c1 = afterTurn1[0]!.content as string
+    assert.ok(c1.includes('turn 1 SR'), 'first SR delivered')
+    assert.ok(!c1.includes('turn 1 SR second'), 'second SR dropped')
+
+    // Reset → new turn
+    session.resetSrCount()
+    session.addUserMessage('turn 2')
+    session.appendSystemReminder('turn 2 SR')
+
+    const afterTurn2 = session.getMessages()
+    assert.equal(afterTurn2.length, 2, 'new turn adds a new message')
+    const c2 = afterTurn2[1]!.content as string
+    assert.ok(c2.includes('turn 2 SR'), 'SR in new turn should be delivered after reset')
   })
 
   it('falls back to addUserMessage when no user message exists', () => {

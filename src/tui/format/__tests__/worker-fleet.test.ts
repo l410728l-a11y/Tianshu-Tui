@@ -28,12 +28,12 @@ function worker(over: Partial<FleetWorkerView> = {}): FleetWorkerView {
 describe('buildWorkerFleetLines', () => {
   it('单 worker：汇总头 + 分支行（职能/elapsed）+ 活动行', () => {
     const lines = buildWorkerFleetLines([worker()], { done: 0, total: 2, running: 1 }, 80)
-    assert.equal(lines.length, 3)
+    assert.equal(lines.length, 4) // 头 + 分支 + 活动 + 提示行
     assert.ok(lines[0]!.includes('子代理'))
     assert.ok(lines[0]!.includes('执行中'))
     // 不再包含英文 profile
     assert.ok(!lines[0]!.includes('Agents'))
-    // 分支行：树形 glyph + 职能名 + elapsed
+    // 分支行：树形 glyph + 职能名 + elapsed + 状态词
     assert.ok(lines[1]!.includes('└─'))
     assert.ok(lines[1]!.includes('侦察'))
     assert.ok(lines[1]!.includes('代码'))
@@ -41,6 +41,8 @@ describe('buildWorkerFleetLines', () => {
     // 活动行：⎿ + 最新活动
     assert.ok(lines[2]!.includes('⎿'))
     assert.ok(lines[2]!.includes('read_file'))
+    // 提示行：/tasks 管理入口
+    assert.ok(lines[3]!.includes('/tasks'))
   })
 
   it('计数段：toolUseCount/tokenCount 有值时渲染，为零时省略', () => {
@@ -60,8 +62,8 @@ describe('buildWorkerFleetLines', () => {
     const w1 = worker({ workerId: 'w1', profile: 'code_scout' })
     const w2 = worker({ workerId: 'w2', profile: 'doc_scout' })
     const lines = buildWorkerFleetLines([w1, w2], undefined, 80)
-    // header + (branch+activity)*2
-    assert.equal(lines.length, 5)
+    // header + (branch+activity)*2 + 提示行
+    assert.equal(lines.length, 6)
     assert.ok(lines[1]!.includes('├─'))
     assert.ok(lines[2]!.includes('│'), '非末支活动行应有 │ 续行')
     assert.ok(lines[3]!.includes('└─'))
@@ -100,8 +102,9 @@ describe('buildWorkerFleetLines', () => {
   it('多 worker 超 maxRows：折叠 …(+N)', () => {
     const workers = Array.from({ length: 9 }, (_, i) => worker({ workerId: `w${i}`, shortLabel: `T${i}`, activity: undefined }))
     const lines = buildWorkerFleetLines(workers, { done: 0, total: 9, running: 9 }, 80, 6)
-    assert.equal(lines.length, 8)
-    assert.ok(lines[lines.length - 1]!.includes('(+3)'))
+    assert.equal(lines.length, 9) // 头 + 6 分支 + 折叠 + 提示行
+    assert.ok(lines[lines.length - 2]!.includes('(+3)'))
+    assert.ok(lines[lines.length - 1]!.includes('/tasks'), '末行为管理提示')
   })
 
   it('状态 glyph：passed/failed/blocked/escalated', () => {
@@ -153,6 +156,16 @@ describe('formatWorkerFleet', () => {
   it('溢出行也被着色', () => {
     const workers = Array.from({ length: 8 }, (_, i) => worker({ workerId: `w${i}`, shortLabel: `T${i}`, activity: undefined }))
     const colored = formatWorkerFleet(workers, theme, 80, { done: 0, total: 8, running: 8 }, 6)
-    assert.equal(colored.length, 8)
+    assert.equal(colored.length, 9) // 头 + 6 分支 + 折叠 + 提示行
+  })
+
+  it('状态词列：running/passed 行尾带状态词；无在跑时无提示行', () => {
+    const lines = buildWorkerFleetLines(
+      [worker({ status: 'passed', activity: undefined })],
+      { done: 1, total: 2, running: 0 },
+      80,
+    )
+    assert.ok(lines[1]!.includes('完成'), 'passed 行尾应有状态词「完成」')
+    assert.ok(!lines.some(l => l.includes('/tasks')), '无在跑 worker 时不渲染提示行')
   })
 })

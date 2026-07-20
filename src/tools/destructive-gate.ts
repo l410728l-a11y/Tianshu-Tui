@@ -26,10 +26,12 @@ export type DestructiveGateDecision =
   | { block: true; message: string }
 
 export interface DestructiveGateState {
-  /** 写入点:pipeline 两处 trackVerification 旁。failed 开窗,passed 关窗。 */
+  /** 写入点:pipeline 两处 trackVerification 旁。failed/blocked 开窗,passed 关窗。 */
   noteVerification(status: 'passed' | 'failed' | 'blocked'): void
   /** 写入点:每个工具实际执行完成处(被拦截的调用不计数,窗口保持)。 */
   noteToolExecuted(): void
+  /** P1 压力信号源：advisory 被忽略累计 ≥ threshold 时开窗（threshold 由调用方判断）。 */
+  noteAdvisoryPressure(): void
   /** 读取点:bash 执行前。返回 block 时调用方应以 is_error tool_result 短路。 */
   evaluate(toolName: string, input: Record<string, unknown>): DestructiveGateDecision
 }
@@ -73,18 +75,23 @@ export function createDestructiveGateState(options?: { windowSize?: number; getV
 
   return {
     noteVerification(status) {
-      if (status === 'failed') {
+      if (status === 'failed' || status === 'blocked') {
         toolCallsSinceFail = 0
       } else if (status === 'passed') {
         toolCallsSinceFail = null
       }
-      // blocked(验证被环境阻断)不是失败信号,窗口状态不变
+      // blocked 和 failed 对 agent 的压力等价——都意味着"我遇到了验证障碍"，
+      // 后续的 git 清场命令需要被拦截。
     },
 
     noteToolExecuted() {
       if (toolCallsSinceFail === null) return
       toolCallsSinceFail++
       if (toolCallsSinceFail > windowSize) toolCallsSinceFail = null
+    },
+
+    noteAdvisoryPressure() {
+      toolCallsSinceFail = 0
     },
 
     evaluate(toolName, input) {

@@ -102,9 +102,21 @@ function getGlobalNpmRoot(): string | null {
 export function findNpm(): string | null {
   try {
     const cmd = process.platform === 'win32' ? 'where npm' : 'which npm'
-    const out = execSync(cmd, { encoding: 'utf-8', timeout: 5_000 }).trim()
-    const first = out.split(/\r?\n/)[0]
-    if (first) return first
+    const out = execSync(cmd, { encoding: 'utf8', timeout: 5_000 }).trim()
+    const lines = out.split(/\r?\n/)
+    if (process.platform === 'win32') {
+      // `where npm` 第一个结果通常是无扩展名的 POSIX shell 脚本 (npm.sh),
+      // PowerShell 用 `& '...\npm'` 调用会静默失败 (不报错也不执行) —— /update
+      // 表现为"开始安装但什么都没发生"。优先选 .cmd (Windows 原生批处理),
+      // 其次 .exe, 最后才回退无扩展名。
+      const preferred = lines.find(p => /\.cmd$/i.test(p))
+        ?? lines.find(p => /\.exe$/i.test(p))
+        ?? lines[0]
+      if (preferred) return preferred
+    } else {
+      const first = lines[0]
+      if (first) return first
+    }
   } catch {
     // fall through
   }

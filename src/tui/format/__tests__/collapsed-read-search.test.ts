@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  buildSummaryText,
+  CollapsedReadSearchBuffer,
   formatCollapsedGroup,
   formatCollapsedGroupLive,
   type CollapsedReadSearchGroup,
@@ -82,11 +84,44 @@ describe('formatCollapsedGroup', () => {
 })
 
 describe('formatCollapsedGroupLive', () => {
-  it('renders active summary line', () => {
+  it('renders active summary line（进行体时态）', () => {
     const group = makeGroup([
       { id: '1', toolName: 'grep', input: { pattern: 'foo' }, displayName: '"foo"', kind: 'search', completed: true, content: 'result' },
     ])
     const lines = formatCollapsedGroupLive(group, theme, 80).map(stripAnsi)
-    assert.ok(lines[0]!.includes('Searched 1 pattern'), 'live summary')
+    assert.ok(lines[0]!.includes('Searching 1 pattern'), 'live 摘要用进行体')
+    assert.ok(!lines[0]!.includes('Searched'), 'live 摘要不应用过去时')
+  })
+})
+
+describe('buildSummaryText 时态（grok verb-group 对标）', () => {
+  const group = () => makeGroup([
+    { id: '1', toolName: 'grep', input: { pattern: 'foo' }, displayName: '"foo"', kind: 'search', completed: true, content: 'r' },
+    { id: '2', toolName: 'read_file', input: { file_path: 'src/a.ts' }, displayName: 'src/a.ts', kind: 'read', completed: true, content: 'l' },
+    { id: '3', toolName: 'ls', input: { path: 'src' }, displayName: 'src', kind: 'list', completed: true, content: 'a.ts' },
+  ])
+
+  it('settled（scrollback）用过去时', () => {
+    const s = buildSummaryText(group(), false)
+    assert.ok(s.includes('Searched 1 pattern') && s.includes('Read 1 file') && s.includes('Listed 1 dir'), s)
+  })
+
+  it('active（live）用进行体', () => {
+    const s = buildSummaryText(group(), true)
+    assert.ok(s.includes('Searching 1 pattern') && s.includes('Reading 1 file') && s.includes('Listing 1 dir'), s)
+  })
+})
+
+describe('CollapsedReadSearchBuffer', () => {
+  it('跨 thinking 折叠：thinking 事件不触碰 buffer，两个 read 仍同组', () => {
+    const buf = new CollapsedReadSearchBuffer()
+    buf.pushUse('1', 'read_file', { file_path: 'src/a.ts' })
+    // thinking delta / thinking commit 介于两个工具调用之间——不调用任何 buffer 方法
+    buf.pushUse('2', 'read_file', { file_path: 'src/b.ts' })
+    const active = buf.getActive()
+    assert.equal(active?.entries.length, 2, '两个 read 仍在同一组')
+    // 只有非折叠工具才打断
+    assert.ok(buf.shouldBreak('write_file'), '非折叠工具应打断组')
+    assert.ok(!buf.shouldBreak('grep'), '折叠工具不打断组')
   })
 })

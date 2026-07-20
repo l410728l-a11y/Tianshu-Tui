@@ -117,6 +117,32 @@ RIVET_DEBUG_RENDER=1 RIVET_ACTIVATION_DEV_BYPASS=1 npm --prefix desktop run taur
 
 **教训**：横幅类 UI 组件必须有"无内容时不渲染"的早返回。只靠内部 state 控制内容分支不够——空 state 也要 return null，否则会显示空壳。
 
+### 坑 4：tauri.windows.conf.json overlay 改了不生效（2026-07-19）
+
+**现象**：Windows 窗口原生标题栏（天枢图标 + 最小化/最大化/关闭按钮）一直显示，跟自定义 chrome 形成两层标题栏。`tauri.windows.conf.json` 已设 `decorations: false`、`transparent: false`，重启 dev 不生效。
+
+**根因（两层）**：
+
+1. **tauri-build 缓存 bug（[Issue #10963](https://github.com/tauri-apps/tauri/issues/10963)）**：只改 overlay 文件不会触发重新合并，必须 touch 主 `tauri.conf.json` 或清 `target/debug/build/{tianshu-desktop,tauri-build}-*`。touch 主 conf 有时也不够，清缓存目录才稳。
+2. **decorations 字段本身的 bug（[Issue #11296](https://github.com/tauri-apps/tauri/issues/11296) / [#14859](https://github.com/tauri-apps/tauri/issues/14859)）**：即使 overlay 正确合并（其他字段如 title 生效了），`decorations: false` 在某些 Tauri 2 版本仍不生效——原生标题栏照显示。`shadow: true` 会加剧这个 bug，但 `shadow: false` 也不一定解。
+
+**诊断技巧**：临时把 overlay 里某个**显眼的字段**（如 `title`）改成测试值（`=== TEST OVERLAY ===`），看窗口标题变没变。
+- 变了 → overlay 合并生效，问题在那个字段本身（如 decorations 的 bug）
+- 没变 → overlay 根本没读，清 tauri-build 缓存
+
+**修法**：`setup` 块加运行时强制调用：
+```rust
+#[cfg(target_os = "windows")]
+if let Some(window) = app.get_webview_window("main") {
+    let _ = window.set_decorations(false);
+}
+```
+配置里的 `decorations: false` 保留（未来 Tauri 修复后会自然生效）。
+
+**教训**：
+- Tauri 2 的配置层有 bug，涉及原生窗口装饰时优先用**运行时 API**（`set_decorations`、`set_transparent` 等）兜底
+- 改 `tauri.*.conf.json` 后必须清 `target/debug/build/{tianshu-desktop,tauri-build}-*`，否则可能用缓存的旧合并结果
+
 ## 调试时常用的命令片段
 
 ```bash
@@ -124,6 +150,10 @@ RIVET_DEBUG_RENDER=1 RIVET_ACTIVATION_DEV_BYPASS=1 npm --prefix desktop run taur
 powershell -Command "Get-Process -Name tianshu-desktop,node -ErrorAction SilentlyContinue | Stop-Process -Force"
 sleep 2
 cd /d/dev/revit/desktop && RIVET_ACTIVATION_DEV_BYPASS=1 npm run tauri:dev
+
+# 改了 tauri.*.conf.json overlay 后必须清 tauri-build 缓存,否则用旧合并结果
+rm -rf desktop/src-tauri/target/debug/build/tianshu-desktop-*
+rm -rf desktop/src-tauri/target/debug/build/tauri-build-*
 
 # 看最新 sidecar 日志
 LATEST=$(ls -t "D:/Program Files (x86)/Tianshu/TianshuData/.rivet/logs/"sidecar-*.log | head -1)

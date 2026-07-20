@@ -348,22 +348,31 @@ export class AgentLoop {
     advisoriesIgnored: number
     /** Holdout 反事实组：被静默扣留的累计数（cockpit advisory 面板消费） */
     advisoriesHeldOut: number
-  } = { ccr: 0, shifts: {}, advisoriesRendered: 0, advisoriesDropped: 0, advisoriesAdopted: 0, advisoriesIgnored: 0, advisoriesHeldOut: 0 }
+    /** Wave 1：SR 通道提交数 + 被 SessionContext cap 丢弃数 */
+    advisoriesSrSubmitted: number
+    advisoriesSrDropped: number
+  } = { ccr: 0, shifts: {}, advisoriesRendered: 0, advisoriesDropped: 0, advisoriesAdopted: 0, advisoriesIgnored: 0, advisoriesHeldOut: 0, advisoriesSrSubmitted: 0, advisoriesSrDropped: 0 }
   private lastGuardianMetaFingerprint = ''
   /** 记录一次结构化改道发射（source: 'kick' | 'convergence' | …）。 */
   recordDecisionShift(source: string): void {
     this.guardianActivity.shifts[source] = (this.guardianActivity.shifts[source] ?? 0) + 1
   }
   /** 累计 advisory 投递账本（来自 AdvisoryBus.drainLedger）。 */
-  recordAdvisoryLedger(delta: { rendered: number; dropped: number; heldOut?: number }): void {
+  recordAdvisoryLedger(delta: { rendered: number; dropped: number; heldOut?: number; srSubmitted?: number; srDropped?: number }): void {
     this.guardianActivity.advisoriesRendered += delta.rendered
     this.guardianActivity.advisoriesDropped += delta.dropped
     this.guardianActivity.advisoriesHeldOut += delta.heldOut ?? 0
+    this.guardianActivity.advisoriesSrSubmitted += delta.srSubmitted ?? 0
+    this.guardianActivity.advisoriesSrDropped += delta.srDropped ?? 0
   }
   /** P1a：核销判定后同步会话累计采纳/忽略（来自 AdvisoryReadback.getTotals）。 */
   recordAdvisoryOutcomes(totals: { adopted: number; ignored: number }): void {
     this.guardianActivity.advisoriesAdopted = totals.adopted
     this.guardianActivity.advisoriesIgnored = totals.ignored
+    // P1：advisory 被忽略 ≥ 2 → 通知 destructive-gate 开窗
+    if (totals.ignored >= 2) {
+      this.destructiveGate.noteAdvisoryPressure()
+    }
   }
 
   /**
@@ -1895,6 +1904,8 @@ export class AgentLoop {
     this._pendingAbort = false
     this._watchdogAborted = false
     this.abortController = new AbortController()
+    // W3：每轮用户输入开始时重置 system-reminder 计数器（每轮最多 1 条）。
+    this.session.resetSrCount()
     // Cancel + drain any pending/in-flight idle compaction before mutating the
     // session, so the user turn never races idle history rewrites. Awaiting the
     // settle is correct (not a stall): the idle abort makes the in-flight pass
@@ -2186,6 +2197,13 @@ export class AgentLoop {
       ? this.latestStructureFlow.relaxation
       : null
 
+    // W4 噪音洪流修复：计算最近工具调用中 status='failed' 的占比。
+    // 高错误率时收敛检测器降级——agent 在绕工具 bug 不是 doom-loop。
+    const toolErrorWindow = this.recentToolHistory.slice(-10)
+    const recentToolErrorRatio = toolErrorWindow.length > 0
+      ? toolErrorWindow.filter(h => h.status === 'failed').length / toolErrorWindow.length
+      : 0
+
     const convergenceCheck = evaluateConvergence({
       turn,
       phaseClass: phaseClass as PhaseClass,
@@ -2214,6 +2232,7 @@ export class AgentLoop {
         } : {})),
       },
       activityMode,
+      recentToolErrorRatio,
     })
     this.latestConvergenceResult = convergenceCheck
     // P3 Wave 3 / P3-D：认知帧回放遥测。full 记录（facts 全量，可回放重算）

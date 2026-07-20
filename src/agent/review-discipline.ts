@@ -200,6 +200,34 @@ function touchesSecurityBoundary(files: readonly string[]): boolean {
   return files.some(f => SECURITY_BOUNDARY_PATTERNS.some(p => f.includes(p)))
 }
 
+/** auto 审查门分层的核心路径：改这些目录的变更一律升 auto-L2（worker 审查）。 */
+const AUTO_REVIEW_CORE_PATH_PATTERN = /(?:^|\/)src\/(agent|api|prompt|server|auth)\//
+
+/** auto 审查门：files ≥ 此数升 L2（worker 审查）。 */
+export const AUTO_REVIEW_L2_MIN_FILES = 3
+
+/**
+ * auto 审查门分层（确定性规则，零模型调用）：
+ * - L2（进阶层，spawn wiring inspector）：forceLevel 非空 / files≥3 / crossModule /
+ *   触核心路径（src/agent|api|prompt|server|auth）/ 安全边界 / 依赖或编译配置
+ * - L1（基础层，零 worker）：其余——静态门禁（cohesion/claim-audit 等已在
+ *   commit 门内运行）摘要即结论
+ *
+ * 与手动路径 classifyChangeScale 相互独立：auto 门回答"要不要付 worker 成本"，
+ * 手动路径回答"审查多深"。goalActive 时压到 L1（对齐 classifyChangeScale，
+ * 不让审查 worker 拖住 goal 自动续跑环）。
+ */
+export function classifyAutoReviewTier(change: ChangeSet): 'L1' | 'L2' {
+  if (change.forceLevel) return 'L2'
+  if (change.goalActive) return 'L1'
+  if (change.files.length >= AUTO_REVIEW_L2_MIN_FILES) return 'L2'
+  if (change.crossModule) return 'L2'
+  if (change.files.some(f => AUTO_REVIEW_CORE_PATH_PATTERN.test(f))) return 'L2'
+  if (touchesSecurityBoundary(change.files)) return 'L2'
+  if (change.files.some(f => DEPENDENCY_OR_COMPILER_CONFIG_PATTERN.test(f))) return 'L2'
+  return 'L1'
+}
+
 /**
  * Classify a change set into the review workflow scale:
  * - L3: cross-module, large (≥5 files), or touches security boundary → Review Squadron

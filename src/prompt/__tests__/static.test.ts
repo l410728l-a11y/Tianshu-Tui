@@ -172,6 +172,33 @@ describe('buildSystemPrompt', () => {
     assert.ok(prompt.includes('确认理解'))
   })
 
+  it('includes P-cognitive-2 intent preservation and level diagnosis in ① 理解', () => {
+    const prompt = buildSystemPrompt({ tools: [] })
+    assert.ok(prompt.includes('意图保存'), '应含意图保存子句——复述用户核心目标而非执行计划')
+    assert.ok(prompt.includes('层级判断'), '应含层级判断——业务目标/链路问题/代码改动三层')
+    assert.ok(prompt.includes('降级处理'), '应禁止把高层问题降级为低层改动')
+    assert.ok(prompt.includes('清场指令'), '应含反例——"人家都提交完了"不是清场指令')
+    assert.ok(prompt.includes('拉偏你的方向'), '锚定防御：失败信号会拉偏方向')
+  })
+
+  it('includes P-cognitive-3 self-check gate before </workflow>', () => {
+    const prompt = buildSystemPrompt({ tools: [] })
+    assert.ok(prompt.includes('自检闸门'), '应含自检闸门标题')
+    assert.ok(prompt.includes('长程目标压缩'), '闸门判据1：目标压缩检测')
+    assert.ok(prompt.includes('失败信号'), '闸门判据2：失败信号锚定')
+    assert.ok(prompt.includes('未解决的矛盾'), '闸门判据3：矛盾未解决')
+    assert.ok(prompt.includes('确认理解'), '闸门出口：停下来确认')
+  })
+
+  it('includes P-cognitive-1 correction-interrupt rule before self-check gate', () => {
+    const prompt = buildSystemPrompt({ tools: [] })
+    assert.ok(prompt.includes('纠正中断规则'), '应含纠正中断规则标题')
+    assert.ok(prompt.includes('停止当前行动链'), '纠偏时停止执行链')
+    assert.ok(prompt.includes('确认你对纠正的理解'), '先确认理解再继续')
+    assert.ok(prompt.includes('绕过项目规定流程'), '应含绕过流程检测')
+    assert.ok(prompt.includes('确认用户意图'), '原路不通时确认意图')
+  })
+
   it('includes task completion reporting requirements', () => {
     const prompt = buildSystemPrompt({ tools: [] })
     assert.ok(prompt.includes('涉及文件'), '收束应有 commit + 文件信息')

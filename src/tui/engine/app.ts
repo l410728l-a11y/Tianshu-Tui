@@ -46,6 +46,7 @@ import { formatThinking } from '../format/thinking.js'
 import { formatGlanceBar, resolveStarDomainDisplay, formatGlanceLeft, formatGlanceRight, formatPermissionModeLine } from '../format/glance-bar.js'
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
 import { formatTaskList, shouldShowTaskPanel } from '../format/task-list.js'
+import { formatContextHints } from '../format/context-hints.js'
 import type { TodoItem } from '../../tools/todo-store.js'
 import { formatTeamPanel } from '../format/team-panel.js'
 import { formatWorkerFleet, formatWorkerFleetSettled } from '../format/worker-fleet.js'
@@ -80,6 +81,7 @@ import { ConnectFlow, type ConnectCommit, type ConnectStepResult } from '../conn
 import { parseScrollbackTranscript, searchTranscript, findNextMatch, findPrevMatch } from '../scrollback-transcript.js'
 import { renderCockpit } from '../format/cockpit.js'
 import type { CockpitSnapshot, Panel } from '../cockpit/types.js'
+import { PANELS } from '../cockpit/types.js'
 import { renderRewind, type RewindData, type RewindFile, type RewindMode } from '../format/rewind.js'
 import { renderHistorySearch, type HistorySearchData } from '../format/history-search.js'
 import { searchHistory, loadHistory } from '../history.js'
@@ -240,6 +242,10 @@ export interface TuiState {
   committedCount: number
   /** 常驻任务面板（todo 列表，canonical 源为 TodoStore） */
   todos: TodoItem[]
+  /** GlanceBar todo 徽章变化高亮截止时间戳（0 = 无高亮；done 增加/total 变化时点亮 ~1s） */
+  todoFlashUntil: number
+  /** todo 面板展开态：全量渲染（含 completed 逐条回看）；ctrl+x t 切换 */
+  todoExpanded: boolean
   /** 右侧面板是否展开（默认折叠） */
   sidePanelOpen: boolean
 }
@@ -259,7 +265,7 @@ import { WorkerMirrorStore } from '../worker-mirror.js'
 import { formatWorkerView } from '../format/worker-view.js'
 import { shortOrderLabel } from '../../tools/worker-activity-stream.js'
 import { profileLabel, authorityStarName } from '../format/profile-labels.js'
-import { formatTokenCount } from '../format/spinner-status.js'
+import { formatTokenCount, isReducedMotion } from '../format/spinner-status.js'
 import { formatElapsed } from '../tool-elapsed.js'
 import { WatchdogRecoveryPolicy } from '../../agent/watchdog-recovery-policy.js'
 import { phaseStatusLabel } from '../phase-status.js'
@@ -483,6 +489,12 @@ export class TuiApp {
   /** Ctrl+X leader key 待处理状态（用于 ctrl+x r 打开右侧面板） */
   private sidePanelLeaderPending = false
   private sidePanelLeaderTimer: ReturnType<typeof setTimeout> | null = null
+  /** todo 徽章高亮熄灭定时器（活动期外 ticker 停转，靠它在 1s 后重绘恢复正常色） */
+  private todoFlashTimer: ReturnType<typeof setTimeout> | null = null
+  /** 监控型 overlay（激活期间随数据/tick 实时重绘，而非打开瞬间的快照） */
+  private static readonly LIVE_OVERLAY_IDS: ReadonlySet<string> = new Set(['tasks', 'cockpit'])
+  /** live overlay 上次重绘时间戳（节流 ≥400ms） */
+  private liveOverlayLastRender = 0
   /** 清理 Ctrl+X leader 状态（overlay/模式切换时调用，防止后续按键误触 side panel）。 */
   private clearSidePanelLeader(): void {
     this.sidePanelLeaderPending = false
@@ -690,6 +702,8 @@ export class TuiApp {
       modelName: options.modelName ?? 'unknown',
       committedCount: 0,
       todos: [],
+      todoFlashUntil: 0,
+      todoExpanded: false,
       sidePanelOpen: false,
     }
 
@@ -938,7 +952,13 @@ export class TuiApp {
           this.setSidePanelOpen(true)
           return
         }
-        // Leader not followed by 'r': fall through to normal input handling.
+        if (key.char.toLowerCase() === 't') {
+          // todo 面板展开态：completed 逐条回看（窄屏主区/宽屏 side panel 同键）
+          this.state.todoExpanded = !this.state.todoExpanded
+          this.renderLive()
+          return
+        }
+        // Leader not followed by 'r'/'t': fall through to normal input handling.
       }
       if (key.name === 'ctrl_]') {
         this.toggleSidePanel()
@@ -1753,20 +1773,37 @@ export class TuiApp {
       return true
     }
 
+    // Cockpit — ←/→/Tab/Shift+Tab 循环切换子面板（与 picker tab bar 同键位语义：
+    // ←/Shift+Tab 上一个，→/Tab 下一个）。此前只能 /cockpit <面板> 输命令切换。
+    if (id === 'cockpit') {
+      const cycle = (dir: 1 | -1): boolean => {
+        const cur = PANELS.indexOf(this.getCockpitPanel())
+        const next = PANELS[(cur + dir + PANELS.length) % PANELS.length]!
+        this.setCockpitPanel(next)
+        this.overlay.rerender()
+        return true
+      }
+      if (key.name === 'right' || (key.name === 'tab' && !key.shift)) return cycle(1)
+      if (key.name === 'left' || (key.name === 'tab' && key.shift)) return cycle(-1)
+    }
+
     if (id === 'tasks') {
       const nav = this.overlayController.nav()
       const data = this.getTasksData(nav.tasksFilter)
       const selectable = data.groups.flatMap(g => g.workers.map(w => w.workerId))
       const count = selectable.length
 
-      if (key.name === 'tab') {
+      // filter 循环（与 cockpit/picker 同键位语义）：→/Tab 正向，←/Shift+Tab 反向
+      const cycleFilter = (dir: 1 | -1): boolean => {
         const filters: TasksFilter[] = ['running', 'completed', 'all']
-        const next = (filters.indexOf(nav.tasksFilter) + 1) % filters.length
+        const next = (filters.indexOf(nav.tasksFilter) + dir + filters.length) % filters.length
         nav.tasksFilter = filters[next]!
         nav.tasksIndex = 0
         this.overlay.rerender()
         return true
       }
+      if (key.name === 'right' || (key.name === 'tab' && !key.shift)) return cycleFilter(1)
+      if (key.name === 'left' || (key.name === 'tab' && key.shift)) return cycleFilter(-1)
       if (key.name === 'down' || c === 'j') {
         if (count > 0) {
           nav.tasksIndex = (nav.tasksIndex + 1) % count
@@ -2780,7 +2817,7 @@ export class TuiApp {
 
   /** 直接设置任务面板内容（供测试与 provider 刷新复用）。 */
   setTodos(items: TodoItem[]): void {
-    this.state.todos = items
+    this.updateTodos(items)
     this.renderLive()
   }
 
@@ -2804,11 +2841,29 @@ export class TuiApp {
     return this.state.sidePanelOpen && resolveSidePanelWidth(this.columns) > 0
   }
 
+  /** 写入 todos 并检测进度变化：done 增加 / total 变化时点亮 GlanceBar 徽章
+   *  高亮 ~1s（reducedMotion 不高亮）。 */
+  private updateTodos(items: TodoItem[]): void {
+    const prev = this.state.todos
+    const prevDone = prev.reduce((n, x) => n + (x.status === 'completed' ? 1 : 0), 0)
+    const nextDone = items.reduce((n, x) => n + (x.status === 'completed' ? 1 : 0), 0)
+    this.state.todos = items
+    if (!isReducedMotion() && (nextDone > prevDone || items.length !== prev.length)) {
+      this.state.todoFlashUntil = Date.now() + 1000
+      if (this.todoFlashTimer) clearTimeout(this.todoFlashTimer)
+      this.todoFlashTimer = setTimeout(() => {
+        this.todoFlashTimer = null
+        this.renderLive()
+      }, 1050)
+      this.todoFlashTimer.unref?.()
+    }
+  }
+
   /** 从 provider 拉取最新 todo 列表刷新面板（无 provider 时 no-op）。 */
   private refreshTodos(): void {
     if (!this.todosProvider) return
     try {
-      this.state.todos = this.todosProvider()
+      this.updateTodos(this.todosProvider())
     } catch {
       // provider 失败不应中断渲染
     }
@@ -3150,6 +3205,20 @@ export class TuiApp {
         this.state.committedCount++
       })
       return
+    }
+    // live 中的活跃 read/search 组：flush 并展开提交（无需等非折叠工具打断）。
+    // flushGroup 会写入 lastCollapsedGroup——立即清掉，避免下次 ctrl+o 重复展开同一组。
+    if (this.toolGroupController.isActiveGroup()) {
+      const g = this.toolGroupController.flushGroup()
+      if (g) {
+        this.toolGroupController.clearLastCollapsedGroup()
+        const formatted = formatCollapsedGroup({ group: g, expanded: true, theme: this.theme })
+        this.commitAbove(() => {
+          this.commit.write({ text: formatted.join('\n'), trailingNewline: true })
+          this.state.committedCount++
+        })
+        return
+      }
     }
     // 其次展开 bash 折叠组
     const collapsedBash = this.toolGroupController.getLastCollapsedBashGroup()
@@ -3586,10 +3655,24 @@ export class TuiApp {
     }
   }
 
+  /** live overlay 节流重绘：仅 tasks/cockpit 等监控型，≥400ms 一次。
+   *  覆盖层引擎自带行级 diff，数据无变化时终端零写入，故 tick/事件驱动都走这里。 */
+  private rerenderLiveOverlayThrottled(): void {
+    const id = this.overlay.activeId()
+    if (!id || !TuiApp.LIVE_OVERLAY_IDS.has(id)) return
+    const now = Date.now()
+    if (now - this.liveOverlayLastRender < 400) return
+    this.liveOverlayLastRender = now
+    this.overlay.rerender()
+  }
+
   private renderLiveImpl(): void {
     // 全屏覆盖层（命令面板 / splash / 详情页）激活时，Live 区域由覆盖层引擎
     // 负责渲染，避免再次绘制内容产生右下角残留。
     if (this.overlay.isActive()) {
+      // 监控型 overlay（/tasks、cockpit）：把渲染驱动转交给覆盖层——否则
+      // 打开期间 worker 推进/指标变化都不会重绘，用户看到的是打开瞬间的快照。
+      this.rerenderLiveOverlayThrottled()
       return
     }
 
@@ -3707,15 +3790,15 @@ export class TuiApp {
       lines.push({ text: line })
     }
 
-    // 2b. 队列预览：⏳ queued: "最后一条前 60 字符"（Up 取回编辑）。
+    // 2b. 队列预览：⏳ 已排队: "最后一条前 60 字符"（↑ 取回编辑）。
     //     全宽反色条（CC 对标）：排队 prompt 是「已提交但未生效」的用户输入，
     //     单行 muted 提示存在感不足，容易被误认为已丢失。
     if (this.steerBuffer.hasPending()) {
       const pending = this.steerBuffer.getPending()
       const last = pending[pending.length - 1]!
       const preview = last.length > 60 ? `${last.slice(0, 60)}…` : last
-      const more = pending.length > 1 ? ` (+${pending.length - 1} more)` : ''
-      lines.push({ text: this.clampLine(this.renderBanner(`⏳ queued: "${preview}"${more} · ↑ to edit`, this.theme.secondary)) })
+      const more = pending.length > 1 ? `（+${pending.length - 1} 条）` : ''
+      lines.push({ text: this.clampLine(this.renderBanner(`⏳ 已排队: "${preview}"${more} · ↑ 取回编辑`, this.theme.secondary)) })
     }
 
     // 2b2. 子代理可视化 —
@@ -3846,9 +3929,16 @@ export class TuiApp {
     let chromeStart = lines.length
 
     // 3b. 常驻任务面板（todo 列表）——空列表不渲染；run 空闲且全部完成时隐藏
-    //    （shouldShowTaskPanel）。宽屏时已由 side panel 承载。
-    if (!showSidePanel && shouldShowTaskPanel(this.state.todos, this.state.phase)) {
-      const taskLines = formatTaskList(this.state.todos, this.theme, { width: cols, maxRows: 6, showProgressBar: false })
+    //    （shouldShowTaskPanel；todoExpanded 展开态强制显示以回看 completed）。
+    //    宽屏时已由 side panel 承载。
+    if (!showSidePanel && this.state.todos.length > 0 && (this.state.todoExpanded || shouldShowTaskPanel(this.state.todos, this.state.phase))) {
+      const taskLines = formatTaskList(this.state.todos, this.theme, {
+        width: cols,
+        maxRows: this.state.todoExpanded ? 15 : 6,
+        showProgressBar: false,
+        expanded: this.state.todoExpanded,
+        expandHint: this.state.todoExpanded ? 'ctrl+x t 收起' : undefined,
+      })
       if (taskLines.length > 0) {
         lines.push({ text: '' })
         // 面板行走 clampLine（与其余 chrome 同口径）：满列行会在 CJK 终端折行，
@@ -3924,6 +4014,7 @@ export class TuiApp {
         planMode: planModeActive,
         goal: goalSnapshot,
         todoSummary,
+        todoFlash: !isReducedMotion() && this.state.todoFlashUntil > Date.now(),
         density: this.glanceDensity,
         // 编排徽章：team 波次 / 在跑子代理 / 终态未读（glance-bar 内按优先级取一）
         // currentWave 是 0-based 活动波索引（team-panel.ts 同款 +1 显示）。
@@ -4005,6 +4096,13 @@ export class TuiApp {
         lines.push({ text: this.clampLine(`  ${rightStr}`) })
       }
 
+      // 5a2. 上下文逃逸提示（wayfinding）：仅 worker 切入视图时显示退路键位，
+      //      其余状态不显示，不占垂直空间。
+      const contextHint = formatContextHints({
+        viewingWorker: this.viewingWorkerId != null,
+      }, this.theme)
+      if (contextHint) lines.push({ text: this.clampLine(`  ${contextHint}`) })
+
       // 5b. slash 命令提示（输入以 / 开头；支持 /skill <name> 等多 token 过滤）
       if (isSlash) {
         for (const hintLine of formatSlashHint({ input: inputVal, commands: this.inputController.slashCommands, selectedIdx: this.inputController.slashSelectedIdx }, this.theme)) {
@@ -4066,6 +4164,7 @@ export class TuiApp {
         columns: sidePanelWidth,
         todos: this.state.todos,
         phase: this.state.phase,
+        todoExpanded: this.state.todoExpanded,
         workers: this.fleet.getActiveWorkers(),
         teamModel: this.liveTeamModel ? this.teamModelWithLiveStatus(this.liveTeamModel) : null,
         currentTool,

@@ -1,4 +1,4 @@
-import { classifyChangeScale, isTrivialChange, upgradeScaleByDepth, type ChangeSet, type ReviewScale } from './review-discipline.js'
+import { classifyChangeScale, isTrivialChange, upgradeScaleByDepth, classifyAutoReviewTier, type ChangeSet, type ReviewScale } from './review-discipline.js'
 import { profileRegistry } from './profile-registry.js'
 import type { WorkerActivityEvent } from './coordinator.js'
 
@@ -92,7 +92,7 @@ export interface ReviewOutcome {
 // long before its 600s budget could matter.
 
 /** Auto in-task review: short and predictable — never stalls the main loop. */
-export const AUTO_REVIEW_BUDGET_MS = 180_000
+export const AUTO_REVIEW_BUDGET_MS = 300_000
 /** Extra slack so worker-internal timers fire before the workflow cap. */
 const REVIEW_BUDGET_GRACE_MS = 60_000
 
@@ -186,6 +186,9 @@ export async function routeReviewWorkflow(
     if (change.changeClass?.skipReview) return { tier: 'auto', verdict: 'nudge' }
     if (isTrivialChange(change.files)) return { tier: 'auto', verdict: 'nudge' }
     if (!deps.spawnWiringReviewer) return { tier: 'auto', verdict: 'nudge' }
+    // auto-L1/L2 分层：基础层（小改动、非核心路径）零 worker 成本——静态门禁
+    // 摘要即结论；进阶层（核心路径/≥3 文件/forceLevel/依赖配置）才付 worker。
+    if (classifyAutoReviewTier(change) === 'L1') return { tier: 'auto', verdict: 'nudge' }
 
     // "The review did not run": no findings at all AND infra failures present.
     // For the single wiring inspector this means its output was unusable.
@@ -197,13 +200,11 @@ export async function routeReviewWorkflow(
     let recoveredByRetry = false
     let attempts = 1
 
-    // Quick in-budget retry on infra failure (worker crash / bad JSON).
-    // Skip when the first attempt timed out (budget is likely exhausted) or
-    // the workflow was aborted. The outer reviewWorkflowBudgetMs race in
-    // deliver-task still caps total wall-clock, so the retry can never extend
-    // the delivery block beyond the existing budget.
-    const firstAttemptTimedOut = infraFailures.some(f => f.kind === 'timeout')
-    if (reviewDidNotRun(wiring) && !firstAttemptTimedOut && !signal?.aborted) {
+    // Quick in-budget retry ONLY for transient failures (worker crash / bad JSON).
+    // 'budget'(max-turns 耗尽)与 'timeout' 是确定性预算不足——同预算重试必死,
+    // 是纯空耗(2026-07-19 审查空耗事故:4 worker 两轮全灭)。aborted  likewise。
+    const deterministicFailure = infraFailures.some(f => f.kind === 'timeout' || f.kind === 'budget')
+    if (reviewDidNotRun(wiring) && !deterministicFailure && !signal?.aborted) {
       attempts = 2
       const retry = await deps.spawnWiringReviewer(change, signal, options.onActivity)
       if (!reviewDidNotRun(retry)) {
@@ -229,11 +230,17 @@ export async function routeReviewWorkflow(
     // Fail-open (delivery proceeds) but NEVER described as verified — the
     // previous wording ("delivery verified by available evidence") let a dead
     // defense line masquerade as a passed review (session 803d897d, T3).
+    // 标签按失败 kind 区分:预算耗尽与超时是配置信号,不应混进 infra failure。
     if (reviewDidNotRun(wiring)) {
+      const kindLabel = infraFailures.some(f => f.kind === 'budget')
+        ? '审查预算耗尽(max-turns)'
+        : infraFailures.some(f => f.kind === 'timeout')
+          ? '审查超时'
+          : 'infra failure'
       return {
         tier: 'auto',
         verdict: 'inconclusive',
-        evidence: `review DID NOT run (infra failure${attempts > 1 ? '; retry also failed' : ''}): ${summarizeInfraFailures(infraFailures)}`,
+        evidence: `review DID NOT run (${kindLabel}${attempts > 1 ? '; retry also failed' : ''}): ${summarizeInfraFailures(infraFailures)}`,
         rounds: attempts,
         infraFailures,
       }

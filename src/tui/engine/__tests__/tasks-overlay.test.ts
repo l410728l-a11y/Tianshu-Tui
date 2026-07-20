@@ -43,7 +43,7 @@ function makeApp() {
 
 const tick = (ms = 10) => new Promise(r => setTimeout(r, ms))
 
-function sendOverlayKey(app: TuiApp, key: { name: string; char: string }): void {
+function sendOverlayKey(app: TuiApp, key: { name: string; char: string; shift?: boolean }): void {
   ;(app as any).handleOverlayKey(key)
 }
 
@@ -236,4 +236,71 @@ test('completed workers are retained after delegation result', () => {
   assert.equal(data.groups.length, 1)
   assert.equal(data.groups[0]!.workers.length, 1)
   assert.equal(data.groups[0]!.workers[0]!.workerId, 'wo_1')
+})
+
+test('/tasks ←/→ 与 Shift+Tab 反向循环 filter（统一 tab 键位语义）', () => {
+  const { app } = makeApp()
+
+  ;(app.callbacks as any).onToolUse('d1', 'delegate_batch', { objective: 'x' })
+  ;(app.callbacks as any).onDelegationActivity({ workOrderId: 'wo_1', parentToolId: 'd1', profile: 'reviewer', status: 'running' })
+  ;(app.callbacks as any).onDelegationActivity({ workOrderId: 'wo_2', parentToolId: 'd1', profile: 'patcher', status: 'passed' })
+  ;(app.callbacks as any).onToolResult('d1', 'delegate_batch', JSON.stringify({ status: 'passed' }), false)
+
+  app.activateOverlay('tasks')
+  assert.equal(app.activeOverlayId(), 'tasks')
+
+  // → 正向等价 Tab
+  sendOverlayKey(app, { name: 'right', char: '' })
+  assert.equal(app['overlayController'].nav().tasksFilter, 'completed')
+
+  // ← 反向
+  sendOverlayKey(app, { name: 'left', char: '' })
+  assert.equal(app['overlayController'].nav().tasksFilter, 'running')
+
+  // ← 再反向：环绕到 all
+  sendOverlayKey(app, { name: 'left', char: '' })
+  assert.equal(app['overlayController'].nav().tasksFilter, 'all')
+
+  // Shift+Tab 反向
+  sendOverlayKey(app, { name: 'tab', char: '', shift: true })
+  assert.equal(app['overlayController'].nav().tasksFilter, 'completed')
+})
+
+test('cockpit ←/→/Tab 循环切换面板（统一 tab 键位语义）', () => {
+  const { app } = makeApp()
+
+  app.activateOverlay('cockpit')
+  assert.equal(app.activeOverlayId(), 'cockpit')
+  assert.equal(app.getCockpitPanel(), 'summary')
+
+  sendOverlayKey(app, { name: 'right', char: '' })
+  assert.equal(app.getCockpitPanel(), 'trace')
+
+  sendOverlayKey(app, { name: 'left', char: '' })
+  assert.equal(app.getCockpitPanel(), 'summary')
+
+  // 反向环绕到最后一个面板
+  sendOverlayKey(app, { name: 'left', char: '' })
+  assert.equal(app.getCockpitPanel(), 'advisory')
+
+  // Tab 正向环绕回 summary
+  sendOverlayKey(app, { name: 'tab', char: '' })
+  assert.equal(app.getCockpitPanel(), 'summary')
+})
+
+test('ctrl+o 可展开 live 中的活跃折叠组（无需等非折叠工具打断）', () => {
+  const { app, out } = makeApp()
+
+  ;(app.callbacks as any).onToolUse('t1', 'read_file', { file_path: 'src/a.ts' })
+  ;(app.callbacks as any).onToolResult('t1', 'read_file', 'line1', false)
+  ;(app.callbacks as any).onToolUse('t2', 'read_file', { file_path: 'src/b.ts' })
+  ;(app.callbacks as any).onToolResult('t2', 'read_file', 'line1', false)
+  assert.ok(app['toolGroupController'].isActiveGroup(), '两个 read 应在活跃组中')
+
+  ;(app as any).expandLastTruncatedTool()
+  assert.ok(!app['toolGroupController'].isActiveGroup(), '展开后组已 flush')
+  // 展开卡片提交到 scrollback，且不残留待展开的 lastCollapsedGroup（避免重复展开）
+  assert.equal(app['toolGroupController'].getLastCollapsedGroup(), null)
+  const joined = out.chunks.join('')
+  assert.ok(joined.includes('Read 2 files'), 'scrollback 应有展开组卡片')
 })

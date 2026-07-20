@@ -455,3 +455,46 @@ test('resize: 宽度变化后稳态重渲不持续滚屏且不残留', () => {
   for (let i = 0; i < 8; i++) engine.render(lines(wide, 'SEP', 'INPUT'))
   assert.equal(term.scrollCount, scrollAfterResize, 'resize 后稳态相同内容不应继续滚屏')
 })
+
+// ── 窄窗口折行帧:display-row 预算(小窗口打字正文泄露修复)─────────────
+
+test('窄窗口折行帧不超过终端高度——正文不泄露到 chrome 之下', () => {
+  // 20 列 × 12 行;长 CJK 正文行在 20 列下折 ≥3 display rows。maxRows=11(= rows-1)。
+  // 行数预算(旧行为)会放过全部 9 行 → 21 display rows → 重写越底滚屏 →
+  // 旧帧正文残留在 chrome 之下(小窗口打字泄露根因)。display-row 预算必须钳住。
+  const term = new MockTerminal(20, 12)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 11 })
+
+  const prose = '星域切换开阳功名只向马上取真是英雄一丈夫' // 20 CJK + 前缀 ≈ 45 列 → 3 rows @20列
+  const dyn = Array.from({ length: 6 }, (_, i) => `正文${i}:${prose}`)
+  const frame = [...dyn, '╭─ glance ─╮', '❯ █', '╰─ yolo ─╯']
+
+  engine.render(frame.map(text => ({ text })), { reservedTail: 3 })
+  const firstWrite = term.flush()
+  const scrollAfterFirst = term.scrollCount
+
+  // chrome 必须保留(尾部 3 行在帧内)
+  assert.ok(firstWrite.includes('❯ █'), '输入框行必须保留')
+  assert.ok(firstWrite.includes('╰─ yolo ─╯'), '尾部 chrome 必须保留')
+
+  // 模拟打字:输入行内容变化,其余同构
+  const frame2 = [...dyn, '╭─ glance ─╮', '❯ a█', '╰─ yolo ─╯']
+  engine.render(frame2.map(text => ({ text })), { reservedTail: 3 })
+  assert.equal(term.scrollCount, scrollAfterFirst, '重渲不得越底滚屏(display-row 预算)')
+
+  // 再渲一帧:diff 路径也不得越底
+  const frame3 = [...dyn, '╭─ glance ─╮', '❯ ab█', '╰─ yolo ─╯']
+  engine.render(frame3.map(text => ({ text })), { reservedTail: 3 })
+  assert.equal(term.scrollCount, scrollAfterFirst, 'diff 重绘同样不得越底滚屏')
+})
+
+test('chrome 本身超屏时仍全量保留输入框(设计的例外)', () => {
+  const term = new MockTerminal(20, 6)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 5 })
+  const chrome = Array.from({ length: 6 }, (_, i) => `chrome-${i}`)
+  const frame = ['dyn-0', 'dyn-1', ...chrome]
+  engine.render(frame.map(text => ({ text })), { reservedTail: 6 })
+  const out = term.flush()
+  for (const c of chrome) assert.ok(out.includes(c), `${c} 必须保留(输入框不消失)`)
+  assert.ok(!out.includes('dyn-0'), 'chrome 超屏时 dynamic 全部让位')
+})

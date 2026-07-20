@@ -1,0 +1,26 @@
+{
+  "name": "office-excel",
+  "version": "1.1.0",
+  "description": "Native .xlsx read/write/edit via exceljs — replaces HTML .xls fallback",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "tianshu": {
+    "name": "office-excel",
+    "version": "1.1.0",
+    "description": "Native .xlsx read/write/edit — sheet/cell/formula read, 2D-array write, in-place edit, basic styles",
+    "entry": "index.js",
+    "tools": [
+      { "name": "xlsx_read", "description": "Read .xlsx file — list sheets, read cells/formulas as markdown table" },
+      { "name": "xlsx_write", "description": "Write .xlsx file from 2D array data (formulas + styles)" },
+      { "name": "xlsx_edit", "description": "Edit existing .xlsx — add sheets, update cells, append rows" }
+    ],
+    "skills": ["skills"],
+    "permissions": { "fs": true }
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}

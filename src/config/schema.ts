@@ -380,8 +380,10 @@ export const cacheSchema = z.object({
 
 export const searchSchema = z.object({
   /** Ordered backend chain for web_search. First available backend with a
-   *  non-empty result wins; the rest are skipped. Unknown names are ignored. */
-  backends: z.array(z.string()).default(['duckduckgo']),
+   *  non-empty result wins; the rest are skipped. Unknown names are ignored.
+   *  Default `['bing', 'duckduckgo']` covers both China (cn.bing.com direct)
+   *  and offshore (DDG) without an API key. */
+  backends: z.array(z.string()).default(['bing', 'duckduckgo']),
   /** Env var holding the Brave Search API key (subscription token). */
   braveApiKeyEnv: z.string().default('BRAVE_API_KEY'),
   /** Env var holding the Tavily Search API key. */

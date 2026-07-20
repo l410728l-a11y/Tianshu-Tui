@@ -353,6 +353,7 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
         if (!alreadyPlanning) self.enterPlanMode()
         return { activePlanFilePath: self.getActivePlanFilePath(), alreadyPlanning }
       },
+      exitPlanMode: () => { if (self.getPlanModeState() === 'planning') self.exitPlanMode() },
       getVerificationEvidence: () => self.evidence.getVerificationSummary(),
       onSkillInvoked: name => self.config.promptEngine.markSkillInvoked(name),
       onSkillCompleted: name => self.config.promptEngine.markSkillCompleted(name),
@@ -1010,6 +1011,7 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     removeLastMessage: () => { self.session.removeLastMessage() },
     addUserMessage: (content) => { self.session.addUserMessage(content) },
     appendSystemReminder: (content) => { self.session.appendSystemReminder(content) },
+    resetSrCount: () => { self.session.resetSrCount() },
     addAssistantBlocks: (blocks) => { self.session.addAssistantBlocks(blocks) },
     addUsage: (usage) => { self.session.addUsage(usage) },
     getEstimatedTokens: () => self.session.getEstimatedTokens(),

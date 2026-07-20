@@ -246,7 +246,7 @@ Preview or apply implementation plan closure updates. Defaults to preview mode (
 Only supports Markdown files under docs/superpowers/plans/ or .rivet/plans/.
 
 ### Action: enter_mode
-Enter plan mode yourself (write tools become blocked; a plan draft file is created). Use ONLY after the user explicitly agreed to plan first (e.g. answered "进入计划模式" to your ask_user_question). Idempotent when already planning. Exiting plan mode remains user-only — submit the plan and let the user approve.`,
+Enter plan mode yourself (write tools become blocked; a plan draft file is created). Use ONLY after the user explicitly agreed to plan first (e.g. answered "进入计划模式" to your ask_user_question). Idempotent when already planning. The user approves the submitted plan via an in-conversation approval card (desktop) or /plan-approve (TUI); after all tasks complete, \`plan close\` with apply=true marks the plan EXECUTED and exits plan mode automatically.`,
     input_schema: {
       type: 'object',
       properties: {
@@ -339,7 +339,7 @@ function planEnterModeExecute(params: ToolCallParams): ToolResult {
         '1. Research first: for multi-module tasks, dispatch 2-4 read-only code_scout workers in parallel via delegate_batch (split by module/file domain), then synthesize the findings.',
         '2. Write the plan incrementally to the draft file with write_file/edit_file.',
         '3. 瑶光反证 (required section, submit-gated): reproduce key claims AT PLAN TIME — re-read cited code AFTER the design is drafted, run_tests for RED evidence on bugfixes, or delegate profile=adversarial_verifier authority=yaoguang. Unreproducible inferences go in as 待验证假设, not conclusions.',
-        '4. Submit with plan action=submit (omit the plan field to submit from the draft). Submit gates: a ```mermaid diagram, a heading-level 反证/复现 section, and ### Wave N structure when >8 tasks/>15 files — all unmet gates are reported in one rejection. Exiting plan mode is user-only.',
+        '4. Submit with plan action=submit (omit the plan field to submit from the draft). Submit gates: a ```mermaid diagram, a heading-level 反证/复现 section, and ### Wave N structure when >8 tasks/>15 files — all unmet gates are reported in one rejection. After submission the user approves via an in-conversation approval card; never ask the user to type /plan-approve or any command.',
       ].filter(Boolean).join('\n'),
     }
   } catch (err) {
@@ -561,8 +561,9 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
         scaleNote,
         cheapModelNote,
         '',
-        `An approval panel has opened for the user. They can choose: approve, reject and revise, or reject and exit plan mode.`,
-        `You can also still use: /plan-approve ${slug}, /plan-reject ${slug}, or /plan-list.`,
+        '',
+        `An approval card has been presented to the user in the conversation (desktop) / approval panel (TUI) — they can approve to start execution immediately, or reject with revision feedback. Approval never requires the user to type any command.`,
+        `TUI fallback if asked: /plan-approve ${slug}, /plan-reject ${slug}, or /plan-list.`,
         '',
         `**Wait here — do not proceed until the user approves.**`,
       ].filter(Boolean).join('\n'),
@@ -679,6 +680,10 @@ async function planCloseExecute(params: ToolCallParams): Promise<ToolResult> {
       // EXECUTED status marker is written only on gate-backed GREEN.
       const contentToWrite = realGreen ? insertPlanStatusMarker(result.content, 'EXECUTED') : result.content
       await writeFileAtomicAsync(filePath, contentToWrite)
+      // 闭环即解锁（桌面端 Cursor 式流程）：EXECUTED 由交付门 GREEN 背书，
+      // 计划锁定的目的已达成——自动退出 plan mode（ref 内仅 planning 时生效）。
+      // 「未执行时退出归用户」原则不变；worker 上下文无 ref，自然不退出。
+      if (realGreen) params.exitPlanMode?.()
       if (params.onPlanClosed) {
         params.onPlanClosed({
           planFile: relativePath,
@@ -695,6 +700,7 @@ async function planCloseExecute(params: ToolCallParams): Promise<ToolResult> {
           `Checkboxes updated: ${result.totalChangedCheckboxes}`,
           `Closure: ${action}`,
           effectiveState ? `Delivery: ${effectiveState}${realGreen ? ' (marked EXECUTED)' : ''}` : '',
+          realGreen && params.exitPlanMode ? '已自动退出计划模式（闭环即解锁）。' : '',
           mismatchNote ? `Evidence: ${mismatchNote}` : '',
         ].filter(Boolean).join('\n'),
       }

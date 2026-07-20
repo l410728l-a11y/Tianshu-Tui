@@ -382,22 +382,45 @@ export class LiveEngine {
    * 行预算：内容超过 maxRows 时，**优先保留尾部 chrome**（GlanceBar + 输入框 + 提示），
    * 截断的是中段 dynamic（streaming tail / 工具输出）的较早部分。
    *
-   * - `lines.length <= maxRows`：全部保留。
-   * - 未指定 reservedTail：沿用旧行为（保留前 maxRows 行）。
-   * - 指定 reservedTail：尾部 N 行恒保留；剩余预算从 dynamic 段取**最近**的若干行。
+   * **预算按 display rows 计量**（非行数）：窄窗口下长正文/长输入折行后，
+   * 行数 ≤ maxRows 也可能整帧超出终端高度——全量重写越过屏幕底部触发滚动，
+   * 回顶量与屏上实际布局错位，旧帧正文残留并叠印在 chrome 之下
+   * （小窗口打字时正文"泄露"到输入框底下的根因）。不变量：整帧恒 ≤ maxRows
+   * display rows（= min(28, rows-1)），重写永不越底。
+   *
+   * - 全帧 display rows ≤ maxRows：全部保留。
+   * - 未指定 reservedTail：按预算保留前若干行。
+   * - 指定 reservedTail：尾部 N 行恒保留；剩余预算从 dynamic 段尾部回填。
    *   若 chrome 本身已超 maxRows，仍全部显示——宁可超行，也不能让输入框消失。
    */
   private applyRowBudget(lines: readonly LiveRegionLine[], reservedTail?: number): LiveRegionLine[] {
-    if (lines.length <= this.maxRows) return lines.slice()
+    if (this.countDisplayRows(lines) <= this.maxRows) return lines.slice()
     if (reservedTail === undefined || reservedTail <= 0) {
-      return lines.slice(0, this.maxRows)
+      const kept: LiveRegionLine[] = []
+      let rows = 0
+      for (const line of lines) {
+        const r = this.rowsForLine(line.text)
+        if (rows + r > this.maxRows) break
+        kept.push(line)
+        rows += r
+      }
+      return kept
     }
     const tail = Math.min(reservedTail, lines.length)
     const tailLines = lines.slice(lines.length - tail)
-    const budget = this.maxRows - tailLines.length
+    const tailRows = this.countDisplayRows(tailLines)
+    const budget = this.maxRows - tailRows
     if (budget <= 0) return tailLines.slice()
     const dynamic = lines.slice(0, lines.length - tail)
-    return [...dynamic.slice(-budget), ...tailLines]
+    const kept: LiveRegionLine[] = []
+    let rows = 0
+    for (let i = dynamic.length - 1; i >= 0; i--) {
+      const r = this.rowsForLine(dynamic[i]!.text)
+      if (rows + r > budget) break
+      kept.unshift(dynamic[i]!)
+      rows += r
+    }
+    return [...kept, ...tailLines]
   }
 
   /** Append 路径：行间 `\n`，尾行不带 `\n`（光标常驻最后一行末尾）。 */

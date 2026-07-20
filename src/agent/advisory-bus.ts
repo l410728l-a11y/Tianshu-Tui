@@ -227,6 +227,10 @@ export interface AdvisoryLedgerDelta {
   revoked: number
   /** holdout:赢得渲染位但被反事实扣留的条目数 */
   heldOut: number
+  /** Wave 1:SR 通道提交数（经 drainSystemReminders 取出前计数） */
+  srSubmitted: number
+  /** Wave 1:SR 被 SessionContext cap 丢弃数（未进入 delivered 桶） */
+  srDropped: number
 }
 
 const LEDGER_DROPPED_KEYS_CAP = 50
@@ -343,8 +347,14 @@ export class AdvisoryBus {
   private flowStateProvider: (() => boolean) | null = null
   /** status 通道 sink — 未设置时 status 条目回退 bus 渲染（不静默消失） */
   private statusSink: ((entries: AdvisoryEntry[]) => void) | null = null
-  /** system-reminder 通道待送内容（drainSystemReminders 取走） */
-  private systemReminderOut: string[] = []
+  /** system-reminder 通道待送内容（drainSystemReminders 取走）。
+   *  Wave 1 SR 账本修正：改为 `{key, content}` 对，供调用方回调确认送达/丢弃。 */
+  private systemReminderOut: Array<{ key: string; content: string }> = []
+  /** Wave 1：等待回调确认的 SR 条目（render 产出但尚未经 SessionContext 确认）。 */
+  private srPendingDelivery = new Map<string, AdvisoryEntry>()
+  /** Wave 1 账本：SR 提交数与被 SessionContext cap 丢弃数。 */
+  private ledgerSrSubmitted = 0
+  private ledgerSrDropped = 0
   // ── Holdout 反事实抽样 ──
   private holdout: HoldoutPolicy | null = null
   private ledgerHeldOut = 0
@@ -362,10 +372,8 @@ export class AdvisoryBus {
   /** 静音期满后的 probation 名单 — 放行一次送达以收集新证据,之后 lift 仍 ≤0 才再静音 */
   private liftProbation = new Set<string>()
   private ledgerLiftMuted = 0
-  // ── W6 CVM 开销节流（通道 B 降级）──
+  // ── W6 CVM 开销节流（由 pressure-monitor 设置，Wave 2 统一预算消费）──
   private overheadThrottled = false
-  /** 节流态下的隔周期投递开关：true = 本渲染周期跳过非豁免条目 */
-  private overheadSkipNext = false
   // ── W2 efficacy 负反馈环 ──
   private efficacyStats: EfficacyStatsProvider | null = null
   /** 本会话被 efficacy 环静默的 key（delivered ≥ 6 且零采纳） */
@@ -434,13 +442,9 @@ export class AdvisoryBus {
     this.efficacyStats = provider
   }
 
-  /** W6 节流次序反转（incident 20b9714e）：CVM 开销越过 5% 阈值时，降级的
-   *  是通道 B（advisory，每条真金白银驻留 token）——非 constitutional、非
-   *  immediate、priority < 0.8 的条目隔个渲染周期送达（等效冷却翻倍）。
-   *  镜面等通道 A 附录块（appendixDelta 字节稳定，稳态近零成本）不受影响。 */
+  /** W6 开销节流：由 pressure-monitor 设置。Wave 2 统一预算消费此信号。 */
   setOverheadThrottled(throttled: boolean): void {
     this.overheadThrottled = throttled
-    if (!throttled) this.overheadSkipNext = false
   }
 
   /** 该 key 是否已被本会话 efficacy 环静默 — decision-shift 卡片同步抑制入口。 */
@@ -461,11 +465,26 @@ export class AdvisoryBus {
     return this.pendingWatch.length
   }
 
-  /** Phase 2：取走 system-reminder 通道的待送内容（调用方负责 appendSystemReminder）。 */
-  drainSystemReminders(): string[] {
+  /** Phase 2 (Wave 1)：取走 system-reminder 通道的待送内容，含 key 供调用方回调确认。 */
+  drainSystemReminders(): Array<{ key: string; content: string }> {
     const out = this.systemReminderOut
     this.systemReminderOut = []
     return out
+  }
+
+  /** Wave 1：调用方确认 SR 已成功送达（经 SessionContext 放行）。 */
+  confirmSrDelivered(key: string): void {
+    const entry = this.srPendingDelivery.get(key)
+    if (!entry) return
+    this.srPendingDelivery.delete(key)
+    this.ledgerRendered++
+    this.delivered.push({ key: entry.key, category: entry.category, tier: entry.tier, expect: entry.expect })
+  }
+
+  /** Wave 1：调用方确认 SR 被 SessionContext cap 拦截丢弃。不进入 delivered 桶。 */
+  confirmSrDropped(key: string): void {
+    this.srPendingDelivery.delete(key)
+    this.ledgerSrDropped++
   }
 
   /**
@@ -505,6 +524,8 @@ export class AdvisoryBus {
       revoked: this.ledgerRevoked,
       heldOut: this.ledgerHeldOut,
       liftMuted: this.ledgerLiftMuted,
+      srSubmitted: this.ledgerSrSubmitted,
+      srDropped: this.ledgerSrDropped,
     }
     this.ledgerSubmitted = 0
     this.ledgerRendered = 0
@@ -514,6 +535,8 @@ export class AdvisoryBus {
     this.ledgerRevoked = 0
     this.ledgerHeldOut = 0
     this.ledgerLiftMuted = 0
+    this.ledgerSrSubmitted = 0
+    this.ledgerSrDropped = 0
     return delta
   }
 
@@ -716,28 +739,11 @@ export class AdvisoryBus {
       }
     }
 
-    // ── W6 CVM 开销节流:通道 B 隔周期送达（等效冷却翻倍）──
-    // 5% 阈值下先降级 advisory（每条都是终身驻留 token），最后才轮到
-    // toolContext（8% 硬顶）；镜面任何档位不熄。fail-open 豁免与 efficacy
-    // 环同口径：constitutional / immediate / priority ≥ 0.8。
-    if (this.overheadThrottled) {
-      if (this.overheadSkipNext) {
-        this.overheadSkipNext = false
-        const droppedByOverhead = new Set<string>()
-        const kept: AdvisoryEntry[] = []
-        for (const e of all) {
-          if (e.tier === 'constitutional' || e.immediate === true || e.priority >= 0.8) {
-            kept.push(e)
-            continue
-          }
-          droppedByOverhead.add(e.key)
-        }
-        this.recordDropped(droppedByOverhead)
-        all = kept
-      } else {
-        this.overheadSkipNext = true
-      }
-    }
+    // ── W6 CVM 开销节流：overheadThrottled 信号由 pressure-monitor 设置 ──
+    // Wave 2 统一注入预算消费：节流态下预算从 3 降到 1，替代旧的隔周期 skip。
+    // 此处不移除条目——预算逻辑在 render() 出口统一执行。overheadThrottled
+    // 仅作为信号保留，不在此处做过滤。
+    // （旧 W6 隔周期 skip 已移除——统一预算闸门替代）
 
     // ── Lift 消费端:负 lift 自动静音（"没提醒也会做"= 纯噪音）──
     // 成熟 lift ≤ 0 → 静音 LIFT_MUTE_RENDERS 周期;期满 probation 放行一次
@@ -822,10 +828,11 @@ export class AdvisoryBus {
         if (!existing || e.priority > existing.priority) srDeduped.set(e.key, e)
       }
       for (const e of srDeduped.values()) {
-        this.systemReminderOut.push(this.applyTone(e))
-        this.ledgerRendered++
-        this.delivered.push({ key: e.key, category: e.category, tier: e.tier, expect: e.expect })
+        // Wave 1：不预记 rendered/delivered——由 turn-step-producer 回调确认
+        this.srPendingDelivery.set(e.key, e)
+        this.systemReminderOut.push({ key: e.key, content: this.applyTone(e) })
       }
+      this.ledgerSrSubmitted += srDeduped.size
     }
     if (this.statusSink) {
       const statusEntries = all.filter(e => e.channel === 'status')
@@ -926,7 +933,7 @@ export class AdvisoryBus {
     }
 
     // Combine: constitutional always first, then by priority
-    const sorted: AdvisoryEntry[] = [...constDeduped.values()]
+    let sorted: AdvisoryEntry[] = [...constDeduped.values()]
     taken.sort(compareEntries)
     sorted.push(...taken)
 
@@ -953,6 +960,27 @@ export class AdvisoryBus {
       expect: e.expect,
       shadow: true,
     })))
+
+    // ── Wave 2 统一注入预算 ──
+    // 上游 8 层降频机制各自判断后，此处单点约束最终进入 prompt 的总数。
+    // W6 throttle 信号 → 削减预算（替代隔周期 skip）；正常态预算 = 3。
+    const CVM_INJECTION_BASE_BUDGET = 3
+    const busCount = sorted.length
+    const srPending = this.srPendingDelivery.size
+    // ⚠ 按 key 数计数初期足够（SR 天然低频），后续可按 injectedTokens 加权校准
+    const cvmInjectionBudget = this.overheadThrottled
+      ? Math.max(1, CVM_INJECTION_BASE_BUDGET - 2)
+      : CVM_INJECTION_BASE_BUDGET
+
+    // constitutional / immediate 完全豁免——不占预算配额，nonexempt 独立计数
+    const exempt = sorted.filter(e => e.tier === 'constitutional' || e.immediate === true)
+    const nonexempt = sorted.filter(e => e.tier !== 'constitutional' && e.immediate !== true)
+    if (nonexempt.length > cvmInjectionBudget) {
+      const keep = [...exempt, ...nonexempt.slice(0, cvmInjectionBudget)]
+      const pruned = nonexempt.slice(cvmInjectionBudget)
+      this.recordDropped(pruned.map(e => e.key))
+      sorted = keep
+    }
 
     if (sorted.length === 0) {
       this.entries = []
@@ -991,6 +1019,9 @@ export class AdvisoryBus {
     this.pendingWatch = []
     this.suppressedCarry = []
     this.systemReminderOut = []
+    this.srPendingDelivery.clear()
+    this.ledgerSrSubmitted = 0
+    this.ledgerSrDropped = 0
     this.ledgerHeldOut = 0
     this.liftMuteRemaining.clear()
     this.liftProbation.clear()

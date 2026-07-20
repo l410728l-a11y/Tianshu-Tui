@@ -201,19 +201,25 @@ export function computeGroupStats(group: CollapsedReadSearchGroup): GroupStats {
   }
 }
 
-/** 构建组摘要文本（用于 scrollback 标题和 live 聚合行） */
+/** 构建组摘要文本（用于 scrollback 标题和 live 聚合行）。
+ *  时态：isActive（live 进行中）用进行体（Searching/Reading/Listing），
+ *  settled（scrollback 落版）用过去时（Searched/Read/Listed）——
+ *  grok verb-group 对标：同一组从"正在发生"平滑过渡到"已发生"。 */
 export function buildSummaryText(group: CollapsedReadSearchGroup, isActive?: boolean): string {
   const stats = computeGroupStats(group)
   const parts: string[] = []
 
   if (stats.searchCount > 0) {
-    parts.push(`Searched ${stats.searchCount} pattern${stats.searchCount > 1 ? 's' : ''}`)
+    const n = `${stats.searchCount} pattern${stats.searchCount > 1 ? 's' : ''}`
+    parts.push(isActive ? `Searching ${n}` : `Searched ${n}`)
   }
   if (stats.readFilePaths.length > 0) {
-    parts.push(`Read ${stats.readFilePaths.length} file${stats.readFilePaths.length > 1 ? 's' : ''}`)
+    const n = `${stats.readFilePaths.length} file${stats.readFilePaths.length > 1 ? 's' : ''}`
+    parts.push(isActive ? `Reading ${n}` : `Read ${n}`)
   }
   if (stats.listCount > 0) {
-    parts.push(`Listed ${stats.listCount} dir${stats.listCount > 1 ? 's' : ''}`)
+    const n = `${stats.listCount} dir${stats.listCount > 1 ? 's' : ''}`
+    parts.push(isActive ? `Listing ${n}` : `Listed ${n}`)
   }
 
   if (isActive && stats.pendingCount > 0) {

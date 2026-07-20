@@ -2314,3 +2314,68 @@ describe('evaluateConvergence — flow 软阈值（P1 Wave 2）', () => {
     assert.ok(result.level <= 1, `todo veto 仍 cap 到 ≤L1，got L${result.level}`)
   })
 })
+
+// ─── W4 噪音洪流修复：工具错误受阻时降级收敛 score ─────────────────
+
+describe('evaluateConvergence — W4 tool error ratio demotion', () => {
+  // 高错误率场景：10 个工具调用中 5 个 failed → errorRatio=0.5 ≥ 0.4
+  const highErrorHistory = () => makeHistory([
+    { tool: 'read_file', status: 'failed', target: 'plan.md' },
+    { tool: 'glob', status: 'failed', target: '*.plan.md' },
+    { tool: 'grep', status: 'failed', target: 'plan' },
+    { tool: 'bash', status: 'success', target: 'cat' },
+    { tool: 'read_file', status: 'failed', target: '.rivet' },
+    { tool: 'glob', status: 'success', target: '*.ts' },
+    { tool: 'grep', status: 'failed', target: 'pattern' },
+    { tool: 'read_file', status: 'success', target: 'src/a.ts' },
+    { tool: 'read_file', status: 'success', target: 'src/a.ts' },
+    { tool: 'read_file', status: 'success', target: 'src/a.ts' },
+  ])
+
+  // 同目标全 success → 经典低分停滞形状（触发 L2）
+  const stuckHistory = () => makeHistory(
+    Array.from({ length: 6 }, () => ({ tool: 'read_file', target: 'a.ts' })),
+  )
+
+  it('高工具错误率压低 score 阻断 L2：同停滞形状，errorRatio≥0.4 时 level≤1', () => {
+    // 同形状同 turn 的高错误率 vs 零错误率对比
+    const withErrors = evaluateConvergence(baseInput({
+      turn: 14, phaseClass: 'explore', recentToolHistory: highErrorHistory(),
+      recentToolErrorRatio: 0.5,
+    }))
+    const withoutErrors = evaluateConvergence(baseInput({
+      turn: 14, phaseClass: 'explore', recentToolHistory: stuckHistory(),
+    }))
+
+    // 高错误率时 score 被 cap 到 0.41 → level ≤1（阻断 L2）
+    assert.ok(withErrors.level <= 1, `高错误率应阻断 L2+，实际 L${withErrors.level} score=${withErrors.score.toFixed(3)}`)
+    // 零错误率时正常触发 L2
+    assert.equal(withoutErrors.level, 2, '零错误率应正常触发 L2')
+  })
+
+  it('低工具错误率不影响收敛检测：errorRatio=0.2 < 0.4 时行为不变', () => {
+    const withLowErrors = evaluateConvergence(baseInput({
+      turn: 14, phaseClass: 'explore', recentToolHistory: stuckHistory(),
+      recentToolErrorRatio: 0.2,
+    }))
+    assert.equal(withLowErrors.level, 2, '低错误率不应影响收敛判断')
+  })
+
+  it('recentToolErrorRatio 缺席时走旧行为（向后兼容）', () => {
+    const result = evaluateConvergence(baseInput({
+      turn: 14, phaseClass: 'explore', recentToolHistory: stuckHistory(),
+      // 不传 recentToolErrorRatio
+    }))
+    assert.equal(result.level, 2, '缺席字段应走旧行为，正常触发 L2')
+  })
+
+  it('no-tool 熔断不受 error ratio 影响', () => {
+    const result = evaluateConvergence(baseInput({
+      turn: 14, phaseClass: 'execute', recentToolHistory: highErrorHistory(),
+      noToolTurnCount: 5,
+      recentToolErrorRatio: 0.8,
+    }))
+    assert.equal(result.shouldAbort, true, 'no-tool 硬熔断不受 error ratio 影响')
+    assert.equal(result.abortCause, 'no-tool')
+  })
+})

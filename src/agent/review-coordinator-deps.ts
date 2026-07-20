@@ -167,6 +167,8 @@ function mapSquadronFindings(run: CoordinatorRun): ReviewFinding[] {
 function classifyInfraFailure(result: WorkerResult): ReviewInfraFailure['kind'] {
   const text = `${result.summary}\n${result.risks.join('\n')}\n${result.artifacts.map(a => a.content).join('\n')}`
   if (/did not contain a JSON object|schema-valid JSON|parse/i.test(text)) return 'json'
+  // 预算耗尽(max-turns/无终轮)——确定性失败,同预算重试必死,单列 kind 供重试分流
+  if (/max.?turns|exhausted without a final turn/i.test(text)) return 'budget'
   if (/timeout|timed out/i.test(text)) return 'timeout'
   if (/skipped/i.test(text)) return 'skip'
   return 'worker'
@@ -348,12 +350,23 @@ function squadronRequests(change: ChangeSet, options: CoordinatorReviewDepsOptio
   }))
 }
 
-// ─── Auto in-task review: single wiring inspector, short budget ─────
-// Auto review must never stall the main loop: 150s internal worker budget
-// (< AUTO_REVIEW_BUDGET_MS 180s outer cap, so the worker's own timer fires
-// first and preserves partial output), bounded turns, read-only profile.
-const AUTO_WIRING_WORKER_TIMEOUT_MS = 150_000
-const AUTO_WIRING_WORKER_MAX_TURNS = 6
+// ─── Auto in-task review: single wiring inspector, bounded budget ─────
+// 预算标定(2026-07-19 审查空耗事故):6 轮/150s 对多文件 diff 系统性不足——
+// worker 分析到一半被 max-turns 杀掉,重试同预算必死。放大到 12 轮/240s 并
+// 配早收敛 prompt(见下)。外层 AUTO_REVIEW_BUDGET_MS 相应放宽到 300s;
+// detached 后审查不阻塞交付,成本仅为后台时长。
+const AUTO_WIRING_WORKER_TIMEOUT_MS = 240_000
+const AUTO_WIRING_WORKER_MAX_TURNS = 12
+
+/** 早收敛预算计划:给 worker 显式轮次分配,杜绝"探索到一半被预算杀掉"。 */
+function earlyConvergenceHint(): string {
+  return [
+    `预算约束(${AUTO_WIRING_WORKER_MAX_TURNS} 轮/${Math.round(AUTO_WIRING_WORKER_TIMEOUT_MS / 1000)}s),按此节奏收敛:`,
+    `1) 前 1/3 轮只看 diff(git show/git diff 与目标区间),禁止整文件 read;`,
+    `2) 中段定点核查 method 前两项,不扩散到范围外;`,
+    `3) 最后 2 轮停止一切探索,输出 verdict JSON——未覆盖项显式标注,best-effort 结论优于无结论。`,
+  ].join('\n')
+}
 
 function wiringReviewerRequest(change: ChangeSet, options: CoordinatorReviewDepsOptions): DelegationRequest {
   const wiring = INSPECTORS.find(i => i.name === 'Wiring')!
@@ -365,7 +378,7 @@ function wiringReviewerRequest(change: ChangeSet, options: CoordinatorReviewDeps
       profile: 'reviewer',
       objective: [
         inspectorObjective(wiring, change),
-        `Time budget is tight (~${Math.round(AUTO_WIRING_WORKER_TIMEOUT_MS / 1000)}s): review the DIFF of the listed files first (git diff/read targeted ranges), do not read whole files or explore beyond scope. Prioritize check 1 and 2 of the method; report what you covered.`,
+        earlyConvergenceHint(),
       ].join('\n'),
     }),
     budget: { timeoutMs: AUTO_WIRING_WORKER_TIMEOUT_MS, maxTurns: AUTO_WIRING_WORKER_MAX_TURNS },
@@ -424,7 +437,7 @@ export function createCoordinatorReviewDeps(
           profile: 'reviewer' as const,
           objective: [
             inspectorObjective(inspector, change),
-            `Time budget is tight (~${Math.round(AUTO_WIRING_WORKER_TIMEOUT_MS / 1000)}s): review the DIFF of the listed files first (git diff/read targeted ranges), do not read whole files or explore beyond scope. Report what you covered.`,
+            earlyConvergenceHint(),
           ].join('\n'),
           onActivity,
         }),

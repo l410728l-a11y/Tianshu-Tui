@@ -2,7 +2,7 @@ import { readFileSync, existsSync } from 'fs'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { resolve, join } from 'path'
 import { z } from 'zod'
-import { configSchema, reviewConfigSchema, workersSchema, councilConfigSchema, editorSchema, mirrorsSchema, envSchema, uiSchema, permissionsSchema, networkSchema, type Config, type ProviderConfig, type ModelConfig, type ReviewConfig, type WorkersConfig, type CouncilConfig, type EditorConfig, type MirrorsConfig, type UiConfig } from './schema.js'
+import { configSchema, reviewConfigSchema, workersSchema, councilConfigSchema, editorSchema, mirrorsSchema, envSchema, uiSchema, permissionsSchema, networkSchema, fetchSchema, searchSchema, type Config, type ProviderConfig, type ModelConfig, type ReviewConfig, type WorkersConfig, type CouncilConfig, type EditorConfig, type MirrorsConfig, type UiConfig } from './schema.js'
 import { DEFAULT_CONFIG } from './default.js'
 import { userConfigPath } from './paths.js'
 import { cloneProviderPreset, findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './provider-presets.js'
@@ -383,6 +383,90 @@ export function setNetworkConfig(input: { proxy?: unknown; noProxy?: unknown }):
     proxy: cfg.network.proxy ?? '',
     noProxy: cfg.network.noProxy ?? '',
   }
+}
+
+// --- web_fetch 配置（超时 / UA / 响应大小 / 正文抽取） ---
+
+export interface FetchConfigSnapshot {
+  timeoutMs: number
+  maxResponseBytes: number
+  maxRedirects: number
+  userAgent: string
+  extractMainContent: boolean
+}
+
+/** 读取用户全局 config 的 fetch 段。 */
+export function getFetchConfig(): FetchConfigSnapshot {
+  const f = loadConfig().fetch
+  return {
+    timeoutMs: f.timeoutMs,
+    maxResponseBytes: f.maxResponseBytes,
+    maxRedirects: f.maxRedirects,
+    userAgent: f.userAgent,
+    extractMainContent: f.extractMainContent,
+  }
+}
+
+/**
+ * 持久化 web_fetch 配置到用户全局 config（`fetch.*`）。
+ * merge 写模式：只传入的字段被更新，未传入的保留原值。
+ * 下次 sidecar/session 启动时生效（buildFetchOptions → httpFetchGuarded）。
+ */
+export function setFetchConfig(input: Record<string, unknown>): FetchConfigSnapshot {
+  const cfg = loadConfig()
+  const merged: Record<string, unknown> = { ...cfg.fetch }
+  for (const [key, val] of Object.entries(input)) {
+    if (val === '' || val === null) {
+      delete merged[key]
+    } else {
+      merged[key] = val
+    }
+  }
+  cfg.fetch = fetchSchema.parse(merged)
+  saveConfig(cfg)
+  return getFetchConfig()
+}
+
+// --- web_search 配置（后端链 / 超时 / 区域） ---
+
+export interface SearchConfigSnapshot {
+  backends: string[]
+  braveApiKeyEnv: string
+  tavilyApiKeyEnv: string
+  timeoutMs: number
+  region: string
+}
+
+/** 读取用户全局 config 的 search 段。 */
+export function getSearchConfig(): SearchConfigSnapshot {
+  const s = loadConfig().search
+  return {
+    backends: [...s.backends],
+    braveApiKeyEnv: s.braveApiKeyEnv,
+    tavilyApiKeyEnv: s.tavilyApiKeyEnv,
+    timeoutMs: s.timeoutMs,
+    region: s.region ?? '',
+  }
+}
+
+/**
+ * 持久化 web_search 配置到用户全局 config（`search.*`）。
+ * merge 写模式：只传入的字段被更新，未传入的保留原值。
+ * 下次 sidecar/session 启动时生效（buildSearchBackends → runBackendChain）。
+ */
+export function setSearchConfig(input: Record<string, unknown>): SearchConfigSnapshot {
+  const cfg = loadConfig()
+  const merged: Record<string, unknown> = { ...cfg.search }
+  for (const [key, val] of Object.entries(input)) {
+    if (val === '' || val === null) {
+      delete merged[key]
+    } else {
+      merged[key] = val
+    }
+  }
+  cfg.search = searchSchema.parse(merged)
+  saveConfig(cfg)
+  return getSearchConfig()
 }
 
 // --- Codex 式常驻目录授权（agent.permissions.additionalReadDirs/WriteDirs） ---

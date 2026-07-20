@@ -45,6 +45,8 @@ export interface SidePanelInput {
   goal?: GoalStateSnapshot
   /** 运行相位（'idle' 且 todo 全完成时任务区按空态渲染，与主区面板同门禁）。 */
   phase?: string
+  /** todo 面板展开态（ctrl+x t）：completed 逐条回看，强制显示并放宽行数上限。 */
+  todoExpanded?: boolean
 }
 
 /** 最多展示的 worker 行数（超出截断）。 */
@@ -129,10 +131,18 @@ export function renderSidePanel(input: SidePanelInput, theme: RivetTheme): strin
     lines.push(...formatGoalSection(input.goal, contentW, theme))
   }
 
-  // ── Section: 任务列表（复用 formatTaskList；idle+全完成时按空态，同主区门禁）──
+  // ── Section: 任务列表（复用 formatTaskList；idle+全完成时按空态，同主区门禁；
+  //    todoExpanded 展开态强制显示且放宽行数，completed 逐条可回看）──
   lines.push(sectionDivider())
-  const taskLines = shouldShowTaskPanel(input.todos, input.phase ?? '')
-    ? formatTaskList(input.todos, theme, { width: contentW, maxRows: MAX_TASK_ROWS, showProgressBar: false })
+  const todosExpanded = input.todoExpanded === true
+  const taskLines = (todosExpanded || shouldShowTaskPanel(input.todos, input.phase ?? ''))
+    ? formatTaskList(input.todos, theme, {
+      width: contentW,
+      maxRows: todosExpanded ? 15 : MAX_TASK_ROWS,
+      showProgressBar: false,
+      expanded: todosExpanded,
+      expandHint: todosExpanded ? 'ctrl+x t 收起' : undefined,
+    })
     : []
   if (taskLines.length > 0) {
     for (const taskLine of taskLines) {

@@ -7,7 +7,7 @@
 
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
 import { starDomainRegistry } from '../../agent/star-domain-registry.js'
-import { color } from '../engine/ansi.js'
+import { ANSI, color } from '../engine/ansi.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
 import { getActiveThemeName, type RivetTheme } from '../theme.js'
 
@@ -57,12 +57,25 @@ export interface TodoSummary {
   total: number
   done: number
   inProgress: number
-  /** 当前 in_progress 任务的 content（用于状态栏显示"正在做哪条"）。 */
+  /** 当前 in_progress 任务的 content（保留字段；徽章改为分态计数后不再渲染）。 */
   current?: string
 }
 
-/** 状态栏当前任务名最大显示列宽（CJK 口径），超出截断为 …。 */
-const CURRENT_TASK_MAX_WIDTH = 24
+/**
+ * Todo 计数徽章（badge-first）：compact 档 `◇2/5`（done/total），
+ * full 档分态计数 `◐1 ☐3 ☒2`（in_progress / pending / completed）。
+ * 无 todo 返回 null（不占位）。flash 时反色高亮（done 增加 / total 变化后 ~1s，
+ * 由 app 侧计时；reducedMotion 时 app 不传 flash，保持静态色）。
+ */
+function formatTodoBadge(t: TodoSummary, compact: boolean, theme: RivetTheme, flash: boolean): string | null {
+  if (t.total <= 0) return null
+  const pending = Math.max(0, t.total - t.done - t.inProgress)
+  const text = compact
+    ? `◇${t.done}/${t.total}`
+    : `◐${t.inProgress} ☐${pending} ☒${t.done}`
+  if (flash) return `${ANSI.REVERSE}${text}${ANSI.RESET}`
+  return color(text, theme.primary)
+}
 
 export interface GlanceBarInput {
   /** 终端宽度 */
@@ -104,6 +117,9 @@ export interface GlanceBarInput {
   goal?: GoalStateSnapshot
   /** todo 摘要 */
   todoSummary?: TodoSummary
+  /** todo 徽章瞬时高亮（done 增加 / total 变化后 ~1s，app 侧计时；
+   *  reducedMotion 时 app 恒传 false → 静态色）。 */
+  todoFlash?: boolean
   /**
    * 信息密度分档（Wave 2 减密）：
    * - 'compact'（TUI 默认）：模型 + effort + cache% + 上下文% + 耗时
@@ -154,6 +170,13 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
     parts.push(color(`✓ ${input.fleetUnread}`, theme.success))
   }
 
+  // Todo 计数徽章：与编排徽章相邻（cache% 之前），compact `◇2/5` / full 分态计数；
+  // 变化后 ~1s 反色高亮。无 todo 不占位。
+  if (input.todoSummary) {
+    const badge = formatTodoBadge(input.todoSummary, compact, theme, input.todoFlash === true)
+    if (badge) parts.push(badge)
+  }
+
   // ── compact 档：模型 + effort + cache% + 上下文% + 耗时 ──
   if (compact) {
     if (input.modelName) {
@@ -198,24 +221,6 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
       : `◆ ${g.iteration}/${g.maxIterations} · ${formatElapsed(g.elapsedMs)}`
     const goalColor = g.status === 'blocked' ? theme.error : g.status === 'paused' ? theme.warning : theme.secondary
     parts.push(color(goalText, goalColor))
-  }
-
-  // Todo 摘要。宽屏时把"正在做哪条"也显示出来（用当前 in_progress 任务的 content，
-  // 而非仅 ◐ 计数）——同一时刻通常只有一个 in_progress，任务名比数字更有信息量。
-  if (input.todoSummary && input.todoSummary.total > 0) {
-    const t = input.todoSummary
-    let todoText: string
-    if (narrow) {
-      todoText = `☐${t.done}/${t.total}`
-    } else if (t.current) {
-      const name = displayWidth(t.current, { ambiguousAsWide: true }) > CURRENT_TASK_MAX_WIDTH
-        ? `${truncateToDisplayWidth(t.current, CURRENT_TASK_MAX_WIDTH - 1, { ambiguousAsWide: true })}…`
-        : t.current
-      todoText = `☐ ${t.done}/${t.total} · ◐ ${name}`
-    } else {
-      todoText = `☐ ${t.done}/${t.total}${t.inProgress > 0 ? ` · ◐ ${t.inProgress}` : ''}`
-    }
-    parts.push(color(todoText, theme.primary))
   }
 
   if (input.modelName) {

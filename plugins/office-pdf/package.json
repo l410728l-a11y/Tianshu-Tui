@@ -1,0 +1,26 @@
+{
+  "name": "office-pdf",
+  "version": "1.1.0",
+  "description": "Native PDF generation (pdfkit, CJK-aware) + text extraction (pdf-parse) — replaces browser-print HTML fallback",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "tianshu": {
+    "name": "office-pdf",
+    "version": "1.1.0",
+    "description": "Native PDF generation (text/headings/tables/lists, CJK fonts, page numbers) + text extraction for context reading",
+    "entry": "index.js",
+    "tools": [
+      { "name": "pdf_create", "description": "Generate a real PDF with text, headings, tables, and lists (CJK-aware, optional page numbers)" },
+      { "name": "pdf_read", "description": "Extract text content from a PDF file for context reading" }
+    ],
+    "permissions": { "fs": true },
+    "skills": ["skills"]
+  },
+  "dependencies": {
+    "pdfkit": "^0.15.0",
+    "pdf-parse": "^1.1.1"
+  }
+}

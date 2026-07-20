@@ -206,6 +206,11 @@ export interface ToolCallParams {
    *  enter_mode 返回错误（fail-closed，worker 不允许切主控状态）。
    *  alreadyPlanning=true 表示进入前已在 plan mode（幂等返回，未重建草稿）。 */
   enterPlanMode?: () => { activePlanFilePath: string | null; alreadyPlanning: boolean }
+  /** 闭环自动退出 plan mode：plan action=close 把 active plan 标记 EXECUTED 后
+   *  由 planCloseExecute 调用（桌面端"闭环即解锁"）。Pre-bound 到主控
+   *  AgentLoop.exitPlanMode；worker/非 agent 上下文缺席 → 不退出。
+   *  「未执行时退出归用户」原则不变——此处只承载闭环自动退出。 */
+  exitPlanMode?: () => void
   /** 当前会话模型名 —— plan submit 用于产出模型留痕（低阶模型计划警告）。 */
   sessionModel?: string
   /** AbortSignal from the tool pipeline — fires when the tool-level timeout

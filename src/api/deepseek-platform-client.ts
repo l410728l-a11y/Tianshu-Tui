@@ -80,8 +80,15 @@ function platformBaseUrl(baseUrl: string | undefined): string {
 /** Load persisted platform auth (from webview login). Returns null if not logged in. */
 function loadPlatformAuth(): { token: string; cookies: string } | null {
   try {
-    const home = process.env.RIVET_HOME || ''
-    const filePath = home + '/deepseek-platform-auth.json'
+    // Must match the path resolution used by config-routes.ts (which writes
+    // the file via rivetHome()). The previous implementation used
+    // `process.env.RIVET_HOME || ''`, which fell back to an empty string
+    // when RIVET_HOME was unset — causing filePath to resolve to the
+    // filesystem root (/deepseek-platform-auth.json) and silently miss the
+    // real file. Using rivetHome() guarantees read/write see the same path.
+    const { rivetHome } = require('../config/paths')
+    const { join } = require('node:path')
+    const filePath = join(rivetHome(), 'deepseek-platform-auth.json')
     // Use dynamic require to avoid pulling fs into the browser bundle
     const { existsSync, readFileSync } = require('node:fs')
     if (!existsSync(filePath)) return null

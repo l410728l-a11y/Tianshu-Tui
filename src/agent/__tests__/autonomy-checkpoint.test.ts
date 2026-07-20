@@ -204,3 +204,34 @@ describe('TurnOrchestrator: autonomy checkpoint (C3)', () => {
     assert.ok(checkpoints[0]!.digest.includes('已执行'), 'digest was generated')
   })
 })
+
+it('最后一个可用轮注入「最终轮」警告(轮次预算硬预警,其余轮不注入)', async () => {
+  const seenTexts: string[] = []
+  let callCount = 0
+  const client = {
+    stream: async (req: { messages?: unknown }, cb: StreamCallbacks) => {
+      callCount++
+      seenTexts.push(JSON.stringify(req?.messages ?? []))
+      cb.onContentBlock({ type: 'tool_use', id: `tu_${callCount}`, name: 'read_file', input: { file_path: join(TEST_CWD, 'f.txt') } })
+      cb.onStopReason('tool_use', { input_tokens: 100, output_tokens: 50 })
+    },
+  } as unknown as StreamClient
+  const registry = new ToolRegistry()
+  registry.register(READ_FILE_TOOL)
+  const agent = new AgentLoop({
+    client,
+    promptEngine: makeEngine(),
+    toolRegistry: registry,
+    maxTurns: 3,
+    contextWindow: 1_000_000,
+    compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+  }, new SessionContext(), TEST_CWD)
+
+  await agent.run('keep reading the file', makeCallbacks([]))
+
+  assert.equal(callCount, 3, '用尽全部 3 轮')
+  assert.ok(!seenTexts[0]!.includes('FINAL turn'), '第 1 轮不注入')
+  assert.ok(!seenTexts[1]!.includes('FINAL turn'), '第 2 轮不注入')
+  assert.ok(seenTexts[2]!.includes('FINAL turn'), '最后一个可用轮注入「最终轮」警告')
+  assert.ok(seenTexts[2]!.includes('WorkerResult JSON'), '警告含 worker 契约提示')
+})

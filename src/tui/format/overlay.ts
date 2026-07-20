@@ -760,7 +760,7 @@ export function renderTasks(
   if (selectable.length === 0) {
     const emptyText = data.filter === 'completed' ? '（暂无已完成的子代理）'
       : data.filter === 'all' ? '（暂无子代理）'
-        : '（暂无运行中的子代理 · Tab 切换筛选）'
+        : '（暂无运行中的子代理 · ←/→ 切换筛选）'
     body.push('')
     body.push(color(`  ${emptyText}`, theme.muted))
   }
@@ -793,7 +793,7 @@ export function renderTasks(
   const summary = summaryParts.join(' · ')
   // 分隔符收紧为 " · "：frameFooter 溢出时从前截断，summary 在最前面，
   // f/x 键位加入后 80 列下过长会把计数吃掉。
-  lines.push(formatFooter(`${summary} · ${compactHints([['↑↓', '选择'], ['Enter', '详情'], ['f', '切入'], ['x', '停止'], ['Tab', '筛选'], ['q/Esc', '关闭']])}`, width, theme))
+  lines.push(formatFooter(`${summary} · ${compactHints([['↑↓', '选择'], ['Enter', '详情'], ['f', '切入'], ['x', '停止'], ['←/→/Tab', '筛选'], ['q/Esc', '关闭']])}`, width, theme))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
 
   return lines

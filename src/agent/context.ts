@@ -86,6 +86,13 @@ export class SessionContext {
   private onMutation: ((m: MessageMutation) => void) | null = null
   /** Tool argument post-processors — intercept large args before entering oaiMessages */
   private argProcessors: ToolArgPostProcessorRegistry
+  /**
+   * W3 噪音洪流修复：system-reminder 每轮最多 1 条。
+   * df4ac4e9 中 7/9 条用户消息是 system-reminder，全部绕过 advisory bus
+   * 的 MAX_ADVISORIES_PER_TURN=3 上限——这才是真正的洪水源。计数器在每轮
+   * 开始时由 AgentLoop 重置；超过 1 条后静默丢弃（不影响关键守护路径，
+   * 它们已迁移到 advisory bus 的 constitutional/immediate 通道）。 */
+  private srCountThisTurn = 0
 
   constructor() {
     this.state = {
@@ -164,6 +171,11 @@ export class SessionContext {
    *     a real user boundary.
    */
   appendSystemReminder(text: string): void {
+    // W3 噪音洪流修复：每轮最多 1 条 system-reminder。
+    // 超过上限时静默丢弃——关键守护路径已迁移到 advisory bus
+    // 的 constitutional / immediate 通道，不受此上限约束。
+    if (this.srCountThisTurn >= 1) return
+    this.srCountThisTurn++
     const wrapped = wrapSystemReminder(text)
     const msgs = this.state.oaiMessages
     const last = msgs[msgs.length - 1]
@@ -178,6 +190,35 @@ export class SessionContext {
       return
     }
     this.addUserMessage(wrapped)
+  }
+
+  /** W3：每轮开始时重置 SR 计数器（由 AgentLoop 调用）。 */
+  resetSrCount(): void {
+    this.srCountThisTurn = 0
+  }
+
+  /**
+   * Wave 1：与 appendSystemReminder 相同，但返回是否成功注入（未被 cap 拦截）。
+   * 供 advisory bus SR 通道回调确认使用。
+   */
+  appendSystemReminderAndReport(text: string): boolean {
+    if (this.srCountThisTurn >= 1) return false
+    this.srCountThisTurn++
+    const wrapped = wrapSystemReminder(text)
+    const msgs = this.state.oaiMessages
+    const last = msgs[msgs.length - 1]
+    if (last && last.role === 'user' && typeof last.content === 'string') {
+      const oldTokens = estimateOaiMessageTokens(last)
+      const merged = { ...last, content: last.content + '\n' + sanitizeForJsonTransport(wrapped) }
+      msgs[msgs.length - 1] = merged
+      const delta = estimateOaiMessageTokens(merged) - oldTokens
+      this.state.estimatedTokens += delta
+      this.state.tailEstimate += delta
+      this.onMutation?.({ type: 'replace', messages: msgs.slice() })
+      return true
+    }
+    this.addUserMessage(wrapped)
+    return true
   }
 
   /**

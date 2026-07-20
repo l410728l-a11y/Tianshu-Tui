@@ -27,6 +27,9 @@ import { describeIntentNote } from '../agent/intent-preview.js'
 import type { Artifact } from '../artifact/types.js'
 import { ArtifactStore } from '../artifact/store.js'
 import type { OaiMessage } from '../api/oai-types.js'
+import { isAssistantWithTools, oaiMessageText } from '../api/oai-types.js'
+import { loadPersistedResult } from '../agent/coordinator.js'
+import { loadWorkerSession } from '../agent/worker-session-persist.js'
 import type { SessionRegistry } from '../agent/session-registry.js'
 import type { DecisionShift } from '../agent/loop-types.js'
 import type { PlanModeState } from '../agent/plan-mode.js'
@@ -1210,6 +1213,42 @@ export class RuntimeSessionManager {
     return { events, lastSeq: s.seq }
   }
 
+  /**
+   * 失败钻取(W2):单个 worker 的完整日志——活动流(会话 delegation 事件)
+   * + 终态结果(loadPersistedResult)+ 转录尾部(loadWorkerSession,
+   * 与 CLI worker-detail 同源 ~/.rivet/subagents/<orderId>.session.jsonl)。
+   * 返回 undefined = 会话不存在;三段数据均可独立为空(worker 无存档时)。
+   */
+  async getWorkerLog(id: string, workerId: string): Promise<{
+    activity: string[]
+    result: ReturnType<typeof loadPersistedResult>
+    transcript: { role: string; text: string; toolName?: string }[]
+    savedAt: number | null
+  } | undefined> {
+    const s = this.sessions.get(id)
+    if (!s) return undefined
+    // 活动日志:会话事件流中该 worker 的 progressLine / 文本增量 / 状态迁移
+    const { events } = (await this.getEventsAsync(id, 0)) ?? { events: [] as SessionEvent[] }
+    const activity: string[] = []
+    for (const e of events) {
+      if (e.type !== 'delegation') continue
+      if (String(e.data.workOrderId ?? '') !== workerId) continue
+      const line = e.data.progressLine
+        ?? (e.data.eventKind === 'text' ? e.data.eventDetail : undefined)
+        ?? (e.data.status != null ? `status: ${String(e.data.status)}` : undefined)
+      if (typeof line === 'string' && line) activity.push(line.slice(0, 300))
+    }
+    const result = loadPersistedResult(workerId)
+    const record = loadWorkerSession(workerId)
+    const transcript = (record?.messages ?? []).slice(-50).map((m: OaiMessage) => ({
+      role: m.role,
+      // 纯工具调用轮的 assistant.content 为 null——oaiMessageText 此时运行期为 null,必须兜底
+      text: (oaiMessageText(m) ?? '').slice(0, 800),
+      toolName: isAssistantWithTools(m) ? m.tool_calls[0]?.function.name : undefined,
+    }))
+    return { activity: activity.slice(-50), result, transcript, savedAt: record?.savedAt ?? null }
+  }
+
   /** Mark a session's log as most-recently-used in the LRU. */
   private touchLoaded(session: InternalSession): void {
     if (!session.eventsLoaded) return
@@ -1574,6 +1613,9 @@ export class RuntimeSessionManager {
       // (and its full replay/restore) tiny while the model still receives the data
       // URLs inline via agent.run below.
       const imageIds = this.persistImages(id, images)
+      // Snapshot "first user message" BEFORE appending — the auto-title hook
+      // below needs to know whether this run is the conversation opener.
+      const wasFirstUser = !session.events.some((e) => e.type === 'user')
       this.append(session, 'user', {
         text: prompt,
         ...(images?.length
@@ -1582,6 +1624,13 @@ export class RuntimeSessionManager {
       })
       this.append(session, 'status', { status: 'running' })
       this.persistRecord(session)
+      // Auto-generate a session title from the first user message when none is
+      // set. Fire-and-forget — extraction never blocks the main run, and the
+      // hook double-checks `!record.title` after the await so a user who sets a
+      // title manually during the ~1s extraction window is never overwritten.
+      if (wasFirstUser && !session.record.title) {
+        void this.maybeAutoTitle(id, prompt)
+      }
       this.bindPlanModeChange(session, agent, runGeneration)
       const callbacks = this.buildCallbacks(session)
       void agent
@@ -2282,6 +2331,38 @@ export class RuntimeSessionManager {
       if (s) this.append(s, 'goal_state', this.snapshotGoal(tracker) as unknown as Record<string, unknown>)
     } catch {
       // non-fatal — tracker keeps its generic default criteria
+    }
+  }
+
+  /**
+   * Auto-generate a session title from the first user message via the cheap
+   * model profile (mirrors extractCriteria's side-path pattern). Fail-open:
+   * any error or missing config leaves the title unset, the UI falls back to
+   * sessionId.slice(0, 8). Double-checks `!record.title` after the await so a
+   * user who set a title manually during extraction is never overwritten.
+   */
+  private async maybeAutoTitle(id: string, firstMessage: string): Promise<void> {
+    const handles = this.resolveGoalHandles?.(id)
+    if (!handles) return
+    try {
+      const { extractSessionTitle } = await import('../agent/title-extract.js')
+      const { completionFromClient, buildCheapClient } = await import('../agent/goal-criteria.js')
+      if (!handles.cheapProfile || !handles.allProviders) return
+      const cheap = buildCheapClient(
+        handles.cheapProfile,
+        handles.allProviders as Parameters<typeof buildCheapClient>[1],
+      )
+      if (!cheap) return // provider not configured or no API key — leave title unset
+      const title = await extractSessionTitle(
+        firstMessage,
+        completionFromClient(cheap.client, cheap.model, 256),
+      )
+      const s = this.sessions.get(id)
+      if (s && title && !s.record.title) {
+        this.setTitle(id, title)
+      }
+    } catch {
+      // non-fatal — title stays unset, UI keeps sessionId-slice fallback
     }
   }
 

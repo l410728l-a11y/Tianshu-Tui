@@ -43,7 +43,7 @@ export function renderCockpit(snapshot: CockpitSnapshot, width: number, height: 
 
   const body: string[] = []
 
-  // Panel rail — 显示可切换的子面板，当前面板高亮（/cockpit <panel> 切换）。
+  // Panel rail — 显示可切换的子面板，当前面板高亮（←/→/Tab 或 /cockpit <panel> 切换）。
   const rail = PANELS.map(p => p === panel
     ? color(`[${PANEL_LABELS[p]}]`, theme.primary, { bold: true })
     : color(` ${PANEL_LABELS[p]} `, theme.dim)).join('')
@@ -138,8 +138,8 @@ export function renderCockpit(snapshot: CockpitSnapshot, width: number, height: 
   }
 
   const footer = panel === 'summary'
-    ? 'q 关闭   ·   /cockpit <面板> 聚焦'
-    : `${PANEL_LABELS[panel]}   ·   /cockpit summary 看全部   ·   q 关闭`
+    ? '←/→ 切换面板   ·   q 关闭'
+    : `${PANEL_LABELS[panel]}   ·   ←/→ 切换面板   ·   /cockpit summary 看全部   ·   q 关闭`
 
   const lines: string[] = [
     frameTop(width, theme, 'subtle'),

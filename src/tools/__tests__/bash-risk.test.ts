@@ -134,4 +134,45 @@ describe('bash tool requiresApproval', () => {
       false,
     )
   })
+
+  // P2: panic-chain accident — git checkout -- / restore / stash (destructive) now require approval
+  it('flags git checkout -- (discard working-tree)', async () => {
+    const tool = await getBashTool()
+    assert.equal(
+      tool.requiresApproval!({ toolUseId: 't1', cwd: '/repo', input: { command: 'git checkout -- .' } }),
+      true,
+    )
+  })
+
+  it('flags git restore (discard changes)', async () => {
+    const tool = await getBashTool()
+    assert.equal(
+      tool.requiresApproval!({ toolUseId: 't1', cwd: '/repo', input: { command: 'git restore src/file.ts' } }),
+      true,
+    )
+  })
+
+  it('flags git stash without safe subcommand (destructive clear)', async () => {
+    const tool = await getBashTool()
+    assert.equal(
+      tool.requiresApproval!({ toolUseId: 't1', cwd: '/repo', input: { command: 'git stash' } }),
+      true,
+    )
+  })
+
+  it('allows git stash pop (safe restore)', async () => {
+    const tool = await getBashTool()
+    assert.equal(
+      tool.requiresApproval!({ toolUseId: 't1', cwd: '/repo', input: { command: 'git stash pop' } }),
+      false,
+    )
+  })
+
+  it('allows git stash list (safe read-only)', async () => {
+    const tool = await getBashTool()
+    assert.equal(
+      tool.requiresApproval!({ toolUseId: 't1', cwd: '/repo', input: { command: 'git stash list' } }),
+      false,
+    )
+  })
 })

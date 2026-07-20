@@ -41,7 +41,6 @@ import { recordAutoReviewRun } from './review-health.js'
 import { detectWroteButNeverRead, formatWroteButNeverRead, detectReadButNeverProduced, formatReadButNeverProduced } from './wiring-nudge.js'
 import { readUnacknowledged, acknowledgeAll, type RecoveryEntry } from './recovery-journal.js'
 import { analyzeImpact } from '../repo/meridian-impact.js'
-import { runChangedFilesTypecheckMemo, runDeclaredCheck, runVerifyRoutes, typecheckGateEnabled } from './typecheck-gate.js'
 import { evaluateTestPresence, testPresenceGateEnabled } from './test-presence.js'
 import { auditDeliveryClaims, claimAuditEnabled } from './claim-audit.js'
 import { scanFilesForProbes, formatProbeHits, type ProbeHit } from './probe-detector.js'
@@ -1002,65 +1001,6 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           ...(mechanicalClass ? { changeClass: mechanicalClass } : {}),
         }
 
-        // Typecheck backstop (Component B) — run a scoped tsc on the changed
-        // files; a real type error that tests/esbuild missed escalates review to
-        // L3 and is surfaced FIRST in focusHint (more urgent than blast radius).
-        // Advisory: wrapped so it never blocks the commit (already landed) or
-        // deliver_task. ctx.typecheckRunner is undefined in prod → real tsc.
-        // Covers both scoped errors (in changed files) and cross-file drift
-        // (new errors in non-changed files from definition changes) — the
-        // latter is the "24-error class" that scoped-only filtering missed.
-        if (typecheckGateEnabled()) {
-          try {
-            const tc = await runChangedFilesTypecheckMemo(params.cwd, change.files, ctx.typecheckRunner)
-            if (tc) {
-              change.forceLevel = 'L3'
-              const note = `Typecheck — ${tc.summary}`
-              change.focusHint = change.focusHint ? `${note} | ${change.focusHint}` : note
-            } else {
-              // A2: non-TS projects — run the declared verify.typecheck/build
-              // (from .rivet-config.json) at pass/fail granularity. Only fires
-              // when no changed file is .ts/.tsx (runDeclaredCheck guards this),
-              // so TS projects pay nothing extra.
-              const dc = await runDeclaredCheck(params.cwd, change.files, ctx.declaredCheckRunner)
-              if (dc) {
-                change.forceLevel = 'L3'
-                const note = `Declared ${dc.kind} — ${dc.summary}`
-                change.focusHint = change.focusHint ? `${note} | ${change.focusHint}` : note
-                // Record the failure as real verification evidence so the NEXT
-                // deliver attempt's gate assesses RED (owned verification failed)
-                // instead of only escalating this review — the declared check is
-                // the project's own build/typecheck, a broken one must block
-                // re-delivery until fixed.
-                ctx.taskLedger.record({
-                  type: 'verification',
-                  command: dc.command.slice(0, 200),
-                  status: 'failed',
-                  meta: { scope: 'full', declared: true, kind: dc.kind },
-                })
-              }
-            }
-            // A3: path-routed verify commands — sub-projects the root tsc
-            // cannot see (desktop/ has its own tsconfig). Runs regardless of
-            // the tsc/declared outcome; failures escalate and record evidence
-            // the same way as the declared-check backstop above.
-            const rr = await runVerifyRoutes(params.cwd, change.files, ctx.declaredCheckRunner)
-            if (rr) {
-              change.forceLevel = 'L3'
-              const note = `Verify routes — ${rr.summary}`
-              change.focusHint = change.focusHint ? `${note} | ${change.focusHint}` : note
-              for (const f of rr.failures) {
-                ctx.taskLedger.record({
-                  type: 'verification',
-                  command: f.command.slice(0, 200),
-                  status: 'failed',
-                  meta: { scope: 'full', declared: true, kind: f.kind, route: f.match },
-                })
-              }
-            }
-          } catch { /* advisory: typecheck gate must never fail delivery */ }
-        }
-
         // Inject meridian blast radius into focusHint so verifier/inspector
         // know which downstream consumers to verify. Absolute paths filtered
         // (repo-relative LIKE silently returns empty on absolute paths).
@@ -1322,16 +1262,16 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                     })
                   }
 
+                  const commitRef = headAfterHash ?? 'HEAD'
+
                   if (explicitReviewLevel) {
+                    // Explicit review_level (补丁 1 方案 A): unified with
+                    // system-triggered path — review runs detached so it never
+                    // blocks the commit return. Verdict flows through
+                    // post-commit-review-queue → AdvisoryBus in a later turn.
                     lastPostCommitReviewAt = Date.now()
-                    // Explicit review_level: the caller asked for review — the
-                    // verdict belongs in this tool result, so wait for it.
-                    params.onOutput?.(`\n⏳ 提交后审查启动中 (${reviewMode} ${explicitReviewLevel}, ≤${budgetSec}s)...\n`)
-                    const outcome = await runReviewOnce(reviewChange, reviewMode, REVIEW_TIMEOUT_MS, reviewAbort)
-                    const outcomeLines = formatReviewOutcomeLines(outcome)
-                    if (outcomeLines.length > 0) lines.push('', ...outcomeLines)
-                    // 同步路径同样补真实审查 worker 终态（泄漏修复）。
-                    settleReviewWorkers(outcome)
+                    launchDetached(reviewChange, reviewMode, String(commitRef))
+                    lines.push('', `⏳ 提交后审查已转后台 (${reviewMode} ${explicitReviewLevel}, ≤${budgetSec}s)——审查结论将通过 system 通道注入后续对话，本次交付不等待。`)
                   } else {
                     // System-triggered review (auto wiring inspector / typecheck-
                     // escalated L3 / goal-achieved L3): detach. The 240s-timeout
@@ -1341,7 +1281,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                     // landed, so the main loop must not stall on it. Outcome
                     // flows through post-commit-review-queue → runtime hook →
                     // AdvisoryBus into a later turn.
-                    const commitRef = headAfterHash ?? 'HEAD'
+                    lastPostCommitReviewAt = Date.now()
                     launchDetached(reviewChange, reviewMode, String(commitRef))
                     lines.push('', `⏳ 提交后审查已转后台 (${reviewMode}${reviewChange.forceLevel ? ' ' + reviewChange.forceLevel : ''}, ≤${budgetSec}s)——进度见子代理面板，结论将以 system 通道注入后续对话并汇总到面板，本次交付不等待。`)
                   }
@@ -1364,33 +1304,35 @@ For complex specs or cross-module integration, include checklist entries: fact-f
       }
 
       // ── 虚空仓库 P0: learned 收割 → memory.jsonl 直写 ──────────────────
-      // appendMemoryEntry 自动生成 id/ts/repeatCount 并走共享锁协议；不经
-      // essence-gate——agent 交付时标记的知识，"agent 觉得重要"即裁决。
+      // 改为 fire-and-forget：不阻塞 commit 返回。I/O 失败由 .catch 防御，
+      // 不崩进程（unhandled rejection guard）。
       // 只在成功路径执行（错误分支已早退，交付被拦时不收割）。
-      try {
-        const entries = parseLearnedEntries(params.input.learned)
-        let written = 0
-        for (const lp of entries) {
-          // 写前相似去重：上一次 learned 重提 / 第四层 PAL 自动收割同结论 → 跳过
-          if (countSimilarMemoryEntries(params.cwd, lp.text) > 0) continue
-          appendMemoryEntry(params.cwd, {
-            text: lp.text,
-            kind: 'verified_pattern',
-            confidence: 0.95,
-            source: 'agent-crafted',
-            status: 'verified',
-            evidence: lp.evidence || undefined,
-            sessionId: ctx.sessionId,
-            tags: lp.tags,
-            transferableTo: ['all'],
-            topic: lp.topic,
-          })
-          written++
+      setImmediate(() => {
+        try {
+          const entries = parseLearnedEntries(params.input.learned)
+          let written = 0
+          for (const lp of entries) {
+            // 写前相似去重：上一次 learned 重提 / 第四层 PAL 自动收割同结论 → 跳过
+            if (countSimilarMemoryEntries(params.cwd, lp.text) > 0) continue
+            appendMemoryEntry(params.cwd, {
+              text: lp.text,
+              kind: 'verified_pattern',
+              confidence: 0.95,
+              source: 'agent-crafted',
+              status: 'verified',
+              evidence: lp.evidence || undefined,
+              sessionId: ctx.sessionId,
+              tags: lp.tags,
+              transferableTo: ['all'],
+              topic: lp.topic,
+            })
+            written++
+          }
+          // Fire-and-forget: no lines.push — the return has already been sent.
+        } catch {
+          // 收割失败绝不阻断交付；.catch 防止 unhandled rejection
         }
-        if (written > 0) lines.push('', `🧠 虚空仓库：已收割 ${written} 条知识，下次会话自动可用。`)
-      } catch {
-        // 收割失败绝不阻断交付
-      }
+      })
 
       return { content: lines.join('\n') }
     },
@@ -1402,23 +1344,12 @@ For complex specs or cross-module integration, include checklist entries: fact-f
     isConcurrencySafe: () => true,
     isEnabled: () => true,
 
-    // Budget arithmetic (2026-07-07 事故链修复): the pipeline timeout must
-    // DOMINATE the sum of every internal stage budget — racing them was the
-    // 240s mid-flight kill that swallowed "commit landed" and drove models to
-    // bypass deliver_task for raw git commit.
-    // Stages inside a commit=true call:
-    //   typecheck backstop  ≤120s (lsp/client runTypeCheck default)
-    //   declared check      ≤120s (non-TS projects, disjoint with tsc path)
-    //   scoped commit/gates  seconds
-    //   review              awaited ONLY for explicit review_level (manual);
-    //                       system-triggered review is detached (zero wait).
+    // Budget: typecheck and review are now agent-owned steps (run before
+    // calling deliver_task), not internal stages. commit=false is a fast
+    // ownership query; commit=true does file I/O + git.
     timeoutMs: (params) => {
-      const TYPECHECK_STAGE_MS = 120_000
-      const GRACE_MS = 60_000
-      if (params?.input?.commit !== true) return 120_000
-      const level = params.input.review_level as ReviewScale | undefined
-      const reviewWait = level ? reviewWorkflowBudgetMs('manual', level) : 0
-      return reviewWait + TYPECHECK_STAGE_MS + GRACE_MS
+      if (params?.input?.commit !== true) return 30_000   // 门禁查询：ownership + cohesion + claim audit
+      return 60_000                                        // commit：文件读写 + git 操作
     },
   }
 }

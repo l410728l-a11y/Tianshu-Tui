@@ -64,7 +64,7 @@ describe('AdvisoryBus tone adapter integration', () => {
     bus.render()
     const reminders = bus.drainSystemReminders()
     assert.equal(reminders.length, 1)
-    assert.ok(reminders[0]!.includes('供你称量'))
+    assert.ok(reminders[0]!.content.includes('供你称量'))
   })
 
   it('does not double-wrap TTL-carried entries across renders', () => {

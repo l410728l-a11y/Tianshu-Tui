@@ -195,7 +195,10 @@ export const DEFAULT_CONFIG: Config = {
     showHitRate: true,
   },
   search: {
-    backends: ['duckduckgo'],
+    // bing first: cn.bing.com is China-reachable with no API key and returns
+    // direct URLs. duckduckgo is the offshore fallback. Users on either side
+    // of the GFW get at least one working backend without touching config.
+    backends: ['bing', 'duckduckgo'],
     braveApiKeyEnv: 'BRAVE_API_KEY',
     tavilyApiKeyEnv: 'TAVILY_API_KEY',
     timeoutMs: 15_000,

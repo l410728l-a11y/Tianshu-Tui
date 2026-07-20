@@ -48,6 +48,16 @@ describe('readFilePayload', () => {
     assert.ok(payload.rawContent.includes('正文内容'))
   })
 
+  it('allows reading gitignored files under docs/superpowers/ (design docs)', async () => {
+    // Session 5268cce4: specs are gitignored but are critical design documents.
+    // Blocking reads on them forces the agent to use bash workarounds.
+    writeFileSync(join(dir, '.gitignore'), 'docs/superpowers/specs/*.md\n', 'utf-8')
+    mkdirSync(join(dir, 'docs/superpowers/specs'), { recursive: true })
+    writeFileSync(join(dir, 'docs/superpowers/specs/analysis.md'), '# Analysis\n根因分析。\n', 'utf-8')
+    const payload = await readFilePayload(dir, { filePath: 'docs/superpowers/specs/analysis.md' })
+    assert.ok(payload.rawContent.includes('根因分析'))
+  })
+
   it('returns canonical path and truncated model content for large files', async () => {
     mkdirSync(join(dir, 'src'), { recursive: true })
     const long = 'a'.repeat(12_000)

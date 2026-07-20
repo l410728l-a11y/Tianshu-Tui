@@ -188,7 +188,7 @@ describe('createCoordinatorReviewDeps', () => {
     assert.deepEqual(result.infraFailures, [])
   })
 
-  it('spawns the auto wiring reviewer as two parallel short-budget inspectors (Wiring + Silence)', async () => {
+  it('spawns the auto wiring reviewer as two parallel inspectors (Wiring + Silence, 12 轮/240s 预算)', async () => {
     const requests: DelegationRequest[] = []
     const coordinator: ReviewCoordinator = {
       delegate: async request => {
@@ -215,11 +215,11 @@ describe('createCoordinatorReviewDeps', () => {
     assert.equal(requests.length, 2, 'auto review spawns 2 inspectors (Wiring + Silence)')
     assert.equal(requests[0]?.profile, 'reviewer')
     assert.equal(requests[0]?.kind, 'review')
-    assert.equal(requests[0]?.budget?.timeoutMs, 150_000)
-    assert.equal(requests[0]?.budget?.maxTurns, 6)
+    assert.equal(requests[0]?.budget?.timeoutMs, 240_000)
+    assert.equal(requests[0]?.budget?.maxTurns, 12)
     assert.match(requests[0]?.objective ?? '', /^Wiring Inspector:/m)
-    assert.match(requests[0]?.objective ?? '', /Time budget is tight/)
-    assert.match(requests[0]?.objective ?? '', /review the DIFF/)
+    assert.match(requests[0]?.objective ?? '', /预算约束\(12 轮\/240s\)/)
+    assert.match(requests[0]?.objective ?? '', /best-effort 结论优于无结论/)
     assert.match(requests[1]?.objective ?? '', /^Silence Inspector:/m)
     assert.ok(result.findings.length >= 0)
   })
@@ -272,5 +272,35 @@ describe('createCoordinatorReviewDeps', () => {
     const deps = createCoordinatorReviewDeps(coordinator)
     await deps.spawnVerifier({ files: ['src/a.ts'], crossModule: false, isFix: true })
     assert.equal(captured !== undefined && 'onActivity' in captured, false)
+  })
+})
+
+describe('classifyInfraFailure 的 budget kind（max-turns 耗尽 ≠ 瞬时故障）', () => {
+  it('max-turns 耗尽归类为 budget（供重试分流，不与 worker 崩溃混淆）', async () => {
+    const coordinator: ReviewCoordinator = {
+      delegate: async () => run([]),
+      delegateBatch: async () => run([worker({
+        status: 'failed',
+        summary: 'max-turns: exhausted without a final turn',
+        evidenceStatus: 'skipped',
+      })]),
+    }
+    const deps = createCoordinatorReviewDeps(coordinator)
+    const result = await deps.spawnWiringReviewer!({ files: ['src/agent/loop.ts'], crossModule: false, isFix: false })
+    assert.equal(result.infraFailures?.[0]?.kind, 'budget')
+  })
+
+  it('普通崩溃仍归类为 worker（瞬时可重试）', async () => {
+    const coordinator: ReviewCoordinator = {
+      delegate: async () => run([]),
+      delegateBatch: async () => run([worker({
+        status: 'failed',
+        summary: 'worker process exited with code 1',
+        evidenceStatus: 'skipped',
+      })]),
+    }
+    const deps = createCoordinatorReviewDeps(coordinator)
+    const result = await deps.spawnWiringReviewer!({ files: ['src/agent/loop.ts'], crossModule: false, isFix: false })
+    assert.equal(result.infraFailures?.[0]?.kind, 'worker')
   })
 })

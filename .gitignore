@@ -33,9 +33,10 @@ desktop/scripts/perf-*.ts
 scripts/summarize-*.ts
 scripts/swebench-*.sh
 # 自动生成的计划、研究与设计草稿
-.rivet/plans/*.md
+# (已移除 .rivet/plans/*.md 和 docs/superpowers/specs/*.md 的 ignore——
+#  这些是 agent 的设计知识资产，gitignore 会导致 read_file 工具拒绝读取，
+#  迫使 agent 用 bash 绕路。源码层面已同步修复 read-file.ts 的豁免逻辑。)
 docs/research/*.md
-docs/superpowers/specs/*.md
 .rivet/sensorium.jsonl
 .rivet/pheromones.json
 .rivet/debug-400.json

@@ -1,0 +1,26 @@
+{
+  "name": "office-ppt",
+  "version": "1.1.0",
+  "description": "Native .pptx generation + reading via pptxgenjs/jszip — replaces HTML .ppt fallback",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "tianshu": {
+    "name": "office-ppt",
+    "version": "1.1.0",
+    "description": "Native .pptx generation (themes, charts, speaker notes) + .pptx text extraction — title slides, content slides, text + image layouts",
+    "entry": "index.js",
+    "tools": [
+      { "name": "pptx_create", "description": "Generate a real .pptx file from slide definitions (theme, chart, speaker notes)" },
+      { "name": "pptx_read", "description": "Extract slide text (+ optional speaker notes) from a .pptx as markdown" }
+    ],
+    "skills": ["skills"],
+    "permissions": { "fs": true }
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "pptxgenjs": "^3.12.0"
+  }
+}

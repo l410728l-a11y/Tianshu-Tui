@@ -1027,7 +1027,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
       const cmd = parts[0]!.toLowerCase()
-      pushStatic(createLogEntry({ type: 'system', content: '模式已由消息内容自动检测，无需手动切换。任务脚手架在有明确意图时自动开启。' }))
+      pushStatic(createLogEntry({ type: 'system', content: '模式已由消息内容自动检测，无需手动切换。任务脚手架在有明确意图时自动开启。子代理任务面板（查看/管理 worker）请用 /tasks。' }))
       setIsStreaming(false)
       return true
     },

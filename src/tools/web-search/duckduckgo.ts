@@ -43,11 +43,20 @@ function stripHtml(text: string): string {
  * `&amp;#x27;` decodes to the literal `&#x27;`, never double-decoded to `'`.
  */
 export function decodeHtmlEntities(text: string): string {
-  return text.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos|#39);/g, (m, e: string) => {
+  return text.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos|#39|nbsp|ensp|emsp|thinsp|rsaquo|lsaquo);/g, (m, e: string) => {
     switch (e) {
       case 'amp': return '&'
       case 'lt': return '<'
       case 'gt': return '>'
+      case 'quot': return '"'
+      case 'apos':
+      case '#39': return "'"
+      case 'nbsp': return '\u00A0'
+      case 'ensp': return '\u2002'
+      case 'emsp': return '\u2003'
+      case 'thinsp': return '\u2009'
+      case 'rsaquo': return '\u203A'
+      case 'lsaquo': return '\u2039'
       case 'quot': return '"'
       case 'apos':
       case '#39': return "'"

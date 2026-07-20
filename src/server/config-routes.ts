@@ -48,6 +48,10 @@ import {
   setPermissionDirs,
   getVisionModelConfig,
   setVisionModelConfig,
+  getFetchConfig,
+  setFetchConfig,
+  getSearchConfig,
+  setSearchConfig,
 } from '../config/manager.js'
 import { applyConfiguredPathGrants } from '../tools/path-grants.js'
 import { expandHome } from '../platform.js'
@@ -362,6 +366,42 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
       try {
         return { status: 200, body: { ok: true, ...setNetworkConfig({ proxy, noProxy }) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // web_fetch timeout / UA / maxResponseBytes / extractMainContent.
+    // Takes effect on the next sidecar start (bootstrap.ts → buildFetchOptions).
+    'GET /config/fetch': withAuth(() => {
+      return { status: 200, body: getFetchConfig() }
+    }, apiToken),
+
+    'PUT /config/fetch': withAuth((body) => {
+      const input = (body ?? {}) as Record<string, unknown>
+      if (Object.keys(input).length === 0) {
+        return { status: 400, body: { error: 'at least one field is required' } }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setFetchConfig(input) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // web_search backends / timeout / region.
+    // Takes effect on the next sidecar start (bootstrap.ts → buildSearchBackends).
+    'GET /config/search': withAuth(() => {
+      return { status: 200, body: getSearchConfig() }
+    }, apiToken),
+
+    'PUT /config/search': withAuth((body) => {
+      const input = (body ?? {}) as Record<string, unknown>
+      if (Object.keys(input).length === 0) {
+        return { status: 400, body: { error: 'at least one field is required' } }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setSearchConfig(input) } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }

@@ -93,6 +93,12 @@ export interface ConvergenceInput {
    *  aborts: the model must have been warned before we conclude it ignored
    *  the guidance. */
   priorWarningAtL2Plus?: boolean
+  /**
+   * W4 噪音洪流修复：最近工具调用中 status='failed' 的占比 [0, 1]。
+   * ≥ 0.4 时判定 agent 遭遇工具错误受阻（如 gitignore 拒绝读取），
+   * 此时收敛 score 降级——agent 在绕工具 bug 不是 doom-loop。
+   * 缺席时走旧行为（向后兼容）。由 loop.ts runConvergenceCheck 计算。 */
+  recentToolErrorRatio?: number
 }
 
 /** W3（incident 20b9714e）：会话活动模式。diagnostic = 近窗口以只读工具为主
@@ -1050,6 +1056,14 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
 
   const score = computeConvergenceScore(signals, weights, input.phaseClass, input.noToolTurnCount ?? 0, input.turn, input.recentToolHistory, input.providerName, signalsMissingData, producingReport, windowSize)
 
+  // W4 噪音洪流修复：工具错误受阻时降级收敛 score。最近窗口中 ≥40% 的
+  // 工具返回 failed → agent 很可能在与坏掉的工具搏斗而非 doom-loop。
+  // 降一档（cap 在 L1-Mid）——不完全抑制（仍有真实卡住的可能性），但
+  // 从 L2+ 降下来足以切断 advisory → system-reminder 的正反馈洪流。
+  const effectiveScore = (input.recentToolErrorRatio ?? 0) >= 0.4
+    ? Math.min(score, 0.41) // cap 仅允许 L1，阻断 L2+ 的正反馈洪流
+    : score
+
   // Determine escalation level
   let level: 0 | 1 | 2 | 3 = 0
   const turn = input.turn
@@ -1121,11 +1135,11 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     level = 2 // kick on 3+ consecutive no-tool turns
   } else if (noToolCount >= 2 && turn >= 4) {
     level = 2 // kick after 2 no-tool turns if we're past the very early turns
-  } else if (turn >= tier.nHigh && score <= 0.2) {
+  } else if (turn >= tier.nHigh && effectiveScore <= 0.2) {
     level = 3
-  } else if (turn >= tier.nMid && score <= 0.4) {
+  } else if (turn >= tier.nMid && effectiveScore <= 0.4) {
     level = 2
-  } else if (turn >= tier.nLow && score <= 0.6) {
+  } else if (turn >= tier.nLow && effectiveScore <= 0.6) {
     level = 1
   }
 

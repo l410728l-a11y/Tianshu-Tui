@@ -31,6 +31,11 @@ export interface TaskListOptions {
    *  三个调用方（主区 live、side panel）都采用 compact 标题，故默认与之对齐；
    *  需要进度条的调用方显式传 true。 */
   showProgressBar?: boolean
+  /** 展开态：原序全量渲染（completed 也逐条 ☒ dim），不再折叠为 `✓ N done`
+   *  摘要；调用方应同时调高 maxRows（12-15）。 */
+  expanded?: boolean
+  /** 展开态末尾的 dim 键位提示（如 "ctrl+x t 收起"）；仅 expanded 时渲染。 */
+  expandHint?: string
 }
 
 /**
@@ -116,6 +121,27 @@ export function formatTaskList(items: TodoItem[], theme: RivetTheme, opts: TaskL
     ? `◇ 任务 [${progressBar(done, items.length)}] ${done}/${items.length}`
     : `◇ 任务 (${done}/${items.length})`
   lines.push(color(header, theme.secondary, { bold: true }))
+
+  // 展开态（ctrl+x t 切换）：原序全量渲染——completed 逐条 ☒ dim 可回看，
+  // 不再折叠为摘要；超预算才 +N more；末尾附 dim 键位提示。
+  if (opts.expanded) {
+    const hint = opts.expandHint
+    const rowBudget = maxRows - 1 - (hint ? 1 : 0)
+    let visibleCount = items.length
+    let hasOverflow = false
+    if (items.length > rowBudget) {
+      visibleCount = Math.max(0, rowBudget - 1) // 留 1 行给 +N more
+      hasOverflow = true
+    }
+    for (let i = 0; i < visibleCount; i++) {
+      lines.push(renderLine(items[i]!, theme, maxContentWidth))
+    }
+    if (hasOverflow) {
+      lines.push(color(`  +${items.length - visibleCount} more`, theme.muted))
+    }
+    if (hint) lines.push(color(`  ⎿ ${hint}`, theme.dim))
+    return lines
+  }
 
   // 预算：标题已占 1 行，完成摘要占 1 行（当有完成项时）
   let budget = maxRows - 1 // 去掉标题

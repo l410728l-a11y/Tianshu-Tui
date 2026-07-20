@@ -348,6 +348,8 @@ export interface ToolPipelineDeps {
   assessDelivery?: (dirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
   /** 主动 plan mode：plan action=enter_mode → AgentLoop.enterPlanMode（仅主控有）。 */
   enterPlanMode?: () => { activePlanFilePath: string | null; alreadyPlanning: boolean }
+  /** 闭环自动退出：plan action=close 标记 EXECUTED 后 → AgentLoop.exitPlanMode（仅主控有）。 */
+  exitPlanMode?: () => void
   /** Real verification records for this session (evidence-gated plan closure). */
   getVerificationEvidence?: () => import('./evidence.js').VerificationSummary
   /** Called when the model explicitly loads a skill via the skill tool. */
@@ -733,6 +735,7 @@ export async function executeToolUse(
     onAskUserQuestion: deps.onAskUserQuestion,
     assessDelivery: deps.assessDelivery,
     enterPlanMode: deps.enterPlanMode,
+    exitPlanMode: deps.exitPlanMode,
     getVerificationEvidence: deps.getVerificationEvidence,
     onSkillInvoked: deps.onSkillInvoked,
     onSkillCompleted: deps.onSkillCompleted,

@@ -157,12 +157,17 @@ describe('Phase 2 通道分级', () => {
     assert.ok(!block.includes('清场守护'), 'SR 条目不进 XML 块')
     const srs = bus.drainSystemReminders()
     assert.equal(srs.length, 1)
-    assert.ok(srs[0]!.includes('清场守护'))
+    assert.ok(srs[0]!.content.includes('清场守护'))
     assert.equal(bus.drainSystemReminders().length, 0, 'drain 后清空')
 
-    // 送达追踪覆盖 SR 通道（核销闭环不因通道不同而断）
-    const delivered = bus.drainDelivered()
-    assert.ok(delivered.some(d => d.key === 'git-clear-after-fail' && d.expect))
+    // Wave 1 SR 账本修正：render 后 SR 不预进 delivered，需 confirmSrDelivered 回调
+    let delivered = bus.drainDelivered()
+    assert.ok(!delivered.some(d => d.key === 'git-clear-after-fail'),
+      'Wave 1: SR not in delivered before confirm callback')
+    bus.confirmSrDelivered(srs[0]!.key)
+    delivered = bus.drainDelivered()
+    assert.ok(delivered.some(d => d.key === 'git-clear-after-fail' && d.expect),
+      'Wave 1: SR in delivered after confirm callback')
   })
 
   it('status 通道:有 sink 时分流,无 sink 时回退 bus(不静默消失)', () => {

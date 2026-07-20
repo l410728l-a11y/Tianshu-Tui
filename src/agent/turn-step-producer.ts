@@ -660,9 +660,16 @@ export class TurnStepProducer {
     // 缓存安全:只追加尾部）。目前仅 git-clear 等 immediate 守护使用。
     // W2-B1: K1 append-only — each drained SR charges its bytes exactly once
     // at the moment it is committed to the session tail.
-    for (const sr of this.self.advisoryBus.drainSystemReminders()) {
-      this.self.session.appendSystemReminder(sr)
-      this.self.pressureMonitor.recordCvmInjection(Math.ceil(sr.length / 4), 'system-reminder')
+    // Wave 1 SR 账本修正：回调确认送达/丢弃，避免 SessionContext cap
+    // 拦截的条目仍被计入 rendered/delivered（采纳率分母污染）。
+    for (const { key, content } of this.self.advisoryBus.drainSystemReminders()) {
+      const ok = this.self.session.appendSystemReminderAndReport(content)
+      if (ok) {
+        this.self.advisoryBus.confirmSrDelivered(key)
+      } else {
+        this.self.advisoryBus.confirmSrDropped(key)
+      }
+      this.self.pressureMonitor.recordCvmInjection(Math.ceil(content.length / 4), 'system-reminder')
     }
 
     // P1a 核销闭环：把本轮实际送达的条目（含 expect 谓词）交给 readback 跟踪。
@@ -748,6 +755,8 @@ export class TurnStepProducer {
           rendered: this.self.guardianActivity.advisoriesRendered,
           dropped: this.self.guardianActivity.advisoriesDropped,
           adopted: this.self.guardianActivity.advisoriesAdopted,
+          srSubmitted: this.self.guardianActivity.advisoriesSrSubmitted,
+          srDropped: this.self.guardianActivity.advisoriesSrDropped,
         },
       })
     }

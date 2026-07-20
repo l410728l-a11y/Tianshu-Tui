@@ -162,6 +162,10 @@ export interface TurnOrchestratorDeps {
   removeLastMessage: () => void
   addUserMessage: (content: string) => void
   appendSystemReminder: (content: string) => void
+  /** W3 SR 计数器每轮重置（设计本意"由 AgentLoop 调用"——此前生产从未调用，
+   *  导致首轮 SR 后 srCountThisTurn 恒 ≥1,后续所有 reminder 被静默丢弃,
+   *  而账本仍计 delivered——审查 CRITICAL 发现的根因修复）。 */
+  resetSrCount: () => void
   addAssistantBlocks: (blocks: import('../api/types.js').ContentBlock[]) => void
   addUsage: (usage: { output_tokens: number }) => void
   getEstimatedTokens: () => number
@@ -434,6 +438,20 @@ export class TurnOrchestrator {
     for (let turn = 0; turn < effectiveLimit; turn++) {
         this.deps.state.thetaRequestsThisTurn = 0
         this.deps.state.runLoopTurn = turn
+        // 轮次预算硬预警:最后一个可用轮注入「最终轮」指令——禁止新工具链,
+        // 立即用已有证据产出最终答复(worker:WorkerResult JSON 契约)。
+        // 结构性缓解 max-turns 耗尽事故:此前模型在最后一轮仍起工具调用,
+        // 被守卫斩杀时一句结论都没留下(审查 worker 反复 "exhausted without
+        // a final turn" 的根因——prompt 级收敛提示不足以约束探索欲)。
+        if (maxTurns > 0 && turn === effectiveLimit - 1) {
+          // 本警告必须送达:仅这一轮重置 SR 计数——W3 噪音防护是「每用户轮
+          // 只放行 1 条 SR」,探索期已消耗的额度会让本警告被静默丢弃。
+          // 不做每轮重置(那会重新打开噪音洪流)。
+          this.deps.resetSrCount()
+          this.deps.appendSystemReminder(
+            `<system-reminder>[turn budget] This is your FINAL turn — the turn budget (${maxTurns}) is exhausted after this turn. Do NOT start new tool-call chains. Based on the evidence you already have, emit your final answer/report immediately (workers: emit the WorkerResult JSON contract now, best-effort with what you have).</system-reminder>`,
+          )
+        }
         // Sync plan-mode state into config so tool-pipeline gate reads it
         this.deps.syncPlanModeToConfig()
         const signal = this.deps.getAbortSignal()

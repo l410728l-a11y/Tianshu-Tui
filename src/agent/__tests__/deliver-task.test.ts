@@ -603,7 +603,7 @@ describe('deliver-task — semantic task delivery tool', () => {
     assert.equal(health.consecutiveInfraFailures, 0)
   })
 
-  it('explicit review_level keeps the synchronous path — verdict lands in the tool result', async () => {
+  it('explicit review_level runs detached — verdict enqueued, not in tool result', async () => {
     const { tool, params } = makeContext({
       taskId: 't1',
       ownedFiles: ['src/a.ts'],
@@ -617,10 +617,12 @@ describe('deliver-task — semantic task delivery tool', () => {
     const result = await tool.execute({ ...params, input: { commit: true, message: 'fix: scoped delivery', review_level: 'L2' } })
 
     assert.equal(result.isError ?? false, false)
-    assert.match(result.content, /审查通过 \(L2\)/, 'explicit review verdict must be in the tool result')
-    assert.doesNotMatch(result.content, /提交后审查已转后台/)
+    assert.match(result.content, /提交后审查已转后台/, 'explicit review must be detached now')
+    assert.doesNotMatch(result.content, /审查通过 \(L2\)/, 'verdict must NOT be in the tool result')
     await settleDetachedReview()
-    assert.equal(consumePostCommitReviewOutcomes().length, 0, 'sync path must not enqueue')
+    const outcomes = consumePostCommitReviewOutcomes()
+    assert.equal(outcomes.length, 1, 'detached path must enqueue')
+    assert.ok(outcomes[0]!.lines.some(l => /审查通过 \(L2\)/.test(l)), 'verdict must land in post-commit queue')
   })
 
   it('detached review outcome carries the commit reference for attribution', async () => {
@@ -722,19 +724,15 @@ describe('deliver-task — semantic task delivery tool', () => {
     }
   })
 
-  it('tool timeout budget dominates internal stage budgets (240s 事故链)', () => {
+  it('tool timeout budget — fast ownership query, no blocking stages', () => {
     const { tool, params } = makeContext({ taskId: 't1', ownedFiles: [] })
     const timeoutMs = tool.timeoutMs!
-    // Readiness check: cheap, no tsc / review stages.
-    assert.equal(timeoutMs({ ...params, input: {} }), 120_000)
-    // Commit without explicit review: typecheck stage (120s) + grace — the
-    // detached review adds ZERO wait, so no review budget is raced in.
-    assert.equal(timeoutMs({ ...params, input: { commit: true } }), 180_000)
-    // Explicit review_level: awaited review budget stacks ON TOP of the
-    // typecheck stage instead of racing it (the old bug: budget 240s < sum
-    // of stages → pipeline killed the tool after the commit had landed).
-    const explicit = timeoutMs({ ...params, input: { commit: true, review_level: 'L2' } })
-    assert.ok(explicit > 180_000, `explicit review budget must exceed commit-only budget, got ${explicit}`)
+    // Readiness check: ownership query, no blocking stages.
+    assert.equal(timeoutMs({ ...params, input: {} }), 30_000)
+    // Commit: file I/O + git, no typecheck/review stages inside.
+    assert.equal(timeoutMs({ ...params, input: { commit: true } }), 60_000)
+    // Explicit review_level no longer adds budget — review is detached.
+    assert.equal(timeoutMs({ ...params, input: { commit: true, review_level: 'L2' } }), 60_000)
   })
 
   it('routes non-fix code commits through ReviewRouter as objective review assistance', async () => {
@@ -906,25 +904,17 @@ describe('deliver-task — semantic task delivery tool', () => {
     assert.deepEqual(routedFiles[1], ['src/a.ts'])
   })
 
-  it('defer records typecheck escalation; final review inherits forceLevel L3', async () => {
+  it('defer records explicit review_level escalation; final review inherits forceLevel L3', async () => {
     let captured: ChangeSet | undefined
     let routeCalls = 0
-    let tcCalls = 0
-    // First commit (defer, src/bad.ts) trips the typecheck backstop; the final
-    // commit (src/good.ts) is clean — L3 must come from the deferred record.
-    const selectiveRunner: import('../typecheck-gate.js').TypecheckRunner = async () => {
-      tcCalls++
-      return tcCalls === 1
-        ? { diagnostics: [{ file: 'src/bad.ts', line: 1, col: 1, severity: 'error', message: 'TS9999: boom' }], formatted: '', ranOk: true }
-        : { diagnostics: [], formatted: '', ranOk: true }
-    }
+    // First commit (defer) defers. Second commit (final) passes explicit
+    // review_level='L3' — forceLevel must be L3 on the routed change.
     const { tool, params } = makeContext({
       taskId: 't1',
-      sessionId: 'sess-defer-tc',
-      ownedFiles: ['src/bad.ts', 'src/good.ts'],
-      dirtyFiles: ['src/bad.ts', 'src/good.ts'],
+      sessionId: 'sess-defer-explicit',
+      ownedFiles: ['src/a.ts', 'src/b.ts'],
+      dirtyFiles: ['src/a.ts', 'src/b.ts'],
       verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
-      typecheckRunner: selectiveRunner,
       routeReviewWorkflow: async change => {
         routeCalls++
         captured = change
@@ -934,17 +924,17 @@ describe('deliver-task — semantic task delivery tool', () => {
       commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
     })
 
-    const d1 = await tool.execute({ ...params, input: { commit: true, message: 'feat: bad step', files: ['src/bad.ts'], review_policy: 'defer' } })
+    const d1 = await tool.execute({ ...params, input: { commit: true, message: 'feat: step 1', files: ['src/a.ts'], review_policy: 'defer' } })
     assert.match(d1.content, /已延迟（review_policy=defer）/)
-    // NB: assert against the call counter, never `captured === undefined` —
-    // aliased-condition narrowing would pin `captured` to undefined (→ never).
-    assert.equal(routeCalls, 0, 'defer must not route even when typecheck fails')
+    assert.equal(routeCalls, 0, 'defer must not route')
 
-    await tool.execute({ ...params, input: { commit: true, message: 'feat: good step', files: ['src/good.ts'], review_policy: 'final' } })
+    // Final commit with explicit review_level='L3' — now detached, but
+    // forceLevel must still be L3 on the routed change.
+    await tool.execute({ ...params, input: { commit: true, message: 'feat: step 2', files: ['src/b.ts'], review_policy: 'final', review_level: 'L3' } })
+    await settleDetachedReview()
     assert.ok(captured, 'final must route the accumulated scope')
-    assert.equal(captured!.forceLevel, 'L3', 'deferred typecheck failure escalates the final review')
-    assert.match(captured!.focusHint ?? '', /Deferred commits escalated/)
-    assert.deepEqual(captured!.files.slice().sort(), ['src/bad.ts', 'src/good.ts'])
+    assert.equal(captured!.forceLevel, 'L3', 'explicit review_level L3 must set forceLevel')
+    assert.deepEqual(captured!.files.slice().sort(), ['src/a.ts', 'src/b.ts'])
   })
 
   it('commit succeeds when review deps are not wired — advisory skip, not block', async () => {
@@ -2334,117 +2324,6 @@ Do not declare a streamed response duplicate in the middle of the stream.
     })
   })
 
-  describe('typecheck backstop gate', () => {
-    const brokenRunner: import('../typecheck-gate.js').TypecheckRunner = async () => ({
-      diagnostics: [{ file: 'src/foo.ts', line: 12, col: 1, severity: 'error', message: 'TS1117: duplicate property' }],
-      formatted: '',
-      ranOk: true,
-    })
-    const cleanRunner: import('../typecheck-gate.js').TypecheckRunner = async () => ({ diagnostics: [], formatted: '', ranOk: true })
-
-    it('escalates to L3 and prefixes focusHint with Typecheck on a type error', async () => {
-      let captured: ChangeSet | undefined
-      const { tool, params } = makeContext({
-        taskId: 't-tc-broken',
-        ownedFiles: ['src/foo.ts'],
-        dirtyFiles: ['src/foo.ts'],
-        verifications: [{ command: 'npm test', status: 'passed' }],
-        commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-        typecheckRunner: brokenRunner,
-        routeReviewWorkflow: async (change) => {
-          captured = change
-          return { tier: 'L3', verdict: 'verified', evidence: 'shim', rounds: 1 }
-        },
-        reviewDeps: {} as ReviewRouterDeps,
-      })
-      const result = await tool.execute({ ...params, input: { commit: true, message: 'test: tc' } })
-      assert.equal(result.isError ?? false, false)
-      assert.ok(captured, 'review workflow should run')
-      assert.equal(captured!.forceLevel, 'L3')
-      assert.match(captured!.focusHint ?? '', /^Typecheck —/)
-      assert.match(captured!.focusHint ?? '', /src\/foo\.ts/)
-    })
-
-    it('typecheck precedes meridian blast radius in focusHint', async () => {
-      const db = {
-        getReverseDependents: (f: string) => f === 'src/foo.ts' ? [{ file: 'src/bar.ts', kind: 'import', weight: 1 }] : [],
-        getTestsFor: () => [],
-        getCoEditNeighbors: () => [],
-      } as unknown as import('../../repo/meridian-db.js').MeridianDb
-      let captured: ChangeSet | undefined
-      const { tool, params } = makeContext({
-        taskId: 't-tc-order',
-        ownedFiles: ['src/foo.ts'],
-        dirtyFiles: ['src/foo.ts'],
-        verifications: [{ command: 'npm test', status: 'passed' }],
-        commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-        meridianDb: db,
-        typecheckRunner: brokenRunner,
-        routeReviewWorkflow: async (change) => {
-          captured = change
-          return { tier: 'L3', verdict: 'verified', evidence: 'shim', rounds: 1 }
-        },
-        reviewDeps: {} as ReviewRouterDeps,
-      })
-      await tool.execute({ ...params, input: { commit: true, message: 'test: order' } })
-      const fh = captured!.focusHint ?? ''
-      assert.ok(fh.indexOf('Typecheck —') < fh.indexOf('Blast radius —'), `expected Typecheck before Blast radius, got: ${fh}`)
-    })
-
-    it('clean typecheck does not escalate or add a Typecheck note', async () => {
-      let captured: ChangeSet | undefined
-      const { tool, params } = makeContext({
-        taskId: 't-tc-clean',
-        ownedFiles: ['src/foo.ts'],
-        dirtyFiles: ['src/foo.ts'],
-        verifications: [{ command: 'npm test', status: 'passed' }],
-        commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-        typecheckRunner: cleanRunner,
-        routeReviewWorkflow: async (change) => {
-          captured = change
-          return { tier: 'L2', verdict: 'verified', evidence: 'shim', rounds: 1 }
-        },
-        reviewDeps: {} as ReviewRouterDeps,
-      })
-      await tool.execute({ ...params, input: { commit: true, message: 'test: clean' } })
-      assert.doesNotMatch(captured!.focusHint ?? '', /Typecheck —/)
-    })
-
-    it('non-TS declared check failure escalates to L3 and records failed verification evidence', async () => {
-      const tmp = mkdtempSync(join(tmpdir(), 'deliver-declared-'))
-      try {
-        writeFileSync(join(tmp, '.rivet-config.json'), JSON.stringify({ verify: { typecheck: 'go vet ./...' } }), 'utf-8')
-        let captured: ChangeSet | undefined
-        const { tool, params, ledger } = makeContext({
-          taskId: 't-declared-fail',
-          ownedFiles: ['main.go'],
-          dirtyFiles: ['main.go'],
-          verifications: [{ command: 'go test ./...', status: 'passed' }],
-          commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-          declaredCheckRunner: async () => ({ exitCode: 2, output: 'vet: main.go:3: undefined symbol' }),
-          routeReviewWorkflow: async (change) => {
-            captured = change
-            return { tier: 'L3', verdict: 'verified', evidence: 'shim', rounds: 1 }
-          },
-          reviewDeps: {} as ReviewRouterDeps,
-        })
-        const result = await tool.execute({ ...params, cwd: tmp, input: { commit: true, message: 'fix: go' } })
-        assert.equal(result.isError ?? false, false)
-        assert.ok(captured, 'review workflow should run')
-        assert.equal(captured!.forceLevel, 'L3')
-        assert.match(captured!.focusHint ?? '', /^Declared typecheck —/)
-        // The failure lands in the ledger as real verification evidence, so the
-        // NEXT deliver attempt's gate assesses RED instead of staying GREEN.
-        const events = ledger.getEvents().filter(e => e.type === 'verification')
-        const declared = events.find(e => (e.meta as Record<string, unknown> | undefined)?.declared === true)
-        assert.ok(declared, 'declared check failure should be recorded as verification evidence')
-        assert.equal(declared!.status, 'failed')
-      } finally {
-        rmSync(tmp, { recursive: true, force: true })
-      }
-    })
-  })
-
   describe('claim audit (宣称-证据对账)', () => {
     it('blocks commit when message claims green but verification predates last write', async () => {
       const { tool, params, ledger } = makeContext({
@@ -2651,7 +2530,7 @@ Do not declare a streamed response duplicate in the middle of the stream.
 
   // ── 虚空仓库 P0：deliver_task 收割集成 ──
   describe('虚空仓库 P0：learned 收割 → memory.jsonl 直写', () => {
-    it('带两条 learned → 写入两条 agent-crafted 记录（含 id/ts，可读回）', async () => {
+    it('带两条 learned → 写入两条 agent-crafted 记录（fire-and-forget，消息不入工具结果）', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'void-harvest-'))
       try {
         const { tool, params } = makeContext({
@@ -2667,7 +2546,11 @@ Do not declare a streamed response duplicate in the middle of the stream.
         ] }
         const result = await tool.execute(params)
         assert.equal(result.isError ?? false, false)
-        assert.match(result.content, /🧠 虚空仓库：已收割 2 条知识/)
+        // Fire-and-forget: 收割消息不再出现在工具结果中
+        assert.doesNotMatch(result.content, /🧠 虚空仓库：已收割/)
+
+        // Flush deferred setImmediate before reading
+        await new Promise<void>(resolve => setImmediate(() => resolve()))
 
         const entries = readMemoryEntries(dir)
         assert.equal(entries.length, 2)

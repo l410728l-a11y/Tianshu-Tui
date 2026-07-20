@@ -104,3 +104,30 @@ describe('review disciplines', () => {
     assert.match(text, /递归.*验证.*自己/)
   })
 })
+
+describe('classifyAutoReviewTier（auto 审查门 L1/L2 分层）', () => {
+  it('小改动（单文件、非核心路径）→ L1（零 worker）', async () => {
+    const { classifyAutoReviewTier } = await import('../review-discipline.js')
+    assert.equal(classifyAutoReviewTier({ files: ['src/utils/format.ts'], crossModule: false, isFix: false }), 'L1')
+  })
+
+  it('触核心路径（src/agent 等）→ L2', async () => {
+    const { classifyAutoReviewTier } = await import('../review-discipline.js')
+    assert.equal(classifyAutoReviewTier({ files: ['src/agent/loop.ts'], crossModule: false, isFix: false }), 'L2')
+    assert.equal(classifyAutoReviewTier({ files: ['src/api/client.ts'], crossModule: false, isFix: false }), 'L2')
+    assert.equal(classifyAutoReviewTier({ files: ['src/prompt/static.ts'], crossModule: false, isFix: false }), 'L2')
+  })
+
+  it('≥3 文件 / crossModule / 依赖配置 / forceLevel → L2', async () => {
+    const { classifyAutoReviewTier } = await import('../review-discipline.js')
+    assert.equal(classifyAutoReviewTier({ files: ['src/utils/a.ts', 'src/utils/b.ts', 'src/utils/c.ts'], crossModule: false, isFix: false }), 'L2')
+    assert.equal(classifyAutoReviewTier({ files: ['src/utils/a.ts'], crossModule: true, isFix: false }), 'L2')
+    assert.equal(classifyAutoReviewTier({ files: ['package.json'], crossModule: false, isFix: false }), 'L2')
+    assert.equal(classifyAutoReviewTier({ files: ['src/utils/a.ts'], crossModule: false, isFix: false, forceLevel: 'L3' }), 'L2')
+  })
+
+  it('goalActive 压回 L1（不拖住 goal 自动续跑环）', async () => {
+    const { classifyAutoReviewTier } = await import('../review-discipline.js')
+    assert.equal(classifyAutoReviewTier({ files: ['src/agent/loop.ts'], crossModule: false, isFix: false, goalActive: true }), 'L1')
+  })
+})

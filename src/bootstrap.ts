@@ -413,8 +413,15 @@ export function createInteractiveToolRegistry(
     // 过滤），@Computer / /tools enable 挂载时才进主控视野。darwin/win32 + Pro gated。
     computerUse: (process.platform === 'darwin' || process.platform === 'win32') && process.env.RIVET_COMPUTER_USE !== '0',
     proEnabled: isProFeatureEnabled(config, 'computerUse'),
-    // web_search 后端链（DDG 默认 / Brave / Tavily），按 config.search 顺序 fallback。
-    searchBackends: buildSearchBackends(config),
+    // web_search 后端链（bing/DDG 默认 / Brave / Tavily），按 config.search 顺序 fallback。
+    // 透传 network.{proxy,noProxy}：web_search 与 web_fetch 走同一代理解析路径，
+    // 否则配了代理仍直连，国内 GFW 外的 backend 全超时。
+    searchBackends: buildSearchBackends(config, {
+      proxy: {
+        ...(config.network.proxy ? { proxyUrl: config.network.proxy } : {}),
+        ...(config.network.noProxy ? { noProxy: config.network.noProxy } : {}),
+      },
+    }),
     // web_fetch 配置注入（超时/大小上限/UA/正文抽取）
     fetchOptions: buildFetchOptions(config),
   })
