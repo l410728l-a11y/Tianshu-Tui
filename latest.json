@@ -1,18 +1,18 @@
 {
-  "version": "2.20.0",
-  "notes": "右栏 Codex 式重做 + 议事会织命升级 Phase 2+3 + VSCode 扩展 P3 双市场发布 + SR 通道分级 + 三端点更新镜像 (jsDelivr + Cloudflare Worker + GitHub)",
-  "pub_date": "2026-07-21T07:36:06.035Z",
+  "version": "2.20.1",
+  "notes": "悬浮 HUD 卡片 v2 + 会话滚动根修 + 遥测议题校准 + delegation 审查拦截透出 + 发版流程沉淀",
+  "pub_date": "2026-07-22T02:15:00.000Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.0/Tianshu_2.20.0_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1E3QUJmdm5FRFRnQUF3MUZDeU4xQzhLWERjbTBnM0hmaVVxWmZVeUZkRklueUVCdXBCd2E5Q08wdHRCakhTUnQvNGx0MWhyRyttZ2hXZU1DRCtkeUFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NjE4OTAwCWZpbGU6VGlhbnNodV8yLjIwLjBfeDY0LXNldHVwLmV4ZQpTNEliZHM5NkxVVnJoOGtoZnN5cEJTMHpjYVpiRmFycmZQT0RJVVI3c1BJT0loV1RxSVVYdU11bUtqQkZXUTlkdkRWdDZxYkg1dGNuTEIvTDU5OVBEUT09Cg=="
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.1/Tianshu_2.20.1_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1lYQ2hQbVliS3MramVwNEIzQ1lGUnd6eW5QczF1dFpaOFhnS1JYWkF1V2pIOVRjQ0k1dkVUWkxaWk1nVUNwQlRyNDB5THZ0OERXQlFsWmg2SzIrY1E0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Njg2MzIyCWZpbGU6VGlhbnNodV8yLjIwLjFfeDY0LXNldHVwLmV4ZQpyS0RtOE83MzdBNEVLeTltN0h4bTl2NGtQOXlCc2pETnhRNXZzYWpMeDhzdys2d1FYdllIMDNqbCt5VGF4V3czLzNlRjBGVzVmSFhETWxhM1E2V2tCUT09Cg=="
     },
     "darwin-aarch64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.0/Tianshu_2.20.0_aarch64.app.tar.gz",
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.1/Tianshu_2.20.1_aarch64.app.tar.gz",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1grS0FRYkJMQWR1QnZiaStYb0hGMVJONWxFMENCRk9EUGcwZElEOXlDVUE0STUva2huSFpPeW14b2FHT0YwNlRpbmU3anFQdWREQkxzZkFack11TkF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDM3MTUxCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkFHamJrNEhmOCtVTEJiV3Y3eTF5NUhiOWF3YVpZRlVnT1NFOGhjUElZWlJ1MWpQRFh2ZUQ3em1UaXlRY2JGb0xlNFBzNVRiQzNUcW0vSE4rUmJmVUNBPT0K"
     },
     "darwin-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.0/Tianshu_2.20.0_x64.app.tar.gz",
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.1/Tianshu_2.20.1_x64.app.tar.gz",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1J0bHRpQWhFRXVMSlZPRUtyMGhYN280cElLdmptQVprSDNiK0d5Wm9pQys5cUpaZXpWWG16ZUVpNjFWeDQ4WlhJMlo1NFFiNi9zdHJBMWRxTVh5TGc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDM3NjE5CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CjdwcHl6SFg4WkM3czJPUjBvS3JvYXVEVmVRZU1lOElOZW9McUpJSnNCcnpWYXpjaGM3c1IyTEkraE5rZTR5dXRnTFlQTDNJa0piY0MvRlJ5QlR5Z0N3PT0K"
     }
   }
