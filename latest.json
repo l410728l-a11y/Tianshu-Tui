@@ -1,11 +1,11 @@
 {
   "version": "2.20.1",
-  "notes": "悬浮 HUD 卡片 v2 + 会话滚动根修 + 遥测议题校准 + delegation 审查拦截透出 + 发版流程沉淀",
-  "pub_date": "2026-07-22T02:15:00.000Z",
+  "notes": "悬浮 HUD 卡片 v2 + 会话滚动根修 + 遥测议题校准 + delegation 审查拦截透出 + 发版流程沉淀 + updater endpoint 顺序修复 (GitHub 第一)",
+  "pub_date": "2026-07-22T03:10:00.000Z",
   "platforms": {
     "windows-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.1/Tianshu_2.20.1_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1lYQ2hQbVliS3MramVwNEIzQ1lGUnd6eW5QczF1dFpaOFhnS1JYWkF1V2pIOVRjQ0k1dkVUWkxaWk1nVUNwQlRyNDB5THZ0OERXQlFsWmg2SzIrY1E0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Njg2MzIyCWZpbGU6VGlhbnNodV8yLjIwLjFfeDY0LXNldHVwLmV4ZQpyS0RtOE83MzdBNEVLeTltN0h4bTl2NGtQOXlCc2pETnhRNXZzYWpMeDhzdys2d1FYdllIMDNqbCt5VGF4V3czLzNlRjBGVzVmSFhETWxhM1E2V2tCUT09Cg=="
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1hrMTRYSnpPZXlUcWtEZExYa1EwREdtZzgwRjRXbjJya3hweEpmc0NJVm16elBwaGNodVFzSjRlTjRxS0FLL1pKZEFaYVJ2elFPS1FZTUR1WXhWT2dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Njg5Nzc3CWZpbGU6VGlhbnNodV8yLjIwLjFfeDY0LXNldHVwLmV4ZQo0a3RMTFpVYTJBK2pqMWdPSnQ3SVdKYStQcnpsWWZQYnFLaExYdlIyY3FubmRhYzR6bi91T1k2Sjl2TmwyMFpxcURmdWZwMEdPV3UxNW83eHp1RDVEQT09Cg=="
     },
     "darwin-aarch64": {
       "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.20.1/Tianshu_2.20.1_aarch64.app.tar.gz",
