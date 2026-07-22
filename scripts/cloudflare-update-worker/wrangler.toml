@@ -1,0 +1,10 @@
+name = "tianshu-update-mirror"
+main = "src/worker.js"
+compatibility_date = "2024-09-01"
+
+# 绑定自有域名 (避开 workers.dev 在国内被 DNS 污染的问题)。
+# 要求: plotstudio.cn 已接入 Cloudflare (NS 指向 Cloudflare)。
+# 部署后 Cloudflare 会自动在 DNS 加一条 CNAME 指向 Worker。
+routes = [
+  { pattern = "update.plotstudio.cn/*", zone_name = "plotstudio.cn" }
+]

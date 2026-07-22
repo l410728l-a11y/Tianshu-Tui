@@ -1,6 +1,7 @@
 import type { TurnStateBag } from './turn-orchestrator.js'
 import type { AgentCallbacks } from './loop-types.js'
 import type { CompleteTurnParams } from './turn-orchestrator.js'
+import type { SrClass } from './context.js'
 import { evaluateThinkingRetry } from './thinking-retry.js'
 
 // ── Types ──
@@ -14,7 +15,11 @@ export type PostTurnState = Pick<TurnStateBag,
 export interface PostTurnDecisionDeps {
   state: PostTurnState
   getDoomLoopLevel: () => 'none' | 'warn' | 'blocked'
-  appendSystemReminder: (content: string) => void
+  appendSystemReminder: (content: string, cls?: SrClass) => void
+  /** 同 appendSystemReminder，但返回 boolean。thinking-retry 用此检测 SR cap 耗尽，
+   *  避免空载荷续轮——retry 消息被吞时放弃 retry，而非盲重试。
+   *  W1 通道分级：functional 类不限流 → 注入不可能失败（返回恒 true）。 */
+  appendSystemReminderAndReport: (content: string, cls?: SrClass) => boolean
   completeTurn: (params: CompleteTurnParams) => Promise<void>
   getTotalUsage: () => import('../api/types.js').Usage
   getTurnCount: () => number
@@ -56,7 +61,8 @@ export class PostTurnDecisionController {
     this.deps.state.lastThinkingContent = result.nextState.lastThinkingContent
     this.deps.state.thinkingOnlyRetries = result.nextState.thinkingOnlyRetries
     if (result.shouldRetry) {
-      this.deps.appendSystemReminder(result.retryMessage)
+      const injected = this.deps.appendSystemReminderAndReport(result.retryMessage, 'functional')
+      if (!injected) return { shouldRetry: false }
       params.callbacks.onTurnComplete(this.deps.getTotalUsage(), this.deps.getTurnCount(), false)
       return { shouldRetry: true }
     }

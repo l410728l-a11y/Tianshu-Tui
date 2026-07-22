@@ -135,25 +135,25 @@ function formatTree(nodes: TreeNode[], prefix: string, isLast: boolean[]): strin
 export const REPO_MAP_TOOL: Tool = {
   definition: {
     name: 'repo_map',
-    description: `Return a condensed file tree with annotated entry points, test files, and config files.
+    description: `返回精简文件树，标注入口文件、测试文件和配置文件。
 
-For file tree use repo_map; for structural relationships (imports/calls, blast radius) use repo_graph.
+看文件树用 repo_map；看结构关系（imports/calls、爆炸半径）用 repo_graph。
 
-Start shallow: repo_map({ depth: 2 }), then drill into areas: repo_map({ path: "src/agent/" }).`,
+先浅后深：repo_map({ depth: 2 })，再下钻到具体区域：repo_map({ path: "src/agent/" })。`,
     input_schema: {
       type: 'object',
       properties: {
         max_files: {
           type: 'integer',
-          description: 'Max files to include (default: 200)',
+          description: '最多包含的文件数（默认：200）',
         },
         path: {
           type: 'string',
-          description: 'Subdirectory to focus on (relative to project root). Default: project root.',
+          description: '要聚焦的子目录（相对项目根目录）。默认：项目根目录。',
         },
         depth: {
           type: 'integer',
-          description: 'Maximum directory depth (default: 4). Use 2 for a shallow overview.',
+          description: '最大目录深度（默认：4）。浅层概览用 2。',
         },
       },
     },

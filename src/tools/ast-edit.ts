@@ -78,7 +78,7 @@ export const AST_EDIT_TOOL: Tool = {
   definition: {
     name: 'ast_edit',
     description:
-      'Edit code by AST structure (not text). Use ast-grep patterns to find and replace syntax nodes. Defaults to dryRun (preview only). Set dryRun:false to write files. For TypeScript/JavaScript/Tsx/Html/Css.',
+      '按 AST 结构（而非文本）编辑代码。用 ast-grep 模式查找并替换语法节点。默认 dryRun（仅预览）。设 dryRun:false 才写文件。适用于 TypeScript/JavaScript/Tsx/Html/Css。',
     input_schema: {
       type: 'object',
       properties: {
@@ -87,17 +87,17 @@ export const AST_EDIT_TOOL: Tool = {
           items: {
             type: 'object',
             properties: {
-              find: { type: 'string', description: 'ast-grep pattern to find (e.g. "var $NAME = $VAL")' },
-              replace: { type: 'string', description: 'Replacement template (e.g. "const $NAME = $VAL")' },
+              find: { type: 'string', description: '要查找的 ast-grep 模式（如 "var $NAME = $VAL"）' },
+              replace: { type: 'string', description: '替换模板（如 "const $NAME = $VAL"）' },
             },
             required: ['find', 'replace'],
           },
-          description: 'Ordered list of find/replace operations',
+          description: 'find/replace 操作的有序列表',
         },
-        paths: { type: 'array', items: { type: 'string' }, description: 'Files or directories to edit' },
-        lang: { type: 'string', description: 'Language: TypeScript, Tsx, JavaScript, Html, Css' },
-        dryRun: { type: 'boolean', description: 'If true (default), preview only — do not write files' },
-        limit: { type: 'integer', description: 'Max changes per file (default 50)' },
+        paths: { type: 'array', items: { type: 'string' }, description: '要编辑的文件或目录' },
+        lang: { type: 'string', description: '语言：TypeScript, Tsx, JavaScript, Html, Css' },
+        dryRun: { type: 'boolean', description: '为 true（默认）时仅预览——不写文件' },
+        limit: { type: 'integer', description: '每文件最大改动数（默认 50）' },
       },
       required: ['ops'],
     },

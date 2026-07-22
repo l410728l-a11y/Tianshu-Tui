@@ -62,26 +62,26 @@ export async function exportFile(input: ExportFileInput): Promise<{ path: string
 export const EXPORT_FILE_TOOL: Tool = {
   definition: {
     name: 'export_file',
-    description: `Create or copy a file to an external path, such as Desktop, Downloads, a mounted drive, or a Windows path.
+    description: `将文件创建或复制到外部路径，如桌面、下载、挂载盘或 Windows 路径。
 
-Use this when the user explicitly asks to place generated assets outside the project workspace. Unlike write_file, this tool is intended for user-visible external outputs and always requires approval.
+当用户明确要求将生成的资产放到项目工作区之外时使用。与 write_file 不同，此工具面向用户可见的外部输出，且始终需要审批。
 
-Supports:
-- Write text content: destination_path + content
-- Write binary content: destination_path + content + encoding="base64"
-- Copy an existing file: destination_path + source_path
+支持：
+- 写文本内容：destination_path + content
+- 写二进制内容：destination_path + content + encoding="base64"
+- 复制已有文件：destination_path + source_path
 
-Examples:
+示例：
 Good: export_file(destination_path="~/Desktop/tianshu-logo.svg", content="<svg>...</svg>")
 Good: export_file(destination_path="H:\\zhuomian\\白嫖gpt\\logo.png", source_path="/tmp/generated.png")
-Bad: using bash redirection or echo to create files in external paths`,
+Bad: 用 bash 重定向或 echo 往外部路径写文件`,
     input_schema: {
       type: 'object',
       properties: {
-        destination_path: { type: 'string', description: 'Absolute or ~-relative destination path. May be outside the project.' },
-        content: { type: 'string', description: 'File content to write. Use encoding="base64" for binary files.' },
-        source_path: { type: 'string', description: 'Existing file to copy to destination_path.' },
-        encoding: { type: 'string', enum: ['text', 'base64'], description: 'How to decode content. Defaults to text.' },
+        destination_path: { type: 'string', description: '绝对路径或 ~ 相对路径。可在项目之外。' },
+        content: { type: 'string', description: '要写入的文件内容。二进制文件用 encoding="base64"。' },
+        source_path: { type: 'string', description: '要复制到 destination_path 的已有文件。' },
+        encoding: { type: 'string', enum: ['text', 'base64'], description: 'content 的解码方式。默认 text。' },
       },
       required: ['destination_path'],
     },

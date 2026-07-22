@@ -435,7 +435,7 @@ export function renderChronicle(data: ChronicleData, width: number, height: numb
 
 // ── Tasks ──────────────────────────────────────────────────────
 
-export type TasksWorkerStatus = 'running' | 'passed' | 'failed' | 'blocked' | 'escalated'
+export type TasksWorkerStatus = 'running' | 'passed' | 'completed' | 'failed' | 'blocked' | 'escalated'
 
 export interface TasksWorkerRow {
   /** 稳定的 per-worker id（work order id），用于进入 detail pager。 */
@@ -453,6 +453,8 @@ export interface TasksWorkerRow {
   tokenCount?: number
   /** 终态后尚未查看——行首 unread 圆点标记。 */
   unread?: boolean
+  /** 终态失败分类（review-findings/review-infra/...）——completed+review-findings 渲染 ⚠️。 */
+  failureReason?: string
 }
 
 export type TasksFilter = 'running' | 'completed' | 'all'
@@ -479,16 +481,20 @@ export interface TasksData {
 const TASK_STATUS_GLYPH: Record<TasksWorkerStatus, string> = {
   running: '◐',
   passed: '✓',
+  completed: '✓',
   failed: '✗',
   blocked: '⊘',
   escalated: '↑',
 }
 
-/** 状态 → 语义色（running 主色、passed 成功、failed 错误、blocked/escalated 警告）。 */
-function taskStatusColor(status: TasksWorkerStatus, theme: RivetTheme): string {
+/** 状态 → 语义色（running 主色、passed 成功、failed 错误、blocked/escalated 警告）。
+ *  completed + review-findings（审查拦截）→ 警告黄，区别于系统失败的错误红。 */
+function taskStatusColor(status: TasksWorkerStatus, theme: RivetTheme, failureReason?: string): string {
+  if (status === 'completed' && failureReason === 'review-findings') return theme.warning
   switch (status) {
     case 'running': return theme.primary
     case 'passed': return theme.success
+    case 'completed': return theme.success
     case 'failed': return theme.error ?? theme.warning
     default: return theme.warning
   }
@@ -726,7 +732,7 @@ export function renderTasks(
     for (const w of g.workers) {
       selectable.push({ workerId: w.workerId, bodyIndex: body.length })
       const glyph = TASK_STATUS_GLYPH[w.status] ?? '·'
-      const glyphColored = color(glyph, taskStatusColor(w.status, theme))
+      const glyphColored = color(glyph, taskStatusColor(w.status, theme, w.failureReason))
       // unread：终态但用户还没打开 detail —— 行首圆点提示（CC 未读结果对标）。
       // 无色纯字符：选中行会被 slice(3) 替换为光标前缀，带 ANSI 会被切坏。
       const unreadMark = w.unread ? '●' : ' '

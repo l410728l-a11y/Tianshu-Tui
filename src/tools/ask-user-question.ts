@@ -131,36 +131,36 @@ export function composeAnswers(
 export const ASK_USER_QUESTION_TOOL: Tool = {
   definition: {
     name: 'ask_user_question',
-    description: `Ask the user one or more questions and wait for their typed response. Use when you need clarifying information, preferences, or a decision you cannot infer from context.
+    description: `向用户提出一个或多个问题，并等待其输入回答。当你需要澄清信息、了解偏好，或需要一个无法从上下文推断的决定时使用。
 
-Single question: pass \`question\` (+ optional \`options\`). Multiple related questions (max 4): pass \`questions\` — the desktop renders them as one structured card the user pages through.
+单个问题：传 \`question\`（+ 可选 \`options\`）。多个相关问题（最多 4 个）：传 \`questions\`——桌面端会把它们渲染成一张结构化卡片，用户逐页作答。
 
-Provide \`options\` for a small set of mutually exclusive choices (the UI renders them as a numbered list the user can answer by number; the desktop card also offers a free-text "Other" entry). Omit \`options\` for open-ended questions.
+为一小组互斥选项提供 \`options\`（UI 渲染为编号列表，用户可直接按编号回答；桌面端卡片还提供自由输入的 "Other" 项）。开放式问题省略 \`options\`。
 
-Do NOT use this to bounce a decision back when the user asked for YOUR analysis, recommendation, or opinion — answer directly in that case. Prefer one question; address what you can determine first.`,
+当用户要的是你的分析、建议或观点时，禁止用这个工具把决定推回给用户——那种情况直接回答。优先只问一个问题；先处理你能确定的部分。`,
     input_schema: {
       type: 'object',
       properties: {
-        question: { type: 'string', description: 'The question to ask the user. Be clear and specific.' },
+        question: { type: 'string', description: '要问用户的问题。清晰、具体。' },
         options: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional 2-4 short, mutually exclusive choices. Omit for open-ended questions or when the user wants your analysis rather than a menu.',
+          description: '可选的 2-4 个简短互斥选项。开放式问题、或用户要的是你的分析而不是菜单时省略。',
         },
-        allow_multiple: { type: 'boolean', description: 'Allow selecting more than one option (default: false).' },
+        allow_multiple: { type: 'boolean', description: '允许选择多个选项（默认：false）。' },
         questions: {
           type: 'array',
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string', description: 'Optional stable id for this question (auto-assigned when omitted).' },
-              prompt: { type: 'string', description: 'The question text.' },
-              options: { type: 'array', items: { type: 'string' }, description: 'Optional 2-4 short, mutually exclusive choices.' },
-              allow_multiple: { type: 'boolean', description: 'Allow selecting more than one option (default: false).' },
+              id: { type: 'string', description: '该问题的可选稳定 id（省略时自动分配）。' },
+              prompt: { type: 'string', description: '问题文本。' },
+              options: { type: 'array', items: { type: 'string' }, description: '可选的 2-4 个简短互斥选项。' },
+              allow_multiple: { type: 'boolean', description: '允许选择多个选项（默认：false）。' },
             },
             required: ['prompt'],
           },
-          description: 'Multi-question form (max 4). When present, takes precedence over the single-question fields.',
+          description: '多问题形式（最多 4 个）。存在时优先于单问题字段。',
         },
       },
     },

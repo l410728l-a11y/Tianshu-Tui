@@ -6,7 +6,7 @@ import { validatePath } from './path-validate.js'
 import { syntaxCheck, checkSyntax } from './syntax-check.js'
 import { detectPointerPlaceholder, pointerPlaceholderError } from './pointer-guard.js'
 import { getFileReadMtime, noteFileObserved, recordSuccessfulEdit, wasFileEditedBySession, incrementEditFailCount, resetEditFailCount } from './read-file.js'
-import { writeFileAtomicAsync } from '../fs-atomic.js'
+import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
 import { detectEol, chooseEol, toLf, applyEol } from './line-endings.js'
 import { getTargetEol } from '../platform.js'
@@ -21,6 +21,33 @@ import { buildFileDiff, computeChangedLineRanges, type LineRange } from './edit-
 export function hashLine(line: string): string {
   const clean = line.endsWith('\r') ? line.slice(0, -1) : line
   return createHash('sha256').update(clean).digest('hex').slice(0, 8)
+}
+
+/**
+ * Build fresh chain-safe anchors for the region just written, so the model
+ * can immediately hash_edit the same file again without re-reading it.
+ * Emits up to 4 anchors: the context line before the edit, the first and
+ * last lines of the new region, and the context line after.
+ *
+ * @param newFileLines  lines of the file AFTER the edit (LF-split)
+ * @param editStart0    0-indexed position of the first new-content line
+ * @param newLineCount  number of lines inserted (0 for pure deletion)
+ */
+export function buildFreshAnchors(newFileLines: string[], editStart0: number, newLineCount: number): string {
+  const parts: string[] = []
+  if (editStart0 > 0) {
+    parts.push(`L${editStart0}:${hashLine(newFileLines[editStart0 - 1]!)}`)
+  }
+  if (newLineCount > 0) {
+    parts.push(`L${editStart0 + 1}:${hashLine(newFileLines[editStart0]!)}`)
+  }
+  if (newLineCount > 1) {
+    parts.push(`L${editStart0 + newLineCount}:${hashLine(newFileLines[editStart0 + newLineCount - 1]!)}`)
+  }
+  if (editStart0 + newLineCount < newFileLines.length) {
+    parts.push(`L${editStart0 + newLineCount + 1}:${hashLine(newFileLines[editStart0 + newLineCount]!)}`)
+  }
+  return parts.length > 0 ? `\nFresh anchors (chain-safe):\n${parts.join('\n')}` : ''
 }
 
 /** Post-write syntax check that never throws — file is already on disk. */
@@ -279,35 +306,39 @@ function formatStaleDiagnostic(
 export const HASH_EDIT_TOOL: Tool = {
   definition: {
     name: 'hash_edit',
-    description: `Content-hash anchored file editing. Safer alternative to edit_file.
+    description: `内容哈希锚定的文件编辑。比 edit_file 更安全的替代。
 
-Anchors use format L<line>:<8-char-hex> (full hash verification) or L<line>
-(position-only fast path — use only when you just read the file). Supply 1-3
-anchors: first and last define the inclusive replacement range; a middle anchor
-validates the interior. Single-anchor mode inserts content after that line.
+锚点格式为 L<line>:<8-char-hex>（完整哈希校验）或 L<line>
+（仅位置快速路径——仅在你刚读过该文件时使用）。提供 1-3 个
+锚点：首尾锚点定义含两端在内的替换区间；中间锚点校验区间内部。
+单锚点模式在该行之后插入内容。
 
-Hash: SHA256(line_content_without_trailing_cr)[0:8].
-Grep results include anchor hints for single-file matches.
+哈希：SHA256(line_content_without_trailing_cr)[0:8]。
+grep 结果对单文件匹配附带锚点提示。
 
-⚠ Position-only: never chain consecutive calls — each hash_edit changes the
-file, invalidating subsequent L<line> anchors.
+编辑成功后回传新区间的新鲜锚点（Fresh anchors）——链式编辑
+同一文件时直接使用回传锚点，不需要重新 read_file。
 
-For multi-location changes, edits over ~20 lines, or structural refactors,
-prefer apply_patch with a unified diff.
+⚠ 仅位置模式（L<line> 无哈希）：绝不链式连续调用——每次
+hash_edit 都会改动文件，使后续的 L<line> 锚点失效。链式编辑
+必须用回传的完整哈希锚点。
 
-Note: For large new_string, the message history keeps only a short pointer
-(file_path + size). Use read_file to review the current content in a later turn.`,
+多处改动、超过约 20 行的编辑或结构性重构，优先用
+apply_patch 加 unified diff。
+
+注意：new_string 较大时，消息历史只保留短指针
+（file_path + 大小）。后续轮次用 read_file 回看当前内容。`,
     input_schema: {
       type: 'object',
       properties: {
-        file_path: { type: 'string', description: 'Absolute path to the file to edit. Provide this parameter first.' },
+        file_path: { type: 'string', description: '要编辑文件的绝对路径。先提供此参数。' },
         anchors: {
           type: 'array',
           items: { type: 'string' },
-          description: '1-3 anchors in "L<line>:<8-char-hex>" (full) or "L<line>" (position-only) format. First and last define the inclusive replacement range.',
+          description: '1-3 个锚点，格式 "L<line>:<8-char-hex>"（完整）或 "L<line>"（仅位置）。首尾锚点定义含两端在内的替换区间。',
         },
-        new_string: { type: 'string', description: 'Replacement text for the anchored block. Use "" to delete. Provide this parameter last.' },
-        dry_run: { type: 'boolean', description: 'If true, compute and return the diff that would be applied without writing to disk.' },
+        new_string: { type: 'string', description: '锚定区间的替换文本。传 "" 表示删除。最后提供此参数。' },
+        dry_run: { type: 'boolean', description: '为 true 时，计算并返回将要应用的 diff，但不写盘。' },
       },
       required: ['file_path', 'anchors', 'new_string'],
     },
@@ -476,7 +507,12 @@ Note: For large new_string, the message history keeps only a short pointer
           const relPath = relative(params.cwd, filePath)
           trackFileChange(params.cwd, { filePath: relPath, action: 'edit', toolCallId: params.toolUseId ?? 'hash_edit' })
 
-          await writeFileAtomicAsync(filePath, applyEol(newContent, eol))
+          {
+            const land = await landingWriteFile(params, filePath, content, applyEol(newContent, eol))
+            if (land.kind === 'delegated' && (isDelegateRejected(land.delegated) || land.delegated.isError)) {
+              return delegatedToToolResult(land.delegated)
+            }
+          }
           const recoveredInfo = recoveredCount > 0
             ? ` (auto-recovered ${recoveredCount} stale anchor${recoveredCount > 1 ? 's' : ''})`
             : ''
@@ -491,9 +527,10 @@ Note: For large new_string, the message history keeps only a short pointer
             ? '⚠ Position-only anchors used on a file modified since last read — line numbers may have drifted. Verify the result or use edit_file instead.'
             : ''
           const extraWarn = [staleAdvice, posDrift, semanticWarning, duplicateWarning].filter(Boolean).join('\n\n')
+          const freshAnchors = buildFreshAnchors(newContent.split('\n'), before.length, newLines.length)
           return await finalizeHashEdit(
             filePath, params.cwd, newContent, params.sessionId,
-            `hash_edit${recoveredInfo} applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines`,
+            `hash_edit${recoveredInfo} applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines${freshAnchors}`,
             extraWarn,
           )
         }
@@ -531,14 +568,20 @@ Note: For large new_string, the message history keeps only a short pointer
     const duplicateWarning = duplicateNames.length > 0
       ? `⚠ Duplicate declarations detected after edit: ${duplicateNames.join(', ')}. If you intended to replace the original, use two anchors.`
       : ''
-    await writeFileAtomicAsync(filePath, applyEol(newContent, eol))
+    {
+      const land = await landingWriteFile(params, filePath, content, applyEol(newContent, eol))
+      if (land.kind === 'delegated' && (isDelegateRejected(land.delegated) || land.delegated.isError)) {
+        return delegatedToToolResult(land.delegated)
+      }
+    }
     const posDrift = positionDriftWarning
       ? '⚠ Position-only anchors used on a file modified since last read — line numbers may have drifted. Verify the result or use edit_file instead.'
       : ''
     const extraWarn = [posDrift, semanticWarning, duplicateWarning].filter(Boolean).join('\n\n')
+    const freshAnchors = buildFreshAnchors(newContent.split('\n'), before.length, newLines.length)
     return await finalizeHashEdit(
       filePath, params.cwd, newContent, params.sessionId,
-      `hash_edit applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines`,
+      `hash_edit applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines${freshAnchors}`,
       extraWarn,
     )
   },

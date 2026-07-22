@@ -23,6 +23,15 @@ export interface CouncilSessionEvent {
   mergedItemCount: number
   convenedAt: number
   timestamp: number
+  // ── Phase 2: 分歧度遥测 —— 回答「同模型戴星域面具是不是自我对话」──
+  /** 是否三柱模式（pillars:true）会诊。 */
+  pillarsMode: boolean
+  /** 首轮席位实际用到的模型（去重排序；缺 modelUsed 的席位不计入）。 */
+  modelsUsed: string[]
+  /** 唯一模型数 > 1 —— 异构议事会。与 divergenceScore 联查验证对抗真实性。 */
+  heterogeneous: boolean
+  /** 冲突数 / 首轮席位数，截断到 [0,1]。同模型 vs 异构的分歧度对比指标。 */
+  divergenceScore: number
 }
 
 /** append-only key —— sessionId + objectiveHash + timestamp 三元唯一。 */
@@ -36,9 +45,16 @@ export function buildCouncilSessionEvent(input: {
   sessionId: string
   plan: CouncilPlan
   timestamp: number
+  /** 三柱模式标记（council_convene pillars:true 时传真）。 */
+  pillars?: boolean
 }): CouncilSessionEvent {
   const { plan } = input
   const decisions = plan.aggregate.decisions
+  const round1 = plan.contributions.filter(c => (c.round ?? 1) === 1)
+  const modelsUsed = [...new Set(round1.map(c => c.modelUsed).filter((m): m is string => Boolean(m)))].sort()
+  const divergenceScore = round1.length > 0
+    ? Math.min(1, plan.aggregate.conflicts.length / round1.length)
+    : 0
   return {
     schemaVersion: 1,
     sessionId: input.sessionId,
@@ -54,6 +70,10 @@ export function buildCouncilSessionEvent(input: {
     mergedItemCount: plan.aggregate.mergedItems.length,
     convenedAt: plan.meta.convenedAt,
     timestamp: input.timestamp,
+    pillarsMode: input.pillars ?? false,
+    modelsUsed,
+    heterogeneous: modelsUsed.length > 1,
+    divergenceScore,
   }
 }
 

@@ -1,5 +1,6 @@
 import type { CouncilPlan, CouncilDecision } from './council-plan.js'
 import { inferModelTierFromName } from '../model-tier-policy.js'
+import { renderQliphothFlags, type QliphothFlag } from './council-qliphoth.js'
 
 /** 转义 markdown 表格元字符：管道符和换行。 */
 function esc(cell: string): string {
@@ -19,6 +20,11 @@ export function renderCouncilPlan(plan: CouncilPlan): string {
 
   lines.push(`# 议事会计划 — ${objective}`, '')
   lines.push(`> 席位: ${plan.seats.join(' · ')} · ${plan.meta.round} 轮会诊 · convenedAt=${plan.meta.convenedAt}`, '')
+
+  // 解析失败留痕：这些席位以 contribution_failed 空贡献计入，未参与合并裁决。
+  if (plan.meta.failedSeats && plan.meta.failedSeats.length > 0) {
+    lines.push(`> ⚠ 贡献解析失败席位（已重试一次）: ${plan.meta.failedSeats.join(' · ')} —— 其意见未进入裁决，采纳计划前请知悉缺席视角。`, '')
+  }
 
   // 模型留痕警告：任一席位跑在低阶模型上时明示——议事会产出即执行依据，
   // flash 席位的贡献真实度不可控（事故链缺口 1b）。
@@ -66,6 +72,11 @@ export function renderCouncilPlan(plan: CouncilPlan): string {
       lines.push(`| ${esc(cf.description)} | ${esc(cf.left)} | ${esc(cf.right)} | ${statusZh} | ${esc(cf.resolution ?? '')} |`)
     }
     lines.push('')
+  }
+
+  // 柱级退化留痕（advisory）：三柱席位的已知失败形态，供采纳计划前知悉。
+  if (plan.meta.qliphoth && plan.meta.qliphoth.length > 0) {
+    lines.push(...renderQliphothFlags(plan.meta.qliphoth as QliphothFlag[]))
   }
 
   lines.push('## 最终任务表', '')

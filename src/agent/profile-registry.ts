@@ -115,7 +115,8 @@ For code search in review tasks, prefer ast_grep over grep when the target is a 
 Return a JSON WorkerResult whose \`artifacts\` contains exactly ONE entry:
 { "kind": "note", "title": "seat-contribution", "content": "<JSON string of your SeatContribution>" }
 SeatContribution = { authority, summary, additions, risks, challenges, alternatives }.
-PlanItem (additions[]) = { id, title, detail, files?: string[] } — set files to the paths the item will modify (from real code lookup, not guesses).`,
+PlanItem (additions[]) = { id, title, detail, files?: string[] } — set files to the paths the item will modify (from real code lookup, not guesses).
+challenges = [{ text, severity?: "advisory"|"blocking", gate?: string, itemId?: string }] — severity:"blocking" vetoes plan compilation until resolved (use sparingly, with concrete grounds); gate is a verifiable acceptance command (e.g. "npx tsc --noEmit") enforced between waves; itemId targets a specific item.`,
     defaultKind: 'plan',
     defaultTimeoutMs: 600_000, // 10min — 单轮会诊需充分读上下文
     builtIn: true,

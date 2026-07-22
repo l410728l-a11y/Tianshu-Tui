@@ -1,4 +1,5 @@
 import type { ServerResponse } from 'node:http'
+import { TIANSHU_PROTOCOL_HEADER, TIANSHU_PROTOCOL_VERSION } from './delegation-protocol.js'
 
 export class SseStream {
   private res: ServerResponse
@@ -25,6 +26,8 @@ export class SseStream {
       // blocks the stream and the client loops forever on "reconnecting" while
       // plain GETs (which DO get CORS via the router) keep working.
       'Access-Control-Allow-Origin': '*',
+      // E4 — protocol version (SSE bypasses router header merge).
+      [TIANSHU_PROTOCOL_HEADER]: String(TIANSHU_PROTOCOL_VERSION),
     })
     // Force the response headers out immediately. Without this, Node buffers the
     // 200 + headers until the first res.write() — but a freshly-caught-up idle

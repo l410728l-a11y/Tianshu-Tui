@@ -498,3 +498,63 @@ test('chrome 本身超屏时仍全量保留输入框(设计的例外)', () => {
   for (const c of chrome) assert.ok(out.includes(c), `${c} 必须保留(输入框不消失)`)
   assert.ok(!out.includes('dyn-0'), 'chrome 超屏时 dynamic 全部让位')
 })
+
+// ── 嵌入换行归一化（2026-07-21 输入框重影修复）───────────────────
+//
+// 上游内容（worker 多行 summary → progressLine → 舰队面板活动行）偶发携带
+// 嵌入 \n。带 \n 的行在屏上占 2+ 显示行，而 rowsForLine 基于 displayWidth
+// （string-width 把 \n 计 0 宽）按 1 行计 → lastDisplayRows 低于屏上实际
+// 行数 → 下一帧 cursorUp 回顶不足 → 旧帧顶部（输入框头行+边框）残留进
+// scrollback（输入框重影叠屏）。引擎入口必须把 \n 展开为独立行。
+
+test('嵌入 \\n 的行被展开为独立行——行数追踪与屏上一致（重影修复）', () => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  // 舰队活动行携带嵌入换行（真实泄漏链：review 门 evidence 以 \n 拼接）
+  engine.render(lines('HEAD', '⎿ 审查未决\ninfra failure', 'INPUT'))
+  term.flush()
+  // 屏上实际 4 行（HEAD / ⎿ 审查未决 / infra failure / INPUT），
+  // 光标驻停末行 → cursorRow 应为 3（修复前引擎按 3 行计，行为不可断言，
+  // 这里以 MockTerminal 光标行为为准）。
+  assert.equal(term.cursorRow, 3, '4 个显示行的帧光标应停在第 4 行')
+
+  // 下一帧结构变化 → 全量重写必须回顶 3 行（修复前只回 2 行 → HEAD 残留成重影）
+  engine.render(lines('HEAD', 'X', 'Y', 'Z', 'INPUT'))
+  const frame = term.flush()
+  assert.ok(frame.includes('\x1B[3A'), `全量重写应 cursorUp(3) 回到帧顶，实际帧: ${JSON.stringify(frame)}`)
+})
+
+test('嵌入 \\n 展开后 H2 短路仍生效（同帧重渲零写入）', () => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  const frame = lines('HEAD', 'A\nB', 'INPUT')
+  engine.render(frame)
+  term.flush()
+  engine.render(lines('HEAD', 'A\nB', 'INPUT'))
+  assert.equal(term.flush(), '', '归一化后相同内容应命中 H2 短路')
+})
+
+test('\\r 与 \\t 被替换为空格（不破坏光标列追踪）', () => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  engine.render(lines('HEAD', 'col1\tcol2\rtail', 'INPUT'))
+  const out = term.flush()
+  assert.ok(!out.includes('\t'), '帧内不应残留 \\t')
+  assert.ok(!/col2\r/.test(out), '内容中的 \\r 应被替换（行间协议性 \\r 不受影响）')
+  assert.ok(out.includes('col1 col2 tail'), '控制字符应替换为空格保留可读内容')
+})
+
+test('嵌入 \\n 的行参与 reservedTail 预算时 chrome 仍完整保留', () => {
+  const term = new MockTerminal(40, 12)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 6 })
+
+  const dyn = ['d0', 'multi\nline\nactivity', 'd1', 'd2']
+  const chrome = ['╭─ glance ─╮', '❯ █', '╰─ yolo ─╯']
+  engine.render([...dyn, ...chrome].map(text => ({ text })), { reservedTail: 3 })
+  const out = term.flush()
+  for (const c of chrome) assert.ok(out.includes(c), `${c} 必须保留`)
+  assert.equal(term.cursorRow, 5, '帧恒 ≤ maxRows=6 display rows（光标停在第 6 行内）')
+})

@@ -8,17 +8,17 @@ export const FILE_INFO_TOOL: Tool = {
   definition: {
     name: 'file_info',
     description:
-      `Get metadata about a file or directory without reading its contents.` +
-      `\n\nReturns: exists, type (file/directory/symlink), size, modified time, permissions, extension.` +
-      `\nFor directories: also returns file count and total size.` +
-      `\nUse this instead of bash stat/ls/file to check if a path exists or how large it is.` +
-      `\nNo approval needed — read-only, no subprocess.`,
+      `获取文件或目录的元数据，不读取其内容。` +
+      `\n\n返回：exists、type（file/directory/symlink）、size、修改时间、permissions、扩展名。` +
+      `\n目录额外返回：文件数量和总大小。` +
+      `\n用本工具替代 bash stat/ls/file 来检查路径是否存在、体积多大。` +
+      `\n无需审批——只读，不启动子进程。`,
     input_schema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
-          description: 'File or directory path (absolute or relative to cwd)',
+          description: '文件或目录路径（绝对路径，或相对 cwd 的路径）',
         },
       },
       required: ['path'],

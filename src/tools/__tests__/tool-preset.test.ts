@@ -24,10 +24,10 @@ function totalCount(preset: ToolPreset): number {
 
 describe('presetIncludes', () => {
   it('minimal keeps daily-dev tools and drops heavy/cold ones', () => {
-    for (const keep of ['read_file', 'bash', 'grep', 'web_search', 'web_fetch', 'deliver_task', 'delegate_task', 'delegate_batch', 'update_goal', 'session_vitals', 'apply_patch', 'plan_task', 'recall_capsule', 'ask_user_question']) {
+    for (const keep of ['read_file', 'bash', 'grep', 'web_search', 'web_fetch', 'deliver_task', 'delegate_task', 'delegate_batch', 'apply_patch', 'plan_task', 'recall_capsule', 'ask_user_question']) {
       assert.ok(presetIncludes('minimal', keep), `minimal must keep ${keep}`)
     }
-    for (const drop of ['council_convene', 'team_orchestrate', 'browser_debug', 'attack_case', 'semantic_search', 'repo_graph', 'undo', 'recall_general', 'record_general_finding', 'ast_edit', 'related_tests', 'inspect_project', 'import_resource', 'leave_mark']) {
+    for (const drop of ['council_convene', 'team_orchestrate', 'browser_debug', 'attack_case', 'semantic_search', 'repo_graph', 'undo', 'recall_general', 'record_general_finding', 'ast_edit', 'related_tests', 'inspect_project', 'import_resource', 'leave_mark', 'file_info', 'session_vitals', 'update_goal']) {
       assert.ok(!presetIncludes('minimal', drop), `minimal must drop ${drop}`)
     }
   })
@@ -44,9 +44,9 @@ describe('presetIncludes', () => {
 })
 
 describe('assembly counts per preset', () => {
-  it('minimal=30 / frontend=31 / full=44（完整装配口径）', () => {
-    assert.equal(totalCount('minimal'), 30)
-    assert.equal(totalCount('frontend'), 31)
+  it('minimal=27 / frontend=28 / full=44（完整装配口径）', () => {
+    assert.equal(totalCount('minimal'), 27)
+    assert.equal(totalCount('frontend'), 28)
     assert.equal(totalCount('full'), 44)
   })
 

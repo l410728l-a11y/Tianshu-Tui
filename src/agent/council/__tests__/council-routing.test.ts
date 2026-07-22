@@ -5,8 +5,59 @@ import {
   buildCouncilRoutingShadow,
   councilRoutingShadowKind,
   persistCouncilRoutingShadow,
+  pillarOf,
+  THREE_PILLAR_COUNCIL_SEATS,
+  mergeSeatOverrides,
   type CouncilRoutingShadowStore,
 } from '../council-routing.js'
+
+describe('三柱席位路由（卡巴拉对抗拓扑）', () => {
+  it('pillarOf：破军/天机/天璇 → expansion；天权/华盖/天府/天梁 → constraint；瑶光 → balance', () => {
+    assert.equal(pillarOf('pojun'), 'expansion')
+    assert.equal(pillarOf('tianji'), 'expansion')
+    assert.equal(pillarOf('tianxuan'), 'expansion')
+    assert.equal(pillarOf('tianquan'), 'constraint')
+    assert.equal(pillarOf('huagai'), 'constraint')
+    assert.equal(pillarOf('tianfu'), 'constraint')
+    assert.equal(pillarOf('tianliang'), 'constraint')
+    assert.equal(pillarOf('yaoguang'), 'balance')
+    assert.equal(pillarOf('unknown-domain'), undefined)
+  })
+
+  it('THREE_PILLAR_COUNCIL_SEATS：三柱齐备（扩张≥2 / 约束≥2 / 平衡=1），authority 不重复', () => {
+    const pillars = THREE_PILLAR_COUNCIL_SEATS.map(s => pillarOf(s.authority))
+    assert.ok(pillars.filter(p => p === 'expansion').length >= 2, '扩张柱至少 2 席')
+    assert.ok(pillars.filter(p => p === 'constraint').length >= 2, '约束柱至少 2 席')
+    assert.equal(pillars.filter(p => p === 'balance').length, 1, '平衡柱恰 1 席（合成裁决唯一）')
+    const auths = THREE_PILLAR_COUNCIL_SEATS.map(s => s.authority)
+    assert.equal(new Set(auths).size, auths.length)
+  })
+
+  it('THREE_PILLAR_COUNCIL_SEATS：约束柱与平衡柱带瑶光门（tierHint strong + noDowngrade）', () => {
+    for (const seat of THREE_PILLAR_COUNCIL_SEATS) {
+      const p = pillarOf(seat.authority)
+      if (p === 'constraint' || p === 'balance') {
+        assert.equal(seat.tierHint, 'strong', `${seat.authority} 应声明 strong`)
+        assert.equal(seat.noDowngrade, true, `${seat.authority} 应带瑶光门`)
+      }
+    }
+  })
+
+  it('mergeSeatOverrides：配置席位按 authority 覆盖 provider/model（异构默认接线），未匹配席保持原样', () => {
+    const merged = mergeSeatOverrides(THREE_PILLAR_COUNCIL_SEATS, [
+      { authority: 'pojun', provider: 'glm', model: 'glm-5' },
+      { authority: 'yaoguang', provider: 'deepseek', model: 'deepseek-v4-pro' },
+      { authority: 'not-in-pillars', provider: 'x', model: 'y' },
+    ])
+    assert.equal(merged.find(s => s.authority === 'pojun')?.provider, 'glm')
+    assert.equal(merged.find(s => s.authority === 'pojun')?.model, 'glm-5')
+    assert.equal(merged.find(s => s.authority === 'yaoguang')?.model, 'deepseek-v4-pro')
+    assert.equal(merged.find(s => s.authority === 'tianquan')?.provider, undefined)
+    // 覆盖不改变席位数量与章程
+    assert.equal(merged.length, THREE_PILLAR_COUNCIL_SEATS.length)
+    assert.equal(merged.find(s => s.authority === 'pojun')?.charter, THREE_PILLAR_COUNCIL_SEATS.find(s => s.authority === 'pojun')?.charter)
+  })
+})
 
 describe('routeCouncilSeat — authority 升级 + 瑶光门', () => {
   it('天府高风险席 → strong（authority 升级路径，council_expert 无 tierLock）', () => {

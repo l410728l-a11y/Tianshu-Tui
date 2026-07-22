@@ -6,9 +6,26 @@ import { buildFileDiff, computeChangedLineRanges, type LineRange } from './edit-
 import { hashLine } from './hash-edit.js'
 import { getFileReadMtime, noteFileObserved, recordSuccessfulEdit, wasFileEditedBySession, incrementEditFailCount, resetEditFailCount } from './read-file.js'
 import { syntaxCheck, checkSyntax } from './syntax-check.js'
-import { writeFileAtomicAsync } from '../fs-atomic.js'
 import { findFuzzyMatch, applyFuzzyReplacement } from './fuzzy-match.js'
-import { detectEol, chooseEol, toLf, applyEol } from './line-endings.js'
+import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
+
+/** E4-aware write: client apply_edit or local atomic write. */
+async function writeEditLanding(
+  params: ToolCallParams,
+  filePath: string,
+  oldContent: string,
+  newContent: string,
+  eol: Eol,
+): Promise<{ delegatedRejectOrError: ReturnType<typeof delegatedToToolResult> } | { ok: true }> {
+  const land = await landingWriteFile(params, filePath, oldContent, applyEol(newContent, eol))
+  if (land.kind === 'delegated') {
+    if (isDelegateRejected(land.delegated) || land.delegated.isError) {
+      return { delegatedRejectOrError: delegatedToToolResult(land.delegated) }
+    }
+  }
+  return { ok: true }
+}
+import { detectEol, chooseEol, toLf, applyEol, type Eol } from './line-endings.js'
 import { getTargetEol } from '../platform.js'
 import { detectPointerPlaceholder, pointerPlaceholderError } from './pointer-guard.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
@@ -52,29 +69,29 @@ function detectRegexPattern(oldString: string): string | null {
 export const EDIT_FILE_TOOL: Tool = {
   definition: {
     name: 'edit_file',
-    description: `Perform exact string replacements in existing files.
+    description: `在已有文件中执行精确字符串替换。
 
-- old_string must be unique — include surrounding context if needed
-- Preserve exact indentation (tabs/spaces) from the file
-- replace_all replaces every occurrence; expected_count warns on mismatch
-- For large edits, message history keeps only a short pointer; use read_file to review
+- old_string 必须唯一——必要时带上周边上下文
+- 严格保留文件原有的缩进（tabs/spaces）
+- replace_all 替换所有出现处；expected_count 数量不符时给出警告
+- 大编辑后消息历史只保留短指针；用 read_file 回看
 
-Prefer edit_file for unique-string swaps; use hash_edit for whitespace-ambiguous edits; use apply_patch with a unified diff for single-file multi-location changes, edits over ~20 lines, or structural refactors.`,
+唯一字符串替换优先用 edit_file；空白字符有歧义的编辑用 hash_edit；单文件多处改动、超过约 20 行的编辑或结构性重构，用 apply_patch 加 unified diff。`,
 
     input_schema: {
       type: 'object',
       properties: {
-        file_path: { type: 'string', description: 'Absolute path to the file to edit. Provide this parameter first.' },
-        old_string: { type: 'string', description: 'The exact text to replace (must be unique in the file)' },
-        new_string: { type: 'string', description: 'The replacement text' },
-        replace_all: { type: 'boolean', description: 'Replace all occurrences of old_string (default: false)' },
+        file_path: { type: 'string', description: '要编辑文件的绝对路径。先提供此参数。' },
+        old_string: { type: 'string', description: '要替换的原始文本（必须在文件中唯一）' },
+        new_string: { type: 'string', description: '替换后的文本' },
+        replace_all: { type: 'boolean', description: '替换 old_string 的所有出现处（默认：false）' },
         expected_count: {
           type: 'number',
-          description: 'Expected number of replacements when replace_all is true. If actual count differs, a warning is returned so you can grep to verify no instances were missed (e.g. due to indentation differences).'
+          description: 'replace_all 为 true 时预期的替换次数。实际次数不符时返回警告，便于你用 grep 核实是否有遗漏（例如缩进差异导致的漏配）。'
         },
         dry_run: {
           type: 'boolean',
-          description: 'If true, compute and return the diff that would be applied without writing to disk.',
+          description: '为 true 时，计算并返回将要应用的 diff，但不写盘。',
         },
       },
       required: ['file_path', 'old_string', 'new_string'],
@@ -161,7 +178,10 @@ Prefer edit_file for unique-string swaps; use hash_edit for whitespace-ambiguous
               return buildDryRunPreview(params.cwd, filePath, freshContent, newContent)
             }
             trackFileChange(params.cwd, { filePath: relative(params.cwd, filePath), action: 'edit', toolCallId: params.toolUseId ?? 'edit_file' })
-            await writeFileAtomicAsync(filePath, applyEol(newContent, freshEol))
+            {
+              const land = await writeEditLanding(params, filePath, freshContent, newContent, freshEol)
+              if ('delegatedRejectOrError' in land) return land.delegatedRejectOrError
+            }
             const occurrences = (freshContent.match(new RegExp(escapeRegExp(oldString), 'g')) || []).length
             const expectedCount = params.input.expected_count as number | undefined
             return await finalizeEdit(params.cwd, filePath, freshContent, newContent, params.sessionId, (warn, ui, changedRanges) => {
@@ -183,7 +203,10 @@ Prefer edit_file for unique-string swaps; use hash_edit for whitespace-ambiguous
             return buildDryRunPreview(params.cwd, filePath, freshContent, recovered)
           }
           trackFileChange(params.cwd, { filePath: relative(params.cwd, filePath), action: 'edit', toolCallId: params.toolUseId ?? 'edit_file' })
-          await writeFileAtomicAsync(filePath, applyEol(recovered, freshEol))
+          {
+            const land = await writeEditLanding(params, filePath, freshContent, recovered, freshEol)
+            if ('delegatedRejectOrError' in land) return land.delegatedRejectOrError
+          }
           return await finalizeEdit(params.cwd, filePath, freshContent, recovered, params.sessionId, (warn, ui, changedRanges) => ({
             content: `Applied edit to ${filePath} (file was modified externally but content still matched)${warn ? '\n\n' + warn : ''}`,
             uiContent: ui,
@@ -268,7 +291,10 @@ Prefer edit_file for unique-string swaps; use hash_edit for whitespace-ambiguous
         return buildDryRunPreview(params.cwd, filePath, content, newContent)
       }
       trackFileChange(params.cwd, { filePath: relative(params.cwd, filePath), action: 'edit', toolCallId: params.toolUseId ?? 'edit_file' })
-      await writeFileAtomicAsync(filePath, applyEol(newContent, eol))
+      {
+        const land = await writeEditLanding(params, filePath, content, newContent, eol)
+        if ('delegatedRejectOrError' in land) return land.delegatedRejectOrError
+      }
       const occurrences = (content.match(new RegExp(escapeRegExp(oldString), 'g')) || []).length
       const expectedCount = params.input.expected_count as number | undefined
       return await finalizeEdit(params.cwd, filePath, content, newContent, params.sessionId, (warn, ui, changedRanges) => {
@@ -295,7 +321,10 @@ Prefer edit_file for unique-string swaps; use hash_edit for whitespace-ambiguous
           return buildDryRunPreview(params.cwd, filePath, content, recovered)
         }
         trackFileChange(params.cwd, { filePath: relative(params.cwd, filePath), action: 'edit', toolCallId: params.toolUseId ?? 'edit_file' })
-        await writeFileAtomicAsync(filePath, applyEol(recovered, eol))
+        {
+          const land = await writeEditLanding(params, filePath, content, recovered, eol)
+          if ('delegatedRejectOrError' in land) return land.delegatedRejectOrError
+        }
         return await finalizeEdit(params.cwd, filePath, content, recovered, params.sessionId, (warn, ui, changedRanges) => {
           // Surface the whitespace drift so the model can self-correct in
           // subsequent edits — without this, error accumulates across calls.
@@ -332,7 +361,10 @@ Prefer edit_file for unique-string swaps; use hash_edit for whitespace-ambiguous
       return buildDryRunPreview(params.cwd, filePath, content, newContent)
     }
     trackFileChange(params.cwd, { filePath: relative(params.cwd, filePath), action: 'edit', toolCallId: params.toolUseId ?? 'edit_file' })
-    await writeFileAtomicAsync(filePath, applyEol(newContent, eol))
+    {
+      const land = await writeEditLanding(params, filePath, content, newContent, eol)
+      if ('delegatedRejectOrError' in land) return land.delegatedRejectOrError
+    }
     return await finalizeEdit(params.cwd, filePath, content, newContent, params.sessionId, (warn, ui, changedRanges) => {
       const draftReceipt = formatActivePlanDraftReceipt(params.cwd, filePath, params.activePlanFilePath, newContent.length)
       const base = draftReceipt ?? `Applied edit to ${filePath}`

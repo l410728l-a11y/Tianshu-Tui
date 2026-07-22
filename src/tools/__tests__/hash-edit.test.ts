@@ -490,4 +490,118 @@ describe('hash_edit', () => {
     const newContent = readFileSync(filePath, 'utf-8')
     assert.equal((newContent.match(/function getStates/g) ?? []).length, 2, 'single-anchor insertion should leave two getStates declarations')
   })
+
+  // ── Fresh anchors (chain-safe) ──────────────────────────────────────
+
+  function parseFreshAnchors(content: string): string[] {
+    const idx = content.indexOf('Fresh anchors (chain-safe):')
+    if (idx === -1) return []
+    return content.slice(idx).split('\n').slice(1)
+      .filter(l => /^L\d+:[0-9a-f]{8}$/.test(l))
+  }
+
+  it('success output returns fresh anchors matching the new file content', async () => {
+    const cwd = setup({
+      'test.txt': 'alpha\nbeta\ngamma\ndelta\nepsilon\n',
+    })
+    const filePath = join(cwd, 'test.txt')
+    const { createHash } = await import('crypto')
+    const h = (line: string): string => createHash('sha256').update(line).digest('hex').slice(0, 8)
+    const lines = readFileSync(filePath, 'utf-8').split('\n')
+
+    const result = await HASH_EDIT_TOOL.execute(params({
+      file_path: filePath,
+      anchors: [`L2:${h(lines[1]!)}`, `L3:${h(lines[2]!)}`],
+      new_string: 'BETA\nGAMMA-NEW\nGAMMA-TAIL',
+    }))
+    assert.equal(result.isError, undefined)
+
+    const fresh = parseFreshAnchors(result.content)
+    // Context-before (L1), first new (L2), last new (L4), context-after (L5)
+    assert.deepEqual(fresh.map(a => a.split(':')[0]), ['L1', 'L2', 'L4', 'L5'])
+
+    // Every returned anchor hash must match the actual line now on disk.
+    const newLines = readFileSync(filePath, 'utf-8').split('\n')
+    for (const anchor of fresh) {
+      const [pos, hash] = anchor.split(':') as [string, string]
+      const lineNo = parseInt(pos.slice(1), 10)
+      assert.equal(hash, h(newLines[lineNo - 1]!), `anchor ${anchor} does not match file content "${newLines[lineNo - 1]}"`)
+    }
+  })
+
+  it('chained edit using returned fresh anchors succeeds without re-reading', async () => {
+    const cwd = setup({
+      'test.txt': 'one\ntwo\nthree\nfour\nfive\n',
+    })
+    const filePath = join(cwd, 'test.txt')
+    const { createHash } = await import('crypto')
+    const h = (line: string): string => createHash('sha256').update(line).digest('hex').slice(0, 8)
+    const lines = readFileSync(filePath, 'utf-8').split('\n')
+
+    const first = await HASH_EDIT_TOOL.execute(params({
+      file_path: filePath,
+      anchors: [`L2:${h(lines[1]!)}`, `L4:${h(lines[3]!)}`],
+      new_string: 'TWO\nTHREE\nFOUR',
+    }))
+    assert.equal(first.isError, undefined)
+    const fresh = parseFreshAnchors(first.content)
+    assert.ok(fresh.length >= 2, `expected fresh anchors in first result, got: ${first.content}`)
+
+    // Second edit consumes the returned anchors verbatim — the chain-safety
+    // contract: no re-read between edits.
+    const firstNew = fresh[1]! // first line of the new region
+    const lastNew = fresh[fresh.length - 2]! // last line of the new region
+    const second = await HASH_EDIT_TOOL.execute(params({
+      file_path: filePath,
+      anchors: [firstNew, lastNew],
+      new_string: 'CHAINED',
+    }))
+    assert.equal(second.isError, undefined, `chained edit failed: ${second.content}`)
+    assert.equal(readFileSync(filePath, 'utf-8'), 'one\nCHAINED\nfive\n')
+    // The chained success also returns anchors for a third hop.
+    assert.ok(parseFreshAnchors(second.content).length >= 2)
+  })
+
+  it('pure deletion returns only context anchors', async () => {
+    const cwd = setup({
+      'test.txt': 'keep-top\ndrop-a\ndrop-b\nkeep-bottom\n',
+    })
+    const filePath = join(cwd, 'test.txt')
+    const { createHash } = await import('crypto')
+    const h = (line: string): string => createHash('sha256').update(line).digest('hex').slice(0, 8)
+    const lines = readFileSync(filePath, 'utf-8').split('\n')
+
+    const result = await HASH_EDIT_TOOL.execute(params({
+      file_path: filePath,
+      anchors: [`L2:${h(lines[1]!)}`, `L3:${h(lines[2]!)}`],
+      new_string: '',
+    }))
+    assert.equal(result.isError, undefined)
+    const fresh = parseFreshAnchors(result.content)
+    // No new lines — only context-before (L1) and context-after (L2).
+    assert.deepEqual(fresh.map(a => a.split(':')[0]), ['L1', 'L2'])
+    assert.equal(readFileSync(filePath, 'utf-8'), 'keep-top\nkeep-bottom\n')
+  })
+
+  it('stale-recovery success path also returns fresh anchors', async () => {
+    const cwd = setup({
+      'test.txt': 'aaa\nbbb\nccc\nddd\n',
+    })
+    const filePath = join(cwd, 'test.txt')
+    const { createHash } = await import('crypto')
+    const h = (line: string): string => createHash('sha256').update(line).digest('hex').slice(0, 8)
+
+    // Anchors carry correct hashes but shifted line numbers (as if a prior
+    // edit above moved the content down) — triggers the recovery path.
+    const result = await HASH_EDIT_TOOL.execute(params({
+      file_path: filePath,
+      anchors: [`L1:${h('bbb')}`, `L2:${h('ccc')}`],
+      new_string: 'RECOVERED',
+    }))
+    assert.equal(result.isError, undefined, `recovery edit failed: ${result.content}`)
+    assert.ok(result.content.includes('auto-recovered'), `expected auto-recovery, got: ${result.content}`)
+    const fresh = parseFreshAnchors(result.content)
+    assert.ok(fresh.length >= 2, `expected fresh anchors on recovery path, got: ${result.content}`)
+    assert.equal(readFileSync(filePath, 'utf-8'), 'aaa\nRECOVERED\nddd\n')
+  })
 })

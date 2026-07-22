@@ -6,7 +6,7 @@
 
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createActivityStreamer, createDelegationActivityMapper, shortOrderLabel } from '../worker-activity-stream.js'
+import { createActivityStreamer, createDelegationActivityMapper, progressSnippet, shortOrderLabel } from '../worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../../agent/coordinator.js'
 import type { DelegationActivity } from '../types.js'
 
@@ -19,6 +19,22 @@ describe('shortOrderLabel', () => {
     assert.equal(shortOrderLabel('wo_abc123'), 'abc123')
     assert.equal(shortOrderLabel('team:T1'), 'T1')
     assert.equal(shortOrderLabel('wo_team:T2'), 'T2')
+  })
+})
+
+describe('progressSnippet', () => {
+  it('压平嵌入换行/制表符后截断（live region 单行契约）', () => {
+    // 真实泄漏链：review 门 evidence 用 \n 拼接 → progressLine → 舰队面板活动行
+    const multi = '⚠️ 审查未决 (auto)\nreview DID NOT run (infra failure)\n\tretry also failed'
+    const snippet = progressSnippet(multi)
+    assert.ok(!snippet.includes('\n'), '片段不得携带换行')
+    assert.ok(!snippet.includes('\t'), '片段不得携带制表符')
+    assert.match(snippet, /审查未决 \(auto\) review DID NOT run/)
+  })
+
+  it('按 max 截断并 trim 首尾空白', () => {
+    assert.equal(progressSnippet('  abc  '), 'abc')
+    assert.equal(progressSnippet('abcdef', 3), 'abc')
   })
 })
 
@@ -110,5 +126,20 @@ describe('createDelegationActivityMapper', () => {
     assert.equal(b[0]!.toolUseCount, 1)
     // 迟到的较小 token 快照不回退
     assert.equal(a[2]!.tokenCount, 2000)
+  })
+
+  it('objective 仅在首条 running 事件携带（查表或 event.objective）', () => {
+    const acts: DelegationActivity[] = []
+    const map = createDelegationActivityMapper('p', a => acts.push(a), {
+      objectiveOf: (id) => id === 'wo_a' ? 'find auth bugs' : undefined,
+    })
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', detail: 'grep' }))
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', detail: 'read_file' }))
+    map(ev({ workOrderId: 'wo_b', kind: 'tool_use', objective: 'from coordinator' }))
+    map(ev({ workOrderId: 'wo_b', kind: 'text', detail: 'x' }))
+    assert.equal(acts[0]!.objective, 'find auth bugs')
+    assert.equal(acts[1]!.objective, undefined)
+    assert.equal(acts[2]!.objective, 'from coordinator')
+    assert.equal(acts[3]!.objective, undefined)
   })
 })

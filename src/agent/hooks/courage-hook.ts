@@ -21,7 +21,9 @@ import { CONSTITUTIONAL_PRIORITY } from '../advisory-bus.js'
 
 export interface CourageHookConfig {
   cooldownTurns?: number
-  courageThreshold?: number
+  /** 活引用 getter：每次触发时求值，读取最新 sessionDomain.courageThreshold。
+   *  域切换后阈值即时生效，非构造期一次性快照。 */
+  getCourageThreshold?: () => number
   /**
    * Sycophancy trap 累积状态查询 — 最小接口，避免循环依赖。
    * 当 trap 检测到连续投降模式时，courage-hook 切换到宪法模式：
@@ -83,7 +85,6 @@ const CONSTITUTIONAL_HINT =
 
 export function createCourageHook(config: CourageHookConfig = {}): PreTurnRuntimeHook {
   const cooldownTurns = config.cooldownTurns ?? DEFAULT_COOLDOWN_TURNS
-  const courageThreshold = config.courageThreshold ?? DEFAULT_COURAGE_THRESHOLD
   const sycophancyTrap = config.sycophancyTrap
   let lastTriggeredTurn = -Infinity
 
@@ -92,6 +93,9 @@ export function createCourageHook(config: CourageHookConfig = {}): PreTurnRuntim
     name: 'courage',
     run(ctx) {
       const turn = ctx.snapshot.turn
+      // 活引用求值：每次触发读取最新 sessionDomain.courageThreshold，
+      // 域切换即时生效（非构造期快照）。
+      const courageThreshold = config.getCourageThreshold?.() ?? DEFAULT_COURAGE_THRESHOLD
       // 宪法级：sycophancy trap 触发 → 绕过冷却、强制注入义务性指令
       const constitutional = sycophancyTrap?.shouldInjectChallenge() ?? false
       if (!constitutional && turn - lastTriggeredTurn < cooldownTurns) return

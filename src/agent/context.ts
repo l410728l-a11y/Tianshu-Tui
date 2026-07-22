@@ -14,6 +14,15 @@ import { editFileArgProcessor } from '../tools/edit-file-arg-processor.js'
 import { hashEditArgProcessor } from '../tools/hash-edit-arg-processor.js'
 import { applyPatchArgProcessor } from '../tools/apply-patch-arg-processor.js'
 
+/** SR 载荷类别 —— W1 通道分级。
+ *  - `user`: 用户输入 steer，无条件放行，不占任何额度
+ *  - `functional`: 续轮门载荷（义务门/action-intent/thinking-retry/goal continuation），
+ *    不限流——调用方自带 run 级闩锁保证有界
+ *  - `discipline`: 工程提醒（readonly-spiral/turn-call-limit 等 bus SR 通道），
+ *    保持每用户轮 1 条（W3 噪音洪流防护）
+ */
+export type SrClass = 'user' | 'functional' | 'discipline'
+
 const MAX_TRACKED_FILES = 500
 const MAX_TEST_RESULTS = 500
 const MAX_CACHE_HISTORY = 500
@@ -87,11 +96,13 @@ export class SessionContext {
   /** Tool argument post-processors — intercept large args before entering oaiMessages */
   private argProcessors: ToolArgPostProcessorRegistry
   /**
-   * W3 噪音洪流修复：system-reminder 每轮最多 1 条。
+   * W3 噪音洪流修复：discipline 类 system-reminder 每轮最多 1 条。
    * df4ac4e9 中 7/9 条用户消息是 system-reminder，全部绕过 advisory bus
-   * 的 MAX_ADVISORIES_PER_TURN=3 上限——这才是真正的洪水源。计数器在每轮
-   * 开始时由 AgentLoop 重置；超过 1 条后静默丢弃（不影响关键守护路径，
-   * 它们已迁移到 advisory bus 的 constitutional/immediate 通道）。 */
+   * 的 MAX_ADVISORIES_PER_TURN=3 上限——这才是真正的洪水源。
+   *
+   * W1 通道分级：仅 discipline 类递增此计数器；user / functional 类
+   * 不触碰——user 无条件放行，functional 由调用方 run 级闩锁保证有界。
+   * 计数器在每轮开始时由 AgentLoop 经 resetSrCount() 重置。 */
   private srCountThisTurn = 0
 
   constructor() {
@@ -170,12 +181,15 @@ export class SessionContext {
    *     message at the end. The SR marker keeps PromptEngine from treating it as
    *     a real user boundary.
    */
-  appendSystemReminder(text: string): void {
-    // W3 噪音洪流修复：每轮最多 1 条 system-reminder。
-    // 超过上限时静默丢弃——关键守护路径已迁移到 advisory bus
-    // 的 constitutional / immediate 通道，不受此上限约束。
-    if (this.srCountThisTurn >= 1) return
-    this.srCountThisTurn++
+  appendSystemReminder(text: string, cls?: SrClass): void {
+    // W1 通道分级：user / functional 不限流，不占 discipline 额度。
+    // 默认 'discipline' 保持存量调用行为不变。
+    const effectiveCls = cls ?? 'discipline'
+    if (effectiveCls === 'discipline') {
+      if (this.srCountThisTurn >= 1) return
+      this.srCountThisTurn++
+    }
+    // user / functional: 无条件放行，不触碰计数器
     const wrapped = wrapSystemReminder(text)
     const msgs = this.state.oaiMessages
     const last = msgs[msgs.length - 1]
@@ -192,18 +206,32 @@ export class SessionContext {
     this.addUserMessage(wrapped)
   }
 
-  /** W3：每轮开始时重置 SR 计数器（由 AgentLoop 调用）。 */
+  /** W3/W1：每轮开始时重置 discipline SR 计数器（由 AgentLoop 调用）。
+   *  W1 通道分级后仅重置 discipline 桶——user/functional 不触碰此计数器。 */
   resetSrCount(): void {
     this.srCountThisTurn = 0
+  }
+
+  /** W2 P2 修复：discipline 额度是否还有剩余。
+   *  供 turn-step-producer 排水循环查询——额度耗尽时 discipline 条目留在 bus
+   *  不取出（不消耗 carry），等下一用户轮额度恢复后自然送达。 */
+  hasDisciplineSrQuota(): boolean {
+    return this.srCountThisTurn < 1
   }
 
   /**
    * Wave 1：与 appendSystemReminder 相同，但返回是否成功注入（未被 cap 拦截）。
    * 供 advisory bus SR 通道回调确认使用。
+   * W1 通道分级：functional 类不限流 → 注入不可能失败（返回恒 true），
+   * fail-closed 守卫保留为纵深防御。
    */
-  appendSystemReminderAndReport(text: string): boolean {
-    if (this.srCountThisTurn >= 1) return false
-    this.srCountThisTurn++
+  appendSystemReminderAndReport(text: string, cls?: SrClass): boolean {
+    const effectiveCls = cls ?? 'discipline'
+    if (effectiveCls === 'discipline') {
+      if (this.srCountThisTurn >= 1) return false
+      this.srCountThisTurn++
+    }
+    // user / functional: 不触碰计数器，无条件放行 → 返回恒 true
     const wrapped = wrapSystemReminder(text)
     const msgs = this.state.oaiMessages
     const last = msgs[msgs.length - 1]

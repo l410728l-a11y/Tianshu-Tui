@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { saveCheckpoint, loadCheckpoint, clearCheckpoint, listCheckpoints, formatCheckpointList, type WaveCheckpoint } from '../wave-checkpoint.js'
+import { saveCheckpoint, loadCheckpoint, clearCheckpoint, listCheckpoints, formatCheckpointList, buildResumeFromCheckpoint, type WaveCheckpoint } from '../wave-checkpoint.js'
 
 function mkCheckpoint(overrides: Partial<WaveCheckpoint> = {}): WaveCheckpoint {
   return {
@@ -139,4 +139,31 @@ test('WaveCheckpoint: completedResults and remainingOrders preserved through rou
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ── W3: buildResumeFromCheckpoint ──────────────────────────────
+
+test('buildResumeFromCheckpoint: generates valid planJson and prompt', () => {
+  const cp = mkCheckpoint({
+    remainingOrders: [
+      { id: 'T2', objective: 'fix tests', profile: 'patcher', kind: 'patch_proposal', scope: {}, authority: 'tianquan' },
+      { id: 'T3', objective: 'review', profile: 'adversarial_verifier', kind: 'verify', scope: {}, authority: 'tianxuan' },
+    ],
+    completedResults: [
+      { workOrderId: 'T1', status: 'passed', summary: 'done', findings: [], risks: [], nextActions: [], changedFiles: [], evidenceStatus: 'verified', artifacts: [], model: 'test', usage: { input_tokens: 100, output_tokens: 50 } },
+    ],
+  })
+  const result = buildResumeFromCheckpoint(cp)
+  assert.ok(result)
+  assert.ok(result!.planJson.includes('"objective":'))
+  assert.ok(result!.planJson.includes('T2'))
+  assert.ok(result!.prompt.includes('[TEAM RESUME]'))
+  assert.ok(result!.prompt.includes('team_orchestrate'))
+  // prompt must include the original objective for context
+  assert.ok(result!.prompt.includes(cp.objective))
+})
+
+test('buildResumeFromCheckpoint: returns null when no remaining orders', () => {
+  const cp = mkCheckpoint({ remainingOrders: [] })
+  assert.equal(buildResumeFromCheckpoint(cp), null)
 })

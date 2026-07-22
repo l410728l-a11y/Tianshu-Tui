@@ -133,4 +133,163 @@ describe('SessionContext.appendSystemReminder', () => {
     assert.equal(msgs.length, 3, 'SR appended as a new tail entry')
     assert.ok((msgs[2]!.content as string).includes('sr text'), 'SR in the new tail message')
   })
+
+  // ── appendSystemReminderAndReport return-value contract ──
+  // 义务门/action-intent gate 依赖此返回值判断是否放弃续轮。
+  // 返回 false = SR cap 已耗尽，调用方必须放弃续轮（fail-closed）。
+
+  it('appendSystemReminderAndReport returns true on first call, false when cap exhausted', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    const first = session.appendSystemReminderAndReport('first SR')
+    assert.equal(first, true, 'first SR should be delivered')
+
+    const second = session.appendSystemReminderAndReport('second SR')
+    assert.equal(second, false, 'second SR must be rejected by cap')
+
+    const msgs = session.getMessages()
+    const content = msgs[0]!.content as string
+    assert.ok(content.includes('first SR'), 'first SR in message')
+    assert.ok(!content.includes('second SR'), 'second SR must NOT be in message')
+  })
+
+  it('appendSystemReminderAndReport vs appendSystemReminder: only AndReport signals failure', () => {
+    // 核心缺陷复现：appendSystemReminder 返回 void，调用方无感知。
+    // appendSystemReminderAndReport 返回 boolean，调用方可据此决策。
+    const session = new SessionContext()
+    session.addUserMessage('task')
+
+    // 先消耗额度
+    session.appendSystemReminder('consumer')
+
+    // void 返回的 appendSystemReminder：静默丢弃，调用方不知道
+    session.appendSystemReminder('should-be-dropped')
+
+    // AndReport 返回 false：调用方知道被吞了
+    const ok = session.appendSystemReminderAndReport('should-also-be-dropped')
+    assert.equal(ok, false, 'AndReport must return false when cap exhausted')
+  })
+
+  // ── W1 通道分级契约 ──
+
+  it('W1: cls=user bypasses cap — multiple user-class SRs all delivered', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    session.appendSystemReminder('steer A', 'user')
+    session.appendSystemReminder('steer B', 'user')
+    session.appendSystemReminder('steer C', 'user')
+
+    const msgs = session.getMessages()
+    const content = msgs[0]!.content as string
+    assert.ok(content.includes('steer A'), 'first user SR should be delivered')
+    assert.ok(content.includes('steer B'), 'second user SR should also be delivered')
+    assert.ok(content.includes('steer C'), 'third user SR should also be delivered')
+  })
+
+  it('W1: cls=user does not consume discipline quota', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    // 先发一条 user 类（不占额度）
+    session.appendSystemReminder('user steer', 'user')
+    // 再发一条 discipline（应该成功，因为 user 不占额度）
+    session.appendSystemReminder('discipline nudge')
+
+    const msgs = session.getMessages()
+    const content = msgs[0]!.content as string
+    assert.ok(content.includes('user steer'), 'user SR should be delivered')
+    assert.ok(content.includes('discipline nudge'), 'discipline SR should still have quota')
+  })
+
+  it('W1: cls=functional bypasses cap even when discipline quota is exhausted', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    // 消耗 discipline 额度
+    session.appendSystemReminder('discipline A', 'discipline')
+    // discipline 第二条应被拦截
+    session.appendSystemReminder('discipline B', 'discipline')
+    // functional 不应受影响
+    session.appendSystemReminder('functional gate', 'functional')
+
+    const msgs = session.getMessages()
+    const content = msgs[0]!.content as string
+    assert.ok(content.includes('discipline A'), 'first discipline SR should be delivered')
+    assert.ok(!content.includes('discipline B'), 'second discipline SR must be dropped')
+    assert.ok(content.includes('functional gate'), 'functional SR must be delivered despite discipline cap exhausted')
+  })
+
+  it('W1: cls=functional appendSystemReminderAndReport always returns true (cannot fail)', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    // 先消耗 discipline 额度
+    session.appendSystemReminder('discipline A', 'discipline')
+
+    // functional AndReport：即使 discipline 额度耗尽，仍应返回 true
+    const ok = session.appendSystemReminderAndReport('obligation gate', 'functional')
+    assert.equal(ok, true, 'functional AndReport must return true even when discipline cap is exhausted')
+
+    // discipline AndReport：应返回 false（额度已耗尽）
+    const ok2 = session.appendSystemReminderAndReport('discipline B', 'discipline')
+    assert.equal(ok2, false, 'discipline AndReport must return false when cap exhausted')
+  })
+
+  it('W1: functional does not consume discipline quota — discipline still works after functional', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    // 先发 functional（不应占 discipline 额度）
+    session.appendSystemReminder('functional reminder', 'functional')
+    // 再发 discipline（应该成功）
+    session.appendSystemReminder('discipline nudge', 'discipline')
+
+    const msgs = session.getMessages()
+    const content = msgs[0]!.content as string
+    assert.ok(content.includes('functional reminder'), 'functional SR delivered')
+    assert.ok(content.includes('discipline nudge'), 'discipline SR still has quota after functional')
+  })
+
+  it('W1: resetSrCount only resets discipline counter — user/functional unaffected', () => {
+    const session = new SessionContext()
+    session.addUserMessage('turn 1')
+
+    // 消耗 discipline 额度
+    session.appendSystemReminder('disc T1', 'discipline')
+    // 再发 discipline 应被拦截
+    session.appendSystemReminder('disc T1 B', 'discipline')
+
+    const t1 = session.getMessages()[0]!.content as string
+    assert.ok(!t1.includes('disc T1 B'), 'second discipline dropped in turn 1')
+
+    // 重置 → 新轮
+    session.resetSrCount()
+    session.addUserMessage('turn 2')
+
+    // discipline 新轮应恢复
+    session.appendSystemReminder('disc T2', 'discipline')
+    // user 仍然无条件放行
+    session.appendSystemReminder('user T2', 'user')
+
+    const msgs = session.getMessages()
+    const t2 = msgs[1]!.content as string
+    assert.ok(t2.includes('disc T2'), 'discipline restored after reset')
+    assert.ok(t2.includes('user T2'), 'user always passes through')
+  })
+
+  it('W1: no cls argument → discipline (backward compatible)', () => {
+    const session = new SessionContext()
+    session.addUserMessage('hello')
+
+    // 不传 cls → 默认 discipline，行为与改前一致
+    session.appendSystemReminder('first')
+    session.appendSystemReminder('second')
+
+    const msgs = session.getMessages()
+    const content = msgs[0]!.content as string
+    assert.ok(content.includes('first'), 'first delivered (default discipline)')
+    assert.ok(!content.includes('second'), 'second dropped (discipline cap)')
+  })
 })

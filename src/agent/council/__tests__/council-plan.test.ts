@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { aggregateCouncil, stableConflictKey, resolveConflictsWithRebuttals } from '../council-plan.js'
+import { aggregateCouncil, stableConflictKey, resolveConflictsWithRebuttals, unresolvedBlockingConflicts, applyResolutionsToMergedItems } from '../council-plan.js'
 import type { CouncilDraft, SeatContribution, CouncilConflict } from '../council-plan.js'
 
 const draft: CouncilDraft = {
@@ -16,7 +16,7 @@ describe('aggregateCouncil — 留痕不丢', () => {
     const c = seat({ authority: 'tianquan',
       additions: [{ id: 'A1', title: 'a', detail: 'd' }],
       risks: [{ claim: 'r', severity: 'low', mitigation: 'm' }],
-      challenges: ['why?'],
+      challenges: [{ text: 'why?' }],
       alternatives: [{ proposal: 'alt', recommend: false, rationale: 'because' }] })
     const agg = aggregateCouncil(draft, [c])
     assert.equal(agg.decisions.length, 4)
@@ -100,9 +100,55 @@ describe('aggregateCouncil — rejected 必带理由 / deferred≠删除', () =>
     assert.ok(d.rationale.length > 0)
   })
   it('challenge 以 deferred 留在 ledger', () => {
-    const c = seat({ authority: 's', challenges: ['edge case?'] })
+    const c = seat({ authority: 's', challenges: [{ text: 'edge case?' }] })
     const d = aggregateCouncil(draft, [c]).decisions.find(x => x.kind === 'challenge')!
     assert.equal(d.verdict, 'deferred')
+  })
+})
+
+describe('aggregateCouncil — blocking challenge 否决语义', () => {
+  it('blocking challenge → severity:blocking 的 open 冲突 + deferred decision 留痕', () => {
+    const c = seat({ authority: 'tianfu', challenges: [{ text: '无回滚方案不得动 schema', severity: 'blocking' }] })
+    const agg = aggregateCouncil(draft, [c])
+    const d = agg.decisions.find(x => x.kind === 'challenge')!
+    assert.equal(d.verdict, 'deferred')
+    assert.equal(agg.conflicts.length, 1)
+    assert.equal(agg.conflicts[0]!.severity, 'blocking')
+    assert.equal(agg.conflicts[0]!.status, 'open')
+    assert.equal(agg.conflicts[0]!.left, '无回滚方案不得动 schema')
+  })
+  it('advisory challenge（缺省 severity）不产生冲突，行为与现状一致', () => {
+    const c = seat({ authority: 'tianfu', challenges: [{ text: '性能影响待量化' }] })
+    const agg = aggregateCouncil(draft, [c])
+    assert.equal(agg.conflicts.length, 0)
+    assert.equal(agg.decisions.filter(x => x.kind === 'challenge').length, 1)
+  })
+  it('同文 blocking challenge 来自两个席位 → 两条冲突（key 含席位+序号不撞）', () => {
+    const a = seat({ authority: 'tianfu', challenges: [{ text: 'X', severity: 'blocking' }] })
+    const b = seat({ authority: 'tianquan', challenges: [{ text: 'X', severity: 'blocking' }] })
+    const agg = aggregateCouncil(draft, [a, b])
+    assert.equal(agg.conflicts.length, 2)
+    assert.notEqual(agg.conflicts[0]!.key, agg.conflicts[1]!.key)
+  })
+  it('unresolvedBlockingConflicts：open/persisted 计入，resolved 与普通冲突不计', () => {
+    const mk = (status: CouncilConflict['status'], severity?: 'blocking'): CouncilConflict => ({
+      description: 'd', left: 'L', right: 'R', key: stableConflictKey(`${status}${severity ?? ''}`, 'R'), status,
+      ...(severity ? { severity } : {}),
+    })
+    const out = unresolvedBlockingConflicts({
+      decisions: [], mergedItems: [],
+      conflicts: [mk('open', 'blocking'), mk('persisted', 'blocking'), mk('resolved', 'blocking'), mk('open')],
+    })
+    assert.equal(out.length, 2)
+    assert.ok(out.every(c => c.severity === 'blocking' && c.status !== 'resolved'))
+  })
+  it('r2 concede 化解 blocking 冲突 → resolved → 不再计入否决', () => {
+    const c = seat({ authority: 'tianfu', challenges: [{ text: 'X', severity: 'blocking' }] })
+    const agg = aggregateCouncil(draft, [c])
+    const key = agg.conflicts[0]!.key
+    const resolved = resolveConflictsWithRebuttals(agg.conflicts, [{ conflictKey: key, stance: 'concede', argument: '补了回滚方案' }])
+    assert.equal(resolved[0]!.status, 'resolved')
+    assert.equal(unresolvedBlockingConflicts({ ...agg, conflicts: resolved }).length, 0)
   })
 })
 
@@ -130,6 +176,39 @@ describe('aggregateCouncil — 冲突带 key 与 open 状态', () => {
     assert.equal(agg.conflicts.length, 1)
     assert.equal(agg.conflicts[0]!.status, 'open')
     assert.ok(agg.conflicts[0]!.key.length > 0)
+  })
+})
+
+describe('applyResolutionsToMergedItems — r2 收敛回写（修复现状断层）', () => {
+  it('addition 冲突登记携带 itemId', () => {
+    const c = seat({ authority: 'tianji', additions: [{ id: 'T1', title: 'x', detail: 'DIFFERENT' }] })
+    const agg = aggregateCouncil(draft, [c])
+    assert.equal(agg.conflicts[0]!.itemId, 'T1')
+  })
+  it('resolved 冲突（带 itemId）→ 该条目 detail 追加 [r2 收敛] 注记', () => {
+    const c = seat({ authority: 'tianji', additions: [{ id: 'T1', title: 'x', detail: 'DIFFERENT' }] })
+    const agg = aggregateCouncil(draft, [c])
+    const resolved = resolveConflictsWithRebuttals(agg.conflicts, [
+      { conflictKey: agg.conflicts[0]!.key, stance: 'revise', argument: '采用增量迁移折中' },
+    ])
+    const items = applyResolutionsToMergedItems(agg.mergedItems, resolved)
+    const t1 = items.find(i => i.id === 'T1')!
+    assert.match(t1.detail, /\[r2 收敛\] 采用增量迁移折中/)
+    assert.match(t1.detail, /do T1/, '原 detail 保留')
+  })
+  it('persisted 冲突不回写；无 itemId 的冲突（blocking challenge）不回写', () => {
+    const c = seat({ authority: 'tianji', additions: [{ id: 'T1', title: 'x', detail: 'DIFFERENT' }], challenges: [{ text: 'veto', severity: 'blocking' }] })
+    const agg = aggregateCouncil(draft, [c])
+    const out = applyResolutionsToMergedItems(agg.mergedItems, agg.conflicts) // 全 open
+    assert.deepEqual(out, agg.mergedItems)
+  })
+  it('纯函数：不改传入的 mergedItems', () => {
+    const c = seat({ authority: 'tianji', additions: [{ id: 'T1', title: 'x', detail: 'DIFFERENT' }] })
+    const agg = aggregateCouncil(draft, [c])
+    const resolved = resolveConflictsWithRebuttals(agg.conflicts, [{ conflictKey: agg.conflicts[0]!.key, stance: 'concede', argument: 'ok' }])
+    const before = JSON.stringify(agg.mergedItems)
+    applyResolutionsToMergedItems(agg.mergedItems, resolved)
+    assert.equal(JSON.stringify(agg.mergedItems), before)
   })
 })
 

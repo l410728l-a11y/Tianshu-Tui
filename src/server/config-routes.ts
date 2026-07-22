@@ -48,6 +48,8 @@ import {
   setPermissionDirs,
   getVisionModelConfig,
   setVisionModelConfig,
+  getDefaultDomainConfig,
+  setDefaultDomainConfig,
   getFetchConfig,
   setFetchConfig,
   getSearchConfig,
@@ -66,6 +68,7 @@ import { getDeepSeekUserSummary, getDeepSeekCostReport } from '../api/deepseek-p
 import { listGrantedApps, revokeApp } from '../tools/computer-use/app-grants.js'
 import { createPlatformDriver, isComputerUsePlatform } from '../tools/computer-use/platform-driver.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
+import { starDomainRegistry } from '../agent/star-domain-registry.js'
 
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
@@ -330,6 +333,33 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
       try {
         return { status: 200, body: { ok: true, ...setToolPresetConfig({ preset }) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // 默认星域（auto | tianshu | …）+ Auto 关键词路由——下个会话生效。
+    'GET /config/default-domain': withAuth(() => {
+      const domains = starDomainRegistry.list().map(d => ({ id: d.id, name: d.name, motto: d.motto }))
+      return { status: 200, body: { ...getDefaultDomainConfig(), domains } }
+    }, apiToken),
+
+    'PUT /config/default-domain': withAuth((body) => {
+      const { defaultDomain, domainKeywordRouting } = (body ?? {}) as {
+        defaultDomain?: unknown
+        domainKeywordRouting?: unknown
+      }
+      if (defaultDomain === undefined && domainKeywordRouting === undefined) {
+        return { status: 400, body: { error: 'defaultDomain or domainKeywordRouting is required' } }
+      }
+      // 域 id 有效性在这一层校验（registry 属 agent 层，config manager 不反向依赖）。
+      if (defaultDomain !== undefined && defaultDomain !== 'auto') {
+        if (typeof defaultDomain !== 'string' || !starDomainRegistry.has(defaultDomain)) {
+          return { status: 400, body: { error: `unknown domain: ${String(defaultDomain)}. Use "auto" or one of: ${starDomainRegistry.getDomainIds().join(', ')}` } }
+        }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setDefaultDomainConfig({ defaultDomain, domainKeywordRouting }) } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }

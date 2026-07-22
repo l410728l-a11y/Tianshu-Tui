@@ -120,22 +120,22 @@ export function createPlanTaskTool(deps: {
   return {
     definition: {
       name: 'plan_task',
-      description: `Decompose a high-level objective into a TaskGraph DAG of HORIZONTAL orthogonal shards and optionally execute it wave-by-wave.
+      description: `把高层目标分解成 TaskGraph DAG——水平正交分片（horizontal orthogonal shards），可选按波次逐波执行。
 
-Use for multi-step work that benefits from structured planning (refactors, feature work). Each shard is a complete, self-contained unit (implement + run tsc/lint/relevant tests to green) owned end-to-end by ONE capable flash — NOT a vertical role pipeline (no separate lint/type/import/test/verify steps). Listing scope files lets the planner cut one orthogonal shard per module so they run in parallel; same-module files stay in one shard.
-Set execute: true to run the plan through the team orchestrator (same execution path as team_orchestrate). Workers write directly into the shared workspace — review the aggregate with git diff.
+适用于需要结构化规划的多步骤工作（重构、功能开发）。每个分片是完整自包含的单元（实现 + 跑 tsc/lint/相关测试到绿），由一个有能力的 flash 端到端负责——不是垂直角色流水线（不拆独立的 lint/type/import/test/verify 步骤）。列出范围文件让规划器按模块切出正交分片以并行执行；同模块文件留在同一分片。
+设 execute: true 通过 team 编排器执行计划（与 team_orchestrate 同一执行路径）。worker 直接写入共享工作区——用 git diff 审查聚合结果。
 
-Output is a UnifiedPlan JSON — pass it to team_orchestrate's planJson parameter for multi-wave continuation.`,
+输出为 UnifiedPlan JSON——传给 team_orchestrate 的 planJson 参数做多波次续跑。`,
       input_schema: {
         type: 'object',
         properties: {
-          objective: { type: 'string', description: 'High-level goal to decompose' },
+          objective: { type: 'string', description: '要分解的高层目标' },
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Scope files. List the files/modules in scope so the planner can cut orthogonal per-module shards instead of one monolith.',
+            description: '范围文件。列出涉及的文件/模块，让规划器按模块切正交分片，而不是揉成一个整块。',
           },
-          execute: { type: 'boolean', description: 'Execute the plan after generation (default false)' },
+          execute: { type: 'boolean', description: '生成后立即执行计划（默认 false）' },
         },
         required: ['objective'],
       },

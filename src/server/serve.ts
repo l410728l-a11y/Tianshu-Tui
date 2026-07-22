@@ -451,6 +451,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // align with the session. Agent assembly is dynamically imported (Wave C) so
   // ... (goal handles resolver captured on first load — see createAgent below).
   let goalHandlesResolve: typeof import('./serve-agent.js').resolveGoalHandles | null = null
+  let reviewGateResolve: typeof import('./serve-agent.js').resolveReviewGateRef | null = null
   // cold /health does not pay for tools/Meridian/council.
   const sessions = new RuntimeSessionManager({
     createAgent: async (cwd, sessionId, approvalMode, modelId) => {
@@ -459,6 +460,9 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
       // cached, so this runs once). Used by resolveGoalHandles below.
       if (!goalHandlesResolve && typeof agentMod.resolveGoalHandles === 'function') {
         goalHandlesResolve = agentMod.resolveGoalHandles
+      }
+      if (!reviewGateResolve && typeof agentMod.resolveReviewGateRef === 'function') {
+        reviewGateResolve = agentMod.resolveReviewGateRef
       }
       return agentMod.buildManagedAgent(
         ctx,
@@ -485,6 +489,9 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
       const liveCtx = specReload ? specReload() : ctx
       return goalHandlesResolve(sessionId, liveCtx.config)
     },
+    // 审查门会话开关 — 与 goal handles 同模式（refs 迟绑定）。
+    resolveReviewGateRef: (sessionId) => reviewGateResolve?.(sessionId),
+    defaultReviewGate: ctx.config.agent.review.skipAuto ? 'off' : 'auto',
     // PlusMenu — provider model source + default for the model picker.
     // Reload-aware: picks up providers configured after startup (no restart).
     listModels: () => listAllModelsWithReload(ctx),

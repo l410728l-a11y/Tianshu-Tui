@@ -7,7 +7,7 @@ import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } fr
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
-import { createActivityStreamer, createDelegationActivityMapper } from './worker-activity-stream.js'
+import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
 
 export interface DelegateBatchCoordinator {
@@ -116,7 +116,7 @@ export function createDelegateBatchTool(
   return {
     definition: {
       name: 'delegate_batch',
-      description: 'Run multiple worker tasks in parallel. Max 5 tasks per batch.',
+      description: '并行运行多个 worker 任务。每批最多 5 个任务。',
       input_schema: {
         type: 'object',
         properties: {
@@ -128,17 +128,17 @@ export function createDelegateBatchTool(
                 objective: { type: 'string' },
                 kind: { type: 'string', enum: [...workOrderKindSchema.options] },
                 profile: { type: 'string', enum: profileRegistry.getProfileNames() },
-                authority: { type: 'string', description: 'Optional star-domain persona (e.g. tianquan, tianji, yuheng).' },
+                authority: { type: 'string', description: '可选星域人格（如 tianquan、tianji、yuheng）。' },
                 files: { type: 'array', items: { type: 'string' } },
                 symbols: { type: 'array', items: { type: 'string' } },
-                dependsOn: { type: 'array', items: { type: 'integer' }, description: 'Indices of tasks in this batch that must finish first (the referenced tasks run before this one). E.g. a test task that depends on the source task it covers.' },
-                resume: { type: 'string', description: 'Worker ID to resume. The worker continues from its previous session context instead of starting fresh.' },
+                dependsOn: { type: 'array', items: { type: 'integer' }, description: '本批次中必须先完成的任务下标（被引用的任务会先运行）。例如测试任务依赖它所覆盖的源码任务。' },
+                resume: { type: 'string', description: '要恢复的 worker ID。worker 从之前的会话上下文继续，而不是从零开始。' },
               },
               required: ['objective'],
             },
-            description: 'Array of tasks to run in parallel (max 5).',
+            description: '要并行运行的任务数组（最多 5 个）。',
           },
-          policy: { type: 'string', enum: [...aggregationPolicySchema.options], description: 'Aggregation policy. Default: primary_decides.' },
+          policy: { type: 'string', enum: [...aggregationPolicySchema.options], description: '聚合策略。默认：primary_decides。' },
         },
         required: ['tasks'],
       },
@@ -200,8 +200,15 @@ export function createDelegateBatchTool(
       const textStreamer = params.onOutput ? createActivityStreamer(params.onOutput) : undefined
       // Build authority lookup: workOrderId prefix → authority, for terminal callbacks.
       const taskAuthorityMap = new Map<number, string | undefined>()
+      // Stable work-order id → objective for activity mapper + terminal callbacks.
+      const objectiveById = new Map<string, string>()
+      for (let i = 0; i < parsed.data.tasks.length; i++) {
+        objectiveById.set(`batch:${i}`, parsed.data.tasks[i]!.objective)
+      }
       const activityMapper = params.onWorkerActivity
-        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity)
+        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity, {
+            objectiveOf: (id) => objectiveById.get(id),
+          })
         : undefined
       const streamActivity = (textStreamer || activityMapper)
         ? (ev: WorkerActivityEvent) => {
@@ -256,8 +263,10 @@ export function createDelegateBatchTool(
             params.onWorkerActivity!({
               workOrderId: r.workOrderId,
               parentToolId: params.toolUseId,
+              objective: objectiveById.get(r.workOrderId),
               status: r.status,
-              progressLine: r.summary.slice(0, 80),
+              progressLine: progressSnippet(r.summary),
+              summary: r.summary,
               failureReason: r.failureReason,
               model: r.model,
               provider: r.provider,

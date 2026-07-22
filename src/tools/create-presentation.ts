@@ -111,32 +111,32 @@ export async function createPresentation(input: CreatePresentationInput): Promis
 export const CREATE_PRESENTATION_TOOL: Tool = {
   definition: {
     name: 'create_presentation',
-    description: `Create a presentation (slideshow) as an HTML file saved with .ppt extension. Opens in any browser.
+    description: `创建演示文稿（幻灯片），以 .ppt 扩展名保存的 HTML 文件。可在任何浏览器中打开。
 
-Each slide is a full-screen section with title and content. Use for presentations, slide decks, and visual summaries.
+每张幻灯片是一个全屏区域，含标题和内容。用于演示、幻灯片组和可视化摘要。
 
-Use open_path to open the result in the default browser.
+用 open_path 在默认浏览器中打开结果。
 
-Examples:
-Good: create_presentation(destination_path="~/Desktop/deck.ppt", title="Q4 Review", slides=[{title:"Overview", content:"Key results..."}, {title:"Next Steps", content:"1. Launch\\n2. Iterate"}])
-Good: create_presentation(destination_path="~/Desktop/dark-deck.ppt", title="Pitch", slides=[{title:"Problem", content:"..."}], theme="dark")`,
+示例：
+Good: create_presentation(destination_path="~/Desktop/deck.ppt", title="Q4 回顾", slides=[{title:"概览", content:"关键结果..."}, {title:"下一步", content:"1. 发布\\n2. 迭代"}])
+Good: create_presentation(destination_path="~/Desktop/dark-deck.ppt", title="路演", slides=[{title:"问题", content:"..."}], theme="dark")`,
     input_schema: {
       type: 'object',
       properties: {
-        destination_path: { type: 'string', description: 'Destination file path. Should end with .ppt or .html. May be outside the project.' },
-        title: { type: 'string', description: 'Optional presentation title (used in browser title bar and HTML title).' },
+        destination_path: { type: 'string', description: '目标文件路径。应以 .ppt 或 .html 结尾。可在项目之外。' },
+        title: { type: 'string', description: '可选演示文稿标题（显示在浏览器标题栏和 HTML title 中）。' },
         slides: {
           type: 'array',
           items: {
             type: 'object',
             properties: {
-              title: { type: 'string', description: 'Slide heading.' },
-              content: { type: 'string', description: 'Slide body text. Use \\n for line breaks, double \\n\\n for paragraphs.' },
+              title: { type: 'string', description: '幻灯片标题。' },
+              content: { type: 'string', description: '幻灯片正文。用 \\n 换行，双 \\n\\n 分段。' },
             },
           },
-          description: 'Slides in order. Each slide has a title and content.',
+          description: '按顺序排列的幻灯片。每张有标题和内容。',
         },
-        theme: { type: 'string', enum: ['light', 'dark'], description: 'Color theme. Default: light.' },
+        theme: { type: 'string', enum: ['light', 'dark'], description: '颜色主题。默认：light。' },
       },
       required: ['destination_path', 'slides'],
     },

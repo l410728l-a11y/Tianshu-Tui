@@ -69,18 +69,18 @@ export function buildRevealCommand(path: string, platform: NodeJS.Platform = pro
 export const OPEN_PATH_TOOL: Tool = {
   definition: {
     name: 'open_path',
-    description: `Open a file or directory in the user's operating system.
+    description: `在用户操作系统中打开文件或目录。
 
-Use this for user-visible files such as generated images, SVGs, PDFs, or folders. It accepts external paths (Desktop, Downloads, mounted drives, Windows paths) and avoids shell quoting issues by launching the OS opener directly.
+用于用户可见文件，如生成的图片、SVG、PDF 或文件夹。接受外部路径（桌面、下载、挂载盘、Windows 路径），通过直接启动 OS 打开器避免 shell 引用问题。
 
-Examples:
+示例：
 Good: open_path(path="~/Desktop/tianshu-logo.svg")
 Good: open_path(path="H:\\zhuomian\\白嫖gpt")
-Bad: using bash explorer/open/start commands with hand-written shell quoting`,
+Bad: 用 bash explorer/open/start 命令加手写 shell 引号`,
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute or ~-relative file/directory path to open. May be outside the project.' },
+        path: { type: 'string', description: '绝对路径或 ~ 相对路径，要打开的文件/目录。可在项目之外。' },
       },
       required: ['path'],
     },

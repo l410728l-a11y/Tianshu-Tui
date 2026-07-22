@@ -17,18 +17,18 @@ import { skillRegistry, listSkillFiles } from '../skills/skill-loader.js'
 export const SKILL_TOOL: Tool = {
   definition: {
     name: 'skill',
-    description: `Load the full instructions for a skill by name, then follow them.
+    description: `按名称加载某个 skill 的完整指令，然后照做。
 
-Skills are reusable workflow playbooks. The available-skills block lists each skill's name and a short description. When a skill's description matches what you are doing, call this tool with its exact name to load its complete instructions on demand, then carry them out.
+skill 是可复用的工作流 playbook。available-skills 区块列出了每个 skill 的名称和简述。当某个 skill 的简述与你正在做的事匹配时，用它的确切名称调用本工具，按需加载完整指令，然后执行。
 
-When you have finished carrying out a loaded skill, call skill(name="<name>", complete=true) to release it. This stops the skill instructions from being re-injected once the workflow is done.
+执行完已加载的 skill 后，调用 skill(name="<name>", complete=true) 释放它。这样工作流结束后，该 skill 的指令不会再被重新注入上下文。
 
-Example: skill(name="brainstorming")`,
+示例：skill(name="brainstorming")`,
     input_schema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Exact name of the skill to load or complete (see the available-skills block).' },
-        complete: { type: 'boolean', description: 'When true, mark the skill as completed instead of loading it. The skill instructions will no longer be re-injected into the context.' },
+        name: { type: 'string', description: '要加载或标记完成的 skill 的确切名称（见 available-skills 区块）。' },
+        complete: { type: 'boolean', description: '为 true 时，将该 skill 标记为已完成而不是加载它。该 skill 的指令将不再被重新注入上下文。' },
       },
       required: ['name'],
     },

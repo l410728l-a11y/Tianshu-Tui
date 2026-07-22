@@ -87,6 +87,8 @@ export interface EFERoutingConfig {
 export interface WorkerActivityEvent {
   workOrderId: string
   profile: string
+  /** Worker task objective (from WorkOrder) — desktop panel / activity mapper. */
+  objective?: string
   /** 星域 id（星名来源），由 coordinator 从 order.authority 透传。 */
   authority?: string
   /** Why this authority was chosen (from WorkOrder.authorityReason). */
@@ -1444,6 +1446,7 @@ export class DelegationCoordinator {
         requestUpstream?.({
           workOrderId: order.id,
           profile: order.profile,
+          objective: order.objective,
           authority: order.authority,
           authorityReason: order.authorityReason,
           kind,
@@ -2124,6 +2127,9 @@ export class DelegationCoordinator {
             sessionTurn: r.sessionTurn,
             budget: r.budget,
             modelOverride: r.modelOverride,
+            // 瑶光门：batch 路径曾丢弃 tierFloor（只传 modelOverride），护栏席
+            // 声明 strong 实际可能跑低档——与单发 delegate() 路径对齐补传。
+            tierFloor: r.tierFloor,
           })
         : createReadOnlyWorkOrder({
             id: stableId,
@@ -2140,6 +2146,7 @@ export class DelegationCoordinator {
             sessionTurn: r.sessionTurn,
             budget: r.budget,
             modelOverride: r.modelOverride,
+            tierFloor: r.tierFloor,
           })
       if (queue.enqueue(order)) {
         orders.push(order)

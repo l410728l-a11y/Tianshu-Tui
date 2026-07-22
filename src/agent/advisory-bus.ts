@@ -1,3 +1,5 @@
+import type { SrClass } from './context.js'
+
 /**
  * 统一劝导总线 — 将五条独立纠偏通道收敛为单一 <星域-advisory> 汇聚器。
  *
@@ -80,6 +82,9 @@ export interface AdvisoryEntry {
   corroborates?: string[]
   /** 投递通道,缺省 'bus' */
   channel?: AdvisoryChannel
+  /** W2 通道分级：SR 载荷类别，缺省 'discipline'。仅 channel='system-reminder' 的条目使用。
+   *  'functional' 类不限流（调用方自带 run 级闩锁），仅 git-clear-after-fail 标记。 */
+  srClass?: SrClass
 }
 
 /** render() 实际送达的条目快照 — 供 readback 跟踪（send 侧账本的"已送达"半边） */
@@ -125,6 +130,8 @@ export const CONSTITUTIONAL_PRIORITY = 0.9
 const MAX_ADVISORIES_PER_TURN = 3
 /** 每个 category 最多保留条数，防止单一信号源垄断 advisory 预算 */
 const MAX_PER_CATEGORY = 2
+/** W2 SR 有界携带：SR 被 cap 拦截后最多 requeue 次数（跨轮延迟送达上限） */
+const SR_CARRY_LIMIT = 2
 
 // ─── F-fix（session 803d897d）：纪律抗习惯化重锚 ─────────────────────
 // execute 阶段 field habituation（alpha=0.35）让 activeDomain 纪律约 4 轮后
@@ -231,6 +238,8 @@ export interface AdvisoryLedgerDelta {
   srSubmitted: number
   /** Wave 1:SR 被 SessionContext cap 丢弃数（未进入 delivered 桶） */
   srDropped: number
+  /** W2:SR 被 cap 拦截后 requeue 携带次数（跨轮延迟送达） */
+  srCarried: number
 }
 
 const LEDGER_DROPPED_KEYS_CAP = 50
@@ -348,13 +357,18 @@ export class AdvisoryBus {
   /** status 通道 sink — 未设置时 status 条目回退 bus 渲染（不静默消失） */
   private statusSink: ((entries: AdvisoryEntry[]) => void) | null = null
   /** system-reminder 通道待送内容（drainSystemReminders 取走）。
-   *  Wave 1 SR 账本修正：改为 `{key, content}` 对，供调用方回调确认送达/丢弃。 */
-  private systemReminderOut: Array<{ key: string; content: string }> = []
+   *  Wave 1 SR 账本修正：改为 `{key, content}` 对，供调用方回调确认送达/丢弃。
+   *  W2 通道分级：增加 srClass 字段供调用方透传给 SessionContext。 */
+  private systemReminderOut: Array<{ key: string; content: string; srClass: SrClass }> = []
   /** Wave 1：等待回调确认的 SR 条目（render 产出但尚未经 SessionContext 确认）。 */
   private srPendingDelivery = new Map<string, AdvisoryEntry>()
+  /** W2：key → requeue 携带次数（跨轮延迟送达追踪，超 SR_CARRY_LIMIT 则 dropped）。 */
+  private srCarryCount = new Map<string, number>()
   /** Wave 1 账本：SR 提交数与被 SessionContext cap 丢弃数。 */
   private ledgerSrSubmitted = 0
   private ledgerSrDropped = 0
+  /** W2：SR requeue 携带次数（跨轮延迟送达计数）。 */
+  private ledgerSrCarried = 0
   // ── Holdout 反事实抽样 ──
   private holdout: HoldoutPolicy | null = null
   private ledgerHeldOut = 0
@@ -465,8 +479,9 @@ export class AdvisoryBus {
     return this.pendingWatch.length
   }
 
-  /** Phase 2 (Wave 1)：取走 system-reminder 通道的待送内容，含 key 供调用方回调确认。 */
-  drainSystemReminders(): Array<{ key: string; content: string }> {
+  /** Phase 2 (Wave 1)：取走 system-reminder 通道的待送内容，含 key 供调用方回调确认。
+   *  W2 通道分级：增加 srClass 字段供调用方透传给 SessionContext。 */
+  drainSystemReminders(): Array<{ key: string; content: string; srClass: SrClass }> {
     const out = this.systemReminderOut
     this.systemReminderOut = []
     return out
@@ -477,6 +492,9 @@ export class AdvisoryBus {
     const entry = this.srPendingDelivery.get(key)
     if (!entry) return
     this.srPendingDelivery.delete(key)
+    // P1 修复：送达后重置 carry 计数——carry 上限是 per-incident 而非 lifetime。
+    // 同 key 后续再次被 cap 拦截时从头计数，不因历史 carry 被永久丢弃。
+    this.srCarryCount.delete(key)
     this.ledgerRendered++
     this.delivered.push({ key: entry.key, category: entry.category, tier: entry.tier, expect: entry.expect })
   }
@@ -485,6 +503,29 @@ export class AdvisoryBus {
   confirmSrDropped(key: string): void {
     this.srPendingDelivery.delete(key)
     this.ledgerSrDropped++
+  }
+
+  /** W2：SR 被 SessionContext cap 拦截后 requeue 回 bus 参与下轮 drain。
+   *  携带上限 SR_CARRY_LIMIT 次，超限则 confirmSrDropped（永久丢弃）。
+   *  此为跨轮延迟送达——条目保留在 systemReminderOut 等待下轮排水。
+   *  suppressCarry 是轮内延迟（同一 render 周期），requeueSr 是跨轮延迟。
+   *  P3 修复：同 key 已在 systemReminderOut 中时跳过（render 可能重新提交了同 key）。
+   *  P2 修复：skipCarry=true 时不消耗携带计数（用于 discipline 额度耗尽的被动等待）。 */
+  requeueSr(key: string, content: string, srClass: SrClass, skipCarry = false): void {
+    // P3: 去重——同 key 已在 systemReminderOut 等待排水，跳过以避免双重注入
+    if (this.systemReminderOut.some(e => e.key === key)) return
+    if (!skipCarry) {
+      const carryCount = (this.srCarryCount.get(key) ?? 0) + 1
+      if (carryCount > SR_CARRY_LIMIT) {
+        this.srCarryCount.delete(key)
+        this.confirmSrDropped(key)
+        return
+      }
+      this.srCarryCount.set(key, carryCount)
+    }
+    // 回注 systemReminderOut 供下轮 drain 重试
+    this.systemReminderOut.push({ key, content, srClass })
+    if (!skipCarry) this.ledgerSrCarried++
   }
 
   /**
@@ -526,6 +567,7 @@ export class AdvisoryBus {
       liftMuted: this.ledgerLiftMuted,
       srSubmitted: this.ledgerSrSubmitted,
       srDropped: this.ledgerSrDropped,
+      srCarried: this.ledgerSrCarried,
     }
     this.ledgerSubmitted = 0
     this.ledgerRendered = 0
@@ -537,6 +579,7 @@ export class AdvisoryBus {
     this.ledgerLiftMuted = 0
     this.ledgerSrSubmitted = 0
     this.ledgerSrDropped = 0
+    this.ledgerSrCarried = 0
     return delta
   }
 
@@ -829,8 +872,12 @@ export class AdvisoryBus {
       }
       for (const e of srDeduped.values()) {
         // Wave 1：不预记 rendered/delivered——由 turn-step-producer 回调确认
+        // P3 补全：render 侧也去重——同 key 已在 systemReminderOut 停放等待时跳过。
+        // requeueSr 侧也做了一次，双保险。P2 放大了停放窗口：discipline 条目可能
+        // 在整个用户轮剩余时长停在 systemReminderOut 中。
+        if (this.systemReminderOut.some(o => o.key === e.key)) continue
         this.srPendingDelivery.set(e.key, e)
-        this.systemReminderOut.push({ key: e.key, content: this.applyTone(e) })
+        this.systemReminderOut.push({ key: e.key, content: this.applyTone(e), srClass: e.srClass ?? 'discipline' })
       }
       this.ledgerSrSubmitted += srDeduped.size
     }
@@ -1020,8 +1067,10 @@ export class AdvisoryBus {
     this.suppressedCarry = []
     this.systemReminderOut = []
     this.srPendingDelivery.clear()
+    this.srCarryCount.clear()
     this.ledgerSrSubmitted = 0
     this.ledgerSrDropped = 0
+    this.ledgerSrCarried = 0
     this.ledgerHeldOut = 0
     this.liftMuteRemaining.clear()
     this.liftProbation.clear()

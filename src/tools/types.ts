@@ -20,9 +20,15 @@ export interface DelegationActivity {
   authority?: string
   /** Why this authority was chosen (from WorkOrder.authorityReason). */
   authorityReason?: string
-  status: 'running' | 'passed' | 'failed' | 'blocked' | 'escalated'
+  status: 'running' | 'passed' | 'completed' | 'failed' | 'blocked' | 'escalated'
+  /** Worker task objective — prefer on first running + terminal events only
+   *  to avoid repeating the same text on every activity tick. */
+  objective?: string
   /** Latest worker activity line (running) or terminal summary. */
   progressLine?: string
+  /** Terminal digest for the desktop thread view / 「汇入主会话」 adopt button.
+   *  Distinct from progressLine (which is truncated for the live ticker). */
+  summary?: string
   /** 该 worker 累计工具调用次数（CC AgentProgress 对标，运行中实时递增）。 */
   toolUseCount?: number
   /** 该 worker 累计 token 总数（input+output，来自 turn 事件的累计快照）。 */
@@ -182,7 +188,7 @@ export interface ToolCallParams {
    *  recent workspace_mutation events). When the in-place run FAILS, run_tests
    *  calls this to force-build a snapshot and reruns there once — snapshot-pass
    *  + live-fail attributes the failure to workspace pollution, not the code. */
-  prepareRetrySnapshot?: () => VerificationSnapshotPlan | null
+  prepareRetrySnapshot?: () => Promise<VerificationSnapshotPlan | null>
   /** P0-2: Active context window — drives per-call read caps for read_file/grep. */
   contextWindow?: number
   /** P0-2: Provider profile — read caps relax for cache-preserving providers. */
@@ -221,6 +227,15 @@ export interface ToolCallParams {
   onSkillInvoked?: (name: string) => void
   /** Called when the model explicitly marks a skill as complete via the skill tool. */
   onSkillCompleted?: (name: string) => void
+  /**
+   * E4 — client landing delegation. Write/edit/bash call this after computing
+   * the final payload and before local fs/spawn. Return null → local path.
+   * Structural type (tools must not import server/) — matches DelegateResult.
+   */
+  onClientDelegate?: (
+    kind: 'apply_edit' | 'terminal_exec',
+    payload: Record<string, unknown>,
+  ) => Promise<{ content: string; isError?: boolean; uiContent?: string; status?: 'ok' | 'rejected' } | null>
 }
 
 export type VerificationFailureKind = 'test_failure' | 'tool_invocation_failure'

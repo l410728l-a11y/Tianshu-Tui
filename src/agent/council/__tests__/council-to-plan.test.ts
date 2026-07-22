@@ -1,8 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { councilPlanToUnifiedPlan } from '../council-to-plan.js'
+import { councilPlanToUnifiedPlan, compileCouncilPlan } from '../council-to-plan.js'
 import { validateUnifiedPlan } from '../../unified-plan.js'
-import type { CouncilPlan, CouncilAggregate, SeatContribution } from '../council-plan.js'
+import type { CouncilPlan, CouncilAggregate, CouncilConflict, SeatContribution } from '../council-plan.js'
 
 function agg(over: Partial<CouncilAggregate> = {}): CouncilAggregate {
   return { decisions: [], conflicts: [], mergedItems: [{ id: 'T1', title: 'Task1', detail: 'do T1', files: ['src/loop.ts'] }], ...over }
@@ -91,5 +91,89 @@ describe('councilPlanToUnifiedPlan', () => {
   it('空 mergedItems → tasks 空（交给 convene 层判空不产 planJson）', () => {
     const u = councilPlanToUnifiedPlan(plan({ aggregate: agg({ mergedItems: [] }) }))
     assert.equal(u.tasks.length, 0)
+  })
+})
+
+describe('councilPlanToUnifiedPlan — Da\'at 编译门（验收门/dependsOn/provenance）', () => {
+  it('challenge.gate 带 itemId → 只挂该任务 verification；无 itemId → 挂所有任务（去重）', () => {
+    const p = plan({
+      aggregate: agg({ mergedItems: [
+        { id: 'T1', title: 't1', detail: 'd1' },
+        { id: 'T2', title: 't2', detail: 'd2' },
+      ] }),
+      contributions: [
+        seat({ authority: 'tianfu', challenges: [
+          { text: '类型必须过', severity: 'blocking', gate: 'npx tsc --noEmit', itemId: 'T1' },
+          { text: '全局测试', gate: 'npm test' },
+          { text: '重复的全局门', gate: 'npm test' },
+        ] }),
+      ],
+    })
+    const u = councilPlanToUnifiedPlan(p)
+    assert.deepEqual(u.tasks.find(t => t.id === 'T1')!.verification, ['npx tsc --noEmit', 'npm test'])
+    assert.deepEqual(u.tasks.find(t => t.id === 'T2')!.verification, ['npm test'])
+  })
+
+  it('dependsOn 推导：同文件重叠 → 后者依赖前者；无重叠 → 各自为空；链式传递正确', () => {
+    const p = plan({
+      aggregate: agg({ mergedItems: [
+        { id: 'A', title: 'a', detail: 'd', files: ['src/x.ts'] },
+        { id: 'B', title: 'b', detail: 'd', files: ['src/x.ts', 'src/y.ts'] },
+        { id: 'C', title: 'c', detail: 'd', files: ['src/y.ts'] },
+        { id: 'D', title: 'd', detail: 'd', files: ['src/z.ts'] },
+      ] }),
+    })
+    const u = councilPlanToUnifiedPlan(p)
+    assert.deepEqual(u.tasks.find(t => t.id === 'A')!.dependsOn, [])
+    assert.deepEqual(u.tasks.find(t => t.id === 'B')!.dependsOn, ['A'])
+    assert.deepEqual(u.tasks.find(t => t.id === 'C')!.dependsOn, ['B'])
+    assert.deepEqual(u.tasks.find(t => t.id === 'D')!.dependsOn, [])
+    const v = validateUnifiedPlan(u)
+    assert.equal(v.valid, true, JSON.stringify(v))
+    assert.equal(v.warnings.length, 0, '显式 dependsOn 后同文件重叠告警应消失')
+  })
+
+  it('metadata.proposedBy：席位新增条目 = authority，草案条目 = draft', () => {
+    const p = plan({
+      aggregate: agg({ mergedItems: [
+        { id: 'T1', title: 't', detail: 'd', proposedBy: 'draft' },
+        { id: 'N1', title: 'n', detail: 'd', proposedBy: 'tianxuan' },
+      ] }),
+    })
+    const u = councilPlanToUnifiedPlan(p)
+    assert.equal(u.tasks.find(t => t.id === 'T1')!.metadata!.proposedBy, 'draft')
+    assert.equal(u.tasks.find(t => t.id === 'N1')!.metadata!.proposedBy, 'tianxuan')
+  })
+})
+
+describe('compileCouncilPlan — 否决拦截', () => {
+  const blockingConflict = (status: CouncilConflict['status']): CouncilConflict => ({
+    description: 'Blocking challenge from tianfu', left: '无回滚不得动 schema', right: 'obj',
+    key: 'k1', status, severity: 'blocking',
+  })
+
+  it('存在 open blocking 冲突 → ok:false + vetoes，无 plan', () => {
+    const r = compileCouncilPlan(plan({ aggregate: agg({ conflicts: [blockingConflict('open')] }) }))
+    assert.equal(r.ok, false)
+    assert.equal(r.vetoes.length, 1)
+    assert.equal(r.plan, undefined)
+  })
+
+  it('persisted blocking 冲突同样否决（r2 未化解不放行）', () => {
+    const r = compileCouncilPlan(plan({ aggregate: agg({ conflicts: [blockingConflict('persisted')] }) }))
+    assert.equal(r.ok, false)
+  })
+
+  it('resolved blocking 冲突 → ok:true 正常编译', () => {
+    const r = compileCouncilPlan(plan({ aggregate: agg({ conflicts: [blockingConflict('resolved')] }) }))
+    assert.equal(r.ok, true)
+    assert.equal(r.plan!.tasks.length, 1)
+    assert.deepEqual(r.vetoes, [])
+  })
+
+  it('普通（非 blocking）open 冲突不否决', () => {
+    const normal: CouncilConflict = { description: 'd', left: 'L', right: 'R', key: 'k2', status: 'open' }
+    const r = compileCouncilPlan(plan({ aggregate: agg({ conflicts: [normal] }) }))
+    assert.equal(r.ok, true)
   })
 })

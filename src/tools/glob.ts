@@ -127,15 +127,15 @@ async function walkDir(
 export const GLOB_TOOL: Tool = {
   definition: {
     name: 'glob',
-    description: `Find files matching a glob pattern.
+    description: `查找匹配 glob 模式的文件。
 
-### Usage
-- Use glob to locate files by name or pattern before reading them
-- Supports ** for recursive directory matching
-- Supports * wildcard, ? single-char, {a,b} alternation
-- Results are sorted and limited to 500
+### 用法
+- 读取文件前，先用 glob 按名称或模式定位文件
+- 支持 ** 递归匹配目录
+- 支持 * 通配符、? 单字符、{a,b} 多选一
+- 结果排序返回，上限 500 条
 
-### Examples
+### 示例
 Good: glob(pattern="src/**/*.ts")
 Good: glob(pattern="*.test.ts", path="src/")
 Good: glob(pattern="src/components/**/*.tsx")
@@ -145,11 +145,11 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
       properties: {
         pattern: {
           type: 'string',
-          description: 'Glob pattern e.g. "src/**/*.ts" or "*.md"',
+          description: 'Glob 模式，如 "src/**/*.ts" 或 "*.md"',
         },
         path: {
           type: 'string',
-          description: 'Search root directory (default: cwd)',
+          description: '搜索的根目录（默认：cwd）',
         },
       },
       required: ['pattern'],

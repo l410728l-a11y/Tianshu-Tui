@@ -19,6 +19,7 @@ import { buildMirrorEnv, rewriteGitHubUrls } from './mirror-env.js'
 import { buildNotFoundHint, extractMissingCommand } from './env-check.js'
 import { getResolvedEnv } from './resolved-env.js'
 import { OutputStreamBudget } from './output-stream-budget.js'
+import { tryClientTerminalExec, delegatedToToolResult } from './client-delegate.js'
 
 /** Success output inline threshold: commands that succeed with ≤ this many lines
  *  return full output to the model. Beyond this, only a header summary is returned
@@ -385,19 +386,19 @@ export function isLongRunner(command: string): boolean {
 export const BASH_TOOL: Tool = {
   definition: {
     name: 'bash',
-    description: `Execute shell commands for build, test, git, and system operations.
+    description: `执行 shell 命令，用于构建、测试、git 和系统操作。
 
-Do NOT use for file reading/writing/searching — use dedicated tools (read_file, grep, glob, edit_file, write_file).
+不要用它读/写/搜索文件——改用专用工具（read_file、grep、glob、edit_file、write_file）。
 
-Chain independent commands with &&. Timeout defaults to 120s; pass timeout for longer commands.
+用 && 串联独立命令。超时默认 120s；更长的命令传 timeout。
 
-Long-running / non-terminating commands (dev servers, watchers, installs) run in the BACKGROUND so they never block the loop: pass run_in_background=true, or let auto-detection handle known long-runners. A backgrounded command returns a job id immediately — use the \`job\` tool to await(pattern), read logs, or kill it. Pass run_in_background=false to force a command to stay in the foreground.`,
+长时间运行/不终止的命令（dev server、watcher、install）在后台运行，永远不阻塞循环：传 run_in_background=true，或让自动检测处理已知的长跑命令。后台命令立即返回 job id——用 \`job\` 工具 await(pattern)、读日志或终止它。传 run_in_background=false 可强制命令保持前台运行。`,
     input_schema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'The shell command to execute' },
-        timeout: { type: 'integer', description: 'Timeout in ms (default 120000)' },
-        run_in_background: { type: 'boolean', description: 'Run detached in the background and return a job id immediately (for dev servers, watchers, installs). Auto-enabled for known long-runners; set false to force foreground.' },
+        command: { type: 'string', description: '要执行的 shell 命令' },
+        timeout: { type: 'integer', description: '超时毫秒数（默认 120000）' },
+        run_in_background: { type: 'boolean', description: '在后台分离运行并立即返回 job id（用于 dev server、watcher、install）。已知长跑命令会自动启用；设 false 强制前台运行。' },
       },
       required: ['command'],
     },
@@ -418,6 +419,16 @@ Long-running / non-terminating commands (dev servers, watchers, installs) run in
     // with sessionId); otherwise falls through to normal foreground execution.
     const explicitBg = params.input.run_in_background
     const wantBackground = explicitBg === true || (explicitBg !== false && isLongRunner(rawCommand))
+    // E4 — foreground only: visible-terminal landing. Background jobs stay local.
+    if (!wantBackground && params.onClientDelegate) {
+      const delegated = await tryClientTerminalExec(params, command, params.cwd)
+      if (delegated) {
+        return {
+          ...delegatedToToolResult(delegated),
+          command: rawCommand,
+        }
+      }
+    }
     if (wantBackground && params.jobs) {
       const mirrorEnv = buildMirrorEnv(mirrorConfig)
       const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv }

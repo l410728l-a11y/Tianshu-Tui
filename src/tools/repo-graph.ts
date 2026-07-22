@@ -10,26 +10,26 @@ interface RepoGraphInput {
 
 const DEFINITION: ToolDefinition = {
   name: 'repo_graph',
-  description: `Query the code graph to find files and symbols structurally related to a given file.
+  description: `查询代码图，找出与给定文件存在结构关联的文件和符号。
 
-### Modes
-- **graph** (default): Returns ranked related files with exported symbols, ordered by call/import proximity.
-- **impact**: Returns the blast radius of changes to the file — which files depend on it and which tests to run.
+### 模式
+- **graph**（默认）：按调用/导入距离排序，返回带导出符号的相关文件排名。
+- **impact**：返回改动该文件的爆炸半径——哪些文件依赖它、需要跑哪些测试。
 
-### When to use
-- After reading a file, to find what it depends on or what depends on it
-- Before editing, to understand the blast radius of a change (use mode: "impact")
-- To navigate unfamiliar code by following structural connections
-- After editing, to know which tests to run (use mode: "impact")
+### 何时使用
+- 读完文件后，查它依赖什么、什么依赖它
+- 编辑前，评估改动的爆炸半径（用 mode: "impact"）
+- 沿结构连接在陌生代码中导航
+- 编辑后，确认需要跑哪些测试（用 mode: "impact"）
 
-### How it works
-The graph is built incrementally as you read/edit files. More files read = richer graph.`,
+### 工作原理
+图随你读/写文件增量构建。读过的文件越多，图越完整。`,
   input_schema: {
     type: 'object',
     properties: {
-      from_file: { type: 'string', description: 'File path to find related code for (relative to project root)' },
-      max_tokens: { type: 'number', default: 2000, description: 'Token budget for the response (controls how many files are returned)' },
-      mode: { type: 'string', enum: ['graph', 'impact'], default: 'graph', description: 'Query mode: "graph" for related files, "impact" for blast radius analysis' },
+      from_file: { type: 'string', description: '要查关联代码的文件路径（相对项目根）' },
+      max_tokens: { type: 'number', default: 2000, description: '响应的 token 预算（控制返回多少文件）' },
+      mode: { type: 'string', enum: ['graph', 'impact'], default: 'graph', description: '查询模式："graph" 查相关文件，"impact" 做爆炸半径分析' },
     },
     required: ['from_file'],
   },

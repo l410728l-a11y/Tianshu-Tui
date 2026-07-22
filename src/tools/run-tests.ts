@@ -555,25 +555,25 @@ function buildExecutionEnv(cwd: string): NodeJS.ProcessEnv {
 export const RUN_TESTS_TOOL: Tool = {
   definition: {
     name: 'run_tests',
-    description: `Run project tests and return parsed results.
+    description: `运行项目测试并返回解析后的结果。
 
-### Usage
-- Use run_tests to verify changes after editing code
-- Use filter to run a specific test file or test name
-- Automatically detects Node.js test scripts and Python pytest projects
-- When no safe runner can be inferred, returns a blocked verification with guidance to use bash
-- Reports: exit code, failed tests, error details, duration
+### 用法
+- 修改代码后用 run_tests 验证改动
+- 用 filter 运行特定测试文件或测试名
+- 自动检测 Node.js 测试脚本和 Python pytest 项目
+- 无法推断出安全的 runner 时，返回受阻的验证结果，并指引改用 bash
+- 报告：exit code、失败的测试、错误详情、耗时
 
-### Examples
-Good: run_tests() — run all tests
-Good: run_tests(filter="loop.test.ts") — run specific test file
-Good: run_tests(filter="tests/test_example.py") — run a Python pytest file
-Good: run_tests(timeout=300000) — longer timeout for slow suites`,
+### 示例
+好：run_tests() —— 运行全部测试
+好：run_tests(filter="loop.test.ts") —— 运行指定测试文件
+好：run_tests(filter="tests/test_example.py") —— 运行一个 Python pytest 文件
+好：run_tests(timeout=300000) —— 为慢速测试套件设置更长超时`,
     input_schema: {
       type: 'object',
       properties: {
-        filter: { type: 'string', description: 'Test file or name pattern' },
-        timeout: { type: 'integer', description: 'Timeout in ms (default: 120000)' },
+        filter: { type: 'string', description: '测试文件或名称模式' },
+        timeout: { type: 'integer', description: '超时时间（毫秒，默认：120000）' },
       },
     },
   },
@@ -607,7 +607,7 @@ Good: run_tests(timeout=300000) — longer timeout for slow suites`,
       // polluted working tree, not the owned changes.
       if (inPlace.isError && params.prepareRetrySnapshot) {
         let retryPlan: VerificationSnapshotPlan | null = null
-        try { retryPlan = params.prepareRetrySnapshot() } catch { /* degrade: keep in-place result */ }
+        try { retryPlan = await params.prepareRetrySnapshot() } catch { /* degrade: keep in-place result */ }
         if (retryPlan) {
           const isolated = await runTestCommandIn(retryPlan.path, testCommand, params, filter, timeout)
           tagVerification(isolated, 'isolated', retryPlan.snapshotRef)

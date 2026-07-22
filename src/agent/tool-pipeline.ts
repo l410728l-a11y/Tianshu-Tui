@@ -728,6 +728,12 @@ export async function executeToolUse(
     onWorkerActivity: callbacks.onDelegationActivity
       ? (activity) => callbacks.onDelegationActivity!(activity)
       : undefined,
+    // E4 — client landing delegation (apply_edit / terminal_exec). Absent when
+    // the host did not wire onToolDelegate (CLI / no capabilities) → tools
+    // fall through to local write/spawn with zero behavior change.
+    onClientDelegate: callbacks.onToolDelegate
+      ? (kind, payload) => callbacks.onToolDelegate!(kind, payload)
+      : undefined,
     onLeaveMark: deps.onLeaveMark,
     onPlanSteps: deps.onPlanSteps,
     onPlanClosed: deps.onPlanClosed,
@@ -1270,7 +1276,7 @@ export async function executeToolUse(
     // failure here degrades to in-place — VSW must never break verification.
     if (tu.name === 'run_tests' && deps.verificationSnapshotManager) {
       try {
-        const plan = deps.verificationSnapshotManager.prepare(deps.ownershipLedger?.getOwnedFiles() ?? [])
+        const plan = await deps.verificationSnapshotManager.prepare(deps.ownershipLedger?.getOwnedFiles() ?? [])
         if (plan) params.verificationSnapshot = { path: plan.path, snapshotRef: plan.snapshotRef }
       } catch {
         // degrade to in-place
@@ -1285,8 +1291,8 @@ export async function executeToolUse(
             .some(e => e.eventType === 'workspace_mutation')
           if (polluted) {
             const mgr = deps.verificationSnapshotManager
-            params.prepareRetrySnapshot = () => {
-              const retry = mgr.prepareRetry(deps.ownershipLedger?.getOwnedFiles() ?? [])
+            params.prepareRetrySnapshot = async () => {
+              const retry = await mgr.prepareRetry(deps.ownershipLedger?.getOwnedFiles() ?? [])
               return retry ? { path: retry.path, snapshotRef: retry.snapshotRef } : null
             }
           }

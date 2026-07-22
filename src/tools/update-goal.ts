@@ -19,26 +19,26 @@ export function createUpdateGoalTool(
   return {
     definition: {
       name: 'update_goal',
-      description: `Update the current goal lifecycle status. Only available when a goal is active.
+      description: `更新当前目标（goal）的生命周期状态。仅在有激活目标时可用。
 
-### When to call
-- Use status="complete" when all work toward the goal is genuinely done.
-- Use status="blocked" when an external condition prevents progress (missing dependency, env issue).
-- Use status="paused" when you need user input before continuing.
+### 何时调用
+- 朝向目标的全部工作真正完成时，用 status="complete"。
+- 外部条件阻断进展（依赖缺失、环境问题）时，用 status="blocked"。
+- 需要用户先给出输入才能继续时，用 status="paused"。
 
-### Parameters
+### 参数
 - status: paused | blocked | complete
-- reason (optional): brief explanation of why this status is being set.`,
+- reason（可选）：简要说明为什么设置该状态。`,
       input_schema: {
         type: 'object',
         properties: {
           status: {
             type: 'string',
-            description: 'The lifecycle status to set: paused, blocked, or complete.',
+            description: '要设置的生命周期状态：paused、blocked 或 complete。',
           },
           reason: {
             type: 'string',
-            description: 'Brief explanation of why this status is being set.',
+            description: '简要说明为什么设置该状态。',
           },
         },
         required: ['status'],

@@ -45,6 +45,14 @@ describe('plan tool submit', () => {
     '待验证假设：无。',
   ].join('\n')
 
+  // 需求提炼门禁（one-shot 软拦）要求计划开头含"需求提炼"章节——需要通过该
+  // 门禁的 fixture 统一附加这段（与 FALSIFICATION 同款用法）。
+  const REQUIREMENT = [
+    '',
+    '## 需求提炼',
+    '用户原话：「修掉边界条件下计数器不重置的问题」。目标：边界正确重置；非目标：不改 API。',
+  ].join('\n')
+
   it('rejects a plan with too many placeholders', async () => {
     const plan = [
       '## 根因分析',
@@ -115,7 +123,7 @@ describe('plan tool submit', () => {
       '## 验证',
       '1. 新增单元测试覆盖边界条件。',
       '2. 运行 `npm test`。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const result = await execute({ action: 'submit', title: 'Concrete Plan', plan })
     assert.ok(!result.isError)
@@ -141,7 +149,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     let submitted: PlanSubmittedInfo | null = null
     const result = await PLAN_TOOL.execute({
@@ -174,7 +182,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION, 'utf-8')
+    ].join('\n') + REQUIREMENT + FALSIFICATION, 'utf-8')
 
     const result = await execute(
       { action: 'submit', title: 'From Draft' },
@@ -207,7 +215,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION, 'utf-8')
+    ].join('\n') + REQUIREMENT + FALSIFICATION, 'utf-8')
 
     const result = await execute(
       { action: 'submit', title: 'Recycled Draft' },
@@ -235,7 +243,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const result = await execute(
       { action: 'submit', title: 'Inline Plan Content', plan },
@@ -267,7 +275,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`（已按反馈调整）。',
-    ].join('\n') + FALSIFICATION, 'utf-8')
+    ].join('\n') + REQUIREMENT + FALSIFICATION, 'utf-8')
 
     const result = await execute(
       { action: 'submit', title: 'Revised Plan' },
@@ -290,7 +298,7 @@ describe('plan tool submit', () => {
       'flowchart TD',
       '    A --> B',
       '```',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const result = await execute({
       action: 'submit',
@@ -324,7 +332,7 @@ describe('plan tool submit', () => {
       '',
       '- [ ] 新增 `src/tui/components/selector.tsx` — 选择器组件',
       '修改 `src/ghost.ts` 的导出。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const first = await execute({ action: 'submit', title: 'Anchor Drift Plan', plan })
     assert.equal(first.isError, true)
@@ -352,7 +360,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/agent/loop.ts:120` 与 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const result = await execute({ action: 'submit', title: 'Clean Anchor Plan', plan })
     assert.ok(!result.isError, result.content)
@@ -372,7 +380,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const result = await execute(
       { action: 'submit', title: 'Provenance Plan', plan },
@@ -404,7 +412,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       ...tasks,
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
   }
 
   it('soft-blocks an oversized plan without wave structure, passes resubmission with note', async () => {
@@ -479,11 +487,60 @@ describe('plan tool submit', () => {
       '',
       '## 原缺陷复现',
       '`npm test -- boundary` 输出 `FAIL: counter not reset`（RED 证据）。',
-    ].join('\n')
+    ].join('\n') + REQUIREMENT
 
     const result = await execute({ action: 'submit', title: 'Reproduced Plan', plan })
     assert.ok(!result.isError, result.content)
     assert.ok(result.content.includes('Plan submitted'))
+  })
+
+  // ── 需求提炼门禁 — 审批先审意图 ──
+  it('soft-blocks first submit without a 需求提炼 section, passes resubmission', async () => {
+    const plan = [
+      '## 根因分析',
+      '边界未重置。',
+      '',
+      '## 实现方案',
+      '```mermaid',
+      'flowchart TD',
+      '    A --> B',
+      '```',
+      '',
+      '修改 `src/foo.ts`。',
+    ].join('\n') + FALSIFICATION
+
+    const first = await execute({ action: 'submit', title: 'No Requirement Plan', plan })
+    assert.equal(first.isError, true)
+    assert.ok(first.content.includes('需求提炼'), first.content)
+    assert.ok(first.content.includes('用户原话'), 'block message explains the distillation requirement')
+    assert.ok(!existsSync(join(dir, '.rivet/plans/no-requirement-plan.md')), 'not persisted on first offense')
+
+    const second = await execute({ action: 'submit', title: 'No Requirement Plan', plan })
+    assert.ok(!second.isError, second.content)
+    assert.ok(second.content.includes('Plan submitted'))
+  })
+
+  it('accepts a plan carrying a 需求提炼 heading without the soft block', async () => {
+    const plan = [
+      '## 需求提炼',
+      '用户原话：「修边界 bug」。目标：边界正确；非目标：不改 API。',
+      '',
+      '## 根因分析',
+      '边界未重置。',
+      '',
+      '## 实现方案',
+      '```mermaid',
+      'flowchart TD',
+      '    A --> B',
+      '```',
+      '',
+      '修改 `src/foo.ts`。',
+    ].join('\n') + FALSIFICATION
+
+    const result = await execute({ action: 'submit', title: 'Distilled Plan', plan })
+    assert.ok(!result.isError, result.content)
+    assert.ok(result.content.includes('Plan submitted'))
+    assert.ok(!result.content.includes('缺「需求提炼」'), 'no requirement block when the heading is present')
   })
 
   // ── 软门禁聚合：一次拒绝列全所有缺口 ──
@@ -496,7 +553,8 @@ describe('plan tool submit', () => {
 
     const first = await execute({ action: 'submit', title: 'Aggregated Gates Plan', plan })
     assert.equal(first.isError, true)
-    assert.ok(first.content.includes('共 3 项缺口'), first.content)
+    assert.ok(first.content.includes('共 4 项缺口'), first.content)
+    assert.ok(first.content.includes('需求提炼'), first.content)
     assert.ok(first.content.includes('no Mermaid diagram'), first.content)
     assert.ok(first.content.includes('瑶光反证'), first.content)
     assert.ok(first.content.includes('规模超阈值'), first.content)
@@ -548,7 +606,7 @@ describe('plan tool submit', () => {
       '```',
       '',
       '修改 `src/foo.ts`。',
-    ].join('\n') + FALSIFICATION
+    ].join('\n') + REQUIREMENT + FALSIFICATION
 
     const result = await execute({ action: 'submit', title: 'Mid Pointer Plan', plan })
     assert.equal(result.isError, true)
@@ -622,9 +680,12 @@ describe('plan tool enter_mode', () => {
     })
     assert.equal(called, 1)
     assert.ok(!result.isError, result.content)
-    assert.ok(result.content.includes('Entered plan mode'))
+    assert.ok(result.content.includes('已进入计划模式'))
     assert.ok(result.content.includes('.rivet/plans/draft-1.md'))
     assert.ok(result.content.includes('delegate_batch'), 'nudges parallel scout research')
+    assert.ok(result.content.includes('todo'), 'receipt instructs todo-tracked investigation')
+    assert.ok(result.content.includes('汇总写计划并用 plan action=submit 提交审批'), 'last todo fixed as plan submission')
+    assert.ok(result.content.includes('需求提炼'), 'receipt names the requirement-distillation gate')
   })
 
   it('is idempotent when already planning', async () => {

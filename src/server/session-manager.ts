@@ -45,6 +45,7 @@ import {
 } from '../plan/plan-store.js'
 import { approvePlanWithGuards, type PlanApprovalResult } from '../plan/plan-approval.js'
 import { SteerBuffer } from '../tui/steer-buffer.js'
+import { TEAM_PANEL_UI_PREFIX } from '../tui/team-panel-model.js'
 import { WatchdogRecoveryPolicy } from '../agent/watchdog-recovery-policy.js'
 import { buildDomainPickerEntries, type DomainPickerEntry } from '../agent/domain-picker-entries.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
@@ -55,11 +56,19 @@ import { join, resolve } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { createWorktree, removeWorktree, listWorktrees, hasUnlandedWork, commitAll, revParseHead, squashMergeBranch, pushBranch, type WorktreeEntry } from '../agent/worktree.js'
 import { createPr } from './gh-cli.js'
-import { getGitGraph, getWorkingTreeFiles, getFileDiff } from '../tools/git.js'
+import { getGitGraph, getWorkingTreeFiles, getFileDiff, getFileAtBase } from '../tools/git.js'
 import type { WorkingTreeFile } from '../tools/git.js'
 import { SessionJobs, type JobEvent } from '../tools/job-store.js'
 import { parseAskUserQuestions } from '../tools/ask-user-question.js'
 import { grantApp as grantComputerUseApp } from '../tools/computer-use/app-grants.js'
+import {
+  DELEGATE_CAPABILITY_TTL_MS,
+  DELEGATE_TIMEOUT_MS,
+  isDelegateKind,
+  type DelegateKind,
+  type DelegateResult as ClientDelegateResult,
+  type DelegatePayload,
+} from './delegation-protocol.js'
 import type {
   ApprovalMode as WireApprovalMode,
   PlanModeState as WirePlanModeState,
@@ -534,6 +543,13 @@ export interface RuntimeSessionManagerOptions {
    * absent, the goal methods on this manager degrade to "feature unavailable".
    */
   resolveGoalHandles?: (sessionId: string) => GoalHandles | undefined
+  /** PlusMenu (review) — 会话级审查门 refs 迟绑定访问（与 resolveGoalHandles 同
+   *  模式：refs 活在 serve-agent 的 SessionStores 里，通用 manager 不可见）。
+   *  无 agent 构建时返回 undefined——override 仍会在 applySelections 时重放。 */
+  resolveReviewGateRef?: (sessionId: string) => { current: 'auto' | 'off' } | undefined
+  /** PlusMenu (review) — 配置默认档（review.skipAuto 派生），session 无 override
+   *  且 refs 未建时的 GET 兜底。 */
+  defaultReviewGate?: 'auto' | 'off'
   /**
    * PlusMenu (model) — enumerate selectable models across all configured
    * providers. Injected by serve.ts (which owns the provider config). Absent in
@@ -592,6 +608,20 @@ interface PendingIntervention {
   toolInput?: Record<string, unknown>
 }
 
+/** E4 — pending client tool-landing delegation (mirrors PendingIntervention). */
+interface PendingDelegation {
+  requestId: string
+  kind: DelegateKind
+  resolve: (value: ClientDelegateResult | null) => void
+  timer?: ReturnType<typeof setTimeout>
+}
+
+interface DelegateCapabilitySlot {
+  clientId: string
+  kinds: Set<DelegateKind>
+  expiresAt: number
+}
+
 interface ActiveRunSettlement {
   settled: boolean
   claimsReleased: boolean
@@ -624,6 +654,10 @@ interface InternalSession {
   /** Permanent-delete tombstone retained by queued callback closures. */
   tombstoned?: boolean
   pending: Map<string, PendingIntervention>
+  /** E4 — in-flight client landing delegations (keyed by requestId). */
+  pendingDelegations: Map<string, PendingDelegation>
+  /** E4 — latest registered client capabilities (later registrant wins). */
+  delegateCapabilities?: DelegateCapabilitySlot
   listeners: Set<(e: SessionEvent) => void>
   knownArtifacts: Set<string>
   /** T3 — mid-run user guidance, drained into the agent at the next tool boundary. */
@@ -651,6 +685,11 @@ interface InternalSession {
   domainState: ActiveStarDomain | null | undefined
   /** PlusMenu (skills) — per-session disabled skill names (in-memory). */
   disabledSkills: Set<string>
+  /** PlusMenu (review) — 会话级审查门覆盖。undefined = 跟随配置默认
+   *  （refs.reviewGateRef 由 review.skipAuto 初始化）；用户经
+   *  POST /sessions/:id/review-gate 设置后成为权威值，agent 重建时
+   *  由 applySelections 重放到新 refs。 */
+  reviewGateOverride?: 'auto' | 'off'
   /**
    * Skills that failed to load from .rivet/skills at session create (e.g. a
    * malformed Claude SKILL.md with no/broken frontmatter). Surfaced to the UI so
@@ -714,7 +753,7 @@ const REDACTED = '[REDACTED]'
 const SENSITIVE_KEY = /(?:api[_-]?key|token|secret|password|authorization)/i
 
 /** Tools that spawn worker agents — surfaced as delegation-tree nodes (N3). */
-const DELEGATION_TOOLS = new Set(['delegate_task', 'delegate_batch', 'team_orchestrate'])
+const DELEGATION_TOOLS = new Set(['delegate_task', 'delegate_batch', 'team_orchestrate', 'council_convene'])
 
 /** 审批拒绝后的 watchdog 续跑抑制窗口——与 TuiApp.APPROVAL_STALL_GRACE_MS 对齐：
  *  拒绝后立刻 stall 的自动 continue 只会重发同一个被拒调用（deny→continue→deny 环）。 */
@@ -782,10 +821,30 @@ export type ResumeRunResult =
 export const RESUME_PROMPT =
   '[续跑] 上一轮执行被进程重启打断。请基于已有上下文继续完成中断前的任务；若中断点不明确，先回顾最近的工具输出与待办清单再继续。'
 
-function extractObjective(input: Record<string, unknown>): string {
+/**
+ * Parent-node objective for a delegation tool call. Prefer a top-level
+ * objective/prompt; for delegate_batch fall back to summarizing tasks[].
+ * Exported for unit tests.
+ */
+export function extractObjective(input: Record<string, unknown>): string {
   for (const key of ['objective', 'prompt', 'description', 'goal']) {
     const v = input[key]
     if (typeof v === 'string' && v.trim()) return v.slice(0, 200)
+  }
+  // delegate_batch: tasks: [{ objective, ... }, ...]
+  const tasks = input.tasks
+  if (Array.isArray(tasks) && tasks.length > 0) {
+    const parts: string[] = []
+    for (const t of tasks.slice(0, 3)) {
+      if (t && typeof t === 'object' && typeof (t as { objective?: unknown }).objective === 'string') {
+        const o = String((t as { objective: string }).objective).trim()
+        if (o) parts.push(o.slice(0, 80))
+      }
+    }
+    if (parts.length > 0) {
+      const more = tasks.length > parts.length ? ` (+${tasks.length - parts.length} more)` : ''
+      return `${parts.join(' · ')}${more}`.slice(0, 200)
+    }
   }
   return ''
 }
@@ -863,6 +922,10 @@ export class RuntimeSessionManager {
   private readonly idleAgentTtlMs: number
   /** Goal mode — late-bound per-session goal handles (refs + sessionDir). */
   private readonly resolveGoalHandles?: (sessionId: string) => GoalHandles | undefined
+  /** PlusMenu (review) — late-bound per-session review-gate ref accessor. */
+  private readonly resolveReviewGateRef?: (sessionId: string) => { current: 'auto' | 'off' } | undefined
+  /** PlusMenu (review) — config-derived default when no override and no refs. */
+  private readonly defaultReviewGate: 'auto' | 'off'
   private readonly toolResultScheduler: {
     setTimeout(callback: () => void, ms: number): unknown
     clearTimeout(handle: unknown): void
@@ -890,6 +953,8 @@ export class RuntimeSessionManager {
     this.resumeFallbackModel = opts.resumeFallbackModel
     this.idleAgentTtlMs = opts.idleAgentTtlMs ?? 30 * 60_000
     this.resolveGoalHandles = opts.resolveGoalHandles
+    this.resolveReviewGateRef = opts.resolveReviewGateRef
+    this.defaultReviewGate = opts.defaultReviewGate ?? 'auto'
     this.toolResultScheduler = opts.toolResultScheduler ?? {
       setTimeout: (callback, ms) => setTimeout(callback, ms),
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -994,6 +1059,7 @@ export class RuntimeSessionManager {
           running: false,
           lifecycleGeneration: 0,
           pending: new Map(),
+          pendingDelegations: new Map(),
           listeners: new Set(),
           knownArtifacts: new Set(),
           steer: new SteerBuffer(),
@@ -1069,6 +1135,7 @@ export class RuntimeSessionManager {
         running: false,
         lifecycleGeneration: 0,
         pending: new Map(),
+        pendingDelegations: new Map(),
         listeners: new Set(),
         knownArtifacts: new Set(
           events.filter((e) => e.type === 'artifact').map((e) => String(e.data.id)),
@@ -1480,8 +1547,11 @@ export class RuntimeSessionManager {
     let sessionDomain = this.defaultDomain ?? 'auto'
     try {
       const projectConfig = loadConfig({ cwd })
+      // loadConfig 合并全局+项目层：取新鲜值（含 'auto'），设置页运行期改
+      // agent.defaultDomain 后新会话即生效，不用重启 sidecar；启动快照仅作
+      // config 加载失败时的回退。
       const projectDomain = projectConfig.agent?.defaultDomain
-      if (projectDomain && projectDomain !== 'auto') sessionDomain = projectDomain
+      if (projectDomain) sessionDomain = projectDomain
       const projectProvider = projectConfig.provider.providers[projectConfig.provider.default]
       if (projectProvider?.models[0]?.id) sessionModel = projectProvider.models[0].id
     } catch { /* project config load failure is non-fatal — fall back to global defaults */ }
@@ -1513,6 +1583,7 @@ export class RuntimeSessionManager {
       running: false,
       lifecycleGeneration: 0,
       pending: new Map(),
+      pendingDelegations: new Map(),
       listeners: new Set(),
       knownArtifacts: new Set(),
       steer: new SteerBuffer(),
@@ -1939,6 +2010,14 @@ export class RuntimeSessionManager {
     try {
       if (session.reasoningEffort !== undefined) agent.setReasoningEffort?.(session.reasoningEffort)
     } catch { /* non-fatal */ }
+    // 审查门 override 重放：switchModel 重建后 refs 是全新对象（回退到配置默认），
+    // 用户显式设置的 auto/off 必须重新写入，否则 Off 静默失效。
+    try {
+      if (session.reviewGateOverride !== undefined) {
+        const ref = this.resolveReviewGateRef?.(session.record.id)
+        if (ref) ref.current = session.reviewGateOverride
+      }
+    } catch { /* non-fatal */ }
     this.bindPlanModeChange(session, agent, session.lifecycleGeneration)
     this.bindAskModeChange(session, agent, session.lifecycleGeneration)
     // Plan mode 是 AgentLoop 的内存态，record.planMode 是持久态。agent 重建
@@ -2070,6 +2149,37 @@ export class RuntimeSessionManager {
     this.touch(session)
     this.append(session, 'model_switched', { modelId: resolved })
     this.persistRecord(session)
+    return true
+  }
+
+  // ── PlusMenu: review gate ─────────────────────────────────────
+
+  /**
+   * PlusMenu (review) — 当前审查门模式。优先级：用户 override > live refs
+   * （配置初始化 + 可能已被翻转）> 配置默认。refs 未建（agent 未构建）时
+   * 由 override / defaultReviewGate 兜底。会话不存在返回 undefined。
+   */
+  getReviewGate(id: string): 'auto' | 'off' | undefined {
+    const session = this.sessions.get(id)
+    if (!session) return undefined
+    return session.reviewGateOverride
+      ?? this.resolveReviewGateRef?.(id)?.current
+      ?? this.defaultReviewGate
+  }
+
+  /**
+   * PlusMenu (review) — 设置会话审查门。写 override（权威）并现写 live refs
+   * （refs 未建时仅记 override，applySelections 在 agent 构建后重放）。
+   * 会话不存在返回 false。
+   */
+  setReviewGate(id: string, mode: 'auto' | 'off'): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    session.reviewGateOverride = mode
+    try {
+      const ref = this.resolveReviewGateRef?.(id)
+      if (ref) ref.current = mode
+    } catch { /* non-fatal — override persists and replays on next build */ }
     return true
   }
 
@@ -2826,11 +2936,24 @@ export class RuntimeSessionManager {
   }
 
   /** Live event subscription for SSE. Unsubscribing never aborts the run. */
-  subscribe(id: string, listener: (e: SessionEvent) => void): (() => void) | undefined {
+  /**
+   * Subscribe to live events. Optional `clientId` ties this SSE connection to
+   * E4 delegate capabilities: on teardown, capabilities registered under the
+   * same clientId are cleared and in-flight delegations fail-back (null).
+   */
+  subscribe(
+    id: string,
+    listener: (e: SessionEvent) => void,
+    opts?: { clientId?: string },
+  ): (() => void) | undefined {
     const s = this.sessions.get(id)
     if (!s) return undefined
     s.listeners.add(listener)
-    return () => { s.listeners.delete(listener) }
+    const clientId = opts?.clientId?.trim() || undefined
+    return () => {
+      s.listeners.delete(listener)
+      if (clientId) this.clearDelegateCapabilities(id, clientId)
+    }
   }
 
   abort(id: string): boolean {
@@ -3024,6 +3147,16 @@ export class RuntimeSessionManager {
     return getFileDiff(ctx.cwd, path, ctx.baseRef)
   }
 
+  /**
+   * Full file content at the session's task baseline — the left pane of an
+   * editor client's native two-pane diff (VS Code extension changes view).
+   */
+  async getSessionFileAtBase(id: string, path: string): Promise<{ exists: boolean; content: string } | null> {
+    const ctx = this.sessionGitContext(id)
+    if (!ctx) return null
+    return getFileAtBase(ctx.cwd, path, ctx.baseRef)
+  }
+
   // ── Change landing (desktop Changes tab: Commit / Merge back / Create PR) ──
 
   /**
@@ -3131,6 +3264,128 @@ export class RuntimeSessionManager {
         /* best-effort per session — one failure must not block others */
       }
     }
+  }
+
+  // ── E4 client tool delegation ──────────────────────────────────────────
+
+  /**
+   * Register (or heartbeat) client landing capabilities. Later registrant
+   * replaces the prior slot. Returns false when the session is missing.
+   */
+  registerDelegateCapabilities(
+    id: string,
+    clientId: string,
+    kinds: DelegateKind[],
+  ): boolean {
+    const s = this.sessions.get(id)
+    if (!s) return false
+    const cid = clientId.trim()
+    if (!cid) return false
+    const valid = kinds.filter(isDelegateKind)
+    s.delegateCapabilities = {
+      clientId: cid,
+      kinds: new Set(valid),
+      expiresAt: this.now() + DELEGATE_CAPABILITY_TTL_MS,
+    }
+    return true
+  }
+
+  /**
+   * Clear capabilities for a clientId (SSE teardown). Also fail-backs any
+   * in-flight PendingDelegation with null so tool-pipeline resumes locally.
+   * If clientId is omitted, clears whatever slot is present.
+   */
+  clearDelegateCapabilities(id: string, clientId?: string): boolean {
+    const s = this.sessions.get(id)
+    if (!s) return false
+    const slot = s.delegateCapabilities
+    if (!slot) return false
+    if (clientId && slot.clientId !== clientId) return false
+    s.delegateCapabilities = undefined
+    // Fail-back in-flight landings — client is gone.
+    for (const [rid, pend] of [...s.pendingDelegations]) {
+      s.pendingDelegations.delete(rid)
+      if (pend.timer) clearTimeout(pend.timer)
+      pend.resolve(null)
+    }
+    return true
+  }
+
+  /** Whether the session currently has a live capability for `kind`. */
+  hasDelegateCapability(id: string, kind: DelegateKind): boolean {
+    const s = this.sessions.get(id)
+    if (!s?.delegateCapabilities) return false
+    const slot = s.delegateCapabilities
+    if (slot.expiresAt <= this.now()) {
+      s.delegateCapabilities = undefined
+      return false
+    }
+    return slot.kinds.has(kind)
+  }
+
+  /**
+   * Resolve a pending delegation with a client result. Returns false if the
+   * request is gone (already timed out / fail-backed).
+   */
+  answerDelegation(id: string, requestId: string, result: ClientDelegateResult): boolean {
+    const s = this.sessions.get(id)
+    if (!s) return false
+    const pend = s.pendingDelegations.get(requestId)
+    if (!pend) return false
+    s.pendingDelegations.delete(requestId)
+    if (pend.timer) clearTimeout(pend.timer)
+    pend.resolve({
+      content: typeof result.content === 'string' ? result.content : '',
+      isError: result.isError === true,
+      uiContent: typeof result.uiContent === 'string' ? result.uiContent : undefined,
+      status: result.status === 'rejected' ? 'rejected' : result.status === 'ok' ? 'ok' : undefined,
+    })
+    return true
+  }
+
+  /**
+   * Hang a landing step for the client. Returns null immediately when no live
+   * capability matches (tool-pipeline fails back to local). Otherwise emits
+   * `tool_delegate` and waits for answerDelegation / timeout→null.
+   */
+  private requestToolDelegate(
+    session: InternalSession,
+    lifecycleGeneration: number,
+    kind: string,
+    payload: Record<string, unknown>,
+  ): Promise<ClientDelegateResult | null> {
+    if (!isDelegateKind(kind)) return Promise.resolve(null)
+    if (!this.ownsSessionLifecycle(session, lifecycleGeneration)) {
+      return Promise.resolve(null)
+    }
+    const slot = session.delegateCapabilities
+    if (!slot || slot.expiresAt <= this.now() || !slot.kinds.has(kind)) {
+      if (slot && slot.expiresAt <= this.now()) session.delegateCapabilities = undefined
+      return Promise.resolve(null)
+    }
+    const timeoutMs = DELEGATE_TIMEOUT_MS[kind]
+    const requestId = randomId()
+    const deadlineMs = this.now() + timeoutMs
+    return new Promise<ClientDelegateResult | null>((resolve) => {
+      const pend: PendingDelegation = {
+        requestId,
+        kind,
+        resolve,
+        timer: setTimeout(() => {
+          if (!session.pendingDelegations.delete(requestId)) return
+          // Timeout → null (fail-back). NOT an error — agent never sees it.
+          resolve(null)
+        }, timeoutMs),
+      }
+      if (typeof pend.timer?.unref === 'function') pend.timer.unref()
+      session.pendingDelegations.set(requestId, pend)
+      this.append(session, 'tool_delegate', {
+        requestId,
+        kind,
+        payload: payload as unknown as DelegatePayload,
+        deadlineMs,
+      })
+    })
   }
 
   /**
@@ -3542,7 +3797,11 @@ export class RuntimeSessionManager {
             : truncateUtf16Safe(redactText(result), 2000),
           // uiContent is the display override (e.g. ask_user_question renders the
           // question + numbered options here, not the model-facing placeholder).
-          ...(uiContent ? { uiContent: truncateUtf16Safe(redactText(uiContent), 2000) } : {}),
+          // Team panel frames encode rich structured data — raise the cap to 8K
+          // so multi-task wave DAGs aren't truncated before the desktop decodes them.
+          ...(uiContent
+            ? { uiContent: truncateUtf16Safe(redactText(uiContent), uiContent.includes(TEAM_PANEL_UI_PREFIX) ? 8000 : 2000) }
+            : {}),
         }
         if (isError === undefined) {
           this.bufferToolResult(session, toolId, name, eventData.result)
@@ -3621,6 +3880,9 @@ export class RuntimeSessionManager {
       },
       onApprovalRequired: (toolId, name, input) =>
         this.requestApproval(session, lifecycleGeneration, toolId, name, input),
+      // E4 — client landing delegation (mirrors onApprovalRequired injection).
+      onToolDelegate: (kind, payload) =>
+        this.requestToolDelegate(session, lifecycleGeneration, kind, payload),
       onIntentNote: (intent) => {
         if (!isActive()) return
         this.emitIntentNote(session, intent)
@@ -4167,7 +4429,7 @@ function resolveDomainState(
   const d = starDomainRegistry.get(key)
   if (!d) return null
   return {
-    state: { id: d.id as StarDomainId, name: d.name, volatileBlock: d.volatileBlock, motto: d.motto },
+    state: { id: d.id as StarDomainId, name: d.name, volatileBlock: d.volatileBlock, motto: d.motto, courageThreshold: d.courageThreshold },
     key: d.id,
     label: d.name,
   }

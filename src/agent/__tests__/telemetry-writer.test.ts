@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createTelemetryWriter, VITALS_LITE_KIND, COGNITIVE_FRAME_LITE_KIND } from '../telemetry-writer.js'
+import { createTelemetryWriter, VITALS_LITE_KIND, COGNITIVE_FRAME_LITE_KIND, ADVISORY_OUTCOME_KIND, ADVISORY_HOLDOUT_KIND } from '../telemetry-writer.js'
 import type { PerceptionTelemetrySnapshot } from '../perception.js'
 import { buildTelemetrySnapshot } from '../perception.js'
 
@@ -176,6 +176,23 @@ describe('createTelemetryWriter — lite mode (W5)', () => {
       const raw = readFileSync(join(dir, '.rivet', 'sensorium.jsonl'), 'utf-8')
       const lines = raw.trim().split('\n').map(line => JSON.parse(line) as { kind?: string })
       assert.deepEqual(lines.map(line => line.kind), [COGNITIVE_FRAME_LITE_KIND])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('P4 前置：advisory-outcome / advisory-holdout 默认落盘（晋级证据源 2）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-telemetry-advisory-'))
+    try {
+      const writer = createTelemetryWriter(dir)
+      writer.write({ kind: ADVISORY_OUTCOME_KIND, key: 'self-verify', outcome: 'adopted', expectKind: 'tool_appears', deliveredTurn: 3, evaluatedTurn: 5 })
+      writer.write({ kind: ADVISORY_HOLDOUT_KIND, key: 'self-verify', outcome: 'ignored', expectKind: 'tool_appears', deliveredTurn: 6, evaluatedTurn: 8, shadow: true })
+      writer.write({ kind: 'recall-summary', foo: 1 }) // debug-only — 仍被过滤
+      await writer.flush()
+
+      const raw = readFileSync(join(dir, '.rivet', 'sensorium.jsonl'), 'utf-8')
+      const lines = raw.trim().split('\n').map(line => JSON.parse(line) as { kind?: string })
+      assert.deepEqual(lines.map(line => line.kind), [ADVISORY_OUTCOME_KIND, ADVISORY_HOLDOUT_KIND])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

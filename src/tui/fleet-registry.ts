@@ -31,6 +31,9 @@ export interface FleetWorkerView {
   authorityReason?: string
   /** 原始委派状态。 */
   status: DelegationActivity['status']
+  /** 终态失败分类（review-findings/review-infra/timeout/...）——TUI 端区分
+   *  completed+review-findings 渲染 ⚠️ 警示态（非系统失败）的数据源。 */
+  failureReason?: string
   /** WorkerPanel 兼容状态（glyph / auto-collapse 用）。 */
   panelStatus: WorkerPanelStatus
   /** 是否已到达终态。 */
@@ -69,6 +72,7 @@ interface FleetRecord {
   authorityReason?: string
   status: DelegationActivity['status']
   terminal: boolean
+  failureReason?: string
   activity?: string
   activityLog: string[]
   startedAt: number
@@ -89,6 +93,7 @@ function usageTotal(usage: DelegationActivity['usage']): number {
 
 const TERMINAL_STATUSES = new Set<DelegationActivity['status']>([
   'passed',
+  'completed', // 审查拦截（rejected）——7cf506eb 引入，缺它则永不终态、卡 active 假象
   'failed',
   'blocked',
   'escalated',
@@ -97,7 +102,7 @@ const TERMINAL_STATUSES = new Set<DelegationActivity['status']>([
 /** 把委派状态映射为 WorkerPanel 状态（blocked/escalated 归入 failed 显示）。 */
 function panelStatusOf(status: DelegationActivity['status']): WorkerPanelStatus {
   if (status === 'running') return 'running'
-  if (status === 'passed') return 'done'
+  if (status === 'passed' || status === 'completed') return 'done'
   return 'failed'
 }
 
@@ -143,6 +148,7 @@ export class FleetRegistry {
       existing.terminal = terminal
       existing.updatedAt = now
       existing.activityLog = log
+      if (activity.failureReason) existing.failureReason = activity.failureReason
       if (activity.profile) existing.profile = activity.profile
       if (activity.authority) existing.authority = activity.authority
       if (activity.authorityReason) existing.authorityReason = activity.authorityReason
@@ -166,6 +172,7 @@ export class FleetRegistry {
       authorityReason: activity.authorityReason,
       status: activity.status,
       terminal,
+      failureReason: activity.failureReason,
       activity: activity.progressLine,
       activityLog: log,
       startedAt: now,
@@ -189,6 +196,7 @@ export class FleetRegistry {
       status: r.status,
       panelStatus: panelStatusOf(r.status),
       terminal: r.terminal,
+      failureReason: r.failureReason,
       activity: r.activity,
       activityLog: r.activityLog,
       elapsedMs: Math.max(0, (r.terminal ? r.updatedAt : now) - r.startedAt),

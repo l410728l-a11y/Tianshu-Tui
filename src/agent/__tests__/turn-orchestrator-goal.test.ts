@@ -50,6 +50,8 @@ function makeController(opts: {
     getSessionId: () => undefined,
     getCwd: () => '/tmp',
     appendSystemReminder: () => {},
+    appendSystemReminderAndReport: () => true,
+    resetSrCount: () => {},
     completeTurn: async () => {},
     writeTelemetry: (entry: TelemetryRecord) => { opts.telemetrySink?.push(entry) },
     flushMeridianTurn: () => {},

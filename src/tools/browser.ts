@@ -89,14 +89,14 @@ export function createBrowserTool(options: BrowserToolOptions = {}): Tool {
   return {
     definition: {
       name: 'browser',
-      description: `Drive a headless browser to verify web UIs. Navigate to an allowlisted URL and screenshot it, extract text, or click an element.
-ALWAYS requires explicit human approval and the target host must be on the configured allowlist (fail-closed). Screenshots are saved as viewable artifacts.`,
+      description: `驱动无头浏览器验证 Web UI。导航到许可名单中的 URL 并截图、提取文本或点击元素。
+始终需要显式人工审批，且目标主机必须在配置的许可名单中（fail-closed）。截图保存为可查看的 artifact。`,
       input_schema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['screenshot', 'text', 'click'], description: 'What to do after navigating.' },
-          url: { type: 'string', description: 'URL to navigate to (host must be allowlisted).' },
-          selector: { type: 'string', description: 'CSS selector for text/click actions.' },
+          action: { type: 'string', enum: ['screenshot', 'text', 'click'], description: '导航后执行的操作。' },
+          url: { type: 'string', description: '要导航到的 URL（主机必须在许可名单中）。' },
+          selector: { type: 'string', description: 'text/click 操作的 CSS 选择器。' },
         },
         required: ['action', 'url'],
       },

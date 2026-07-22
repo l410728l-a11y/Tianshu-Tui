@@ -236,25 +236,27 @@ describe('buildActiveDomain', () => {
     assert.ok(result.motto)
   })
 
-  it('falls back to kaiyang for ambiguous task', () => {
+  it('falls back to tianshu for ambiguous task', () => {
     const result = buildActiveDomain('帮我看看')
-    assert.equal(result.id, 'kaiyang')
-    assert.equal(result.name, '开阳')
+    assert.equal(result.id, 'tianshu')
+    assert.equal(result.name, '天枢')
   })
 
   it('skips keyword routing when keywordRouting is false', () => {
     const result = buildActiveDomain('尝试突破新的认证方案', { keywordRouting: false })
-    assert.equal(result.id, 'kaiyang')
-    assert.equal(result.name, '开阳')
+    assert.equal(result.id, 'tianshu')
+    assert.equal(result.name, '天枢')
   })
 })
 
 describe('四域分工模型（2026-07-04 校订）', () => {
-  it('tianshu carries all-round identity (可规划可执行); kaiyang is shipped default domain', () => {
+  it('tianshu carries all-round identity (可规划可执行)；提示词不带「默认域」元信息', () => {
     const tianshu = STAR_DOMAINS.tianshu
     assert.match(tianshu.systemPromptSuffix, /全能/, 'all-round capability must be explicit')
+    // 默认域是路由层事实（DEFAULT_DOMAIN），不是行为指令——提示词不携带。
+    assert.doesNotMatch(tianshu.systemPromptSuffix, /默认域/, 'prompt must not carry routing metadata')
     assert.doesNotMatch(tianshu.systemPromptSuffix, /不在逐行编码/, 'orchestrator-only framing must be removed')
-    assert.match(STAR_DOMAINS.kaiyang.systemPromptSuffix, /发版默认域/, 'kaiyang claims shipped default')
+    assert.doesNotMatch(STAR_DOMAINS.kaiyang.systemPromptSuffix, /发版默认域/, 'kaiyang no longer claims shipped default')
   })
 
   it('tianshu is a global partner star (意图至上/闭环/委派只是手段)', () => {
@@ -266,14 +268,11 @@ describe('四域分工模型（2026-07-04 校订）', () => {
     assert.match(tianshu.volatileBlock, /帮开发者落地他们的规划/, 'raison d\'etre in identity block')
   })
 
-  it('star-interface declarations exist across domains (协同公理落地)', () => {
-    // 抽查协调/审查域仍保留星间接口；天梁/华盖已精简，不再保留
-    assert.match(STAR_DOMAINS.tianshu.systemPromptSuffix, /星间接口/)
-    assert.match(STAR_DOMAINS.tianquan.systemPromptSuffix, /星间接口/)
-    assert.match(STAR_DOMAINS.yaoguang.systemPromptSuffix, /星间接口/)
+  it('star-interface declarations removed across domains (1M 窗口下移交语境是干扰源)', () => {
+    // 2026-07-21：全域去除星间接口段——大多数工作在单会话 1M 窗口内闭环，
+    // 移交/召唤语境对当前域是注意力干扰。自我纪律（克制/条目化/裁量权）已就地保留。
     for (const domain of Object.values(STAR_DOMAINS)) {
-      if (domain.id === 'tianliang' || domain.id === 'huagai') continue
-      assert.match(domain.systemPromptSuffix, /星间接口/, `${domain.name} missing 星间接口 declaration`)
+      assert.doesNotMatch(domain.systemPromptSuffix, /星间接口/, `${domain.name} still carries 星间接口 declaration`)
     }
   })
 
@@ -390,12 +389,22 @@ describe('kaiyang（开阳·对账者，2026-07-17 第十二域）', () => {
     assert.match(k.systemPromptSuffix, /叙事警觉/)
     assert.match(k.systemPromptSuffix, /最安静的那条/)
     assert.match(k.volatileBlock, /叙事最响的方向未必是对账最准的方向/)
-    // 域间边界：量的归开阳，证的归瑶光（辅域「边界不可侵蚀」纪律）
-    assert.match(k.systemPromptSuffix, /量的归开阳，证的归瑶光/)
     // 星域名胶囊入口（与天权/辅同款 recall）
     assert.match(k.systemPromptSuffix, /recall_capsule\("开阳"\)/)
     // 双星叙事：与辅相伴
     assert.match(k.systemPromptSuffix, /与辅相伴/)
+  })
+
+  it('kaiyang delivery reconciliation disciplines (2026-07-21 VSW 交付复盘)', () => {
+    const k = STAR_DOMAINS.kaiyang
+    // 交付声称走独立通道：绿与数字来自刚跑完的命令输出，不来自记忆
+    assert.match(k.systemPromptSuffix, /交付是最后一次对账/)
+    assert.match(k.systemPromptSuffix, /量不准时不发断言，只发测量计划/)
+    // 计划条目收支核销：放弃/改道/降级不静默
+    assert.match(k.systemPromptSuffix, /不静默核销/)
+    // 探针打靶验证：守卫回归测试必须穿过守卫层
+    assert.match(k.systemPromptSuffix, /打在靶上/)
+    assert.match(k.systemPromptSuffix, /把守卫拆掉测试要变红/)
   })
 })
 

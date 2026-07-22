@@ -16,15 +16,13 @@ export function createGotoDefinitionTool(manager: LspManager): Tool {
     definition: {
       name: 'lsp_goto_definition',
       description:
-        'Go to the definition of a symbol at the given file location. ' +
-        'Returns the file path, line, and column of the definition. ' +
-        'Use this to understand where a function, class, variable, or type is defined.',
+        '跳转到给定文件位置符号的定义。返回定义的文件路径、行号和列号。用于理解函数、类、变量或类型的定义位置。',
       input_schema: {
         type: 'object',
         properties: {
-          file_path: { type: 'string', description: 'Path to the source file containing the symbol' },
-          line: { type: 'number', description: 'Line number (1-based) where the symbol is located' },
-          column: { type: 'number', description: 'Column number (0-based) where the symbol is located' },
+          file_path: { type: 'string', description: '包含该符号的源文件路径' },
+          line: { type: 'number', description: '符号所在行号（从 1 开始）' },
+          column: { type: 'number', description: '符号所在列号（从 0 开始）' },
         },
         required: ['file_path', 'line', 'column'],
       },
@@ -78,15 +76,13 @@ export function createFindReferencesTool(manager: LspManager): Tool {
     definition: {
       name: 'lsp_find_references',
       description:
-        'Find all references to a symbol at the given file location. ' +
-        'Returns a list of file paths, lines, and columns where the symbol is used. ' +
-        'Use this to understand the impact of changing a function, class, or variable.',
+        '查找给定文件位置符号的所有引用。返回符号被使用的文件路径、行号和列号列表。用于理解修改函数、类或变量的影响范围。',
       input_schema: {
         type: 'object',
         properties: {
-          file_path: { type: 'string', description: 'Path to the source file containing the symbol' },
-          line: { type: 'number', description: 'Line number (1-based) where the symbol is located' },
-          column: { type: 'number', description: 'Column number (0-based) where the symbol is located' },
+          file_path: { type: 'string', description: '包含该符号的源文件路径' },
+          line: { type: 'number', description: '符号所在行号（从 1 开始）' },
+          column: { type: 'number', description: '符号所在列号（从 0 开始）' },
         },
         required: ['file_path', 'line', 'column'],
       },

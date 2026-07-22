@@ -12,6 +12,7 @@ import type { TurnMode } from '../context/task-contract.js'
 import type { Usage } from '../api/types.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import type { PressureResult } from '../context/pressure-monitor.js'
+import type { SrClass } from './context.js'
 import type { Sensorium, StrategyProfile } from './sensorium.js'
 import { createTurnBudget } from './turn-budget.js'
 import { getGitChangeRate, smoothChangeRate } from './git-freshness.js'
@@ -161,10 +162,13 @@ export interface TurnOrchestratorDeps {
   // === Session ===
   removeLastMessage: () => void
   addUserMessage: (content: string) => void
-  appendSystemReminder: (content: string) => void
-  /** W3 SR 计数器每轮重置（设计本意"由 AgentLoop 调用"——此前生产从未调用，
-   *  导致首轮 SR 后 srCountThisTurn 恒 ≥1,后续所有 reminder 被静默丢弃,
-   *  而账本仍计 delivered——审查 CRITICAL 发现的根因修复）。 */
+  appendSystemReminder: (content: string, cls?: SrClass) => void
+  /** 同 appendSystemReminder，但返回 boolean 表示是否成功注入（未被 cap 拦截）。
+   *  义务门/action-intent gate/steer preempt 续轮前用此方法检查注入结果。
+   *  W1 通道分级：functional/user 类不限流 → 注入不可能失败。fail-closed 守卫保留。 */
+  appendSystemReminderAndReport: (content: string, cls?: SrClass) => boolean
+  /** W3/W1 SR 计数器每用户轮重置（AgentLoop 在每次用户输入时调用，loop.ts:1909）。
+   *  W1 通道分级后仅重置 discipline 桶——functional/user 不触碰此计数器。 */
   resetSrCount: () => void
   addAssistantBlocks: (blocks: import('../api/types.js').ContentBlock[]) => void
   addUsage: (usage: { output_tokens: number }) => void
@@ -225,7 +229,7 @@ export interface TurnOrchestratorDeps {
   /** 义务 store 版本号（误触发遥测：续轮后 version 未变 = misfire）。 */
   getObligationVersion?: () => number
   /** 遥测：auto-continue 触发/误触发/诚实受阻计数（postSession 落 meta）。 */
-  recordObligationGateEvent?: (event: 'continued' | 'misfire' | 'honest_blocked') => void
+  recordObligationGateEvent?: (event: 'continued' | 'misfire' | 'honest_blocked' | 'suppressed') => void
 
   // === Stop-reason 落盘（2026-07-07 观测缺口修复）===
   /** 把结构化停止原因写进 AgentLoop.latestStopReason + session meta。
@@ -444,12 +448,11 @@ export class TurnOrchestrator {
         // 被守卫斩杀时一句结论都没留下(审查 worker 反复 "exhausted without
         // a final turn" 的根因——prompt 级收敛提示不足以约束探索欲)。
         if (maxTurns > 0 && turn === effectiveLimit - 1) {
-          // 本警告必须送达:仅这一轮重置 SR 计数——W3 噪音防护是「每用户轮
-          // 只放行 1 条 SR」,探索期已消耗的额度会让本警告被静默丢弃。
-          // 不做每轮重置(那会重新打开噪音洪流)。
-          this.deps.resetSrCount()
+          // W1 通道分级：functional 类不限流（turn-budget 只有一次触发机会，
+          // 无需 resetSrCount hack）。fail-closed 守卫保留为纵深防御。
           this.deps.appendSystemReminder(
             `<system-reminder>[turn budget] This is your FINAL turn — the turn budget (${maxTurns}) is exhausted after this turn. Do NOT start new tool-call chains. Based on the evidence you already have, emit your final answer/report immediately (workers: emit the WorkerResult JSON contract now, best-effort with what you have).</system-reminder>`,
+            'functional'
           )
         }
         // Sync plan-mode state into config so tool-pipeline gate reads it
@@ -1215,7 +1218,9 @@ export class TurnOrchestrator {
             signal!,
             'steer-preempt-complete',
           )
-          this.deps.appendSystemReminder(steerText)
+          // W1 通道分级：steer 是用户的话，user 类无条件放行。
+          // 无需 resetSrCount hack——user 不占 discipline 额度。
+          this.deps.appendSystemReminder(steerText, 'user')
           continue
         }
 
@@ -1254,15 +1259,20 @@ export class TurnOrchestrator {
         ) {
           actionIntentFiredThisRun = true
           this.lastActionIntentNudgeTime = now
-          this.deps.appendSystemReminder(
-            '<system-reminder>上一轮你以"我将做…""接下来…"结尾但未发出对应的工具调用。如果还需要执行，请在本轮直接发起工具调用。</system-reminder>'
+          const actionIntentInjected = this.deps.appendSystemReminderAndReport(
+            '<system-reminder>上一轮你以"我将做…""接下来…"结尾但未发出对应的工具调用。如果还需要执行，请在本轮直接发起工具调用。</system-reminder>',
+            'functional'
           )
-          await rejectOnAbort(
-            this.deps.completeTurn({ turn, isFinal: false, callbacks }),
-            signal!,
-            'action-intent-gate-complete',
-          )
-          continue
+          if (actionIntentInjected) {
+            await rejectOnAbort(
+              this.deps.completeTurn({ turn, isFinal: false, callbacks }),
+              signal!,
+              'action-intent-gate-complete',
+            )
+            continue
+          }
+          // SR cap exhausted — fall through to natural finish instead of
+          // empty-payload continuation.
         }
 
         // ── Obligation final gate（action-intent 之后、natural-finish 之前）──
@@ -1287,21 +1297,28 @@ export class TurnOrchestrator {
             && !obligationGateFiredThisRun
           ) {
             obligationGateFiredThisRun = true
-            this.deps.markObligationContinued?.(obGate.nextAction.obligationId)
-            this.deps.recordObligationGateEvent?.('continued')
             obligationContinuation = { version: this.deps.getObligationVersion?.() ?? 0 }
             debugLog(`[obligation-gate] turn=${turn} continue_once action=${obGate.nextAction.action} claim=${obGate.nextAction.claim.slice(0, 80)}`)
-            this.deps.appendSystemReminder(
+            const obInjected = this.deps.appendSystemReminderAndReport(
               `<system-reminder>上一轮结论依赖尚未证实的高风险断言：「${obGate.nextAction.claim}」。`
               + `在给出最终答案前，请先执行最短证据动作：${obGate.nextAction.action}。`
               + `若该动作确实无法执行（缺权限/环境/依赖），请在最终答复中明确标注该结论未经验证及具体障碍，不要声称已验证。</system-reminder>`,
+              'functional'
             )
-            await rejectOnAbort(
-              this.deps.completeTurn({ turn, isFinal: false, callbacks }),
-              signal!,
-              'obligation-gate-complete',
-            )
-            continue
+            if (obInjected) {
+              this.deps.markObligationContinued?.(obGate.nextAction.obligationId)
+              this.deps.recordObligationGateEvent?.('continued')
+              await rejectOnAbort(
+                this.deps.completeTurn({ turn, isFinal: false, callbacks }),
+                signal!,
+                'obligation-gate-complete',
+              )
+              continue
+            }
+            // SR cap exhausted — SR 被 W3 限流静默丢弃，放弃续轮。
+            // 记 suppressed 而非 continued，账本可区分"续了没送达"（事故）
+            // 与"续了且送达"（正常续轮）。
+            this.deps.recordObligationGateEvent?.('suppressed')
           }
           if (obGate.verdict === 'honest_blocked') {
             // 高风险义务受阻或已续过一轮仍未关闭：允许结束（诚实受阻出口），

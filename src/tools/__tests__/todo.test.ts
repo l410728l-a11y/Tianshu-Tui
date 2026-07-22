@@ -273,11 +273,13 @@ describe('TODO_TOOL onPlanSteps (U6/C1)', () => {
   it('description includes when-to-use and when-not-to-use guidance', () => {
     const desc = TODO_TOOL.definition.description
     // when-to-use triggers
-    assert.ok(desc.includes('3+ distinct steps') || desc.includes('non-trivial') || desc.includes('multi-file'))
+    assert.ok(desc.includes('3 个以上不同步骤') || desc.includes('多文件'))
     // when-not-to-use: explicit negative example
-    assert.ok(desc.includes('single trivial step') || desc.includes('one-shot edits'))
+    assert.ok(desc.includes('单步琐碎') || desc.includes('一次性小编辑'))
     // proactive capture
-    assert.ok(desc.includes('right after receiving new instructions') || desc.includes('BEFORE starting work'))
+    assert.ok(desc.includes('收到新指令后立即建') || desc.includes('先落成 todo'))
+    // plan-mode 调研约定
+    assert.ok(desc.includes('汇总写计划并提交审批'), 'plan-mode todo convention documented')
   })
 
   it('write success returns continuation reminder', async () => {

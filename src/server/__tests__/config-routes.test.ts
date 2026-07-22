@@ -244,3 +244,70 @@ describe('PUT /config/mirrors', () => {
     assert.equal(res.status, 401)
   })
 })
+
+describe('/config/default-domain', () => {
+  const prevHome = process.env.RIVET_HOME
+  let home: string
+  before(() => {
+    home = mkdtempSync(join(tmpdir(), 'rivet-domain-routes-'))
+    process.env.RIVET_HOME = home
+  })
+  after(() => {
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('GET returns the defaults (auto + keyword routing on) with the domain list', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/default-domain', {}, AUTH)
+    assert.equal(res.status, 200)
+    const body = res.body as { defaultDomain: string; domainKeywordRouting: boolean; domains: { id: string; name: string }[] }
+    assert.equal(body.defaultDomain, 'auto')
+    assert.equal(body.domainKeywordRouting, true)
+    assert.ok(body.domains.some(d => d.id === 'tianshu'), 'domain list includes tianshu')
+    assert.ok(body.domains.some(d => d.id === 'kaiyang'), 'domain list includes kaiyang')
+  })
+
+  it('PUT pins a domain and a follow-up GET sees it', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const put = await router('PUT', '/config/default-domain', { defaultDomain: 'tianshu' }, AUTH)
+    assert.equal(put.status, 200)
+    const res = await router('GET', '/config/default-domain', {}, AUTH)
+    const body = res.body as { defaultDomain: string }
+    assert.equal(body.defaultDomain, 'tianshu')
+  })
+
+  it('PUT accepts auto + keyword routing toggle', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const put = await router('PUT', '/config/default-domain', { defaultDomain: 'auto', domainKeywordRouting: false }, AUTH)
+    assert.equal(put.status, 200)
+    const body = put.body as { ok: boolean; defaultDomain: string; domainKeywordRouting: boolean }
+    assert.equal(body.ok, true)
+    assert.equal(body.defaultDomain, 'auto')
+    assert.equal(body.domainKeywordRouting, false)
+  })
+
+  it('PUT rejects an unknown domain id', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/default-domain', { defaultDomain: 'not-a-domain' }, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('PUT rejects an empty payload', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/default-domain', {}, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('rejects unauthorized requests', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/default-domain', {}, {})
+    assert.equal(res.status, 401)
+  })
+})

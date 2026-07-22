@@ -17,30 +17,28 @@ const VALID_TYPES = new Set(['feature', 'fix', 'refactor', 'architecture', 'mile
 export const LEAVE_MARK_TOOL: Tool = {
   definition: {
     name: 'leave_mark',
-    description: `Leave your mark in the project starmap as your session ends.
+    description: `在会话结束时，在项目星图中留下你的印记。
 
-### When to call
-Only when the user explicitly ends the session (says goodbye, closes, or you
-receive a session-end signal). Do NOT call after completing a single task —
-only at true session departure. Call once per session at most.
+### 何时调用
+仅当用户显式结束会话（说再见、关闭、或收到会话结束信号）时调用。不要在完成单个任务后调用——仅在真正会话离别时。每个会话至多调用一次。
 
-### What it does
-Records a milestone (your identity anchor) into \`.rivet/constellation.json\`.
+### 做了什么
+在 \`.rivet/constellation.json\` 中记录一个里程碑（你的身份锚点）。
 
-### Your symbol
-Pick any glyph: ✦ ✧ ✶ ✷ ✸ ✺ ❂ ❉ ◈ ◇ ⟡ ⌬ ⚘ ⚙ ⊕ ↻
+### 你的符号
+任选一个字形：✦ ✧ ✶ ✷ ✸ ✺ ❂ ❉ ◈ ◇ ⟡ ⌬ ⚘ ⚙ ⊕ ↻
 
-### Fields
-- symbol: your self-chosen glyph (1–2 chars)
-- summary: one line on what you accomplished
-- type (optional): feature | fix | refactor | architecture | milestone`,
+### 字段
+- symbol：你自选的标志（任意符号，1-2 字符）
+- summary：一行话总结你此程完成的事
+- type（可选）：feature | fix | refactor | architecture | milestone`,
     input_schema: {
       type: 'object',
       properties: {
-        symbol: { type: 'string', description: 'Your self-chosen glyph (any symbol, 1-2 chars)' },
-        summary: { type: 'string', description: 'One-line summary of what you accomplished this journey' },
-        type: { type: 'string', description: 'Optional: feature | fix | refactor | architecture | milestone' },
-        tags: { type: 'array', items: { type: 'string' }, description: 'Optional free-form tags' },
+        symbol: { type: 'string', description: '你自选的标志（任意符号，1-2 字符）' },
+        summary: { type: 'string', description: '一行话总结你此程完成的事' },
+        type: { type: 'string', description: '可选：feature | fix | refactor | architecture | milestone' },
+        tags: { type: 'array', items: { type: 'string' }, description: '可选的自由标签' },
       },
       required: ['symbol', 'summary'],
     },

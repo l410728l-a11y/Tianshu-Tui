@@ -14,6 +14,7 @@
 
 import type { PostToolRuntimeHook, PostTurnRuntimeHook, RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
 import type { AdvisoryReadback } from '../advisory-readback.js'
+import { ADVISORY_OUTCOME_KIND, ADVISORY_HOLDOUT_KIND } from '../telemetry-writer.js'
 
 export interface AdvisoryReadbackHookDeps {
   readback: AdvisoryReadback
@@ -66,8 +67,9 @@ export function createAdvisoryReadbackHooks(
       if (decided === 0) return
       const outcomes = deps.readback.drainOutcomes()
       for (const o of outcomes) {
-        // shadow 判定单独 kind:'advisory-holdout'——反事实基线与投递组账本分开回放
-        deps.writeTelemetry?.({ kind: o.shadow ? 'advisory-holdout' : 'advisory-outcome', ...o })
+        // shadow 判定单独 kind:'advisory-holdout'——反事实基线与投递组账本分开回放。
+        // 两 kind 均在 telemetry lite 白名单（P4 晋级证据源 2，默认落盘）。
+        deps.writeTelemetry?.({ kind: o.shadow ? ADVISORY_HOLDOUT_KIND : ADVISORY_OUTCOME_KIND, ...o })
       }
       deps.onOutcomes?.(deps.readback.getTotals())
     },

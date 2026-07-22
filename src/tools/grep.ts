@@ -42,16 +42,16 @@ function parseGrepPattern(input: Record<string, unknown>): string | null {
 export const GREP_TOOL: Tool = {
   definition: {
     name: 'grep',
-    description: `Search file contents with regex or literal patterns.
+    description: `用正则或字面量模式搜索文件内容。
 
-### Usage
-- Use grep to find functions, classes, patterns, or keywords in source code
-- Prefer grep over bash grep/rg — this tool is faster and respects .gitignore
-- Results are grouped by file with line numbers
-- Pattern can be a regex (default) or literal string
-- For concept-based search when you don't know the exact string or symbol, use semantic_search instead
+### 用法
+- 用 grep 在源码中查找函数、类、模式或关键字
+- 优先用本工具而不是 bash grep/rg——更快，且遵守 .gitignore
+- 结果按文件分组并带行号
+- pattern 可以是正则（默认）或字面量字符串
+- 不知道确切字符串或符号、需要按概念搜索时，改用 semantic_search
 
-### Examples
+### 示例
 Good: grep(pattern="function handleSubmit", path="src/")
 Good: grep(pattern="API_KEY", path=".", glob="*.{ts,tsx}")
 Good: grep(pattern="class Foo", path="src/", context_lines=3)
@@ -59,12 +59,12 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
     input_schema: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'Regex or literal pattern to search for' },
-        path: { type: 'string', description: 'Directory or file to search (default: cwd)' },
-        glob: { type: 'string', description: 'File filter e.g. "*.ts" or "*.{ts,tsx}"' },
-        max_results: { type: 'integer', description: 'Max matching lines (default: 100)' },
-        literal: { type: 'boolean', description: 'Treat pattern as literal, not regex (default: false)' },
-        context_lines: { type: 'integer', description: 'Number of context lines before and after each match (default: 0). Use 2-3 to see surrounding code without a separate read_file.' },
+        pattern: { type: 'string', description: '要搜索的正则或字面量模式' },
+        path: { type: 'string', description: '要搜索的目录或文件（默认：cwd）' },
+        glob: { type: 'string', description: '文件过滤，如 "*.ts" 或 "*.{ts,tsx}"' },
+        max_results: { type: 'integer', description: '最大匹配行数（默认：100）' },
+        literal: { type: 'boolean', description: '把 pattern 按字面量处理，不当正则（默认：false）' },
+        context_lines: { type: 'integer', description: '每个匹配前后附带的上下文行数（默认：0）。设 2-3 可直接看到周边代码，省去单独的 read_file。' },
       },
       required: ['pattern'],
     },

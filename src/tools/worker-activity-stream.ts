@@ -8,17 +8,35 @@ export function shortOrderLabel(workOrderId: string): string {
 }
 
 /**
+ * 单行进度片段：压平空白（含 \n/\r/\t）后截断。
+ *
+ * progressLine / activity 最终落进 TUI live region 的单行槽位——worker 的
+ * summary/detail 是自由文本（review 门 evidence 甚至显式用 \n 拼接），
+ * 直接 slice 会把嵌入换行带进渲染行，破坏 LiveEngine 的显示行数追踪
+ * （输入框重影根因之一）。所有进度片段截断必须走这里。
+ */
+export function progressSnippet(text: string, max = 80): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+/**
  * One concise progress line for a worker activity event, for the structured
  * subagent fleet panel. Uses minimal English labels — tools already cycle
  * between types, so the label just records the current state without noise.
  */
 export function activityProgressLine(event: WorkerActivityEvent): string {
-  if (event.kind === 'tool_use') return `⚙ ${event.detail ? event.detail.slice(0, 60) : 'tool'}`
-  if (event.kind === 'tool_result') return `✓ ${event.detail ? event.detail.slice(0, 50) : 'done'}`
+  if (event.kind === 'tool_use') return `⚙ ${event.detail ? progressSnippet(event.detail, 60) : 'tool'}`
+  if (event.kind === 'tool_result') return `✓ ${event.detail ? progressSnippet(event.detail, 50) : 'done'}`
   if (event.kind === 'thinking') return 'thinking'
   if (event.kind === 'retry') return '↻ upstream retry'
   if (event.kind === 'turn') return ''
   return 'writing'
+}
+
+export interface DelegationActivityMapperOpts {
+  /** Resolve the worker objective by workOrderId. Objective is attached only
+   *  on the first running event per worker to keep the SSE stream small. */
+  objectiveOf?: (workOrderId: string) => string | undefined
 }
 
 /**
@@ -29,12 +47,15 @@ export function activityProgressLine(event: WorkerActivityEvent): string {
  * - tool_use 事件累计工具调用次数
  * - turn 事件携带累计 token 总数（worker 每 turn 结束上报一次）
  * 每条 running 事件都带上最新计数，读模型（FleetRegistry / 桌面面板）只做归约。
+ * objective 仅在该 worker 首条 running 事件携带（避免每 tick 重复传输）。
  */
 export function createDelegationActivityMapper(
   parentToolId: string,
   onWorkerActivity: (activity: DelegationActivity) => void,
+  opts?: DelegationActivityMapperOpts,
 ): (event: WorkerActivityEvent) => void {
   const counters = new Map<string, { toolUseCount: number; tokenCount: number }>()
+  const objectiveSent = new Set<string>()
 
   return (event: WorkerActivityEvent) => {
     let c = counters.get(event.workOrderId)
@@ -48,6 +69,12 @@ export function createDelegationActivityMapper(
       if (Number.isFinite(n) && n > c.tokenCount) c.tokenCount = n
     }
     const line = activityProgressLine(event)
+    let objective: string | undefined
+    if (!objectiveSent.has(event.workOrderId)) {
+      // Prefer coordinator-attached objective; fall back to tool-side lookup.
+      objective = event.objective ?? opts?.objectiveOf?.(event.workOrderId)
+      if (objective) objectiveSent.add(event.workOrderId)
+    }
     onWorkerActivity({
       workOrderId: event.workOrderId,
       parentToolId,
@@ -55,6 +82,7 @@ export function createDelegationActivityMapper(
       authority: event.authority,
       authorityReason: event.authorityReason,
       status: 'running',
+      ...(objective ? { objective } : {}),
       progressLine: line || undefined,
       toolUseCount: c.toolUseCount,
       tokenCount: c.tokenCount > 0 ? c.tokenCount : undefined,
@@ -84,12 +112,12 @@ export function createActivityStreamer(
     if (event.kind === 'turn') return  // 计数心跳，不产生文本行
     const label = `${shortOrderLabel(event.workOrderId)}·${event.profile}`
     if (event.kind === 'tool_use') {
-      const toolDetail = event.detail ? ` ${event.detail.slice(0, 60)}` : ''
+      const toolDetail = event.detail ? ` ${progressSnippet(event.detail, 60)}` : ''
       emit(`  ↳ [${label}] ⚙${toolDetail}\n`)
       return
     }
     if (event.kind === 'tool_result') {
-      const resultHint = event.detail ? ` (${event.detail.slice(0, 40)})` : ''
+      const resultHint = event.detail ? ` (${progressSnippet(event.detail, 40)})` : ''
       emit(`  ↳ [${label}] ✓ 完成${resultHint}\n`)
       return
     }

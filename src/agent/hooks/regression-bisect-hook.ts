@@ -20,6 +20,7 @@
 
 import type { PostToolRuntimeHook, RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
 import type { AdvisoryBus } from '../advisory-bus.js'
+import { renderRouteAnnotation, STALL_ROUTE_TABLE } from '../failure-taxonomy.js'
 
 export interface RegressionBisectDeps {
   advisoryBus: Pick<AdvisoryBus, 'submit'>
@@ -122,7 +123,7 @@ export function createRegressionBisectHook(
           `② 用 \`git bisect\`（或 checkpoint/rewind 的基线 diff 对照）二分定位引入回归的具体提交，` +
           `再 \`git show <commit>\` 直读该提交对相关文件的改动；` +
           `③ 若任务契约/已批准计划带「回归清单」，逐项 grep 清单锚点定位消失的功能挂在哪个文件。` +
-          `回归问题的答案在提交历史里，不在猜测里。`,
+          `回归问题的答案在提交历史里，不在猜测里。 ${renderRouteAnnotation(STALL_ROUTE_TABLE['regression-loop'])}`,
         ttl: 3,
         // 采纳 = 转向 git 历史类命令（log/bisect/show/diff 基线对照）
         expect: { kind: 'tool_appears', tools: ['bash'], targetIncludes: 'git', withinTurns: 3 },

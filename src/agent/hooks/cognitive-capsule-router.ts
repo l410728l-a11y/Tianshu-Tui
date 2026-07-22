@@ -541,6 +541,7 @@ function getDominantDimValue(rule: RouteRule, state: RouteState): number {
 
 import type { ObligationStore } from '../evidence-obligation.js'
 import type { CaseOpenSignal } from '../case-open-signals.js'
+import { classifyFailureSignal, renderRouteAnnotation } from '../failure-taxonomy.js'
 
 export type CvmVectorMode = 'off' | 'shadow' | 'active'
 
@@ -634,6 +635,21 @@ const PERSPECTIVE_YIELD_KEYS = [
   'regression-bisect',
   'capsule-recall',
 ] as const
+
+/**
+ * 检查 pending keys 中是否有专用声源的让位信号。
+ *
+ * 扩展了 PERSPECTIVE_YIELD_KEYS 的匹配：基础表用精确 includes，
+ * edit-failure-recovery（带动态文件路径后缀）用前缀匹配。
+ * 让位 ≠ 丢失——edit-failure 信号仍在 caseOpenSignals 中，
+ * CV3-open 在后续轮次无专用声源时可正常开火（升级阶梯不断裂）。
+ */
+function hasPendingSpecialKey(pendingKeys: readonly string[]): string | undefined {
+  const exact = PERSPECTIVE_YIELD_KEYS.find(k => pendingKeys.includes(k))
+  if (exact) return exact
+  if (pendingKeys.some(k => k.startsWith('edit-failure-recovery:'))) return 'edit-failure-recovery'
+  return undefined
+}
 const VERIFY_YIELD_KEYS = [
   'self-verify',
   'self-verify:verification-required',
@@ -765,11 +781,14 @@ export function createCvmVectorEvaluator(): { evaluate(input: CvmVectorInput): C
         ) {
           const sig = openSignals[0]
           if (sig) {
+            const route = classifyFailureSignal(sig)
+            const annotation = renderRouteAnnotation(route)
+            const initialProbe = route.ladder[0] ?? '读实现'
             const skeleton = JSON.stringify({ anchor: sig.anchor, problem: sig.summary })
             return {
               variant: 'open',
               anchorKey: `${sig.anchor.kind}:${sig.anchor.ref}`,
-              content: `【天机】卡住形状已带锚事实（${sig.source}: ${sig.anchor.kind}:${sig.anchor.ref}——${sig.summary}）。这是攻坚案件的形状——直接开案：attack_case open ${skeleton}（problem 可改写为你的一句话问题），提出 ≥2 条竞争假设，用判别探针淘汰。有效探针/排除/复现都会计分。本提醒不重复。`,
+              content: `【天机】卡住形状已带锚事实（${sig.source}: ${sig.anchor.kind}:${sig.anchor.ref}——${sig.summary}）。这是攻坚案件的形状——直接开案：attack_case open ${skeleton}（problem 可改写为你的一句话问题），提出 ≥2 条竞争假设，用判别探针淘汰。有效探针/排除/复现都会计分。${annotation} 初始探针建议：${initialProbe}。本提醒不重复。`,
             }
           }
           return {
@@ -794,7 +813,7 @@ export function createCvmVectorEvaluator(): { evaluate(input: CvmVectorInput): C
         if (input.scoutOwned) {
           return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: { ruleId: 'CV3', to: 'anchor-break-scout' } }
         }
-        const pendingSpecial = PERSPECTIVE_YIELD_KEYS.find(k => input.pendingAdvisoryKeys.includes(k))
+        const pendingSpecial = hasPendingSpecialKey(input.pendingAdvisoryKeys)
         if (pendingSpecial) {
           return { classification: { kind: 'attack-stalled', ruleId: 'CV3', facts }, candidate: null, yielded: { ruleId: 'CV3', to: pendingSpecial } }
         }
@@ -858,7 +877,7 @@ export function createCvmVectorEvaluator(): { evaluate(input: CvmVectorInput): C
               yielded: { ruleId: 'CV2', to: 'anchor-break-scout' },
             }
           }
-          const pendingSpecial = PERSPECTIVE_YIELD_KEYS.find(k => input.pendingAdvisoryKeys.includes(k))
+          const pendingSpecial = hasPendingSpecialKey(input.pendingAdvisoryKeys)
           if (pendingSpecial) {
             return {
               classification: { kind: 'perspective-locked', ruleId: 'CV2', facts },

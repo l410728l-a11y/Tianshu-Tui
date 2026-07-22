@@ -237,6 +237,48 @@ describe('executeToolUse', () => {
     assert.equal(seen, undefined)
   })
 
+  it('VSW: degrades to in-place when snapshot build (prepare) rejects', async () => {
+    // Real pipeline degrade contract: manager.prepare throwing (e.g. VSW overlay
+    // git diff failure) must be swallowed by executeToolUse's catch — run_tests
+    // still executes, with no verificationSnapshot injected.
+    let seen: any = 'sentinel'
+    let executed = false
+    const deps = makeDeps({
+      ownershipLedger: { getOwnedFiles: () => ['a.ts'], getBaselineHead: () => 'head1' } as any,
+      verificationSnapshotManager: {
+        prepare: async () => { throw new Error('VSW overlay: git diff failed for baseline head1: fatal: bad object') },
+        lastDecision: () => null,
+        currentSnapshotRef: () => undefined,
+        destroy: () => {},
+      } as any,
+      config: {
+        ...makeDeps().config,
+        toolRegistry: {
+          execute: async (_name: string, params: any) => {
+            executed = true
+            seen = params.verificationSnapshot
+            return { content: 'ok', isError: false }
+          },
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+          resolveName: (n: string) => n,
+        },
+      } as any,
+    })
+
+    const result = await executeToolUse(
+      { id: 'tu-rt3', name: 'run_tests', input: {} },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.equal(executed, true, 'run_tests must still execute after snapshot build failure')
+    assert.equal(seen, undefined, 'no verificationSnapshot must be injected on degrade')
+    assert.ok(
+      String((result.toolResult as any).content).includes('ok'),
+      'degrade must return the in-place tool result, not an error',
+    )
+  })
+
   it('A1: tool timeout cascades an abort into the underlying op before rejecting', async () => {
     let captured: AbortSignal | undefined
     let abortedInTool = false

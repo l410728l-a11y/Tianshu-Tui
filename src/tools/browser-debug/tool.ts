@@ -214,34 +214,34 @@ export function createBrowserDebugTool(options: BrowserDebugToolOptions = {}): T
   return {
     definition: {
       name: 'browser_debug',
-      description: `Drive a persistent browser to debug local web apps (frontend + backend API联调) over CDP.
+      description: `驱动持久浏览器通过 CDP 调试本地 Web 应用（前后端 + API 联调）。
 
-Connection:
-- Default: headed Chromium; login persists in ~/.rivet/browser-debug-profile.
-- Connect: connect_url on open or RIVET_BROWSER_URL (Chrome --remote-debugging-port=9222). close disconnects only.
+连接：
+- 默认：有头 Chromium；登录态持留在 ~/.rivet/browser-debug-profile。
+- 连接模式：open 时传 connect_url 或设 RIVET_BROWSER_URL（Chrome --remote-debugging-port=9222）。close 仅断开连接。
 
-API联调 tips:
-- network {url_filter="/api/", failed_only=true, include_body=true, api_only=true} — failed API calls with response bodies.
-- network_detail {request_id="r2"} — full detail for one request (status, timing, body).
+API 联调技巧：
+- network {url_filter="/api/", failed_only=true, include_body=true, api_only=true} — 失败 API 调用含响应体。
+- network_detail {request_id="r2"} — 单个请求完整详情（状态、耗时、响应体）。
 
-Actions:
+操作：
 - open / navigate {url}
 - console {level?}
 - network {failed_only?, url_filter?, api_only?, include_body?}
-- network_detail {request_id} — status, timing, request headers + payload, response headers + body (secrets like Authorization/Cookie are masked).
+- network_detail {request_id} — 状态、耗时、请求头+载荷、响应头+响应体（Authorization/Cookie 等密钥已遮蔽）。
 - snapshot / eval / screenshot / click
-- type {selector, text, submit?} — submit=true presses Enter after filling
-- press {selector?, key} — keyboard key, e.g. Enter/Tab/Escape/ArrowDown
-- select {selector, value} — pick a <select> option
+- type {selector, text, submit?} — submit=true 填完后按 Enter
+- press {selector?, key} — 键盘按键，如 Enter/Tab/Escape/ArrowDown
+- select {selector, value} — 选择 <select> 选项
 - hover {selector} / scroll {selector? | to?}
-- wait {selector? | state?} — selector visible, or load state (load/domcontentloaded/networkidle)
+- wait {selector? | state?} — 等待选择器可见，或载入状态（load/domcontentloaded/networkidle）
 - history {go: back|forward|reload}
-- cookies {url_filter?} — list cookies for the context (values masked)
-- storage {kind: local|session} — dump localStorage/sessionStorage (secret-looking values masked)
-- set_cookie {name, value, url? | domain?+path?} — inject a cookie (restore a login)
-- clear_cookies — wipe all cookies (reset the session)
-- set_storage {kind, key, value} / clear_storage {kind} — write/reset web storage
-- pages — list open tabs/popups (OAuth popups become the action target automatically)
+- cookies {url_filter?} — 列出上下文 cookie（值已遮蔽）
+- storage {kind: local|session} — 导出 localStorage/sessionStorage（疑似密钥的值已遮蔽）
+- set_cookie {name, value, url? | domain?+path?} — 注入 cookie（恢复登录态）
+- clear_cookies — 清除所有 cookie（重置会话）
+- set_storage {kind, key, value} / clear_storage {kind} — 写入/重置 Web Storage
+- pages — 列出打开的标签页/弹窗（OAuth 弹窗自动成为操作目标）
 - status / clear_logs / await_login / close`,
       input_schema: {
         type: 'object',
@@ -255,32 +255,32 @@ Actions:
               'set_cookie', 'clear_cookies', 'set_storage', 'clear_storage',
               'await_login', 'status', 'clear_logs', 'close',
             ],
-            description: 'What to do.',
+            description: '要执行的操作。',
           },
-          url: { type: 'string', description: 'URL for open/navigate.' },
-          connect_url: { type: 'string', description: 'CDP endpoint for open, e.g. http://127.0.0.1:9222.' },
-          request_id: { type: 'string', description: 'network_detail: id from network output (e.g. r2).' },
-          url_filter: { type: 'string', description: 'network: substring filter on request URL (e.g. /api/).' },
-          api_only: { type: 'boolean', description: 'network: only xhr/fetch requests.' },
-          include_body: { type: 'boolean', description: 'network: include captured response bodies (xhr/fetch and 4xx/5xx).' },
-          selector: { type: 'string', description: 'CSS selector for click/type/press/select/hover/scroll/wait/snapshot.' },
-          text: { type: 'string', description: 'Text to fill for type.' },
-          submit: { type: 'boolean', description: 'type: press Enter after filling (submit the form).' },
-          key: { type: 'string', description: 'press: keyboard key (Enter/Tab/…); set_storage: storage key.' },
-          value: { type: 'string', description: 'select option / set_cookie value / set_storage value.' },
-          state: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'], description: 'wait: load state to wait for (when no selector).' },
-          to: { type: 'string', enum: ['top', 'bottom'], description: 'scroll: page target when no selector (default bottom).' },
-          go: { type: 'string', enum: ['back', 'forward', 'reload'], description: 'history: navigation direction.' },
-          kind: { type: 'string', enum: ['local', 'session'], description: 'storage/set_storage/clear_storage: which web storage (default local).' },
-          name: { type: 'string', description: 'set_cookie: cookie name.' },
-          domain: { type: 'string', description: 'set_cookie: cookie domain (with path, when no url).' },
-          path: { type: 'string', description: 'set_cookie: cookie path (default /).' },
-          expression: { type: 'string', description: 'JavaScript expression for eval.' },
-          level: { type: 'string', enum: ['log', 'info', 'warn', 'error', 'debug'], description: 'Console level filter.' },
-          failed_only: { type: 'boolean', description: 'network: only failures and 4xx/5xx.' },
-          headless: { type: 'boolean', description: 'Launch hidden (default false).' },
-          timeout_ms: { type: 'integer', description: 'wait: timeout in ms (default 10000).' },
-          message: { type: 'string', description: 'await_login: prompt shown to the user.' },
+          url: { type: 'string', description: 'open/navigate 的目标 URL。' },
+          connect_url: { type: 'string', description: 'open 的 CDP 端点，如 http://127.0.0.1:9222。' },
+          request_id: { type: 'string', description: 'network_detail：来自 network 输出的 id（如 r2）。' },
+          url_filter: { type: 'string', description: 'network：请求 URL 子串过滤（如 /api/）。' },
+          api_only: { type: 'boolean', description: 'network：仅 xhr/fetch 请求。' },
+          include_body: { type: 'boolean', description: 'network：包含捕获的响应体（xhr/fetch 及 4xx/5xx）。' },
+          selector: { type: 'string', description: 'click/type/press/select/hover/scroll/wait/snapshot 的 CSS 选择器。' },
+          text: { type: 'string', description: 'type 要填入的文本。' },
+          submit: { type: 'boolean', description: 'type：填完后按 Enter（提交表单）。' },
+          key: { type: 'string', description: 'press：键盘按键（Enter/Tab/…）；set_storage：存储键名。' },
+          value: { type: 'string', description: 'select 选项值 / set_cookie 值 / set_storage 值。' },
+          state: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'], description: 'wait：等待的载入状态（无选择器时）。' },
+          to: { type: 'string', enum: ['top', 'bottom'], description: 'scroll：无选择器时的页面目标（默认 bottom）。' },
+          go: { type: 'string', enum: ['back', 'forward', 'reload'], description: 'history：导航方向。' },
+          kind: { type: 'string', enum: ['local', 'session'], description: 'storage/set_storage/clear_storage：哪个 Web Storage（默认 local）。' },
+          name: { type: 'string', description: 'set_cookie：cookie 名称。' },
+          domain: { type: 'string', description: 'set_cookie：cookie 域名（无 url 时配合 path 使用）。' },
+          path: { type: 'string', description: 'set_cookie：cookie 路径（默认 /）。' },
+          expression: { type: 'string', description: 'eval 的 JavaScript 表达式。' },
+          level: { type: 'string', enum: ['log', 'info', 'warn', 'error', 'debug'], description: '控制台日志级别过滤。' },
+          failed_only: { type: 'boolean', description: 'network：仅失败和 4xx/5xx。' },
+          headless: { type: 'boolean', description: '隐藏启动（默认 false）。' },
+          timeout_ms: { type: 'integer', description: 'wait：超时毫秒数（默认 10000）。' },
+          message: { type: 'string', description: 'await_login：展示给用户的提示。' },
         },
         required: ['action'],
       },

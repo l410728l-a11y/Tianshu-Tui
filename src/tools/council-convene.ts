@@ -1,16 +1,20 @@
 import { z } from 'zod'
 import type { AggregationPolicy } from '../agent/work-order.js'
-import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
-import { runCouncil, runCouncilDebate, type CouncilDeps } from '../agent/council/council-orchestrator.js'
+import type { CoordinatorRun, DelegationRequest, WorkerActivityEvent } from '../agent/coordinator.js'
+import { runCouncil, runCouncilDebate, buildSeatObjective, type CouncilDeps } from '../agent/council/council-orchestrator.js'
 import { summarizeCouncilPlan } from '../agent/council/council-render.js'
-import { DEFAULT_COUNCIL_SEATS, type CouncilSeat, type CouncilRoutingShadowEvent } from '../agent/council/council-routing.js'
+import { DEFAULT_COUNCIL_SEATS, THREE_PILLAR_COUNCIL_SEATS, mergeSeatOverrides, type CouncilSeat, type CouncilRoutingShadowEvent } from '../agent/council/council-routing.js'
 import { isCouncilEnabled } from '../agent/council/council-gate.js'
 import { buildCouncilSessionEvent, type CouncilSessionEvent } from '../agent/council/council-telemetry.js'
 import type { PlanItem } from '../agent/council/council-plan.js'
-import { councilPlanToUnifiedPlan } from '../agent/council/council-to-plan.js'
+import { compileCouncilPlan } from '../agent/council/council-to-plan.js'
+import { sealPlan } from '../agent/council/council-seal.js'
+import { extractObligations, attachObligations } from '../agent/council/council-obligations.js'
+import { runWaveReconvene, type ReconveneTaskRef } from '../agent/council/council-reconvene.js'
 import { serializeUnifiedPlan, unifiedPlanToTeamTasks } from '../agent/unified-plan.js'
 import { storePlan } from '../agent/plan-store.js'
 import { executePlan, type PlanExecutorDeps } from '../agent/plan-executor.js'
+import { createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 
 /** Coordinator surface the council tool needs — only `delegateBatch` drives the
@@ -56,6 +60,10 @@ const inputSchema = z.object({
   draftItems: z.array(planItemSchema).optional(),
   seats: z.array(seatSchema).optional(),
   rounds: z.number().int().min(1).max(2).optional(),
+  /** Phase 2 三柱模式（council max）：席位强制三柱对抗结构——扩张柱（破军/天机）×
+   *  约束柱（天权/华盖）× 平衡柱（瑶光）。配置席位（agent.council.seats）按
+   *  authority 沿用专属模型绑定；显式 seats 参数仍然优先。 */
+  pillars: z.boolean().optional(),
   /** When true, automatically dispatch the council-approved plan to team_orchestrate.
    *  Saves a model round-trip — the council result directly triggers execution
    *  instead of waiting for the model to extract planJson and call team_orchestrate. */
@@ -76,28 +84,28 @@ export function createCouncilConveneTool(
     definition: {
       name: 'council_convene',
       description:
-        'Convene a star-domain council to review a plan draft. Default is a single advisory round; pass rounds:2+ to enable a rebuttal/debate round (round 2 only fires when round 1 surfaces conflicts). Fans out to seat experts (advisory only, no execution), deterministically adjudicates, and returns an auditable Markdown plan. Pass autoExecute:true to automatically dispatch the approved plan to team_orchestrate — the plan executes immediately after review without a model round-trip. Disabled when COUNCIL=0.',
+        '召集星域多席审查（council）评审计划草稿。默认单轮咨询；传 rounds:2+ 启用反驳/辩论轮（第 2 轮仅在第 1 轮暴露冲突时触发）。向各席位专家 fanout（仅咨询，不执行），确定性裁决，返回可审计的 Markdown 计划。传 autoExecute:true 自动把批准的计划派发给 team_orchestrate——审查后立即执行，省去一次模型往返。COUNCIL=0 时禁用。',
       input_schema: {
         type: 'object',
         properties: {
-          objective: { type: 'string', description: 'The plan objective to review.' },
+          objective: { type: 'string', description: '要评审的计划目标。' },
           draftItems: {
             type: 'array',
-            description: 'Optional draft plan items to put before the council.',
+            description: '可选的草稿计划条目，提交给 council 评审。',
             items: {
               type: 'object',
               properties: {
                 id: { type: 'string' },
                 title: { type: 'string' },
                 detail: { type: 'string' },
-                files: { type: 'array', items: { type: 'string' }, description: 'Files this item touches (for team wave grouping).' },
+                files: { type: 'array', items: { type: 'string' }, description: '该条目涉及的文件（用于 team 波次分组）。' },
               },
               required: ['id', 'title', 'detail'],
             },
           },
           seats: {
             type: 'array',
-            description: 'Optional seat overrides. Defaults to tianquan/tianfu/tianxuan (or agent.council.seats from config). Set provider+model on a seat to run it on a dedicated model (heterogeneous council).',
+            description: '可选的席位覆盖。默认 tianquan/tianfu/tianxuan（或配置中的 agent.council.seats）。为席位设 provider+model 可用专属模型运行该席（异构 council）。',
             items: {
               type: 'object',
               properties: {
@@ -105,14 +113,15 @@ export function createCouncilConveneTool(
                 charter: { type: 'string' },
                 tierHint: { type: 'string', enum: ['cheap', 'balanced', 'strong'] },
                 noDowngrade: { type: 'boolean' },
-                provider: { type: 'string', description: 'Per-seat provider (must exist in config.provider.providers). Pair with model.' },
-                model: { type: 'string', description: 'Per-seat model (must exist in the provider). Pair with provider.' },
+                provider: { type: 'string', description: '单席位 provider（必须存在于 config.provider.providers）。与 model 配对使用。' },
+                model: { type: 'string', description: '单席位模型（必须存在于该 provider）。与 provider 配对使用。' },
               },
               required: ['authority'],
             },
           },
-          rounds: { type: 'number', description: 'Max debate rounds (1-2, default 1 = single round). Pass 2 to enable a rebuttal round; round 2 only fires when round 1 surfaces conflicts.' },
-          autoExecute: { type: 'boolean', description: 'When true, automatically dispatch the council-approved plan to team_orchestrate. Saves a model round-trip — the plan executes immediately after council review instead of waiting for manual extraction.' },
+          rounds: { type: 'number', description: '最大辩论轮数（1-2，默认 1 = 单轮）。传 2 启用反驳轮；第 2 轮仅在第 1 轮暴露冲突时触发。' },
+          pillars: { type: 'boolean', description: '为 true 时启用三柱旗舰议事会（council max）：扩张柱（破军激进+天机质疑）× 约束柱（天权称量+华盖否决）× 平衡柱（瑶光合成裁决），共 5 席制度化对抗。最复杂的工程任务用它。显式 seats 参数优先于此模式。' },
+          autoExecute: { type: 'boolean', description: '为 true 时，自动把 council 批准的计划派发给 team_orchestrate。省去一次模型往返——计划在审查后立即执行，无需手工提取。' },
         },
         required: ['objective'],
       },
@@ -123,7 +132,7 @@ export function createCouncilConveneTool(
       }
       const parsed = inputSchema.safeParse(params.input)
       if (!parsed.success) return { content: `Invalid input: ${parsed.error.message}`, isError: true }
-      const { objective, draftItems, seats, rounds: requestedRounds, autoExecute } = parsed.data
+      const { objective, draftItems, seats, rounds: requestedRounds, pillars, autoExecute } = parsed.data
 
       // ── Pro gate: 多轮议事会 ──
       // rounds≥2（反驳轮）是 Pro 功能，未启用时降级单轮继续（不拒绝——单轮
@@ -136,10 +145,14 @@ export function createCouncilConveneTool(
       }
 
       const items: PlanItem[] = draftItems ?? []
-      // Precedence: per-call seats > configured agent.council.seats > built-in default.
+      // Precedence: per-call seats > pillars 三柱模式 > configured agent.council.seats > built-in default.
+      // pillars 模式下配置席位不替换结构，只按 authority 沿用 provider/model/tierHint 绑定。
+      const pillarsActive = Boolean(pillars) && !(seats && seats.length > 0)
       const baseSeats: CouncilSeat[] = seats && seats.length > 0
         ? seats
-        : (defaultSeats && defaultSeats.length > 0 ? defaultSeats : [...DEFAULT_COUNCIL_SEATS])
+        : pillarsActive
+          ? mergeSeatOverrides(THREE_PILLAR_COUNCIL_SEATS, defaultSeats ?? [])
+          : (defaultSeats && defaultSeats.length > 0 ? defaultSeats : [...DEFAULT_COUNCIL_SEATS])
       const councilSeats: CouncilSeat[] = baseSeats.map(s => ({
         authority: s.authority,
         ...(s.charter ? { charter: s.charter } : {}),
@@ -159,9 +172,40 @@ export function createCouncilConveneTool(
         return { content: `council_convene: 席位 authority 重复「${dupe}」—— 每席必须是不同的星域 id（议事会按 authority 绑定结果，重复会丢席并重复计票）。`, isError: true }
       }
 
+      // Build authority lookup: workOrderId prefix → authority, for activity mapper.
+      const seatObjectiveByAuthority = new Map(councilSeats.map(s => [s.authority, buildSeatObjective(s, { objective, items })]))
+      const activityMapper = params.onWorkerActivity
+        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity, {
+            objectiveOf: (id) => {
+              // council workOrderIds are `council:seat-<authority>`
+              // (round 2: `-r2`; parse-failure retry: `-retry`; 波间复议: `-reconvene`；
+              // 复议内的重试可叠加为 `-retry-reconvene`)
+              const authority = id.startsWith('council:seat-')
+                ? id.slice('council:seat-'.length).replace(/(-(r2|retry|reconvene))+$/, '')
+                : undefined
+              return authority ? seatObjectiveByAuthority.get(authority) : undefined
+            },
+          })
+        : undefined
+
+      // Collect delegateBatch results for terminal event emission (P1 fix).
+      // Each delegateBatch call stores its results; after plan is available,
+      // we emit terminal events per contribution → workOrderId match.
+      const batchResults: Array<{ results: import('../agent/work-order.js').WorkerResult[]; workerModels?: Array<{ workOrderId: string; model: string }> }> = []
+
       const deps: CouncilDeps = {
         delegateBatch: async (requests, policy, signal, onProgress) => {
-          const run = await coordinator.delegateBatch(requests as unknown as DelegationRequest[], policy, signal, onProgress)
+          // W1: inject onActivity into each council fanout request so seat
+          // workers appear in the desktop subagent panel (WorkerListPane /
+          // WorkerThreadView) alongside delegate_batch / team_orchestrate workers.
+          const augmentedRequests = activityMapper
+            ? requests.map(r => ({
+                ...r,
+                onActivity: (ev: WorkerActivityEvent) => activityMapper(ev),
+              }))
+            : requests
+          const run = await coordinator.delegateBatch(augmentedRequests as unknown as DelegationRequest[], policy, signal, onProgress)
+          batchResults.push({ results: run.results, workerModels: run.workerModels })
           return { results: run.results, workerModels: run.workerModels }
         },
         now: () => Date.now(),
@@ -174,12 +218,49 @@ export function createCouncilConveneTool(
           : undefined,
       }
 
+      // Terminal event emission for every seat worker that actually ran —
+      // shared by the success path AND the fail-loud path (quorum 流会 throws
+      // AFTER seats already dispatched; without this, failed councils leave
+      // seats stuck 'running' in the desktop panel — the exact P1 regression).
+      const emitSeatTerminals = (summaryOf?: (authority: string) => string | undefined, fromBatch = 0): void => {
+        if (!params.onWorkerActivity) return
+        for (const batch of batchResults.slice(fromBatch)) {
+          for (const r of batch.results) {
+            const seatId = r.workOrderId.startsWith('council:seat-')
+              ? r.workOrderId.slice('council:seat-'.length)
+              : undefined
+            const isR2 = seatId?.endsWith('-r2') ?? false
+            const authority = seatId?.replace(/(-(r2|retry|reconvene))+$/, '')
+            const contribSummary = authority ? summaryOf?.(authority) : undefined
+            // r2 rebuttal seats report their own packet; r1 seats prefer the
+            // parsed contribution summary (cleaner than the raw worker packet).
+            const summary = (isR2 ? (r.summary || contribSummary) : (contribSummary || r.summary))?.trim() ?? ''
+            params.onWorkerActivity!({
+              workOrderId: r.workOrderId,
+              parentToolId: params.toolUseId,
+              profile: 'council_expert',
+              ...(authority ? { authority } : {}),
+              objective: authority ? seatObjectiveByAuthority.get(authority) : undefined,
+              status: r.status,
+              progressLine: progressSnippet(summary) || undefined,
+              summary: summary || undefined,
+              failureReason: r.status !== 'passed' ? r.failureReason : undefined,
+              model: r.model,
+              provider: r.provider,
+              usage: r.usage,
+            })
+          }
+        }
+      }
+
       let plan
       try {
         // 分两层入口：默认走单轮 runCouncil；显式 rounds≥2 才走多轮层 runCouncilDebate。
         const runner = (rounds && rounds >= 2) ? runCouncilDebate : runCouncil
         plan = await runner({ draft: { objective, items }, seats: councilSeats, ...(rounds ? { maxRounds: rounds } : {}), ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}) }, deps)
       } catch (err) {
+        // 流会/编排失败：席位 worker 已真实跑过 —— 终态事件照发，面板不留悬挂席位。
+        emitSeatTerminals()
         const msg = err instanceof Error ? err.message : String(err)
         return { content: `council_convene failed: ${msg}`, isError: true }
       }
@@ -191,10 +272,27 @@ export function createCouncilConveneTool(
             sessionId: coordinator.getSessionId?.() ?? 'unknown',
             plan,
             timestamp: Date.now(),
+            ...(pillarsActive ? { pillars: true } : {}),
           }))
         } catch {
           // 遥测失败不影响交付。
         }
+      }
+
+      // P1 fix: emit terminal events for every council seat so the desktop
+      // subagent panel transitions seats from 'running' → 终态. Mirrors
+      // delegate_batch's emitTerminal: driven by the real delegateBatch
+      // results (covers r1/r2/retry workOrderIds — each settles under its own
+      // id), status passed through verbatim (a failed seat must never render
+      // as passed). Seat contribution summary is preferred when parsed cleanly.
+      {
+        // First-wins: plan.contributions is [...round1, ...r2] with duplicate
+        // authorities — round-1 seats must read their own round's summary.
+        const contribSummaryByAuthority = new Map<string, string>()
+        for (const c of plan.contributions) {
+          if (!contribSummaryByAuthority.has(c.authority)) contribSummaryByAuthority.set(c.authority, c.summary)
+        }
+        emitSeatTerminals(authority => contribSummaryByAuthority.get(authority))
       }
 
       // content: 全文议事记录 markdown(进 model 上下文,供其原样 echo 给用户)。
@@ -205,7 +303,22 @@ export function createCouncilConveneTool(
       // uiContent: 紧凑裁决摘要 —— 工具卡默认仅展示前 4 行,避免裸 markdown 被截成无意义片段。
       const parts = [plan.finalPlanMarkdown]
       const hasTasks = plan.aggregate.mergedItems.length > 0
-      const unifiedPlan = hasTasks ? councilPlanToUnifiedPlan(plan) : undefined
+      // Da'at 编译门：未化解的 blocking challenge = 否决态，没有可执行契约——
+      // 不产 planJson、不 storePlan、不 autoExecute。
+      const compiled = hasTasks ? compileCouncilPlan(plan) : undefined
+      if (compiled && !compiled.ok) {
+        parts.push('', '## ⛔ 议事会否决（blocking challenge 未化解）',
+          ...compiled.vetoes.map(v => `- ${v.description}: ${v.left}`),
+          '', '计划未编译执行。化解方式：传 rounds:2 让席位复议收敛（concede/revise 化解否决），或修订草案后重新召集。')
+      }
+      // Atropos 密封（Phase 3）：编译通过的契约即密封——摘要钉住执行语义
+      // （objective/files/dependsOn/verification），此后静默改写在
+      // team_orchestrate 消费入口被硬拦；修订走 revisePlanSeal 豁免协议留痕。
+      // Norns 义务账随契约挂载：暂缓项/高危缓解承诺/advisory gate 流到
+      // deliver_task 交付前逐项核验（义务不入 digest，账目更新不破封）。
+      const unifiedPlan = compiled?.ok && compiled.plan
+        ? sealPlan(attachObligations(compiled.plan, extractObligations(plan)))
+        : undefined
       const planJson = unifiedPlan ? serializeUnifiedPlan(unifiedPlan) : undefined
       if (planJson) {
         parts.push('', '```council-plan-json', planJson, '```')
@@ -255,6 +368,46 @@ export function createCouncilConveneTool(
               const noteBlock = [run.notes.reviewNote, run.notes.scopeHealthNote, run.notes.waveGateNote, run.notes.deliverySynthesis]
                 .map(n => n.trim()).filter(Boolean)
               if (noteBlock.length > 0) waveLines.push(...noteBlock.map(n => `  ${n.replace(/\n/g, '\n  ')}`))
+              // W2d: surface structured gate failures so the user can see which
+              // checks blocked the next wave — these were previously silently
+              // discarded when autoExecute consumed only the text noteBlock.
+              if (run.gate && !run.gate.passed) {
+                waveLines.push(`  ⛔ 门禁未通过 (wave ${run.gate.wave + 1})`)
+                for (const f of run.gate.failures.slice(0, 5)) {
+                  waveLines.push(`    ❌ ${f}`)
+                }
+                if (run.gate.failures.length > 5) waveLines.push(`    … (+${run.gate.failures.length - 5} more)`)
+                // Phase 3 波间自动复议：按 provenance 只召回提案席 + 平衡柱做
+                // 轻量诊断（advisory——契约修订仍是主控决策点，走豁免协议）。
+                // 复议后停止推波：下一波入口门禁必拦，与其抛错不如把复议建议
+                // 和续跑指引一起交回主控。
+                const failedWaveTaskIds = new Set(run.summary.waves[fromWave]?.taskIds ?? [])
+                const taskRefs: ReconveneTaskRef[] = unifiedPlan.tasks
+                  .filter(t => failedWaveTaskIds.size === 0 || failedWaveTaskIds.has(t.id))
+                  .map(t => ({
+                    id: t.id,
+                    title: t.title,
+                    detail: t.objective,
+                    ...(typeof t.metadata?.proposedBy === 'string' ? { proposedBy: t.metadata.proposedBy } : {}),
+                  }))
+                const preReconveneBatches = batchResults.length
+                const reconveneLines = await runWaveReconvene({
+                  objective,
+                  wave: run.gate.wave,
+                  failures: run.gate.failures,
+                  tasks: taskRefs,
+                  originalSeats: councilSeats,
+                  ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+                }, deps)
+                // 复议席位 worker 的终态事件：复用同一回路，只发新增批次
+                // （首轮席位的终态早已发过，重发会污染面板）。
+                emitSeatTerminals(undefined, preReconveneBatches)
+                waveLines.push('', ...reconveneLines)
+                storePlan(planJson, params.sessionId)
+                waveLines.push('', '⚠ 后续波已暂停（门禁硬拦）。计划已存入会话 — 按复议建议修订后调用 `team_orchestrate({ objective, fromWave })` 续跑。')
+                fromWave++
+                break
+              }
               fromWave++
             } while (fromWave < totalWaves)
             parts.push('', `## Auto-Executed (${workers} workers, ${totalWaves} waves)`)

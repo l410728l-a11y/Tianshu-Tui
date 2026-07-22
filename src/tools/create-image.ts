@@ -60,22 +60,22 @@ export async function createImage(input: CreateImageInput): Promise<{ path: stri
 export const CREATE_IMAGE_TOOL: Tool = {
   definition: {
     name: 'create_image',
-    description: `Create an SVG image file from SVG markup.
+    description: `从 SVG 标记创建 SVG 图片文件。
 
-The SVG content can be a full <svg>...</svg> document, raw SVG inner elements, or a markdown code fence. Use this for logos, diagrams, charts, illustrations, and any vector graphics.
+SVG 内容可以是完整 <svg>...</svg> 文档、原始 SVG 内部元素，或 markdown 代码块。用于 logo、图表、示意图、插画等各种矢量图形。
 
-Use open_path to open the generated image in the OS default viewer.
+用 open_path 在 OS 默认查看器中打开生成的图片。
 
-Examples:
+示例：
 Good: create_image(destination_path="~/Desktop/logo.svg", svg="<svg xmlns=\\"http://www.w3.org/2000/svg\\" viewBox=\\"0 0 100 100\\"><circle cx=\\"50\\" cy=\\"50\\" r=\\"40\\" fill=\\"#38bdf8\\"/></svg>")
 Good: create_image(destination_path="~/Desktop/chart.svg", svg="<rect x=\\"10\\" y=\\"20\\" width=\\"30\\" height=\\"40\\" fill=\\"#818cf8\\"/>", width=200, height=120)`,
     input_schema: {
       type: 'object',
       properties: {
-        destination_path: { type: 'string', description: 'Destination file path. Should end with .svg. May be outside the project.' },
-        svg: { type: 'string', description: 'SVG markup — either a full <svg> document, inner SVG elements, or a markdown code fence.' },
-        width: { type: 'number', description: 'Optional width attribute for the SVG element.' },
-        height: { type: 'number', description: 'Optional height attribute for the SVG element.' },
+        destination_path: { type: 'string', description: '目标文件路径。应以 .svg 结尾。可在项目之外。' },
+        svg: { type: 'string', description: 'SVG 标记——完整 <svg> 文档、内部 SVG 元素，或 markdown 代码块均可。' },
+        width: { type: 'number', description: '可选的 SVG 元素 width 属性。' },
+        height: { type: 'number', description: '可选的 SVG 元素 height 属性。' },
       },
       required: ['destination_path', 'svg'],
     },

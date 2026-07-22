@@ -22,6 +22,7 @@ import { loadConfig as loadRivetConfig, setupProvider, setupCustomProvider, setU
 import { isProFeatureEnabled } from './config/pro-license.js'
 import type { GoalTracker as GoalTrackerInstance } from './agent/goal-tracker.js'
 import { createUpdateGoalTool } from './tools/update-goal.js'
+import { presetIncludes } from './tools/tool-preset.js'
 import { TuiApp } from './tui/engine/app.js'
 import { wrapCallbacksWithTuiApp } from './tui/engine/bridge.js'
 import { getPaletteCommands, filterCommands } from './tui/command-palette.js'
@@ -342,10 +343,12 @@ async function main() {
           getLastVerdict: () => goalTrackerRef.current?.getLastVerdict() ?? null,
           getImpactedTests: () => headlessAgentRef.current ? [...headlessAgentRef.current.getEvidenceState().impactedTests] : [],
         })))
-        toolRegistry.register(createUpdateGoalTool(
-          () => goalTrackerRef.current,
-          () => ({ sessionId, cwd: process.cwd() }),
-        ))
+        if (presetIncludes(registryOptions.preset, 'update_goal')) {
+          toolRegistry.register(createUpdateGoalTool(
+            () => goalTrackerRef.current,
+            () => ({ sessionId, cwd: process.cwd() }),
+          ))
+        }
 
         const agentCfg = createAgentConfig(createMainAgentConfigInput({
           apiKey: key,
@@ -574,20 +577,21 @@ async function main() {
   ctx!.agent.onAskUserQuestionRequested = (info) => {
     setImmediate(() => tuiApp.openAskUserQuestionPanel(info))
   }
-  // TUI / 桌面共用 agent.defaultDomain（发版默认开阳）。在首个请求前钉住，
+  // TUI / 桌面共用 agent.defaultDomain（默认 auto）。非 auto 时在首个请求前钉住，
   // 仅构建初始 frozenBase，无缓存代价；钉住后 bindSessionDomain 跳过 Auto 绑定。
-  // defaultDomain === 'auto' 时保持未钉定，由 bindSessionDomain 按 domainKeywordRouting
-  // 落到开阳（关键词路由默认关）。尊重 STAR_SOUL 总开关。
+  // defaultDomain === 'auto'（默认）时保持未钉定，由 bindSessionDomain 按首条消息
+  // 关键词路由（domainKeywordRouting 默认开），未命中回退天枢。尊重 STAR_SOUL 总开关。
   if (ctx!.agent.getSessionDomain() === undefined && isStarSoulEnabled()) {
-    const key = ctx!.config.agent?.defaultDomain ?? 'kaiyang'
+    const key = ctx!.config.agent?.defaultDomain ?? 'auto'
     if (key !== 'auto') {
-      const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('kaiyang')
+      const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('tianshu')
       if (pinned) {
         ctx!.agent.setSessionDomain({
           id: pinned.id as import('./agent/star-domain.js').StarDomainId,
           name: pinned.name,
           volatileBlock: pinned.volatileBlock,
           motto: pinned.motto,
+          courageThreshold: pinned.courageThreshold,
         })
       }
     }
@@ -999,7 +1003,7 @@ async function main() {
     } else {
       const d = starDomainRegistry.get(key)
       if (d) {
-        ctx!.agent.setSessionDomain({ id: d.id, name: d.name, volatileBlock: d.volatileBlock, motto: d.motto })
+        ctx!.agent.setSessionDomain({ id: d.id, name: d.name, volatileBlock: d.volatileBlock, motto: d.motto, courageThreshold: d.courageThreshold })
         tuiApp.setSessionStarDomain(d.name)
         tuiApp.commitStatic(`Domain → ${d.name} (${d.decisionStyle})`)
       } else {

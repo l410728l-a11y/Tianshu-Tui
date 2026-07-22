@@ -122,7 +122,7 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   registry.register(REPO_MAP_TOOL)
   if (presetIncludes(preset, 'related_tests')) registry.register(RELATED_TESTS_TOOL)
   registry.register(READ_SECTION_TOOL)
-  registry.register(FILE_INFO_TOOL)
+  if (presetIncludes(preset, 'file_info')) registry.register(FILE_INFO_TOOL)
   registry.register(REQUEST_PATH_ACCESS_TOOL)
   registry.register(SKILL_TOOL)
   // leave_mark — 星图里程碑。preset full 含；RIVET_LEAVE_MARK=1 强制开启。

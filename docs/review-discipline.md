@@ -48,7 +48,7 @@
 | **L2 单对抗子代理** | 单/双文件代码/依赖/配置改动，包含但不限于 fix | 1 个 `adversarial_verifier` | RED 拦截 / GREEN 放行 |
 | **L1 nudge** | 仅文档/轻量数据文件 | 提示注入 | 提醒但不阻塞 |
 
-审查闭环有界（默认 3 轮），verifier 与 patcher 为不同子代理。
+审查闭环有界（L2 patch→verify 环默认 1 轮，可调 `maxRounds`），verifier 与 patcher 为不同子代理。
 
 ### 客观审查姿态
 
@@ -65,12 +65,18 @@
 
 ## 配置
 
-### 开关
+### 开关（三级）
 
-默认**开启**。可用环境变量关闭：
+| 层级 | 开关 | 作用域 | 手动 `/review` |
+|------|------|--------|---------------|
+| 硬关闭 | `RIVET_REVIEW_DISCIPLINE=0` | 进程级（CI/headless） | 经 deliver_task 的一并关闭 |
+| 持久 | `review.skipAuto: true`（config；桌面端 Settings → Routing checkbox） | 全局、跨会话（新会话生效） | **可用** |
+| 会话 | `/review off` · `/review on` · `/review status`（TUI） | 当前会话，即时生效 | **可用** |
+
+核心原则：**一切"关闭"只抑制系统自动审查（auto / defer / final / goal-achieved L3）；显式 `review_level`（手动 `/review`，用户明确意图）永远放行**。off 模式下主控的测试/验证/提交环节完全不受影响——只是不再自动 spawn 审查 worker，用户可手动 `/review [max]` 或交给外部会话审，省掉无效 token 消耗。
 
 ```bash
-# 关闭审查纪律门禁
+# 硬关闭审查纪律门禁
 RIVET_REVIEW_DISCIPLINE=0
 
 # 显式开启（也是默认值）

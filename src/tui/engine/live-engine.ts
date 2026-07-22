@@ -250,6 +250,44 @@ export class LiveEngine {
     return total
   }
 
+  /**
+   * 输入行归一化（2026-07-21 输入框重影修复）。
+   *
+   * LiveRegionLine 的契约是「单逻辑行」，但上游内容偶发携带嵌入换行——已证实的
+   * 泄漏链：worker 多行 summary（review 门 evidence 用 `\n` 拼接）→
+   * `progressLine: summary.slice(0, 80)` → FleetRegistry.activity → 舰队面板活动行。
+   * 带 `\n` 的行在屏上占多个显示行，而 rowsForLine 基于 displayWidth
+   * （string-width 剥控制符，`\n` 计 0 宽）按 1 行计 → lastDisplayRows 低于屏上
+   * 实际行数 → 下一帧 cursorUp 回顶不足 → 旧帧顶部（输入框头行+边框）残留进
+   * scrollback，正是「输入框重影叠屏」的形态。
+   *
+   * 处理：`\n` 展开为独立行；`\r`/`\t` 替换为空格（同样是 string-width 计 0 宽
+   * 但终端会移动光标/跳列的字符）。内容侧净化（progressSnippet）是第一道防线，
+   * 这里是引擎层兜底——任何未来新增的内容路径都不能再破坏行数追踪。
+   */
+  private normalizeLines(lines: readonly LiveRegionLine[]): readonly LiveRegionLine[] {
+    let dirty = false
+    for (const l of lines) {
+      if (l.text.includes('\n') || l.text.includes('\r') || l.text.includes('\t')) {
+        dirty = true
+        break
+      }
+    }
+    if (!dirty) return lines
+    const out: LiveRegionLine[] = []
+    for (const l of lines) {
+      const cleaned = l.text.replace(/[\r\t]/g, ' ')
+      if (!cleaned.includes('\n')) {
+        out.push(cleaned === l.text ? l : { ...l, text: cleaned })
+        continue
+      }
+      for (const seg of cleaned.split('\n')) {
+        out.push({ ...l, text: seg })
+      }
+    }
+    return out
+  }
+
   // ── Render ────────────────────────────────────────────────────
 
   /**
@@ -283,7 +321,7 @@ export class LiveEngine {
    * @param lines 要显示的行（含 ANSI 格式化）
    */
   render(lines: readonly LiveRegionLine[], opts?: { reservedTail?: number }): void {
-    const bounded = this.applyRowBudget(lines, opts?.reservedTail)
+    const bounded = this.applyRowBudget(this.normalizeLines(lines), opts?.reservedTail)
 
     // 恢复重铺：CPR 检出外来写入污染后，不再信任 lastDisplayRows 的屏上假设
     // （H2 短路会被 lineCache 与屏上不符的内容欺骗，diff 会加剧错位）。

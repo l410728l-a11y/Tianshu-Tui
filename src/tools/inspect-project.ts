@@ -191,15 +191,15 @@ async function findConfigFiles(cwd: string): Promise<string[]> {
 export const INSPECT_PROJECT_TOOL: Tool = {
   definition: {
     name: 'inspect_project',
-    description: `Analyze the current project and return a summary: language, package manager, scripts, entry files, test structure, and framework hints.
+    description: `分析当前项目并返回摘要：语言、包管理器、scripts、入口文件、测试结构与框架线索。
 
-### Usage
-- Use inspect_project when first entering a project to understand its structure
-- No parameters needed — operates on the current working directory
-- Returns structured summary useful for planning the first edit
+### 用法
+- 首次进入一个项目时用 inspect_project 了解其结构
+- 无需参数——作用于当前工作目录
+- 返回结构化摘要，便于规划第一次编辑
 
-### Examples
-Good: inspect_project() — get project overview`,
+### 示例
+推荐：inspect_project() — 获取项目概览`,
     input_schema: {
       type: 'object',
       properties: {},

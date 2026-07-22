@@ -40,6 +40,31 @@ describe('RepoLock', () => {
     assert.equal(lock.isHeld(), false)
   })
 
+  it('withLockAsync holds the lock across awaits and releases on throw', async () => {
+    const lockPath = join(makeDir(), 'r.lock')
+    const lock = new RepoLock({ lockPath })
+    let heldDuringAwait = false
+
+    await lock.withLockAsync(async () => {
+      assert.ok(existsSync(lockPath), 'lock file must exist while held')
+      // Simulate async work — the lock must survive the await.
+      await new Promise(resolve => setTimeout(resolve, 10))
+      heldDuringAwait = existsSync(lockPath)
+    })
+
+    assert.ok(heldDuringAwait, 'lock must be held during await')
+    assert.equal(existsSync(lockPath), false, 'lock released after completion')
+    assert.equal(lock.isHeld(), false)
+
+    // Throw path: lock released even when fn throws.
+    await assert.rejects(
+      () => lock.withLockAsync(async () => { throw new Error('async boom') }),
+      /async boom/,
+    )
+    assert.equal(existsSync(lockPath), false, 'lock released after async throw')
+    assert.equal(lock.isHeld(), false)
+  })
+
   it('serializes: a second lock cannot acquire while the first holds it', () => {
     const lockPath = join(makeDir(), 'r.lock')
     const a = new RepoLock({ lockPath })

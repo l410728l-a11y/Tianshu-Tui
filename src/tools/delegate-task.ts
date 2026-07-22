@@ -6,7 +6,7 @@ import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } fr
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
-import { createActivityStreamer, createDelegationActivityMapper } from './worker-activity-stream.js'
+import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
 
 export interface DelegateTaskCoordinator {
@@ -57,17 +57,17 @@ export function createDelegateTaskTool(
   return {
     definition: {
       name: 'delegate_task',
-      description: 'Delegate a bounded task to a worker agent. Supports code search, review, planning, verification, and patching.',
+      description: '把有边界的任务委派给 worker 代理执行。支持代码搜索、审查、规划、验证和打补丁。',
       input_schema: {
         type: 'object',
         properties: {
-          objective: { type: 'string', description: 'Specific objective for the worker.' },
-          kind: { type: 'string', enum: ['code_search', 'doc_research', 'plan', 'review', 'verify', 'patch_proposal'], description: 'Worker task type. Default: code_search.' },
-          profile: { type: 'string', enum: profileRegistry.getProfileNames(), description: 'Worker profile. Default: code_scout.' },
-          authority: { type: 'string', description: 'Optional star-domain persona (e.g. tianquan, tianji, yuheng). Injects that expert\'s perspective + methodology and restricts tools to its whitelist.' },
-          files: { type: 'array', items: { type: 'string' }, description: 'Optional file paths to focus on.' },
-          symbols: { type: 'array', items: { type: 'string' }, description: 'Optional symbols to focus on.' },
-          resume: { type: 'string', description: 'Worker ID to resume. The worker continues from its previous session context instead of starting fresh. Use the workOrderId from a previous delegate_task result.' },
+          objective: { type: 'string', description: 'worker 的具体目标。' },
+          kind: { type: 'string', enum: ['code_search', 'doc_research', 'plan', 'review', 'verify', 'patch_proposal'], description: 'worker 任务类型。默认：code_search。' },
+          profile: { type: 'string', enum: profileRegistry.getProfileNames(), description: 'worker profile。默认：code_scout。' },
+          authority: { type: 'string', description: '可选星域人格（如 tianquan、tianji、yuheng）。注入该专家的视角与方法论，并把工具限制在其白名单内。' },
+          files: { type: 'array', items: { type: 'string' }, description: '可选，要聚焦的文件路径。' },
+          symbols: { type: 'array', items: { type: 'string' }, description: '可选，要聚焦的符号。' },
+          resume: { type: 'string', description: '要恢复的 worker ID。worker 从之前的会话上下文继续，而不是从零开始。使用之前 delegate_task 结果中的 workOrderId。' },
         },
         required: ['objective'],
       },
@@ -103,8 +103,11 @@ export function createDelegateTaskTool(
 
       // T9 P3 text stream + T4 structured per-worker updates (subagent panel).
       const textStreamer = params.onOutput ? createActivityStreamer(params.onOutput) : undefined
+      const taskObjective = parsed.data.objective
       const activityMapper = params.onWorkerActivity
-        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity)
+        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity, {
+            objectiveOf: () => taskObjective,
+          })
         : undefined
       const onActivity = (textStreamer || activityMapper)
         ? (ev: WorkerActivityEvent) => {
@@ -115,7 +118,7 @@ export function createDelegateTaskTool(
 
       const run = await coordinator.delegate({
         parentTurnId: params.toolUseId,
-        objective: parsed.data.objective,
+        objective: taskObjective,
         kind: parsed.data.kind ?? 'code_search',
         profile: (parsed.data.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
         authority: parsed.data.authority,
@@ -137,8 +140,10 @@ export function createDelegateTaskTool(
             workOrderId: r.workOrderId,
             parentToolId: params.toolUseId,
             authority: parsed.data.authority,
+            objective: taskObjective,
             status: r.status,
-            progressLine: r.summary.slice(0, 80),
+            progressLine: progressSnippet(r.summary),
+            summary: r.summary,
             failureReason: r.failureReason,
             model: r.model,
             provider: r.provider,

@@ -108,6 +108,85 @@ describe('/context 占用明细', () => {
   })
 })
 
+describe('/review off|on|status — 会话级审查门开关', () => {
+  it('/review off 关闭本会话自动审查门，并提示手动审查仍可用', async () => {
+    let captured = ''
+    const reviewGateRef: { current: 'auto' | 'off' } = { current: 'auto' }
+    const ctx = makeCtx({
+      parts: ['/review', 'off'],
+      reviewGateRef,
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    assert.equal(reviewGateRef.current, 'off')
+    assert.match(captured, /自动审查门已关闭/)
+    assert.match(captured, /\/review on 恢复/)
+  })
+
+  it('/review on 恢复自动审查门', async () => {
+    let captured = ''
+    const reviewGateRef: { current: 'auto' | 'off' } = { current: 'off' }
+    const ctx = makeCtx({
+      parts: ['/review', 'on'],
+      reviewGateRef,
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    assert.equal(reviewGateRef.current, 'auto')
+    assert.match(captured, /自动审查门已恢复/)
+  })
+
+  it('/review status 只报告状态，不翻转开关', async () => {
+    let captured = ''
+    const reviewGateRef: { current: 'auto' | 'off' } = { current: 'off' }
+    const ctx = makeCtx({
+      parts: ['/review', 'status'],
+      reviewGateRef,
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    assert.equal(reviewGateRef.current, 'off', 'status 不得改变开关')
+    assert.match(captured, /已关闭（off）/)
+  })
+
+  it('无 reviewGateRef 注入时明确提示，不静默丢输入', async () => {
+    let captured = ''
+    const ctx = makeCtx({
+      parts: ['/review', 'off'],
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    assert.match(captured, /不支持会话级审查门开关/)
+  })
+
+  it('/review off 不再被 resolveAppPromptInput 误映射为 focus 审查', () => {
+    const resolved = resolveAppPromptInput('/review off', '/cwd')
+    assert.ok(resolved !== null)
+    assert.match(resolved!.prompt, /TUI-local session toggle/)
+    assert.doesNotMatch(resolved!.prompt, /call deliver_task/)
+  })
+
+  it('/review l1 映射为 L1 轻量审查（nudge，零 worker）', () => {
+    const resolved = resolveAppPromptInput('/review l1', '/cwd')
+    assert.ok(resolved !== null)
+    assert.match(resolved!.prompt, /review_level="L1"/)
+    assert.match(resolved!.prompt, /zero review workers/)
+  })
+
+  it('/review l2 / 无关键词 / max 的档位映射回归', () => {
+    assert.match(resolveAppPromptInput('/review l2', '/cwd')!.prompt, /review_level="L2"/)
+    assert.match(resolveAppPromptInput('/review', '/cwd')!.prompt, /review_level="L2"/)
+    assert.match(resolveAppPromptInput('/review max', '/cwd')!.prompt, /review_level="L3"/)
+    assert.match(resolveAppPromptInput('/review l3', '/cwd')!.prompt, /review_level="L3"/)
+    // focus 描述不与档位关键词混淆
+    assert.match(resolveAppPromptInput('/review l2 检查锚点漂移', '/cwd')!.prompt, /Focus specifically on: 检查锚点漂移/)
+  })
+})
+
 describe('/resume 无参行为（会话选择器）', () => {
   it('注入 openSessionPicker 时无参 /resume 打开选择器而非打用法', async () => {
     let pickerOpened = 0

@@ -4,7 +4,7 @@ import type { Tool } from './types.js'
 import { validatePath } from './path-validate.js'
 import { syntaxCheck, checkSyntax } from './syntax-check.js'
 import { getFileReadMtime, recordSuccessfulEdit, incrementEditFailCount, resetEditFailCount } from './read-file.js'
-import { writeFileAtomicAsync } from '../fs-atomic.js'
+import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
 import { applyEol, chooseEol, detectFileEol, toLf } from './line-endings.js'
 import { getTargetEol } from '../platform.js'
@@ -19,25 +19,25 @@ const MAX_WRITE_FILE_BYTES = 10 * 1024 * 1024 // 10MB — safety ceiling for sin
 export const WRITE_FILE_TOOL: Tool = {
   definition: {
     name: 'write_file',
-    description: `Create or overwrite a file. Creates parent directories automatically.
+    description: `创建或覆盖一个文件。自动创建父目录。
 
-### Usage
-- Prefer edit_file for targeted changes to existing files
-- Use write_file only for new files or complete file rewrites
-- Always provide absolute file paths
-- File content is the complete file contents, not a diff
-- Parent directories are created if they don't exist
+### 用法
+- 对已有文件的定点修改优先用 edit_file
+- write_file 只用于新文件或整文件重写
+- 始终提供绝对文件路径
+- content 是完整文件内容，不是 diff
+- 父目录不存在时自动创建
 
-### Examples
-Good: write_file(file_path="/abs/path/src/new-component.tsx", content="...full file content...")
-Bad: using write_file to change one line in an existing file (use edit_file instead)
+### 示例
+好的：write_file(file_path="/abs/path/src/new-component.tsx", content="...full file content...")
+坏的：用 write_file 只改已有文件里的一行（应改用 edit_file）
 
-**Note:** The file on disk is the source of truth. For large writes, the message history keeps only a short pointer to \`file_path\` instead of the full content — use \`read_file\` if you need to review what was written in a later turn.`,
+**注意：** 磁盘上的文件是唯一事实来源。大内容写入后，消息历史里只保留一个指向 \`file_path\` 的短指针而不是完整内容——后续轮次如需回看写入内容，用 \`read_file\`。`,
     input_schema: {
       type: 'object',
       properties: {
-        file_path: { type: 'string', description: 'Absolute path to the file. Provide this parameter first.' },
-        content: { type: 'string', description: 'Complete file contents (not a diff). Provide this parameter last.' },
+        file_path: { type: 'string', description: '文件的绝对路径。先提供此参数。' },
+        content: { type: 'string', description: '完整文件内容（不是 diff）。最后提供此参数。' },
       },
       required: ['file_path', 'content'],
     },
@@ -174,7 +174,13 @@ Bad: using write_file to change one line in an existing file (use edit_file inst
     const existingEol = fileExists ? await detectFileEol(filePath) : null
     const finalContent = applyEol(content, chooseEol(filePath, existingEol, getTargetEol()))
 
-    await writeFileAtomicAsync(filePath, finalContent)
+    const land = await landingWriteFile(params, filePath, haveOldContentForDiff ? oldContentForDiff : '', finalContent)
+    if (land.kind === 'delegated') {
+      if (isDelegateRejected(land.delegated) || land.delegated.isError) {
+        return delegatedToToolResult(land.delegated)
+      }
+      // Client applied — continue post-write validation on the live file.
+    }
 
     // Post-write structural validation: if the file is unparseable, roll back.
     const syntax = await checkSyntax(filePath, finalContent)

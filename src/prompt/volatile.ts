@@ -37,7 +37,7 @@ const METHODOLOGY_ADVISORY_TEMPLATES: Record<PlanMethodology, string> = {
 
 /** Plan Mode 专用：设计文档口径，不注入可执行 TDD/bash「执行计划基线」。 */
 const PLAN_MODE_METHODOLOGY_ADVISORY =
-  '<plan-methodology route="full" mode="design-doc">Plan Mode 产出完整设计文档（写入活动计划文件），不是逐步 bash/commit 菜谱。章节要求：① 问题与根因；② 至少一张 Mermaid 架构/数据流图；③ 方案取舍表（有决策时）；④ 文件:行锚点 + 提议 diff/伪代码；⑤ 验证清单（测什么/看什么，不写逐步 shell 块）；⑥ 「瑶光反证」——关键断言 + file:line 或 run_tests 证据摘要，复现不了的标待验证假设；⑦ 重构类须含「回归清单」；⑧ 大计划（任务 >8 或引用文件 >15）须显式分波——`### Wave N` 标题 + 每波验证命令（submit 门禁）。逐步命令与 git commit 留给批准后的执行阶段。</plan-methodology>'
+  '<plan-methodology route="full" mode="design-doc">Plan Mode 产出完整设计文档（写入活动计划文件），不是逐步 bash/commit 菜谱。章节要求：① 需求提炼（用户原话提炼目标与非目标，H1 之后，submit 门禁）；② 问题与根因；③ 至少一张 Mermaid 架构/数据流图；④ 方案取舍表（有决策时）；⑤ 文件:行锚点 + 提议 diff/伪代码；⑥ 验证清单（测什么/看什么，不写逐步 shell 块）；⑦ 「瑶光反证」——关键断言 + file:line 或 run_tests 证据摘要，复现不了的标待验证假设；⑧ 重构类须含「回归清单」；⑨ 大计划（任务 >8 或引用文件 >15）须显式分波——`### Wave N` 标题 + 每波验证命令（submit 门禁）。逐步命令与 git commit 留给批准后的执行阶段。</plan-methodology>'
 
 export function renderPlanMethodologyAdvisory(
   methodology: PlanMethodology | undefined,
@@ -88,6 +88,7 @@ export function renderPlanModeBlock(
 - 逐步命令与 commit 留给用户批准之后的执行阶段。
 
 工作流：
+0. **建调研 todo** — 先用 \`todo\` 列出 3-6 个调研步骤（摸清各模块现状、外部调研、设计收敛），**最后一项固定为「汇总写计划并用 plan action=submit 提交审批」**；逐项勾掉推进。计划正文只进计划文件，不进 todo。
 1. **识别关键问题** — 先列出 2-3 个对计划至关重要的问题。不确定代码结构时，用 \`delegate_task\`（profile=code_scout）并行调研；独立问题并行派多个 worker。**多模块任务先并行调研**：用 \`delegate_batch\` 一次并行派 2-4 个只读 code_scout（按模块/文件域切分），汇总后再写计划——串行逐个调研浪费轮次。
 2. **外部调研** — 涉及外部库/协议/最佳实践时，用 \`web_search\` / \`web_fetch\` 核实，不凭训练记忆下结论。
 3. **设计收敛** — 最多 2-3 个真正不同的方案；一个明显更优就只提一个。偏好/约束不明时用 \`ask_user_question\` 澄清。
@@ -99,6 +100,7 @@ export function renderPlanModeBlock(
 - 只有遇到你无法自行判断的真实分歧才 \`ask_user_question\`——存在多个实质取舍不同、且取决于用户偏好的方向，或需求自相矛盾/关键信息缺失到无法继续。为了凑收尾、给个交代而提问是禁止的：没有真正要用户拍板的事就继续推进，不要中断。
 
 计划质量标准——你的计划应该是一份完整的**设计文档**，禁止占位符：
+- **需求提炼**：计划开头（H1 之后）必须有标题含「需求提炼」的 ## 级章节——用用户原话提炼需求目标与非目标（submit 门禁）。审批先审意图，再审方案。
 - 至少包含一张 Mermaid 图（架构图或数据流图）。图形承载语义——(圆角)=用户/输入，[[子程序]]=agent/处理器，{{六边形}}=LLM/模型，[(圆柱)]=存储/DB，{菱形}=判断；边 --> 同步/读，==> 写/强，-.-> 异步/事件。复制下方骨架并替换节点文字：
 \`\`\`mermaid
 flowchart TD

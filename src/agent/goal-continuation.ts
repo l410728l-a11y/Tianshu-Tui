@@ -1,3 +1,4 @@
+import type { SrClass } from './context.js'
 import type { GoalTracker } from './goal-tracker.js'
 import type { GoalJudgeDeps } from './goal-judge.js'
 import { runGoalJudge } from './goal-judge.js'
@@ -20,7 +21,13 @@ export interface GoalContinuationDeps {
   getEstimatedTokens: () => number
   getSessionId: () => string | undefined
   getCwd: () => string
-  appendSystemReminder: (content: string) => void
+  appendSystemReminder: (content: string, cls?: SrClass) => void
+  /** 同 appendSystemReminder，但返回 boolean 表示是否成功注入（未被 W3 cap 拦截）。
+   *  W1 通道分级：functional 类不限流，注入不可能失败。 */
+  appendSystemReminderAndReport: (content: string, cls?: SrClass) => boolean
+  /** 重置本轮 discipline SR 计数器——W1 通道分级后仅 loop.ts 每用户轮调用。
+   *  functional 类调用方不再需要 resetSrCount 前置 hack。 */
+  resetSrCount: () => void
   completeTurn: (params: CompleteTurnParams) => Promise<void>
   writeTelemetry: (entry: TelemetryRecord) => void
   flushMeridianTurn: () => void
@@ -85,7 +92,7 @@ export class GoalContinuationController {
           tracker.advanceIteration()
           return this.finishContinuation(tracker, signal, params, decision.reminder)
         }
-        this.deps.appendSystemReminder(decision.reminder)
+        this.deps.appendSystemReminder(decision.reminder, 'functional')
         tracker.deactivate('achieved')
         this.persistGoalState(tracker)
         this.deps.flushMeridianTurn()
@@ -102,7 +109,7 @@ export class GoalContinuationController {
         tracker.advanceIteration()
         return this.finishContinuation(tracker, signal, params, decision.reminder)
       } else {
-        this.deps.appendSystemReminder(decision.reminder)
+        this.deps.appendSystemReminder(decision.reminder, 'functional')
         tracker.deactivate('achieved')
         this.persistGoalState(tracker)
         this.deps.flushMeridianTurn()
@@ -144,7 +151,7 @@ export class GoalContinuationController {
     )
 
     if (judgeReminder) {
-      this.deps.appendSystemReminder(judgeReminder)
+      this.deps.appendSystemReminder(judgeReminder, 'functional')
     } else {
       const iter = tracker.getIteration()
       const maxIter = tracker.getMaxIterations()
@@ -157,7 +164,8 @@ export class GoalContinuationController {
         `[GOAL CONTINUATION ${iter}/${maxIter}${wallInfo}] 目标尚未达成。继续执行。\n` +
         `目标: ${tracker.getGoal()}\n` +
         `上轮输出摘要: ${this.deps.getStreamedText().slice(-500)}\n` +
-        `完成后输出 "GOAL ACHIEVED" 声明完成。遇到无法解决的阻塞时输出 "GOAL BLOCKED"。`
+        `完成后输出 "GOAL ACHIEVED" 声明完成。遇到无法解决的阻塞时输出 "GOAL BLOCKED"。`,
+        'functional'
       )
     }
     return { kind: 'continue' }

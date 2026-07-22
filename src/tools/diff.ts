@@ -12,25 +12,25 @@ const MAX_TOTAL_CHARS = 8000
 export const DIFF_TOOL: Tool = {
   definition: {
     name: 'diff',
-    description: `Show git diff for working tree changes.
+    description: `显示工作树改动的 git diff。
 
-### Usage
-- Use diff to see what files have changed before committing
-- Use diff before editing to understand current state
-- Use diff after editing to verify changes are correct
-- Results are truncated per file (200 lines max)
+### 用法
+- 提交前用 diff 查看哪些文件有改动
+- 编辑前用 diff 了解当前状态
+- 编辑后用 diff 验证改动是否正确
+- 结果按文件截断（每个文件最多 200 行）
 
-### Examples
-Good: diff() — show all unstaged changes
-Good: diff(staged=true) — show staged changes
-Good: diff(path="src/api/client.ts") — show diff for one file`,
+### 示例
+Good: diff() — 显示所有未暂存改动
+Good: diff(staged=true) — 显示已暂存改动
+Good: diff(path="src/api/client.ts") — 显示单个文件的 diff`,
     input_schema: {
       type: 'object',
       properties: {
-        staged: { type: 'boolean', description: 'Show staged changes (--cached)' },
-        path: { type: 'string', description: 'Filter to specific file or directory' },
-        context_lines: { type: 'integer', description: 'Lines of context (default: 3)' },
-        current_task_only: { type: 'boolean', description: 'Show diff only for files owned by the current task (B1 ownership scope)' },
+        staged: { type: 'boolean', description: '显示已暂存改动（--cached）' },
+        path: { type: 'string', description: '过滤到指定文件或目录' },
+        context_lines: { type: 'integer', description: '上下文行数（默认 3）' },
+        current_task_only: { type: 'boolean', description: '只显示当前任务拥有文件的 diff（B1 归属范围）' },
       },
     },
   },

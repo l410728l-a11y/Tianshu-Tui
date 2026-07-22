@@ -702,6 +702,81 @@ test('team_orchestrate auto-consumes plan from session store when planJson omitt
   assert.ok(getStoredPlan(sessionId) !== null)
 })
 
+// ── Atropos 密封校验（Phase 3）：密封契约静默改写 → 消费入口硬拦 ──
+
+function sealablePlan(): import('../../agent/unified-plan.js').UnifiedPlan {
+  return {
+    version: 1,
+    objective: 'sealed contract test',
+    tasks: [{
+      id: 'T1', title: 'Edit foo', objective: 'Modify src/agent/foo.ts',
+      profile: 'patcher', kind: 'patch_proposal',
+      files: ['src/agent/foo.ts'], dependsOn: [], riskTier: 'low',
+    }],
+    source: 'plan_task',
+    createdAt: Date.now(),
+  }
+}
+
+test('team_orchestrate 密封完好 → 放行并留密封状态行', async () => {
+  const { sealPlan } = await import('../../agent/council/council-seal.js')
+  const sealed = sealPlan(sealablePlan())
+  const tool = createTeamOrchestrateTool({ delegateBatch: async () => stubRun('sealed-ok') })
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: sealed contract run', planJson: JSON.stringify(sealed) },
+    cwd: process.cwd(),
+    toolUseId: 'tu-seal-ok',
+  })
+  assert.equal(result.isError, false)
+  assert.match(result.content, /契约已密封 v1/)
+})
+
+test('team_orchestrate 密封破损（静默改写 files）→ 硬拦且零派发', async () => {
+  const { sealPlan } = await import('../../agent/council/council-seal.js')
+  const sealed = sealPlan(sealablePlan())
+  const tampered = {
+    ...sealed,
+    tasks: sealed.tasks.map(t => ({ ...t, files: ['src/agent/other.ts'] })),
+  }
+  let dispatched = false
+  const tool = createTeamOrchestrateTool({ delegateBatch: async () => { dispatched = true; return stubRun() } })
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: tampered contract run', planJson: JSON.stringify(tampered) },
+    cwd: process.cwd(),
+    toolUseId: 'tu-seal-broken',
+  })
+  assert.equal(result.isError, true)
+  assert.match(result.content, /密封破损/)
+  assert.match(result.content, /revisePlanSeal/)
+  assert.equal(dispatched, false, '破封契约必须在派发前拦截')
+})
+
+test('team_orchestrate 豁免修订后（revisePlanSeal v2）→ 放行', async () => {
+  const { sealPlan, revisePlanSeal } = await import('../../agent/council/council-seal.js')
+  const sealed = sealPlan(sealablePlan())
+  const modified = { ...sealed, tasks: sealed.tasks.map(t => ({ ...t, files: ['src/agent/moved.ts'] })) }
+  const revised = revisePlanSeal(modified, '波间复议调整范围')
+  const tool = createTeamOrchestrateTool({ delegateBatch: async () => stubRun('revised-ok') })
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: revised contract run', planJson: JSON.stringify(revised) },
+    cwd: process.cwd(),
+    toolUseId: 'tu-seal-revised',
+  })
+  assert.equal(result.isError, false)
+  assert.match(result.content, /契约已密封 v2/)
+})
+
+test('team_orchestrate 未密封计划不受密封门影响（向后兼容）', async () => {
+  const tool = createTeamOrchestrateTool({ delegateBatch: async () => stubRun('unsealed-ok') })
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: unsealed plan run', planJson: JSON.stringify(sealablePlan()) },
+    cwd: process.cwd(),
+    toolUseId: 'tu-seal-none',
+  })
+  assert.equal(result.isError, false)
+  assert.doesNotMatch(result.content, /密封/)
+})
+
 // ── Pro gate（双层模式）：mode:'max' 仅 Pro 可用 ──
 
 test('team_orchestrate max mode blocked without plan when teamMax Pro gate off', async () => {

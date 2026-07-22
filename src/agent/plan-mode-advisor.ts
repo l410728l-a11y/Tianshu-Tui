@@ -1,13 +1,15 @@
 /**
- * 主动 Plan Mode 建议 — 任务入口识别多模块任务，提示主控询问用户是否先规划。
+ * 主动 Plan Mode 建议 — 任务入口识别多模块任务，提示主控直接进入计划模式。
  *
  * 识别复用既有意图信号：initializeRun 里 classifyPlanMethodology 已把
  * 「多执法文件 / 重构 / system 深度 / 安全关键」任务归为 'full' 方法论——
- * 这正是「值得先进 plan mode 并行调研再动手」的任务形态（对齐 Cursor/Codex
- * 桌面版的主动规划交互）。本模块是纯函数判定；advisory 文案由 wiring 侧组装。
+ * 这正是「值得先进 plan mode 并行调研再动手」的任务形态（对齐 kimi-code
+ * EnterPlanMode 的自主进入语义：进入无需用户确认，审批门在 submit 时）。
+ * 本模块是纯函数判定；advisory 文案由 wiring 侧组装。
  *
- * one-shot 语义：同一 task contract 只建议一次（用户选「直接执行」后不复问）；
- * 新任务（新 contract id）重新评估。RIVET_PLAN_MODE_SUGGEST=0 整体禁用。
+ * one-shot 语义：同一 task contract 只建议一次（用户/模型无视后不复问）；
+ * 新任务（新 contract id）重新评估。RIVET_PLAN_MODE_SUGGEST 控制模式：
+ * 默认 auto（直接建议进入），'ask' 回到旧的先问用户行为，'0'/'off' 整体禁用。
  */
 
 import type { TaskContract, TaskDepthLayer, PlanMethodology, TurnMode } from '../context/task-contract.js'
@@ -34,8 +36,18 @@ export interface PlanModeSuggestion {
   reason: string
 }
 
+export type PlanModeSuggestMode = 'auto' | 'ask' | 'off'
+
+/** RIVET_PLAN_MODE_SUGGEST：默认 auto（直接建议进入）；'ask' 先问用户；'0'/'off' 禁用。 */
+export function planModeSuggestMode(): PlanModeSuggestMode {
+  const raw = process.env.RIVET_PLAN_MODE_SUGGEST?.trim().toLowerCase()
+  if (raw === '0' || raw === 'off') return 'off'
+  if (raw === 'ask') return 'ask'
+  return 'auto'
+}
+
 export function planModeSuggestEnabled(): boolean {
-  return process.env.RIVET_PLAN_MODE_SUGGEST !== '0'
+  return planModeSuggestMode() !== 'off'
 }
 
 /** 纯函数：是否建议进入 plan mode。命中条件全部满足才建议。 */
@@ -104,8 +116,8 @@ export function buildStructureFlowPlanAdvisory(
       key,
       content:
         '结构压力信号持续偏高（认知不确定性/新颖域占优）且当前没有计划上下文。'
-        + '如果任务规模成立，考虑用 `ask_user_question` 征询用户是否进入计划模式'
-        + '（`plan` 工具 action="enter_mode"，先并行调研再动手）；小任务可忽略本条。',
+        + '如果任务规模成立，直接用 `plan` 工具 action="enter_mode" 进入计划模式'
+        + '（先建 todo 调研清单再动手，无需先问用户——审批门在提交计划时）；小任务可忽略本条。',
     }
   }
   if (rec === 'exit') {
@@ -124,7 +136,7 @@ export function buildStructureFlowPlanAdvisory(
   return null
 }
 
-/** 建议 advisory 文案 — 指令主控先用 ask_user_question 征询用户。 */
+/** 建议 advisory 文案（ask 变体）— 指令主控先用 ask_user_question 征询用户。 */
 export function buildPlanModeSuggestAdvisory(reason: string): string {
   return (
     `此任务命中 full 规划方法论（${reason}），当前不在 plan mode。` +
@@ -133,5 +145,22 @@ export function buildPlanModeSuggestAdvisory(reason: string): string {
     `「直接执行 — 跳过规划，立即开始改动」。` +
     `用户选择进入计划模式后：调用 \`plan\` 工具 action="enter_mode" 进入，然后用 \`delegate_batch\` 并行派 code_scout 调研。` +
     `用户选择直接执行则正常开工，本任务内不再询问。`
+  )
+}
+
+/**
+ * 建议 advisory 文案（auto 默认）— 指令主控自主进入 plan mode，不问用户。
+ * 对齐 kimi-code EnterPlanMode 语义：进入零成本且可逆（用户随时可退出），
+ * 真正的审批门在 plan submit 时；省掉一轮 ask 往返。
+ */
+export function buildPlanModeAutoEnterAdvisory(reason: string): string {
+  return (
+    `此任务命中 full 规划方法论（${reason}），当前不在 plan mode。` +
+    `直接调用 \`plan\` 工具 action="enter_mode" 进入计划模式——无需先问用户` +
+    `（进入可逆：用户可随时退出；用户审批门在计划提交时）。` +
+    `进入后先用 \`todo\` 建调研清单（3-6 项：摸清各模块现状/外部调研/设计收敛），` +
+    `最后一项固定为「汇总写计划并用 plan action=submit 提交审批」；` +
+    `再用 \`delegate_batch\` 并行派 code_scout 调研，逐项勾掉 todo 推进。` +
+    `若你判断此任务其实不需要规划（小改动/需求已明确），忽略本条，本任务内不再提醒。`
   )
 }

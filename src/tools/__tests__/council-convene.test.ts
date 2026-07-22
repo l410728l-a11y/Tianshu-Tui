@@ -252,6 +252,130 @@ describe('council_convene 工具', () => {
     assert.ok(r2Reqs.every(r => r.parentTurnId.endsWith('-r2')), 'round2 parentTurnId 带 -r2')
   })
 
+  // ── P1 终态回路：席位在桌面子代理面板必须从 running 走到真实终态 ──────────
+
+  it('终态回路：failed 席位终态保持 failed（不虚构 passed），passed 席位带贡献摘要', async () => {
+    // 3 席中 1 席持续失败（首轮 + 重试均无 artifact）：法定人数 2/3 仍满足，
+    // 会诊继续；失败席位以 failed 终态 + contribution_failed 留痕。
+    const coordinator: CouncilConveneCoordinator = {
+      delegateBatch: async (requests): Promise<CoordinatorRun> => {
+        const results = requests.map(req => {
+          if (req.authority === 'tianquan') {
+            return {
+              ...workerResultFor(req),
+              status: 'failed' as const,
+              failureReason: 'timeout' as const,
+              summary: 'tianquan exploded',
+              artifacts: [],
+            }
+          }
+          return workerResultFor(req)
+        })
+        return { status: 'completed', results, packet: '', workerModels: results.map(r => ({ workOrderId: r.workOrderId, model: 'm' })) }
+      },
+      getSessionId: () => 'sess-1',
+    }
+    const events: import('../types.js').DelegationActivity[] = []
+    const tool = createCouncilConveneTool(coordinator)
+    const res = await tool.execute({
+      input: { objective: 'x', seats: [{ authority: 'tianquan' }, { authority: 'tianfu' }, { authority: 'tianxuan' }] },
+      toolUseId: 't1',
+      cwd: process.cwd(),
+      onWorkerActivity: (a) => events.push(a),
+    } as ToolCallParams)
+    assert.equal(res.isError, false)
+
+    const failed = events.find(e => e.workOrderId === 'council:seat-tianquan')
+    assert.ok(failed, 'failed 席位应收到终态事件')
+    assert.equal(failed!.status, 'failed', 'failed 结果不得被映射成 passed')
+    assert.equal(failed!.failureReason, 'timeout')
+
+    // 解析失败触发的单席重试也各自收到终态（-retry id，authority 归并回席位名）
+    const retried = events.find(e => e.workOrderId === 'council:seat-tianquan-retry')
+    assert.ok(retried, '重试 worker 应收到终态事件')
+    assert.equal(retried!.authority, 'tianquan')
+
+    const passed = events.find(e => e.workOrderId === 'council:seat-tianfu')
+    assert.ok(passed, 'passed 席位应收到终态事件')
+    assert.equal(passed!.status, 'passed')
+    assert.equal(passed!.summary, 'tianfu-said', 'passed 席位优先带解析后的贡献摘要')
+    assert.equal(passed!.parentToolId, 't1')
+  })
+
+  it('终态回路：法定人数不足流会时，已跑席位仍收到终态事件（面板不悬挂）', async () => {
+    // 2 席中 1 席持续失败：有效 1 < 法定 ⌈4/3⌉=2 → 流会 isError；
+    // 但已真实派发的席位 worker 必须转终态。
+    const coordinator: CouncilConveneCoordinator = {
+      delegateBatch: async (requests): Promise<CoordinatorRun> => {
+        const results = requests.map(req => {
+          if (req.authority === 'tianquan') {
+            return { ...workerResultFor(req), status: 'failed' as const, failureReason: 'timeout' as const, artifacts: [] }
+          }
+          return workerResultFor(req)
+        })
+        return { status: 'completed', results, packet: '' }
+      },
+      getSessionId: () => 'sess-1',
+    }
+    const events: import('../types.js').DelegationActivity[] = []
+    const tool = createCouncilConveneTool(coordinator)
+    const res = await tool.execute({
+      input: { objective: 'x', seats: [{ authority: 'tianquan' }, { authority: 'tianfu' }] },
+      toolUseId: 't1',
+      cwd: process.cwd(),
+      onWorkerActivity: (a) => events.push(a),
+    } as ToolCallParams)
+    assert.equal(res.isError, true)
+    assert.match(String(res.content), /流会/)
+    assert.ok(events.find(e => e.workOrderId === 'council:seat-tianquan' && e.status === 'failed'))
+    assert.ok(events.find(e => e.workOrderId === 'council:seat-tianfu' && e.status === 'passed'))
+    assert.ok(events.find(e => e.workOrderId === 'council:seat-tianquan-retry'), '重试 worker 也须终态')
+  })
+
+  it('终态回路：rounds=2 时 r2 席位（-r2 workOrderId）也各自收到终态，且每 id 恰好一条', async () => {
+    const coordinator: CouncilConveneCoordinator = {
+      delegateBatch: async (requests): Promise<CoordinatorRun> => {
+        const results = requests.map(req => {
+          if (req.parentTurnId.endsWith('-r2')) {
+            return {
+              ...workerResultFor(req),
+              artifacts: [{ kind: 'note' as const, title: 'seat-contribution', content: JSON.stringify({ authority: req.authority, summary: 'r2', rebuttals: [] }) }],
+            }
+          }
+          // round1：两席对同 id 给出不同 detail → 产生冲突，触发 r2
+          const detail = req.authority === 'tianquan' ? 'X' : 'Y'
+          return {
+            ...workerResultFor(req),
+            artifacts: [{ kind: 'note' as const, title: 'seat-contribution', content: JSON.stringify({ authority: req.authority, summary: `${req.authority}-s`, additions: [{ id: 'NEW', title: 't', detail }], risks: [], challenges: [], alternatives: [] }) }],
+          }
+        })
+        return { status: 'completed', results, packet: '', workerModels: results.map(r => ({ workOrderId: r.workOrderId, model: 'm' })) }
+      },
+      getSessionId: () => 'sess-1',
+    }
+    const events: import('../types.js').DelegationActivity[] = []
+    const tool = createCouncilConveneTool(coordinator)
+    const res = await tool.execute({
+      input: { objective: 'x', seats: [{ authority: 'tianquan' }, { authority: 'tianfu' }], rounds: 2 },
+      toolUseId: 't1',
+      cwd: process.cwd(),
+      onWorkerActivity: (a) => events.push(a),
+    } as ToolCallParams)
+    assert.equal(res.isError, false)
+
+    const ids = events.map(e => e.workOrderId).sort()
+    assert.deepEqual(ids, [
+      'council:seat-tianfu',
+      'council:seat-tianfu-r2',
+      'council:seat-tianquan',
+      'council:seat-tianquan-r2',
+    ], 'r1 与 r2 各 workOrderId 恰好一条终态，无重复无遗漏')
+    assert.ok(events.every(e => e.status === 'passed'))
+    // r2 事件的 authority 剥掉 -r2 后缀
+    const r2 = events.find(e => e.workOrderId === 'council:seat-tianquan-r2')
+    assert.equal(r2!.authority, 'tianquan')
+  })
+
   it('rounds 透传：默认（不传）→ 单轮（1 次 delegateBatch）', async () => {
     const { coordinator, calls } = makeCoordinator()
     const tool = createCouncilConveneTool(coordinator)
@@ -328,6 +452,45 @@ describe('council_convene 工具', () => {
     assert.match(res.content, /team_orchestrate/)
   })
 
+  it('Da\'at 否决：blocking challenge 未化解 → 不产 planJson、不 storePlan、不 autoExecute', async () => {
+    const sessionId = `council-veto-${Date.now()}`
+    let executed = 0
+    const coordinator: CouncilConveneCoordinator = {
+      delegateBatch: async (requests): Promise<CoordinatorRun> => {
+        executed++
+        const results = requests.map(req => {
+          const contrib = JSON.stringify({
+            authority: req.authority, summary: `${req.authority}-said`,
+            additions: [], risks: [], alternatives: [],
+            challenges: req.authority === 'tianfu'
+              ? [{ text: '无回滚方案不得动 schema', severity: 'blocking' }]
+              : [],
+          })
+          return { ...workerResultFor(req), artifacts: [{ kind: 'note' as const, title: 'seat-contribution', content: contrib }] }
+        })
+        return { status: 'completed', results, packet: '' }
+      },
+      getSessionId: () => sessionId,
+    }
+    const tool = createCouncilConveneTool(coordinator)
+    const res = await tool.execute({
+      ...paramsWith({
+        objective: 'risky schema change',
+        draftItems: [{ id: 'T1', title: 'Migrate', detail: 'do it', files: ['src/db.ts'] }],
+        seats: [{ authority: 'tianquan' }, { authority: 'tianfu' }, { authority: 'tianxuan' }],
+        autoExecute: true,
+      }),
+      sessionId,
+    })
+    assert.equal(res.isError, false, '否决是结构化结果，不是工具错误')
+    assert.match(res.content, /⛔ 议事会否决/)
+    assert.match(res.content, /无回滚方案不得动 schema/)
+    assert.ok(!res.content.includes('council-plan-json'), '否决态不得内嵌可执行 planJson')
+    assert.ok(!res.content.includes('Auto-Executed'), '否决态不得 autoExecute')
+    assert.equal(consumePlan(sessionId), null, '否决态不得 storePlan')
+    assert.equal(executed, 1, '只有席位扇出，无执行波派发')
+  })
+
   it('A3：无任务 → 不 storePlan', async () => {
     const sessionId = `council-a3-empty-${Date.now()}`
     const { coordinator } = makeCoordinator()
@@ -402,6 +565,61 @@ describe('council_convene 工具', () => {
     }
   })
 
+  it('Phase 3：autoExecute 波间门禁失败 → 自动复议（-reconvene 派发）+ 停波 + 回存计划', async () => {
+    const sessionId = `council-reconvene-${Date.now()}`
+    const cwd = mkdtempSync(join(tmpdir(), 'rivet-council-recon-'))
+    // 席位贡献：tianquan 对 T1 声明一个必然失败的白名单 gate 命令。
+    // 两个 draft 条目共享文件 → 编译层生成 dependsOn → 两波；wave 0 完成后
+    // 出口门禁执行该命令失败 → 触发复议。
+    const dispatchedTurnIds: string[] = []
+    const failingGate = 'node --test ./definitely-missing-gate.test.js'
+    const coordinator: CouncilConveneCoordinator = {
+      delegateBatch: async (requests): Promise<CoordinatorRun> => {
+        for (const r of requests) dispatchedTurnIds.push(r.parentTurnId)
+        const results = requests.map(req => {
+          if (req.parentTurnId.startsWith('council:seat-')) {
+            const contrib = JSON.stringify({
+              authority: req.authority, summary: `${req.authority}-view`, additions: [], risks: [],
+              challenges: req.authority === 'tianquan'
+                ? [{ text: '必须过门禁', severity: 'advisory', gate: failingGate, itemId: 'T1' }]
+                : [],
+              alternatives: [],
+            })
+            return { ...workerResultFor(req), artifacts: [{ kind: 'note' as const, title: 'seat-contribution', content: contrib }] }
+          }
+          return { ...workerResultFor(req), artifacts: [] }
+        })
+        return { status: 'completed', results, packet: '', workerModels: [] }
+      },
+      getSessionId: () => sessionId,
+    }
+    const tool = createCouncilConveneTool(coordinator)
+    try {
+      const res = await tool.execute({
+        ...paramsWith({
+          objective: 'refactor with gates',
+          draftItems: [
+            { id: 'T1', title: 'a', detail: 'da', files: ['src/shared.ts'] },
+            { id: 'T2', title: 'b', detail: 'db', files: ['src/shared.ts'] },
+          ],
+          autoExecute: true,
+        }),
+        sessionId,
+        cwd,
+      })
+      assert.equal(res.isError, false, '门禁失败是波级事实，评审产物仍交付')
+      assert.match(res.content, /⛔ 门禁未通过/)
+      assert.match(res.content, /## 波间复议/)
+      assert.match(res.content, /revisePlanSeal/)
+      const reconveneDispatches = dispatchedTurnIds.filter(id => id.endsWith('-reconvene'))
+      assert.ok(reconveneDispatches.length > 0, '复议席位应以 -reconvene 后缀派发')
+      assert.ok(!dispatchedTurnIds.some(id => id.includes(':w1')), '门禁失败后不得推 wave 1')
+      assert.ok(consumePlan(sessionId), '停波时计划回存会话桥供修订续跑')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   // ── Pro gate（双层模式）：rounds≥2 仅 Pro 可用 ──
 
   it('rounds:2 且 multiRoundEnabled=false → 降级单轮并注明，不报错', async () => {
@@ -428,5 +646,79 @@ describe('council_convene 工具', () => {
     const res = await tool.execute(paramsWith({ objective: 'review the plan', rounds: 1 }))
     assert.equal(res.isError, false)
     assert.ok(!res.content.includes('[Pro]'))
+  })
+
+  // ── Phase 2: pillars 三柱模式（council max）──
+
+  it('pillars:true → 扇出三柱五席（破军/天机/天权/华盖/瑶光）', async () => {
+    const { coordinator, calls } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator)
+    const res = await tool.execute(paramsWith({ objective: 'x', pillars: true }))
+    assert.equal(res.isError, false)
+    const reqs = calls.requests[0]!
+    assert.deepEqual(
+      reqs.map(r => r.authority).sort(),
+      ['huagai', 'pojun', 'tianji', 'tianquan', 'yaoguang'],
+    )
+  })
+
+  it('pillars:true → 约束柱与平衡柱请求带 tierFloor（瑶光门接线）', async () => {
+    const { coordinator, calls } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator)
+    await tool.execute(paramsWith({ objective: 'x', pillars: true }))
+    const reqs = calls.requests[0]!
+    for (const authority of ['tianquan', 'huagai', 'yaoguang']) {
+      const req = reqs.find(r => r.authority === authority)
+      assert.equal(req?.tierFloor, 'strong', `${authority} 应带 strong tierFloor`)
+    }
+  })
+
+  it('pillars:true + config defaultSeats → 按 authority 沿用专属模型绑定（mergeSeatOverrides）', async () => {
+    const { coordinator, calls } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator, [
+      { authority: 'tianquan', provider: 'deepseek', model: 'deepseek-v4-pro' },
+      { authority: 'tianfu', provider: 'glm', model: 'glm-4.6' }, // 不在三柱席 → 忽略
+    ])
+    await tool.execute(paramsWith({ objective: 'x', pillars: true }))
+    const reqs = calls.requests[0]!
+    assert.equal(reqs.length, 5, '仍是三柱五席，配置席不追加')
+    assert.deepEqual(
+      reqs.find(r => r.authority === 'tianquan')?.modelOverride,
+      { provider: 'deepseek', model: 'deepseek-v4-pro' },
+    )
+    assert.equal(reqs.find(r => r.authority === 'tianfu'), undefined)
+  })
+
+  it('per-call seats 优先于 pillars:true（显式席位覆盖三柱结构）', async () => {
+    const { coordinator, calls } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator)
+    await tool.execute(paramsWith({ objective: 'x', pillars: true, seats: [{ authority: 'wenqu' }] }))
+    const reqs = calls.requests[0]!
+    assert.deepEqual(reqs.map(r => r.authority), ['wenqu'])
+  })
+
+  it('编译通过的 planJson 已密封（Atropos v1，可校验完好）', async () => {
+    const { verifyPlanSeal } = await import('../../agent/council/council-seal.js')
+    const { coordinator } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator)
+    const res = await tool.execute(paramsWith({
+      objective: 'x',
+      draftItems: [{ id: 'T1', title: 't', detail: 'd', files: ['src/a.ts'] }],
+    }))
+    const plan = extractPlanJson(res.content)
+    assert.ok(plan, '应产出 planJson')
+    const check = verifyPlanSeal(plan as never)
+    assert.deepEqual(check, { status: 'intact', version: 1 })
+  })
+
+  it('pillars:true → 会诊遥测事件带 pillarsMode=true 与模型构成', async () => {
+    const sessions: Array<Record<string, unknown>> = []
+    const { coordinator } = makeCoordinator({ recordCouncilSession: e => sessions.push(e as unknown as Record<string, unknown>) })
+    const tool = createCouncilConveneTool(coordinator)
+    await tool.execute(paramsWith({ objective: 'x', pillars: true }))
+    assert.equal(sessions.length, 1)
+    assert.equal(sessions[0]!.pillarsMode, true)
+    assert.deepEqual(sessions[0]!.modelsUsed, ['test-model'])
+    assert.equal(sessions[0]!.heterogeneous, false)
   })
 })

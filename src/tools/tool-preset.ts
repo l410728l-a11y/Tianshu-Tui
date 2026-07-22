@@ -93,6 +93,10 @@ const MINIMAL_EXCLUDES: ReadonlySet<string> = new Set([
   'inspect_project',
   'import_resource',
   'leave_mark',
+  // 2026-07-22 minimal 再瘦身（会话日志使用率实测验证）：极低频工具
+  'file_info',
+  'session_vitals',
+  'update_goal',
 ])
 
 /** 判断某工具在给定档位下是否注册。 */

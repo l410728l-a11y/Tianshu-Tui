@@ -1,13 +1,14 @@
 import { spawnGit } from './spawn-git.js'
-import { writeFile, unlink, readFile } from 'node:fs/promises'
+import { writeFile, unlink, readFile, mkdir, cp, rm } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { Tool, ToolCallParams } from './types.js'
 import { checkSyntax } from './syntax-check.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
 import { incrementEditFailCount, resetEditFailCount, recordSuccessfulEdit } from './read-file.js'
 import { APPLY_PATCH_POINTER_PREFIX } from './apply-patch-arg-processor.js'
+import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
 
 /** Post-apply syntax verification + rollback. Default on; RIVET_APPLY_PATCH_VERIFY=0
  *  falls back to the legacy "git apply and trust it" behaviour. */
@@ -100,17 +101,17 @@ export async function applyPatch(cwd: string, input: ApplyPatchInput, abortSigna
 export const APPLY_PATCH_TOOL: Tool = {
   definition: {
     name: 'apply_patch',
-    description: 'Apply a unified diff to the current git repository using git apply. Supports check-only validation before applying. Use for multi-file changes or applying an existing patch; for a single targeted edit prefer edit_file or hash_edit. Note: after a large patch is applied, the message history keeps only a summary pointer (changed file list + size) instead of the verbatim diff — use read_file or git diff to inspect the result. check_only validations keep the full diff inline.',
+    description: '用 git apply 把 unified diff 应用到当前 git 仓库。支持应用前先做 check-only 校验。用于多文件改动或应用已有 patch；单点定向编辑优先用 edit_file 或 hash_edit。注意：大 patch 应用后，消息历史里只保留摘要指针（改动文件列表 + 大小）而非 diff 原文——用 read_file 或 git diff 查看结果。check_only 校验会保留完整 diff 内联。',
     input_schema: {
       type: 'object',
       properties: {
         diff: {
           type: 'string',
-          description: 'Unified diff content to apply.',
+          description: '要应用的 unified diff 内容。',
         },
         check_only: {
           type: 'boolean',
-          description: 'Validate that the patch applies cleanly without modifying files.',
+          description: '只校验 patch 能否干净应用，不修改文件。',
         },
       },
       required: ['diff'],
@@ -153,6 +154,14 @@ export const APPLY_PATCH_TOOL: Tool = {
       if (t.existedBefore) {
         trackFileChange(params.cwd, { filePath: t.rel, action: 'edit', toolCallId: params.toolUseId ?? 'apply_patch' })
       }
+    }
+
+    // E4 — when a client can apply_edit, materialize final file snapshots in a
+    // temp tree and land each file via WorkspaceEdit (whole-file payload).
+    if (!checkOnly && params.onClientDelegate && targets.length > 0) {
+      const clientResult = await applyPatchViaClient(params, normalizedDiff, targets)
+      if (clientResult) return clientResult
+      // null → fail-back to local git apply below
     }
 
     const result = await applyPatch(params.cwd, {
@@ -201,6 +210,70 @@ export const APPLY_PATCH_TOOL: Tool = {
   requiresApproval: () => true,
   isConcurrencySafe: () => false,
   isEnabled: () => true,
+}
+
+/**
+ * E4 path: apply patch in a temp tree, then land each resulting file via
+ * apply_edit (whole-file old/new snapshots). Returns null to fail-back locally.
+ */
+async function applyPatchViaClient(
+  params: ToolCallParams,
+  normalizedDiff: string,
+  targets: PatchTarget[],
+): Promise<{ content: string; isError?: boolean; uiContent?: string } | null> {
+  const tmpRoot = join(tmpdir(), `rivet-patch-client-${process.pid}-${Date.now()}`)
+  try {
+    await mkdir(tmpRoot, { recursive: true })
+    for (const t of targets) {
+      const dest = join(tmpRoot, t.rel)
+      await mkdir(dirname(dest), { recursive: true })
+      if (t.existedBefore) {
+        await cp(t.abs, dest)
+      }
+    }
+    // Init a throwaway git repo so `git apply` has a valid cwd.
+    const { spawnSync } = await import('node:child_process')
+    const init = spawnSync('git', ['init'], { cwd: tmpRoot, stdio: 'ignore' })
+    if (init.status !== 0) return null
+    const applied = await applyPatch(tmpRoot, { diff: normalizedDiff, checkOnly: false })
+    if (!applied.ok) return null
+
+    for (const t of targets) {
+      const tmpFile = join(tmpRoot, t.rel)
+      if (!existsSync(tmpFile) && !t.existedBefore) continue
+      const oldContent = t.existedBefore && existsSync(t.abs)
+        ? await readFile(t.abs, 'utf-8')
+        : ''
+      const newContent = existsSync(tmpFile) ? await readFile(tmpFile, 'utf-8') : ''
+      // Deletion: newContent empty and file gone in tmp — still land empty + client deletes?
+      // v1: write empty content for deleted-to-empty; skip pure deletions (no tmp file, existed).
+      if (!existsSync(tmpFile) && t.existedBefore) {
+        // Pure delete — fall back to local git apply for the whole patch.
+        return null
+      }
+      const land = await landingWriteFile(params, t.abs, oldContent, newContent)
+      if (land.kind === 'delegated') {
+        if (isDelegateRejected(land.delegated) || land.delegated.isError) {
+          return delegatedToToolResult(land.delegated)
+        }
+        // accepted — continue remaining files
+        resetEditFailCount(t.abs)
+        await recordSuccessfulEdit(t.abs, params.sessionId)
+      } else {
+        // Capability vanished mid-patch — remaining already written locally by landingWriteFile
+        resetEditFailCount(t.abs)
+        await recordSuccessfulEdit(t.abs, params.sessionId)
+      }
+    }
+    return {
+      content: 'Patch applied successfully.',
+      uiContent: truncateDiffForUi(normalizedDiff.trim()),
+    }
+  } catch {
+    return null
+  } finally {
+    await rm(tmpRoot, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 /** Parse-check each written target; return the first fatal error found, or null.

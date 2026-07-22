@@ -9,11 +9,11 @@ interface RecallCapsuleInput {
 const DEFINITION: ToolDefinition = {
   name: 'recall_capsule',
   description:
-    'Pull the full sealed cognitive methods (seed capsule) of a predecessor star-domain on demand. The frozen prefix only carries a one-line index per star; call this when you want to adopt a specific stance (e.g. 瑶光 for verification/recurrence discipline, 天权 for planning/weighing review, 天璇 when stuck and needing a fresh angle). The capsule body lands here in the tool result — it does not mutate the cached prompt prefix.',
+    '按需拉取前辈星域封存的完整认知方法（seed capsule）。冻结前缀里每颗将星只有一行索引；当你想采用某种特定姿态时调用本工具（例如：瑶光——验证/复发纪律，天权——规划/权衡审查，天璇——卡住、需要新角度时）。胶囊正文落在本工具的结果里——不会改动已缓存的提示词前缀。',
   input_schema: {
     type: 'object',
     properties: {
-      star: { type: 'string', description: 'Star name, e.g. 瑶光 / 天权 / 天璇 / 天府 / 天枢.' },
+      star: { type: 'string', description: '星域名，例如 瑶光 / 天权 / 天璇 / 天府 / 天枢。' },
     },
     required: ['star'],
   },

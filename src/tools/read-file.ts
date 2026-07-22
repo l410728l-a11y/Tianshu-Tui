@@ -599,25 +599,25 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
 export const READ_FILE_TOOL: Tool = {
   definition: {
     name: 'read_file',
-    description: `Read files from the filesystem with optional line range.
+    description: `从文件系统读取文件，支持可选的行范围。
 
-- Files up to ~50,000 lines returned in full — don't split them into slices yourself
-- Use offset/limit only for known sub-ranges (e.g. lines 800-900), not as a workaround for long files
-- Files > ~2000 lines returned as PARTIAL view with navigation hints
-- Don't re-read unchanged files — prior result is still in context
-- file_paths reads up to 5 files in one call`,
+- 约 50,000 行以内的文件完整返回——不要自己切成小片分多次读
+- offset/limit 只用于已知子区间（如第 800-900 行），不要拿它当长文件的绕行手段
+- 超过约 2000 行的文件返回 PARTIAL 视图并附导航提示
+- 不要重读未变更的文件——此前结果仍在上下文里
+- file_paths 一次调用最多读 5 个文件`,
     input_schema: {
       type: 'object',
       properties: {
-        file_path: { type: 'string', description: 'Absolute path to the file' },
+        file_path: { type: 'string', description: '文件的绝对路径' },
         file_paths: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Read multiple files in one call. Use instead of repeated read_file calls. Each file gets its own section. Max 5 files.',
+          description: '一次调用读取多个文件。用于替代重复的 read_file 调用。每个文件单独成节。最多 5 个文件。',
         },
 
-        offset: { type: 'integer', description: 'Line number to start reading from (1-based)' },
-        limit: { type: 'integer', description: 'Maximum number of lines to read' },
+        offset: { type: 'integer', description: '起始读取行号（从 1 开始）' },
+        limit: { type: 'integer', description: '最多读取的行数' },
       },
       required: ['file_path'],
     },

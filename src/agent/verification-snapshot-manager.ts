@@ -55,13 +55,13 @@ export interface VerificationSnapshotManagerInit {
 export interface VerificationSnapshotManager {
   /** Decide + lazily build/refresh the snapshot for the given owned files.
    *  Returns a plan when snapshot mode is active, or null for in-place. */
-  prepare(ownedFiles: string[]): VerificationSnapshotPlan | null
+  prepare(ownedFiles: string[]): Promise<VerificationSnapshotPlan | null>
   /** C3: force-build a snapshot for a failure-attribution retry, bypassing the
    *  §6 wants-check (git repo + baseline still required — never fake-green).
    *  Used when an in-place verification failed and live pollution signals
    *  (peer sessions / workspace mutations) make "my code vs polluted tree"
    *  ambiguous. Reuses the session worktree like prepare(). */
-  prepareRetry(ownedFiles: string[]): VerificationSnapshotPlan | null
+  prepareRetry(ownedFiles: string[]): Promise<VerificationSnapshotPlan | null>
   /** Most recent policy decision (surfaces the reason even when in-place). */
   lastDecision(): SnapshotDecision | null
   /** Current active snapshotRef, or undefined when not snapshotting. */
@@ -90,7 +90,7 @@ export function createVerificationSnapshotManager(
   let activeRef: string | undefined
   let decision: SnapshotDecision | null = null
 
-  function prepareWith(ownedFiles: string[], forceSnapshot: boolean): VerificationSnapshotPlan | null {
+  async function prepareWith(ownedFiles: string[], forceSnapshot: boolean): Promise<VerificationSnapshotPlan | null> {
     decision = decideSnapshotPolicy({
       isGitRepo: init.isGitRepo,
       baselineHead: init.baselineHead,
@@ -110,7 +110,7 @@ export function createVerificationSnapshotManager(
     const ref = computeRef(init.baseCwd, baselineHead, ownedFiles)
 
     if (!snapshot) {
-      snapshot = createSnapshot({
+      snapshot = await createSnapshot({
         baseCwd: init.baseCwd,
         sessionId: init.sessionId,
         baselineHead,
@@ -119,7 +119,7 @@ export function createVerificationSnapshotManager(
       writeOwnerMarker(snapshot.path, init.sessionId)
     } else if (ref !== activeRef) {
       // Owned diff changed → rebuild so verification runs on current owned content.
-      snapshot.refresh(ownedFiles)
+      await snapshot.refresh(ownedFiles)
     }
     activeRef = ref
 

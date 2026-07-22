@@ -20,6 +20,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { spawnGitSync } from '../tools/spawn-git.js'
 import { join, isAbsolute } from 'node:path'
 import type { Tool, ToolCallParams, ToolResult, DelegationActivity } from '../tools/types.js'
@@ -45,6 +46,9 @@ import { evaluateTestPresence, testPresenceGateEnabled } from './test-presence.j
 import { auditDeliveryClaims, claimAuditEnabled } from './claim-audit.js'
 import { scanFilesForProbes, formatProbeHits, type ProbeHit } from './probe-detector.js'
 import { findApprovedPlanInventory, verifyRegressionInventory, formatInventoryReport, type InventorySearcher } from './regression-inventory.js'
+import { verifyObligations, formatObligationReport, type GateRunner, type PlanWithObligations } from './council/council-obligations.js'
+import { getStoredPlan } from './plan-store.js'
+import { deserializeUnifiedPlan } from './unified-plan.js'
 import { enqueuePostCommitReviewOutcome } from './post-commit-review-queue.js'
 import { addPendingReviewFiles, consumePendingReview, __resetPostCommitReviewPending } from './post-commit-review-pending.js'
 import { isUiFilePath, isVisualVerifyTool } from './hooks/render-verify-hook.js'
@@ -96,6 +100,9 @@ export interface B1Context {
    *  gating of auto review (review.skipAuto) without re-reading the full Config.
    *  Optional: absent → no-skip (preserves current behavior). */
   reviewConfig?: ReviewConfig
+  /** 会话级运行时开关（TUI `/review off` 写入）：true 时抑制系统自动审查。
+   *  显式 review_level（手动 /review）是用户明确意图，不受此开关影响。 */
+  isAutoReviewOff?: () => boolean
   /** Meridian indexer — when available, blast radius is injected into review
    *  focusHint so verifier/inspector know which downstream consumers to check. */
   meridianIndexer?: import('../repo/meridian-indexer.js').MeridianIndexer | null
@@ -113,6 +120,9 @@ export interface B1Context {
   getTaskContract?: () => import('../context/task-contract.js').TaskContract | undefined
   /** 层3 测试钩子：注入清单锚点搜索器（默认 git grep -F）。 */
   inventorySearcher?: InventorySearcher
+  /** Norns 义务账：advisory_gate 白名单命令执行器（默认 sh -c，60s 超时）。
+   *  测试注入 mock 免真实 spawn。 */
+  obligationGateRunner?: GateRunner
   /** W1 回归防线: Meridian blast-radius tests (EvidenceTracker.impactedTests).
    *  Absent → coverage check disabled (unchanged behavior). */
   getImpactedTests?: () => string[]
@@ -315,44 +325,44 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
   return {
     definition: {
       name: 'deliver_task',
-      description: `Check task delivery readiness using the B1 ownership and verification ledger.
+      description: `基于 B1 归属与验证台账检查任务交付就绪度。
 
-### Usage
-- Use deliver_task to check if the current task is ready to deliver/commit
-- Reports GREEN (ready), YELLOW (ready with external caveats), or RED (blocked)
-- Includes owned files, external files, and verification status
-- By default, reports readiness without committing
-- With commit=true, executes an ownership-scoped commit after approval
+### 用法
+- 用 deliver_task 检查当前任务是否可交付/提交
+- 报告 GREEN（就绪）、YELLOW（就绪但附外部注意事项）或 RED（阻塞）
+- 包含已归属文件、外部文件与验证状态
+- 默认只报告就绪度，不执行提交
+- commit=true 时，在审批通过后执行一次归属范围限定的提交
 
-### Parameters
-- commit: set to true to request approval for scoped commit (default: false)
-- message: commit message (required if commit=true)
-- files: optional array of owned file paths to commit (subset). When omitted, commits all owned files. Use this to commit logical units separately.
-- adopt: array of external or co-owned file paths to claim ownership of before committing. Use when taking over work from a crashed/frozen session. Requires commit=true. The adopted files are force-added to the owned set and included in the commit scope.
-- force: set to true to override the cohesion gate when committing many files across multiple areas. Use sparingly.
-- learned: array of reusable patterns confirmed this session (each "模式描述——证据：路径或复现步骤"). Persisted to the project knowledge base and auto-injected in future sessions. Only submit verified patterns.
-- review_policy: post-commit review batching for long tasks. each (default) reviews per commit; defer accumulates commits into a session pending scope without reviewing; final runs one review over everything accumulated. Prefer defer+final over many small commits to avoid paying a review worker per commit.
+### 参数
+- commit: 设为 true 以请求限定范围提交的审批（默认：false）
+- message: 提交信息（commit=true 时必填）
+- files: 可选，要提交的已归属文件路径数组（子集）。省略时提交全部已归属文件。用此参数把逻辑单元分开提交。
+- adopt: 提交前要认领归属的外部或共同归属文件路径数组。用于接管崩溃/冻结会话的工作。要求 commit=true。被认领的文件会强制加入已归属集合，并纳入提交范围。
+- force: 设为 true 可在跨多个区域提交大量文件时覆盖内聚性门禁。谨慎使用。
+- learned: 本次会话确认的可复用模式数组（每条格式："模式描述——证据：路径或复现步骤"）。持久化到项目知识库，未来会话自动注入。只提交已验证的模式。
+- review_policy: 长任务的提交后审查分批。each（默认）每次提交都审查；defer 不审查，把提交累积进会话待审范围；final 对所有累积提交做一次审查。相比大量小提交，优先 defer+final，避免每次提交都消耗一个 review worker。
 
-### Complex spec delivery checklist
-For complex specs or cross-module integration, include checklist entries: fact-flow graph verified, condition matrix verified, counterexample tests verified.`,
+### 复杂 spec 交付清单
+对复杂 spec 或跨模块集成，清单条目要包含：事实流图已验证、条件矩阵已验证、反例测试已验证。`,
       input_schema: {
         type: 'object',
         properties: {
-          commit: { type: 'boolean', description: 'Request scoped commit of owned files' },
-          message: { type: 'string', description: 'Commit message (required if commit=true)' },
+          commit: { type: 'boolean', description: '请求对已归属文件做限定范围的提交' },
+          message: { type: 'string', description: '提交信息（commit=true 时必填）' },
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Optional subset of owned files to commit. When omitted, commits all owned files. Use this to split work into separate logical commits.',
+            description: '可选，要提交的已归属文件子集。省略时提交全部已归属文件。用于把工作拆成独立的逻辑提交。',
           },
           adopt: {
             type: 'array',
             items: { type: 'string' },
-            description: 'External file paths to adopt into owned set before committing. For cross-session takeover when another session crashed. Requires commit=true.',
+            description: '提交前认领进已归属集合的外部文件路径。用于另一会话崩溃后的跨会话接管。要求 commit=true。',
           },
           force: {
             type: 'boolean',
-            description: 'Override cohesion gate. Only use when the commit truly is one logical unit despite spanning multiple areas.',
+            description: '覆盖内聚性门禁。仅在提交尽管跨多个区域、但确实是一个逻辑单元时使用。',
           },
           checklist: {
             type: 'array',
@@ -365,21 +375,21 @@ For complex specs or cross-module integration, include checklist entries: fact-f
               },
               required: ['item', 'done'],
             },
-            description: 'Task completion audit entries. For complex specs include fact-flow graph verified, condition matrix verified, and counterexample tests verified/deferred.',
+            description: '任务完成度审计条目。对复杂 spec，要包含事实流图已验证、条件矩阵已验证、反例测试已验证/已延期。',
           },
           review_level: {
             type: 'string',
             enum: ['L2', 'L3'],
-            description: 'Explicitly set review workflow depth. L2 = single adversarial verifier. L3 = Review Squadron (5 inspectors). When omitted, review level is auto-classified from change structure (default: L1 nudge-only). Use this to manually trigger deeper review for high-risk or critical-path changes.',
+            description: '显式设置审查工作流深度。L2 = 单个对抗式验证器。L3 = Review Squadron（5 个检查员）。省略时按变更结构自动分级（默认：L1 仅提醒）。用于对高风险或关键路径变更手动触发更深的审查。',
           },
           skipAutoReview: {
             type: 'boolean',
-            description: 'Suppress automatic post-commit review. Set automatically when a goal tracker is active (goal-driven auto-continuation). Set manually to bypass review for trivial or urgent changes.',
+            description: '抑制提交后的自动审查。goal tracker 激活时（目标驱动的自动续跑）自动设置。对琐碎或紧急变更可手动设置以绕过审查。',
           },
           review_policy: {
             type: 'string',
             enum: ['each', 'defer', 'final'],
-            description: 'Post-commit review batching for long tasks. each (default): review per commit. defer: skip immediate review and accumulate this commit into the session pending scope. final: run one review over all accumulated deferred commits plus this one. Ignored when review_level is set.',
+            description: '长任务的提交后审查分批。each（默认）：每次提交都审查。defer：跳过即时审查，把本次提交累积进会话待审范围。final：对所有累积的延迟提交连同本次做一次审查。设置 review_level 时忽略此参数。',
           },
           learned: {
             type: 'array',
@@ -407,8 +417,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         : undefined
       const report = ctx.gate.getReport([], currentDirtyFiles, ctx.getCurrentSnapshotRef?.(), moduleCoverage)
 
-      // C-fix (session 803d897d): cap file lists and filter external noise.
-      // 67 untracked .test-tmp files used to drown the GREEN/YELLOW signal.
+      // Cap file lists and filter external noise to keep the GREEN/YELLOW signal readable.
       const FILE_LIST_CAP = 5
       const renderFileList = (files: string[], extraHiddenCount = 0): string[] => {
         if (files.length === 0 && extraHiddenCount === 0) return ['  (none)']
@@ -585,8 +594,8 @@ For complex specs or cross-module integration, include checklist entries: fact-f
           // suggest finishing the current wave before starting the next batch.
           const totalCount = auditList.length
           const doneCount = complete.length
-          // E-fix: threshold lowered from >5 to >=4 — a 5-task plan executed in
-          // one unbroken batch is exactly the failure mode (session 803d897d).
+          // Threshold: >=4 — a plan with 4+ tasks executed in one unbroken batch
+          // is the exact failure mode for missing task-level commits.
           if (totalCount >= 4) {
             const remainingRatio = incomplete.length / totalCount
             if (remainingRatio > 0.4) {
@@ -601,9 +610,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
       }
 
       // ── 层3: 重构行为等价契约 — 回归清单逐项核验（advisory，绝不阻断交付）──
-      // 清单来源优先级：task contract 的 regressionInventory → 最近 APPROVED
-      // 计划的「回归清单」章节。重构类交付且零清单 → 按 YELLOW 处理并留痕，
-      // 掐断「重构丢功能却 GREEN 交付」的事故链（缺口 3）。
+      // 重构类交付且零清单 → 按 YELLOW 处理并留痕，防止重构丢失功能。
       try {
         const { isRefactorObjective } = await import('../context/task-contract.js')
         const contract = ctx.getTaskContract?.()
@@ -621,6 +628,30 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         }
       } catch {
         // advisory: 回归契约核验绝不让交付本身失败
+      }
+
+      // ── Norns 义务账: 议事会契约随附的未偿义务，交付前逐项核验（advisory）──
+      // 义务账随 UnifiedPlan JSON 存活在会话 plan-store（多波续跑期间 re-store）。
+      // advisory_gate 白名单命令真实执行；暂缓项/缓解承诺列账要求报告逐项披露。
+      try {
+        const storedJson = getStoredPlan(params.sessionId)
+        const storedPlan = storedJson ? (deserializeUnifiedPlan(storedJson) as PlanWithObligations | null) : null
+        if (storedPlan?.obligations && storedPlan.obligations.length > 0) {
+          const runGate: GateRunner = ctx.obligationGateRunner ?? ((command) => {
+            try {
+              const res = spawnSync(command, { cwd: params.cwd, shell: true, encoding: 'utf-8', timeout: 60_000 })
+              if (res.status === 0) return { ok: true }
+              const tail = `${res.stdout ?? ''}\n${res.stderr ?? ''}`.trim().split('\n').slice(-3).join('\n')
+              return { ok: false, detail: tail.slice(0, 300) }
+            } catch (err) {
+              return { ok: false, detail: err instanceof Error ? err.message : String(err) }
+            }
+          })
+          const results = verifyObligations(storedPlan.obligations, runGate)
+          lines.push(...formatObligationReport(results))
+        }
+      } catch {
+        // advisory: 义务账核验绝不让交付本身失败
       }
 
       // ── P4 收束闸: PAL 收敛假设 ↔ 交付范围一致性（弱 advisory，绝不阻断）──
@@ -973,9 +1004,12 @@ For complex specs or cross-module integration, include checklist entries: fact-f
         // recursively reviewing themselves.
         // RIVET_REVIEW_DISCIPLINE=0 / false / off / no disables the gate (default: enabled).
         const explicitReviewLevel = params.input.review_level as ReviewScale | undefined
+        // 只抑制「系统自动」审查（auto / defer / final / goal-achieved L3）。
+        // 显式 review_level（手动 /review）是用户明确意图，永远绕过本抑制。
         const skipAutoReview = params.input.skipAutoReview === true
           || ctx.isGoalActive?.() === true
           || ctx.reviewConfig?.skipAuto === true
+          || ctx.isAutoReviewOff?.() === true
         const goalAchieved = ctx.isGoalAchieved?.() === true
         const goalVerdict = ctx.getLastVerdict?.() ?? null
         // review_policy（长任务审查批处理）：'each' 默认逐 commit；'defer'
@@ -1037,8 +1071,10 @@ For complex specs or cross-module integration, include checklist entries: fact-f
 
         // Suppress auto review when goal is active OR caller explicitly skips.
         // Goal-driven auto-continuation can't afford child review worker stalls.
-        if (skipAutoReview) {
-          lines.push('', '⏭ 自动审查已跳过（goal 模式或 skipAutoReview）。')
+        // 显式 review_level（手动 /review）是用户明确意图，绕过一切自动审查抑制——
+        // off 模式关闭的是「自动审查」，不是「禁止用户手动审」。
+        if (skipAutoReview && !explicitReviewLevel) {
+          lines.push('', '⏭ 自动审查已跳过（goal 模式 / skipAuto / /review off）。手动 /review [max] 审查不受影响。')
         } else if (reviewDepth === 0 && shouldRouteReviewWorkflow(change) && isReviewDisciplineEnabled()) {
           // review_policy=defer：长任务声明"过程不审、收尾终审"——commit 范围
           // 累积进会话级 pending（typecheck 升级标记一并记录），由 final /
@@ -1125,19 +1161,27 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                     ? createDelegationActivityMapper(params.toolUseId, trackedUpstream)
                     : undefined
                   const reviewTerminalOf = (outcome: ReviewOutcome) => {
+                    // rejected = 审查正常走完并发现问题（已落地，不是系统失败）
                     const terminalStatus: DelegationActivity['status'] =
-                      outcome.verdict === 'verified' || outcome.verdict === 'nudge' ? 'passed' : 'failed'
+                      outcome.verdict === 'verified' || outcome.verdict === 'nudge'
+                        ? 'passed'
+                        : outcome.verdict === 'rejected'
+                          ? 'completed'
+                          : 'failed'
                     const failureReason = outcome.verdict === 'rejected' ? 'review-findings'
                       : outcome.verdict === 'inconclusive' ? 'review-infra' : undefined
                     const lines0 = formatReviewOutcomeLines(outcome)
                     const progressLine = outcome.verdict === 'nudge'
                       ? '审查门完成 (nudge)：变更琐碎，免深审'
-                      : (lines0[0]?.slice(0, 120) ?? `审查门完成 (${outcome.verdict})`)
-                    return { terminalStatus, failureReason, progressLine }
+                      : (lines0[0] ?? `审查门完成 (${outcome.verdict})`)
+                    const summary = outcome.verdict === 'rejected' || outcome.verdict === 'inconclusive'
+                      ? lines0.join('\n')
+                      : undefined
+                    return { terminalStatus, failureReason, progressLine, summary }
                   }
                   const settleReviewWorkers = (outcome: ReviewOutcome): void => {
                     if (!params.onWorkerActivity || seenReviewWorkerIds.size === 0) return
-                    const { terminalStatus, failureReason, progressLine } = reviewTerminalOf(outcome)
+                    const { terminalStatus, failureReason, progressLine, summary } = reviewTerminalOf(outcome)
                     for (const wid of seenReviewWorkerIds) {
                       params.onWorkerActivity({
                         workOrderId: wid,
@@ -1146,6 +1190,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                         status: terminalStatus,
                         progressLine,
                         ...(failureReason ? { failureReason } : {}),
+                        ...(summary ? { summary } : {}),
                       })
                     }
                     seenReviewWorkerIds.clear()
@@ -1227,7 +1272,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                         verdict: outcome.verdict,
                         tier: String(outcome.tier),
                       })
-                      const { terminalStatus, failureReason, progressLine } = reviewTerminalOf(outcome)
+                      const { terminalStatus, failureReason, progressLine, summary } = reviewTerminalOf(outcome)
                       params.onWorkerActivity?.({
                         workOrderId: reviewRunId,
                         parentToolId: params.toolUseId,
@@ -1235,6 +1280,7 @@ For complex specs or cross-module integration, include checklist entries: fact-f
                         status: terminalStatus,
                         progressLine,
                         ...(failureReason ? { failureReason } : {}),
+                        ...(summary ? { summary } : {}),
                       })
                       // 真实审查 worker（wo_<uuid>）补终态——它们只发过 running，
                       // 不补会永远挂在子代理面板（deliver_task 不走 clearGroup）。
@@ -1347,9 +1393,15 @@ For complex specs or cross-module integration, include checklist entries: fact-f
     // Budget: typecheck and review are now agent-owned steps (run before
     // calling deliver_task), not internal stages. commit=false is a fast
     // ownership query; commit=true does file I/O + git.
+    //
+    // commit 预算 60s→180s（2026-07-21 事故）：多会话共享工作区（几十个外部
+    // 改动文件）+ 并发 tsc/test 满载 CPU 时，所有权扫描 + claim 审计 + git
+    // 操作 60s 跑不完 → 超时重试全灭 → 模型退回裸 git 提交 → 把并发会话的
+    // 半成品 tracked 改动卷进提交、漏掉 untracked 依赖文件（损毁提交
+    // 7b0c2936）。提交是终态动作，宁可慢不可断。
     timeoutMs: (params) => {
-      if (params?.input?.commit !== true) return 30_000   // 门禁查询：ownership + cohesion + claim audit
-      return 60_000                                        // commit：文件读写 + git 操作
+      if (params?.input?.commit !== true) return 60_000    // 门禁查询：ownership + cohesion + claim audit
+      return 180_000                                       // commit：文件读写 + git 操作（满载机器留余量）
     },
   }
 }

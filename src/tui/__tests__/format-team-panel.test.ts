@@ -52,4 +52,31 @@ describe('formatTeamPanel', () => {
     const plain = stripAnsi(formatTeamPanel(decoded!, theme, 80).join('\n'))
     assert.ok(plain.includes('explore api'))
   })
+
+  it('W2b: round-trips gate and reviewDetail fields', () => {
+    const withGate: TeamPanelModel = {
+      ...model,
+      gate: { wave: 0, passed: false, failures: ['tsc --noEmit: type error in src/foo.ts'] },
+      reviewDetail: 'Review gate [L2]: rejected — typecheck failed with 3 errors',
+    }
+    const encoded = encodeTeamPanelModel(withGate)
+    assert.ok(encoded.includes('rivet:team-panel:v1:'))
+    const decoded = decodeTeamPanelModel(encoded)
+    assert.ok(decoded)
+    assert.ok(decoded!.gate)
+    assert.equal(decoded!.gate!.wave, 0)
+    assert.equal(decoded!.gate!.passed, false)
+    assert.equal(decoded!.gate!.failures.length, 1)
+    assert.ok(decoded!.gate!.failures[0]!.includes('tsc'))
+    assert.ok(decoded!.reviewDetail!.includes('Review gate'))
+    assert.ok(decoded!.reviewDetail!.includes('rejected'))
+  })
+
+  it('W2b: gate absent when not provided', () => {
+    const encoded = encodeTeamPanelModel(model)
+    const decoded = decodeTeamPanelModel(encoded)
+    assert.ok(decoded)
+    assert.equal(decoded!.gate, undefined)
+    assert.equal(decoded!.reviewDetail, undefined)
+  })
 })

@@ -3,10 +3,11 @@ import { z } from 'zod'
 import { classifyOrchestrationScale } from '../agent/task-size-gate.js'
 import type { TeamRunSummary } from '../agent/team-orchestrator.js'
 import { deserializeUnifiedPlan, unifiedPlanToTeamTasks, validateUnifiedPlan } from '../agent/unified-plan.js'
+import { formatSealStatus, verifyPlanSeal, type SealedUnifiedPlan } from '../agent/council/council-seal.js'
 import { clearPlan, consumePlan, storePlan } from '../agent/plan-store.js'
 import { buildTeamPanelModel, encodeTeamPanelModel } from '../tui/team-panel-model.js'
 import { validatePathSafe } from './path-validate.js'
-import { createActivityStreamer, createDelegationActivityMapper } from './worker-activity-stream.js'
+import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 // Shared execution kernel — the dispatch + scope-health + review gate + telemetry
@@ -130,17 +131,17 @@ export function createTeamOrchestrateTool(
     definition: {
       name: 'team_orchestrate',
       description:
-        'Run the deterministic team orchestrator: parse a plan (standard), group tasks into waves respecting file conflicts and dependencies, and dispatch the first ready wave of workers. Returns the wave schedule and dispatch summary. Does NOT auto-commit.\n\nSHARDING: split the work HORIZONTALLY into orthogonal shards — each a complete, self-contained unit (implement + run tsc/lint/relevant tests) owned end-to-end by ONE capable flash. Do NOT split vertically by stage (no separate lint/type/import/test role tasks). Keep shards on disjoint files so they run in parallel; when two shards must touch the same file, set dependsOn to order them (the validator warns about overlap without ordering). Workers write directly into the controller\'s single shared workspace — there are no per-worker diffs to merge; review the aggregate with git diff.\n\nPass planJson (UnifiedPlan from plan_task) to skip Markdown/planner fanout and execute directly.',
+        '运行确定性 team 编排器：解析计划（standard 模式），按文件冲突与依赖把任务分组成波次（wave），派发第一个就绪波次的 worker。返回波次调度与派发摘要。不自动提交（NOT auto-commit）。\n\n分片（SHARDING）：把工作水平切成正交分片——每个分片是完整自包含的单元（实现 + 跑 tsc/lint/相关测试），由一个有能力的 flash 端到端负责。不要按阶段垂直切分（不拆独立的 lint/type/import/test 角色任务）。让分片落在不相交的文件上以并行执行；两个分片必须改同一文件时，设 dependsOn 排序（校验器会对未排序的重叠发出警告）。worker 直接写入控制器的单一共享工作区——没有逐 worker 的 diff 要合并；用 git diff 审查聚合结果。\n\n传 planJson（plan_task 输出的 UnifiedPlan）可跳过 Markdown 解析与 planner fanout，直接执行。',
       input_schema: {
         type: 'object',
         properties: {
-          mode: { type: 'string', enum: ['standard', 'max'], description: 'standard: execute an existing plan. max: multi-perspective planning first.' },
-          objective: { type: 'string', description: 'The mission statement.' },
-          planPath: { type: 'string', description: 'Optional path to a Markdown plan inside the project (standard mode).' },
-          planMarkdown: { type: 'string', description: 'Optional inline Markdown plan; takes precedence over planPath.' },
-          planJson: { type: 'string', description: 'UnifiedPlan JSON from plan_task output. When provided, bypasses Markdown parsing and max planner fanout.' },
-          maxParallel: { type: 'number', description: 'Max parallel workers per wave (1-5, default 3).' },
-          fromWave: { type: 'number', description: 'Dispatch this zero-based wave index after integrating prior wave diffs.' },
+          mode: { type: 'string', enum: ['standard', 'max'], description: 'standard: 执行已有计划。max: 先做多视角规划。' },
+          objective: { type: 'string', description: '任务目标陈述。' },
+          planPath: { type: 'string', description: '项目内 Markdown 计划文件路径（可选，standard 模式）。' },
+          planMarkdown: { type: 'string', description: '内联 Markdown 计划（可选）；优先级高于 planPath。' },
+          planJson: { type: 'string', description: 'plan_task 输出的 UnifiedPlan JSON。提供时跳过 Markdown 解析与 max planner fanout。' },
+          maxParallel: { type: 'number', description: '每波次最大并行 worker 数（1-5，默认 3）。' },
+          fromWave: { type: 'number', description: '整合前序波次 diff 后，派发这个从零开始的波次索引。' },
         },
         required: ['objective'],
       },
@@ -178,6 +179,19 @@ export function createTeamOrchestrateTool(
         }
         if (validation.warnings.length > 0) {
           planAdvisoryNote = `\n\n分片建议(不阻断):\n${validation.warnings.map(w => `  - ${w}`).join('\n')}`
+        }
+        // Atropos 密封校验（Phase 3）：议事会密封过的契约被静默改写 → 消费入口
+        // 硬拦。未密封计划（plan_task/manual 产出）不受影响；修订走豁免协议
+        // （revisePlanSeal 复封后 version+1，此处放行）。
+        const sealCheck = verifyPlanSeal(plan as SealedUnifiedPlan)
+        if (sealCheck.status === 'broken') {
+          return {
+            content: `team_orchestrate blocked: ${formatSealStatus(plan as SealedUnifiedPlan)}`,
+            isError: true,
+          }
+        }
+        if (sealCheck.status === 'intact') {
+          planAdvisoryNote += `\n\n${formatSealStatus(plan as SealedUnifiedPlan)}`
         }
         tasks = unifiedPlanToTeamTasks(plan)
         // Re-store for multi-wave: consumePlan cleared it, but subsequent
@@ -226,12 +240,18 @@ export function createTeamOrchestrateTool(
       }
 
       // T9 P3 text stream + T4 structured per-worker updates (subagent panel).
+      // objectiveById is filled from live activity events (coordinator attaches
+      // order.objective) so terminal callbacks can re-emit the full objective.
+      const objectiveById = new Map<string, string>()
       const textStreamer = params.onOutput ? createActivityStreamer(params.onOutput) : undefined
       const activityMapper = params.onWorkerActivity
-        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity)
+        ? createDelegationActivityMapper(params.toolUseId, params.onWorkerActivity, {
+            objectiveOf: (id) => objectiveById.get(id),
+          })
         : undefined
       const onActivity = (textStreamer || activityMapper)
         ? (ev: WorkerActivityEvent) => {
+            if (ev.objective) objectiveById.set(ev.workOrderId, ev.objective)
             textStreamer?.(ev)
             activityMapper?.(ev)
           }
@@ -245,8 +265,10 @@ export function createTeamOrchestrateTool(
             params.onWorkerActivity!({
               workOrderId: r.workOrderId,
               parentToolId: params.toolUseId,
+              objective: objectiveById.get(r.workOrderId),
               status: r.status,
-              progressLine: r.summary.slice(0, 80),
+              progressLine: progressSnippet(r.summary),
+              summary: r.summary,
               failureReason: r.failureReason,
               model: r.model,
               provider: r.provider,
@@ -315,7 +337,7 @@ export function createTeamOrchestrateTool(
         }
       }
 
-      const panelModel = buildTeamPanelModel(summary, effectiveFromWave, reviewVerdict)
+      const panelModel = buildTeamPanelModel(summary, effectiveFromWave, reviewVerdict, undefined, run.gate, run.reviewDetail)
       return {
         content: formatTeamSummary(summary, effectiveFromWave) + notes.reviewNote + notes.scopeHealthNote + notes.impactNote + notes.waveGateNote + notes.deliverySynthesis + planAdvisoryNote + proGateNote,
         uiContent: encodeTeamPanelModel(panelModel),

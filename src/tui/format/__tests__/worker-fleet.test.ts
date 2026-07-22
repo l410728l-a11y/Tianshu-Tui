@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { getTheme } from '../../theme.js'
-import { buildWorkerFleetLines, formatWorkerFleet } from '../worker-fleet.js'
+import { buildWorkerFleetLines, formatWorkerFleet, formatWorkerRow } from '../worker-fleet.js'
 import type { FleetWorkerView } from '../../fleet-registry.js'
 
 const theme = getTheme(0)
@@ -167,5 +167,21 @@ describe('formatWorkerFleet', () => {
     )
     assert.ok(lines[1]!.includes('完成'), 'passed 行尾应有状态词「完成」')
     assert.ok(!lines.some(l => l.includes('/tasks')), '无在跑 worker 时不渲染提示行')
+  })
+
+  it('completed + review-findings 渲染 warning 黄（审查拦截，非系统失败的 error 红）', () => {
+    const reviewRow = formatWorkerRow(worker({ status: 'completed', failureReason: 'review-findings', activity: undefined }), theme, 80)
+    const passRow = formatWorkerRow(worker({ status: 'completed', activity: undefined }), theme, 80)
+    const failRow = formatWorkerRow(worker({ status: 'failed', activity: undefined }), theme, 80)
+    // 三行内容同形（glyph/label/elapsed 相同），唯一差异是着色——据此区分三类
+    assert.notEqual(reviewRow, failRow, '审查拦截 ≠ 系统失败红')
+    assert.notEqual(reviewRow, passRow, '审查拦截 ≠ 普通完成绿（应是 warning 黄）')
+    assert.notEqual(passRow, failRow, '普通完成绿 ≠ 系统失败红（ sanity ）')
+  })
+
+  it('completed 无 failureReason（普通完成）与 passed 同色（success 绿）', () => {
+    const completedRow = formatWorkerRow(worker({ status: 'completed', activity: undefined }), theme, 80)
+    const passedRow = formatWorkerRow(worker({ status: 'passed', activity: undefined }), theme, 80)
+    assert.equal(completedRow, passedRow, '普通 completed 应与 passed 同为 success 绿')
   })
 })

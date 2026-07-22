@@ -128,6 +128,9 @@ export function createGitClearAfterFailHook(
           // 恶化（挂起/抑制）。真正的当轮拦截需要工具层 pre-execution gate。
           immediate: true,
           channel: 'system-reminder',
+          // W2 通道分级：git 清场是用户保护类守护，不限流（SessionContext 不设额度）——
+          // 事后告警只有一次触发机会，被 cap 拦截意味着永久丢失。
+          srClass: 'functional',
         })
       }
 

@@ -140,6 +140,10 @@ export interface RuntimeHookDeps {
   chronicle?: { addRadio: (message: string, turn: number) => void; addPhaseTransition: (input: { fromPhase: string; toPhase: string; turn: number; summary: string }) => void }
   /** Returns current star domain id for radio voice modulation. null when no domain matched. */
   getDomainId?: () => DomainVoiceId
+  /** 星域勇气阈值 getter（来自 sessionDomain.courageThreshold），缺省 0.5。
+   *  活引用而非构造期快照：每次求值读取最新 sessionDomain，域切换即时生效。
+   *  Fix 2026-07-21：此前硬编码 0.5；2026-07-22 改为 getter 修复生命周期断裂。 */
+  getCourageThreshold?: () => number
   /** File observation claims for cross-store consistency checks. */
   getFileObservations?: () => Array<Pick<ContextClaim, 'id' | 'text' | 'evidence'>>
   /** Meridian code graph indexer (optional). */
@@ -313,7 +317,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   const hooks: RuntimeHook[] = [
     createPerceptionRuntimeHook(),
     createSignalConsumerRuntimeHook({ advisoryBus: deps.advisoryBus }),
-    ...(isStarSoulEnabled() ? [createCourageHook({ cooldownTurns: 5, courageThreshold: 0.5, sycophancyTrap: deps.sycophancyTrap, advisoryBus: deps.advisoryBus })] : []),
+    ...(isStarSoulEnabled() ? [createCourageHook({ cooldownTurns: 5, getCourageThreshold: deps.getCourageThreshold, sycophancyTrap: deps.sycophancyTrap, advisoryBus: deps.advisoryBus })] : []),
     createKickRuntimeHook({
       deposit: deps.stigmergyDeposit,
       wasConvergenceTriggered: deps.wasConvergenceTriggered,

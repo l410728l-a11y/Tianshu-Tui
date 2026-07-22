@@ -20,35 +20,35 @@ import { readCommitFacts } from '../context/project-memory-writer.js'
 
 const DEFINITION: ToolDefinition = {
   name: 'memory',
-  description: `Search and persist project knowledge across sessions.
+  description: `跨会话搜索并持久化项目知识。
 
 ### Actions
-- recall: Hybrid search over the project knowledge base (structured entries + knowledge/*.md + playbook lessons). Supports kind/topic/source filters; returns only currently-valid entries by default (superseded knowledge needs includeHistory).
-- remember: Persist a claim (decisions, observations, verification facts, failure patterns, or project rules). Session scope is immediate; project scope is queued and admitted by a session-end quality gate — a "pending quality gate" response means the claim IS recorded, do not retry.
+- recall: 对项目知识库做混合检索（结构化条目 + knowledge/*.md + playbook 教训）。支持 kind/topic/source 过滤；默认只返回当前有效的条目（已被取代的知识需要 includeHistory）。
+- remember: 持久化一条 claim（决策、观察、验证事实、失败模式或项目规则）。session 作用域立即生效；project 作用域先入队，由会话结束时的质量门禁准入——返回 "pending quality gate" 表示该 claim 已被记录，不要重试。
 
-### Claim kinds (for remember)
-- decision — architectural or implementation decisions made
-- file_observation — key observations about specific files
-- verification_fact — test results or verified facts
-- failure_pattern — bugs encountered and their root causes
-- project_rule — patterns or conventions discovered in the codebase`,
+### Claim kinds（remember 用）
+- decision — 已做出的架构或实现决策
+- file_observation — 对特定文件的关键观察
+- verification_fact — 测试结果或已验证的事实
+- failure_pattern — 遇到的 bug 及其根因
+- project_rule — 代码库中发现的模式或约定`,
   input_schema: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['recall', 'remember'], description: 'recall: search memory; remember: store a claim' },
+      action: { type: 'string', enum: ['recall', 'remember'], description: 'recall: 搜索记忆；remember: 存储一条 claim' },
       // recall params
-      query: { type: 'string', description: 'Search keywords (hybrid BM25 + structured filters over the project knowledge base). Required for recall.' },
-      kind: { type: 'string', enum: ['user_constraint', 'user_preference', 'decision', 'file_observation', 'verification_fact', 'failure_pattern', 'security_finding', 'worker_finding', 'project_rule'], description: 'Filter by claim kind' },
-      topic: { type: 'string', description: 'Filter by topic scope (module/subject metadata) for recall' },
-      source: { type: 'string', enum: ['playbook'], description: 'Restrict recall to a specific source. "playbook" returns only distilled playbook lessons.' },
-      limit: { type: 'number', default: 5, description: 'Max results to return' },
-      includeHistory: { type: 'boolean', default: false, description: 'Include superseded/expired knowledge entries in recall results (default: only current)' },
-      includeCommitFacts: { type: 'boolean', default: false, description: 'Include historical commit facts in recall results (auto-enabled when query looks like a commit hash)' },
+      query: { type: 'string', description: '搜索关键词（对项目知识库做 BM25 + 结构化过滤的混合检索）。recall 必填。' },
+      kind: { type: 'string', enum: ['user_constraint', 'user_preference', 'decision', 'file_observation', 'verification_fact', 'failure_pattern', 'security_finding', 'worker_finding', 'project_rule'], description: '按 claim 类型过滤' },
+      topic: { type: 'string', description: 'recall 时按主题范围（模块/主题元数据）过滤' },
+      source: { type: 'string', enum: ['playbook'], description: '把 recall 限制在特定来源。"playbook" 只返回蒸馏后的 playbook 教训。' },
+      limit: { type: 'number', default: 5, description: '返回的最大结果数' },
+      includeHistory: { type: 'boolean', default: false, description: '在 recall 结果中包含已被取代/过期的知识条目（默认：只返回当前有效条目）' },
+      includeCommitFacts: { type: 'boolean', default: false, description: '在 recall 结果中包含历史 commit 事实（query 形如 commit hash 时自动启用）' },
       // remember params
-      text: { type: 'string', description: 'The claim text — be concise and specific (1-3 sentences). Required for remember.' },
-      scope: { type: 'string', enum: ['session', 'project'], default: 'session', description: 'Lifetime: session (dies with session) or project (survives across sessions)' },
-      confidence: { type: 'number', default: 0.9, description: 'Confidence 0-1. Use 0.9+ for verified facts, 0.5-0.7 for tentative observations' },
-      tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
+      text: { type: 'string', description: 'claim 文本——简洁具体（1-3 句）。remember 必填。' },
+      scope: { type: 'string', enum: ['session', 'project'], default: 'session', description: '生命周期：session（随会话消亡）或 project（跨会话存活）' },
+      confidence: { type: 'number', default: 0.9, description: '置信度 0-1。已验证事实用 0.9+，试探性观察用 0.5-0.7' },
+      tags: { type: 'array', items: { type: 'string' }, description: '可选分类标签' },
     },
     required: ['action'],
   },

@@ -1,5 +1,5 @@
 /**
- * session_vitals tool — 会话生命体征自查（W5，incident 20b9714e）。
+ * session_vitals tool — 会话生命体征自查。
  *
  * 模型在写"系统状态"类结论（上下文占用、缓存命中、信号台账）前有处取证，
  * 替代凭感觉脑补。只读、零副作用；数据全部来自运行时内存态，无磁盘 IO。
@@ -74,13 +74,13 @@ export function createSessionVitalsTool(getVitals: () => SessionVitalsData | nul
   return {
     definition: {
       name: 'session_vitals',
-      description: `Read-only snapshot of this session's runtime vitals: context usage (exact tokens + window), recent cache hit data, sensorium dimensions, CVM overhead/throttle state, and the advisory ledger.
+      description: `本会话运行时生命体征的只读快照：上下文占用（精确 token 数 + 窗口大小）、近期缓存命中数据、sensorium 各维度、CVM 开销/节流状态，以及 advisory 台账。
 
-### When to call
-Before making any claim about the session's own state — context pressure, cache behavior, signal noise. Cite these numbers instead of guessing. Also useful when diagnosing why system advisories keep firing.
+### 何时调用
+在对会话自身状态下任何结论之前调用——上下文压力、缓存行为、信号噪声。引用这里的数字，不要凭感觉猜。诊断系统 advisory 为何反复触发时也可用。
 
-### Output
-Compact markdown. Fields without data are explicitly marked 无数据 — never fabricated.`,
+### 输出
+紧凑 markdown。没有数据的字段会显式标注「无数据」——绝不编造。`,
       input_schema: {
         type: 'object',
         properties: {},

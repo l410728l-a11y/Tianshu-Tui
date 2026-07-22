@@ -108,23 +108,23 @@ export async function createPdf(input: CreatePdfInput): Promise<{ path: string; 
 export const CREATE_PDF_TOOL: Tool = {
   definition: {
     name: 'create_pdf',
-    description: `Create a print-ready HTML document with professional typography and @page rules. Open in any browser and print to PDF (Ctrl+P / Cmd+P → Save as PDF).
+    description: `创建打印就绪的 HTML 文档，含专业排版和 @page 规则。在任何浏览器中打开并打印为 PDF（Ctrl+P / Cmd+P → 另存为 PDF）。
 
-Supports A4 and Letter page sizes, portrait and landscape orientation. Content is raw HTML — use standard HTML tags for structure.
+支持 A4 和 Letter 纸张大小、纵向和横向。内容为原始 HTML——使用标准 HTML 标签组织结构。
 
-Use open_path to open the result in the default browser, then print to PDF.
+用 open_path 在默认浏览器中打开结果，然后打印为 PDF。
 
-Examples:
-Good: create_pdf(destination_path="~/Desktop/report.html", title="Q4 Report", content="<h1>Q4 Report</h1><p>Revenue grew 15%...</p>")
-Good: create_pdf(destination_path="~/Desktop/invoice.html", title="Invoice #42", content="<table>...</table>", pageSize="Letter")`,
+示例：
+Good: create_pdf(destination_path="~/Desktop/report.html", title="Q4 报告", content="<h1>Q4 报告</h1><p>营收增长 15%...</p>")
+Good: create_pdf(destination_path="~/Desktop/invoice.html", title="发票 #42", content="<table>...</table>", pageSize="Letter")`,
     input_schema: {
       type: 'object',
       properties: {
-        destination_path: { type: 'string', description: 'Destination file path. Should end with .html. May be outside the project. Open in browser and print to PDF.' },
-        title: { type: 'string', description: 'Document title (used in browser title bar).' },
-        content: { type: 'string', description: 'HTML body content. Use standard HTML tags (h1-h3, p, ul, ol, table, pre, code, div.page-break).' },
-        orientation: { type: 'string', enum: ['portrait', 'landscape'], description: 'Page orientation. Default: portrait.' },
-        pageSize: { type: 'string', enum: ['A4', 'Letter'], description: 'Page size for @page CSS. Default: A4.' },
+        destination_path: { type: 'string', description: '目标文件路径。应以 .html 结尾。可在项目之外。在浏览器中打开后打印为 PDF。' },
+        title: { type: 'string', description: '文档标题（显示在浏览器标题栏）。' },
+        content: { type: 'string', description: 'HTML 正文内容。使用标准 HTML 标签（h1-h3、p、ul、ol、table、pre、code、div.page-break）。' },
+        orientation: { type: 'string', enum: ['portrait', 'landscape'], description: '页面方向。默认：portrait。' },
+        pageSize: { type: 'string', enum: ['A4', 'Letter'], description: '@page CSS 的纸张大小。默认：A4。' },
       },
       required: ['destination_path', 'content'],
     },

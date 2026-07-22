@@ -1,5 +1,5 @@
 import { extractJsonCandidates, type WorkerResult } from '../work-order.js'
-import { aggregateCouncil, resolveConflictsWithRebuttals, type CouncilDraft, type CouncilPlan, type SeatContribution, type SeatRebuttal } from './council-plan.js'
+import { aggregateCouncil, applyResolutionsToMergedItems, resolveConflictsWithRebuttals, type CouncilDraft, type CouncilPlan, type SeatChallenge, type SeatContribution, type SeatRebuttal } from './council-plan.js'
 import { renderCouncilPlan } from './council-render.js'
 import {
   routeCouncilSeat,
@@ -7,6 +7,7 @@ import {
   type CouncilSeat,
   type CouncilRoutingShadowEvent,
 } from './council-routing.js'
+import { detectQliphoth } from './council-qliphoth.js'
 
 /** 结构型扇出依赖 —— 仅声明 runCouncil 用到的批量委派能力，保持与 coordinator 解耦。 */
 export interface CouncilFanoutRequest {
@@ -69,8 +70,30 @@ export function buildSeatObjective(seat: CouncilSeat, draft: CouncilDraft): stri
     '{ "kind": "note", "title": "seat-contribution", "content": "<a JSON string of your SeatContribution>" }',
     'SeatContribution = { authority, summary, additions, risks, challenges, alternatives }.',
     'PlanItem (additions[]) = { id, title, detail, files?: string[] } —— files 为该条目涉及的文件路径。',
+    'challenges = [{ text, severity?: "advisory"|"blocking", gate?: string, itemId?: string }] ——',
+    'severity:"blocking" 是否决级质疑（未化解前计划不得编译执行，慎用、必须给出具体依据）；',
+    'gate 填可验证的验收命令（如 "npx tsc --noEmit"、"npm test"），会编译进任务验收门波间强制执行；',
+    'itemId 指向被质疑的条目 id，缺省为全局质疑。',
     `Set authority to "${seat.authority}".`,
   ].join('\n')
+}
+
+/** challenge 归一化：旧格式纯字符串 → {text}；结构化对象透传；畸形元素丢弃。 */
+function normalizeChallenges(raw: unknown): SeatChallenge[] {
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap((ch): SeatChallenge[] => {
+    if (typeof ch === 'string') return ch.trim() ? [{ text: ch }] : []
+    if (ch && typeof ch === 'object' && typeof (ch as SeatChallenge).text === 'string') {
+      const c = ch as SeatChallenge
+      return [{
+        text: c.text,
+        ...(c.severity === 'blocking' || c.severity === 'advisory' ? { severity: c.severity } : {}),
+        ...(typeof c.gate === 'string' && c.gate.trim() ? { gate: c.gate } : {}),
+        ...(typeof c.itemId === 'string' && c.itemId.trim() ? { itemId: c.itemId } : {}),
+      }]
+    }
+    return []
+  })
 }
 
 /** 第二轮反驳 objective —— 席位只就 round1 冲突表态，不重出全稿。 */
@@ -79,6 +102,8 @@ export function buildSeatRebuttalObjective(
   draft: CouncilDraft,
   conflicts: { key: string; description: string; left: string; right: string }[],
   ownRound1Summary?: string,
+  /** 其他席位的首轮摘要（交叉可见）——r2 不再只对冲突条目盲表态。 */
+  peerSummaries?: Array<{ authority: string; summary: string }>,
 ): string {
   return [
     `你是 ${seat.authority} 席位专家。议事会第二轮：首轮各席已出稿，现就以下分歧表态收敛，只出立场不执行。`,
@@ -86,6 +111,9 @@ export function buildSeatRebuttalObjective(
     '',
     `Objective: ${draft.objective}`,
     ...(ownRound1Summary ? [`你的首轮摘要：${ownRound1Summary}`] : []),
+    ...(peerSummaries && peerSummaries.length > 0
+      ? ['', '各席首轮立场（交叉可见）：', ...peerSummaries.map(p => `- ${p.authority}: ${p.summary}`)]
+      : []),
     '',
     '待裁分歧（针对每条给出立场）：',
     ...conflicts.map(c => `- [${c.key}] ${c.description} | 一方: ${c.left} | 另一方: ${c.right}`),
@@ -98,44 +126,71 @@ export function buildSeatRebuttalObjective(
   ].join('\n')
 }
 
-/** 解析席位 WorkerResult → SeatContribution；artifact 缺失或畸形时降级为空贡献（不阻塞会诊）。 */
-export function parseSeatContribution(seat: string, result: WorkerResult): SeatContribution {
-  const empty: SeatContribution = { authority: seat, summary: result.summary ?? '', additions: [], risks: [], challenges: [], alternatives: [] }
+/** 席位解析判别式结果 —— fail-loud：调用方能区分成功 / artifact 缺失 / JSON 全部畸形，
+ *  不再静默降级为空贡献（曾把解析失败伪装成「席位没意见」，垃圾进垃圾出）。 */
+export type SeatParseResult =
+  | { ok: true; contribution: SeatContribution }
+  | { ok: false; reason: 'missing_artifact' | 'malformed_json'; detail: string }
+
+/** 解析席位 WorkerResult → SeatContribution。失败返回 ok:false 供调用方重试/留痕。 */
+export function parseSeatContribution(seat: string, result: WorkerResult): SeatParseResult {
   const artifact = result.artifacts.find(a => a.title === 'seat-contribution')
-  if (!artifact) return empty
+  if (!artifact) {
+    return { ok: false, reason: 'missing_artifact', detail: `席位 ${seat} 未产出 seat-contribution artifact（worker status=${result.status}）` }
+  }
   try {
     for (const candidate of extractJsonCandidates(artifact.content)) {
       try {
         const raw = JSON.parse(candidate) as Partial<SeatContribution>
         return {
-          authority: seat,
-          summary: raw.summary ?? empty.summary,
-          additions: Array.isArray(raw.additions) ? raw.additions : [],
-          risks: Array.isArray(raw.risks) ? raw.risks : [],
-          challenges: Array.isArray(raw.challenges) ? raw.challenges : [],
-          alternatives: Array.isArray(raw.alternatives) ? raw.alternatives : [],
-          ...(raw.modelUsed ? { modelUsed: raw.modelUsed } : {}),
-          ...(Array.isArray(raw.rebuttals) ? { rebuttals: raw.rebuttals.filter((r): r is SeatRebuttal =>
-            r !== null && typeof r === 'object'
-            && typeof r.conflictKey === 'string'
-            && typeof r.stance === 'string'
-            && typeof r.argument === 'string'
-          ) } : {}),
+          ok: true,
+          contribution: {
+            authority: seat,
+            summary: raw.summary ?? result.summary ?? '',
+            additions: Array.isArray(raw.additions) ? raw.additions : [],
+            risks: Array.isArray(raw.risks) ? raw.risks : [],
+            challenges: normalizeChallenges(raw.challenges),
+            alternatives: Array.isArray(raw.alternatives) ? raw.alternatives : [],
+            ...(raw.modelUsed ? { modelUsed: raw.modelUsed } : {}),
+            ...(Array.isArray(raw.rebuttals) ? { rebuttals: raw.rebuttals.filter((r): r is SeatRebuttal =>
+              r !== null && typeof r === 'object'
+              && typeof r.conflictKey === 'string'
+              && typeof r.stance === 'string'
+              && typeof r.argument === 'string'
+            ) } : {}),
+          },
         }
       } catch {
         // 下一个候选 —— 模型输出可能夹杂散文/畸形示例
       }
     }
   } catch {
-    // 无 JSON 候选 → 降级空贡献
+    // extractJsonCandidates 无候选时抛错 → 落到下方 malformed_json
   }
-  return empty
+  return { ok: false, reason: 'malformed_json', detail: `席位 ${seat} artifact 无可解析的 SeatContribution JSON` }
 }
 
 function objectiveHash(s: string): string {
   let h = 0
   for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
   return (h >>> 0).toString(16)
+}
+
+/** 真实 model 回填：从 coordinator 的 workerModels 匹配 workOrderId，
+ *  而非信任 worker 自报（席位 schema 不含 modelUsed）。 */
+function withModelBackfill(
+  contrib: SeatContribution,
+  run: { workerModels?: Array<{ workOrderId: string; model: string }> },
+  workOrderId: string,
+): SeatContribution {
+  if (contrib.modelUsed || !run.workerModels) return contrib
+  const m = run.workerModels.find(wm => wm.workOrderId === workOrderId)
+  return m ? { ...contrib, modelUsed: m.model } : contrib
+}
+
+/** 法定人数：有效席位（贡献解析成功）不得少于 ⌈2/3 × 总席位⌉，否则议事会流会。 */
+export function councilQuorum(totalSeats: number): number {
+  return Math.ceil((totalSeats * 2) / 3)
 }
 
 /** Per-seat model override fragment — only when the seat declares both
@@ -190,21 +245,75 @@ export async function runCouncil(input: CouncilInput, deps: CouncilDeps): Promis
           deps.onSeatProgress?.(`${completed}/${total}`, 'done')
         }
       : undefined)
-  const contributions = input.seats.map(seat => {
+  // ── fail-loud 解析：失败席位收集重试，绝不静默空降级 ──
+  const contribByAuthority = new Map<string, SeatContribution>()
+  const retrySeats: CouncilSeat[] = []
+  const failDetails = new Map<string, string>()
+  for (const seat of input.seats) {
     const result = run.results.find(r => r.workOrderId === `council:seat-${seat.authority}`)
-    if (!result) return { authority: seat.authority, summary: '', additions: [], risks: [], challenges: [], alternatives: [] }
-    const contrib = parseSeatContribution(seat.authority, result)
-    // 真实 model 回填：从 coordinator 的 workerModels 匹配 workOrderId，
-    // 而非信任 worker 自报（buildSeatObjective schema 未包含 modelUsed）。
-    if (run.workerModels && !contrib.modelUsed) {
-      const m = run.workerModels.find(wm => wm.workOrderId === result.workOrderId)
-      if (m) contrib.modelUsed = m.model
+    if (!result) {
+      retrySeats.push(seat)
+      failDetails.set(seat.authority, `席位 ${seat.authority} worker 无结果`)
+      continue
     }
-    return contrib
-  })
+    const parsed = parseSeatContribution(seat.authority, result)
+    if (parsed.ok) {
+      contribByAuthority.set(seat.authority, withModelBackfill(parsed.contribution, run, result.workOrderId))
+    } else {
+      retrySeats.push(seat)
+      failDetails.set(seat.authority, parsed.detail)
+    }
+  }
+
+  // ── 单席重试一次：换 -retry parentTurnId 绕开队列 authority 去重 ──
+  const failedSeats: string[] = []
+  if (retrySeats.length > 0) {
+    const retryRequests: CouncilFanoutRequest[] = retrySeats.map(seat => ({
+      parentTurnId: `council:seat-${seat.authority}-retry`,
+      objective: buildSeatObjective(seat, input.draft),
+      kind: 'plan',
+      profile: 'council_expert',
+      scope: {},
+      authority: seat.authority,
+      ...seatModelOverride(seat),
+      ...seatTierFloor(seat, input.draft.objective),
+    }))
+    const retryRun = await deps.delegateBatch(retryRequests, 'all_required', input.abortSignal)
+    for (const seat of retrySeats) {
+      const result = retryRun.results.find(r => r.workOrderId === `council:seat-${seat.authority}-retry`)
+      const parsed = result ? parseSeatContribution(seat.authority, result) : null
+      if (parsed?.ok) {
+        contribByAuthority.set(seat.authority, withModelBackfill(parsed.contribution, retryRun, result!.workOrderId))
+      } else {
+        failedSeats.push(seat.authority)
+        const detail = parsed && !parsed.ok ? parsed.detail : (failDetails.get(seat.authority) ?? `席位 ${seat.authority} 重试仍无结果`)
+        contribByAuthority.set(seat.authority, {
+          authority: seat.authority,
+          summary: `[contribution_failed] ${detail}（已重试一次）`,
+          additions: [], risks: [], challenges: [], alternatives: [],
+        })
+      }
+    }
+  }
+
+  // ── 法定人数：有效席位 < ⌈2/3⌉ → 整会流会 fail-loud ──
+  const quorum = councilQuorum(input.seats.length)
+  const validCount = input.seats.length - failedSeats.length
+  if (validCount < quorum) {
+    throw new Error(`议事会流会：有效席位 ${validCount}/${input.seats.length} 不足法定人数 ${quorum}（贡献解析失败：${failedSeats.join(', ')}）`)
+  }
+
+  const contributions = input.seats.map(seat => contribByAuthority.get(seat.authority)!)
   const aggregate = aggregateCouncil(input.draft, contributions)
-  const finalPlanMarkdown = renderCouncilPlan({ objective: input.draft.objective, seats: authorities, contributions, aggregate, finalPlanMarkdown: '', meta: { round: 1, convenedAt, objectiveHash: hash } })
-  return { objective: input.draft.objective, seats: authorities, contributions, aggregate, finalPlanMarkdown, meta: { round: 1, convenedAt, objectiveHash: hash } }
+  // 柱级退化检测（advisory）：三柱席位的已知失败形态留痕进裁决与面板。
+  const qliphoth = detectQliphoth(contributions, aggregate)
+  const meta = {
+    round: 1, convenedAt, objectiveHash: hash,
+    ...(failedSeats.length > 0 ? { failedSeats } : {}),
+    ...(qliphoth.length > 0 ? { qliphoth } : {}),
+  }
+  const finalPlanMarkdown = renderCouncilPlan({ objective: input.draft.objective, seats: authorities, contributions, aggregate, finalPlanMarkdown: '', meta })
+  return { objective: input.draft.objective, seats: authorities, contributions, aggregate, finalPlanMarkdown, meta }
 }
 
 /**
@@ -223,6 +332,10 @@ export async function runCouncilDebate(input: CouncilInput, deps: CouncilDeps): 
       input.draft,
       round1.aggregate.conflicts,
       round1.contributions.find(c => c.authority === seat.authority)?.summary,
+      // V1 回收「交叉质询」：r2 席位可见彼此 r1 贡献，不再只对冲突条目盲表态。
+      round1.contributions
+        .filter(c => c.authority !== seat.authority && c.summary.trim())
+        .map(c => ({ authority: c.authority, summary: c.summary })),
     ),
     kind: 'plan',
     profile: 'council_expert',
@@ -238,7 +351,12 @@ export async function runCouncilDebate(input: CouncilInput, deps: CouncilDeps): 
   const r2Contributions: SeatContribution[] = input.seats.map(seat => {
     const result = run2.results.find(r => r.workOrderId === `council:seat-${seat.authority}-r2`)
     if (!result) return { authority: seat.authority, summary: '', additions: [], risks: [], challenges: [], alternatives: [], round: 2 }
-    const contrib: SeatContribution = { ...parseSeatContribution(seat.authority, result), round: 2 }
+    const parsed = parseSeatContribution(seat.authority, result)
+    // r2 是收敛轮：解析失败按 hold 语义处理（空 rebuttals → 冲突自然 persisted），不重试。
+    const base: SeatContribution = parsed.ok
+      ? parsed.contribution
+      : { authority: seat.authority, summary: result.summary ?? '', additions: [], risks: [], challenges: [], alternatives: [] }
+    const contrib: SeatContribution = { ...base, round: 2 }
     // 真实 model 回填：与 round1 一致，从 coordinator workerModels 匹配，
     // 而非信任 worker 自报（rebuttal schema 同样不含 modelUsed）。
     if (run2.workerModels && !contrib.modelUsed) {
@@ -248,7 +366,14 @@ export async function runCouncilDebate(input: CouncilInput, deps: CouncilDeps): 
     return contrib
   })
   const allRebuttals = r2Contributions.flatMap(c => c.rebuttals ?? [])
-  const aggregate = { ...round1.aggregate, conflicts: resolveConflictsWithRebuttals(round1.aggregate.conflicts, allRebuttals) }
+  const resolvedConflicts = resolveConflictsWithRebuttals(round1.aggregate.conflicts, allRebuttals)
+  // r2 收敛回写：resolved 冲突的化解依据注记进 mergedItems（修复「收敛结果只留在
+  // conflicts 表、执行图看不见」的断层）。
+  const aggregate = {
+    ...round1.aggregate,
+    conflicts: resolvedConflicts,
+    mergedItems: applyResolutionsToMergedItems(round1.aggregate.mergedItems, resolvedConflicts),
+  }
   const contributions = [...round1.contributions, ...r2Contributions]
   const meta = { ...round1.meta, round: 2 }
   const finalPlanMarkdown = renderCouncilPlan({ objective: input.draft.objective, seats: round1.seats, contributions, aggregate, finalPlanMarkdown: '', meta })

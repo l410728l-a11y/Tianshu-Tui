@@ -87,44 +87,46 @@ export function createTodoTool(store: TodoStore = defaultStore): Tool {
   return {
     definition: {
       name: 'todo',
-      description: `Read and write the session task list — your goal decomposition. Use it PROACTIVELY.
+      description: `读写会话任务清单——你的目标分解。主动使用它。
 
 Actions:
-- write: Replace the ENTIRE list (full-replace, not a patch). Each item has id, content, status (pending/in_progress/completed). Always re-send completed items so they are not lost.
-- read: Return the current list.
+- write: 整体替换清单（全量替换，不是补丁）。每项含 id、content、status（pending/in_progress/completed）。已完成项也要重发，否则丢失。
+- read: 返回当前清单。
 
-When to create/update (do it without being asked):
-- A task needs 3+ distinct steps, or is non-trivial / multi-file.
-- The user gives multiple tasks (a numbered or comma-separated list).
-- Right after receiving new instructions — capture them as todos immediately, BEFORE starting work.
+何时创建/更新（不用等用户要求）：
+- 任务需要 3 个以上不同步骤，或非平凡/跨多文件。
+- 用户一次给多个任务（编号或逗号分隔的清单）。
+- 收到新指令后立即建——先落成 todo，再开工。
 
-When NOT to use: a single trivial step (don't add ceremony to one-shot edits).
+何时不用：单步琐碎操作（一次性小编辑别加仪式）。
 
-TDD discipline:
-- For code tasks (not docs/config), the FIRST step of each task should be writing or updating a test (RED), then making it pass (GREEN). Structure your todos to reflect this: e.g. "Write test for X" → "Implement X" → "Refactor".
-- This is NOT mandatory for: documentation, config changes, refactors with existing test coverage, or quick typo fixes.
+Plan mode 下：用 todo 跟踪调研步骤（最后一项固定为「汇总写计划并提交审批」）；计划正文写活动计划文件，不进 todo。
 
-Status rules:
-- Mark a task in_progress BEFORE you start it; keep exactly ONE task in_progress at a time.
-- Mark a task completed IMMEDIATELY when done — do not batch completions.
-- Never silently drop or reset a completed item when rewriting the list.`,
+TDD 纪律：
+- 代码任务（非文档/配置）每个任务的第一步应是写或更新测试（RED），再实现通过（GREEN）。todo 结构体现这一点：如「写 X 的测试」→「实现 X」→「重构」。
+- 以下不强制：文档、配置改动、已有测试覆盖的重构、快速 typo 修复。
+
+状态规则：
+- 开工前把任务标为 in_progress；任何时刻恰好只有一个 in_progress。
+- 完成立即标 completed——不要攒批。
+- 重写清单时不要静默丢弃或重置已完成项。`,
       input_schema: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
             enum: ['read', 'write'],
-            description: 'Read current todos or write a new list',
+            description: 'read 读当前清单；write 写新清单',
           },
           todos: {
             type: 'array',
-            description: 'The complete todo list (only for write action)',
+            description: '完整 todo 清单（仅 write 用）',
             items: {
               type: 'object',
               properties: {
-                id: { type: 'string', description: 'Unique identifier for this task' },
-                content: { type: 'string', description: 'Task description' },
-                status: { type: 'string', enum: [...VALID_STATUSES], description: 'Task status' },
+                id: { type: 'string', description: '任务唯一标识' },
+                content: { type: 'string', description: '任务描述' },
+                status: { type: 'string', enum: [...VALID_STATUSES], description: '任务状态' },
               },
               required: ['id', 'content', 'status'],
             },

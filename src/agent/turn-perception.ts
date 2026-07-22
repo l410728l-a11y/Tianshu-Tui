@@ -50,6 +50,8 @@ export interface PerceptionInput {
   thetaTelemetry: Omit<ThetaTelemetrySnapshot, 'inFlight'>
   thetaCheckInFlight: boolean
   baselineFingerprint: PrefixFingerprint | null
+  /** v3：当前轮收敛评分 (ConvergenceResult.score, 0-1)，null 表示无收敛数据 */
+  convergenceScore?: number | null
 }
 
 export interface PerceptionResult {
@@ -92,6 +94,7 @@ export class TurnPerceptionController {
       doomLevel: getDoomLoopLevel(input.traceStore.toolFingerprints),
       gitChangeRate: input.gitChangeRate,
       fsEventRate: input.fsEventRate,
+      convergenceScore: input.convergenceScore ?? null,
     }
 
     let nextSensorium = input.sensorium

@@ -47,6 +47,10 @@ export interface TeamPanelModel {
   waves: TeamPanelWave[]
   tasks: TeamPanelTask[]
   reviewVerdict?: string
+  /** W2b — 波间硬门禁结构化结果，供桌面端渲染 gate 失败卡。 */
+  gate?: { wave: number; passed: boolean; failures: string[] }
+  /** W2b — review gate 审查全文（截 ~1000 字），供桌面端展开阅读。 */
+  reviewDetail?: string
 }
 
 function authorityForTask(task: Pick<TeamTask, 'profile' | 'objective'>): string {
@@ -103,6 +107,10 @@ export function buildTeamPanelModel(
   reviewVerdict?: string,
   /** B3: active task IDs from live worker activity — marks tasks as 'running' */
   activeTaskIds?: ReadonlySet<string>,
+  /** W2b: structured gate result from executePlan */
+  gate?: TeamPanelModel['gate'],
+  /** W2b: review detail text from executePlan */
+  reviewDetail?: string,
 ): TeamPanelModel {
   const current = summary.waves[currentWave]
   return {
@@ -126,6 +134,8 @@ export function buildTeamPanelModel(
       summary: taskSummary(task.id, summary.run?.results),
     })),
     reviewVerdict,
+    gate,
+    reviewDetail,
   }
 }
 

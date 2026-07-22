@@ -6,13 +6,13 @@ export function createUndoTool(getFileHistory: () => FileHistory | undefined): T
   return {
     definition: {
       name: 'undo',
-      description: `Undo the most recent file change by restoring it to its previous backup. Shows what would change before restoring. This operates at file level — only the files modified in the last tool call are reverted.`,
+      description: `撤销最近一次文件改动，将其恢复到之前的备份。恢复前先展示将发生的变化。该操作以文件为单位——只回退上一次工具调用中修改过的文件。`,
       input_schema: {
         type: 'object',
         properties: {
           confirm: {
             type: 'boolean',
-            description: 'Set to true to execute the undo. Without confirm, shows preview only.',
+            description: '设为 true 才执行撤销。不带 confirm 时只展示预览。',
           },
         },
       },

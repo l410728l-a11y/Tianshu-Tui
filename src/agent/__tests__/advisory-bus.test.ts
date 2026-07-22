@@ -493,5 +493,189 @@ describe('priority tier (constitutional/operational/informational)', () => {
       assert.equal(ledger.srSubmitted, 2, '2 SR submitted')
       assert.equal(ledger.srDropped, 1, '1 SR dropped by SessionContext cap')
     })
+
+    // ── W2 SR 有界携带 ──
+
+    it('W2: requeueSr puts SR back into systemReminderOut for next-turn drain', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+
+      bus.render(undefined, 5)
+      let srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, '1 SR drained')
+      assert.equal(srs[0]!.srClass, 'discipline', 'default srClass is discipline')
+
+      // Simulate SessionContext cap: requeue instead of drop
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)
+
+      // Next drain should see the requeued entry
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'requeued SR appears in next drain')
+      assert.equal(srs[0]!.key, 'readonly-spiral', 'same key carried forward')
+
+      // Confirm delivery — should succeed (still in srPendingDelivery)
+      bus.confirmSrDelivered(srs[0]!.key)
+      const ledger = bus.drainLedger()
+      assert.equal(ledger.srCarried, 1, '1 SR carried across turns')
+      assert.equal(ledger.srDropped, 0, 'not dropped — eventually delivered')
+    })
+
+    it('W2: requeueSr exceeds carry limit → dropped', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+
+      bus.render(undefined, 5)
+      let srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1)
+
+      const entry = srs[0]!
+
+      // Carry 3 times (limit is 2) → 3rd should drop
+      bus.requeueSr(entry.key, entry.content, entry.srClass)  // carry #1
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'carry #1: still in drain')
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)  // carry #2
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'carry #2: still in drain')
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)  // carry #3 → dropped
+
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 0, 'carry #3 exceeded limit — not in drain')
+
+      const ledger = bus.drainLedger()
+      assert.equal(ledger.srCarried, 2, '2 carries counted (3rd = dropped, not carried)')
+      assert.equal(ledger.srDropped, 1, '1 dropped after carry limit exceeded')
+    })
+
+    it('W2: srClass flow through systemReminderOut with functional class', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'git-clear-after-fail', priority: 0.9, category: 'constitutional',
+        tier: 'constitutional', content: '清场告警',
+        channel: 'system-reminder', immediate: true,
+        srClass: 'functional',
+      })
+
+      bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1)
+      assert.equal(srs[0]!.srClass, 'functional', 'srClass=functional flows through drain')
+      assert.equal(srs[0]!.key, 'git-clear-after-fail')
+    })
+
+    it('W2: srCarried counter reset on delivered (P1 regression)', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+
+      bus.render(undefined, 5)
+      let srs = bus.drainSystemReminders()
+      const entry = srs[0]!
+
+      // requeue 2 times (reach carry limit), then deliver — should reset counter
+      bus.requeueSr(entry.key, entry.content, entry.srClass)  // carry #1
+      srs = bus.drainSystemReminders()
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)  // carry #2 (at limit)
+      srs = bus.drainSystemReminders()
+      // Deliver — this must reset carry counter
+      bus.confirmSrDelivered(srs[0]!.key)
+
+      // Re-submit same key → fresh incident
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读 again', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 6)
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'new submission with same key appears')
+
+      // requeue again — counter must be fresh (not accumulated from previous incident)
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)  // carry #1 fresh
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'P1 GREEN: fresh carry count after reset — still alive')
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)  // carry #2 fresh
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'P1 GREEN: carry #2 also alive (counter was reset)')
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass)  // carry #3 → should drop
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 0, 'P1 GREEN: carry #3 dropped (fresh counter, limit still 2)')
+    })
+
+    // ── P2 测试：额度耗尽停放不烧 carry ──
+
+    it('P2: discipline entry parked without consuming carry when quota exhausted (RED)', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+
+      bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1)
+
+      // Simulate P2 drain loop: quota exhausted → requeueSr with skipCarry=true
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass, true)
+
+      // Entry should still be drainable (parked, not dropped)
+      const nextDrain = bus.drainSystemReminders()
+      assert.equal(nextDrain.length, 1, 'P2: parked entry appears in next drain')
+
+      // Carry count must NOT have been consumed
+      const ledger = bus.drainLedger()
+      assert.equal(ledger.srCarried, 0, 'P2: skipCarry=true → srCarried=0')
+      assert.equal(ledger.srDropped, 0, 'P2: not dropped')
+
+      // Many skipCarry cycles — never drops
+      let entry = nextDrain[0]!
+      for (let i = 0; i < 10; i++) {
+        bus.requeueSr(entry.key, 'content', 'discipline', true)
+        const s = bus.drainSystemReminders()
+        assert.equal(s.length, 1, `P2: cycle ${i} — still parked`)
+        entry = s[0]!
+      }
+
+      // Quota restored: deliver → reset carry
+      bus.confirmSrDelivered(entry.key)
+      const finalLedger = bus.drainLedger()
+      assert.equal(finalLedger.srDropped, 0, 'P2: never dropped through parking cycles')
+    })
+
+    // ── P3 测试：render 侧去重 ──
+
+    it('P3: render dedup — parked key not pushed twice into systemReminderOut (RED)', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+
+      // First render + drain
+      bus.render(undefined, 5)
+      let srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1)
+
+      // Park it: skipCarry requeue
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass, true)
+
+      // While parked, hook fires again → same key submitted and rendered
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读 again', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 6)
+
+      // Drain: must have exactly 1 entry (not double-injected)
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, 'P3 RED: only 1 entry — render dedup must prevent double injection')
+    })
   })
 })

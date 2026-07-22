@@ -80,32 +80,32 @@ function extractSection(rawContent: string, sectionId: string): string {
 export const READ_SECTION_TOOL: Tool = {
   definition: {
     name: 'read_section',
-    description: `Read a specific section from a previously saved artifact or a live file on disk.
+    description: `从之前保存的 artifact 或磁盘上的活动文件中读取指定区段。
 
-### Usage
-- Use this to load details from artifact output that was summarized in the message history
-- Or use with file_path to recover content from a file that was read earlier in the session (e.g. after a read-ref reference)
-- Requires artifactId or file_path — at least one must be provided
-- Supports line ranges (L100-L200) and character ranges (c0-c5000)
+### 用法
+- 用于加载消息历史中被摘要化的 artifact 输出的细节
+- 或配合 file_path 恢复本会话早前读过的文件内容（例如 read-ref 引用之后）
+- 需要 artifactId 或 file_path——至少提供一个
+- 支持行范围（L100-L200）和字符范围（c0-c5000）
 
-### Examples
-Good: read_section(artifactId="abc123", section="L1-L500")
-Good: read_section(artifactId="abc123", section="c0-c50000")
-Good: read_section(file_path="src/tools/bash.ts", section="L100-L200")`,
+### 示例
+好：read_section(artifactId="abc123", section="L1-L500")
+好：read_section(artifactId="abc123", section="c0-c50000")
+好：read_section(file_path="src/tools/bash.ts", section="L100-L200")`,
     input_schema: {
       type: 'object',
       properties: {
         artifactId: {
           type: 'string',
-          description: 'The artifact ID from a prior tool_result',
+          description: '先前 tool_result 中的 artifact ID',
         },
         file_path: {
           type: 'string',
-          description: 'Path to a live file on disk. Use when recovering content after a read-ref reference. Path is validated against the project directory.',
+          description: '磁盘上活动文件的路径。用于 read-ref 引用之后恢复内容。路径会校验是否位于项目目录内。',
         },
         section: {
           type: 'string',
-          description: 'Section to read: "L100-L200" for lines 100-200, "c0-c5000" for char range',
+          description: '要读取的区段："L100-L200" 表示第 100-200 行，"c0-c5000" 表示字符范围',
         },
       },
       required: ['section'],

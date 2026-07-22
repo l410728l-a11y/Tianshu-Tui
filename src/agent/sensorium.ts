@@ -57,6 +57,8 @@ export interface SensoriumQuality {
   momentum: 'measured' | 'no-data'
   /** stability 的 verification 分量是否实测（vacuous 时已做去饱和重归一） */
   stability: 'measured' | 'partial'
+  /** v3：decisiveness 是否有收敛数据——no-data = convergenceScore 缺失 */
+  decisiveness: 'measured' | 'no-data'
 }
 
 export interface Sensorium {
@@ -67,8 +69,18 @@ export interface Sensorium {
   /** Verification coverage ratio: verified_count / modified_count.
    *  Returns 1.0 when no files modified (vacuously true — 0/0 = all verified).
    *  This is a coverage metric, NOT general confidence.
-   *  In the cognitive-mirror it is rendered as `verification_coverage`. */
+   *  In the cognitive-mirror it is rendered as `verification_coverage`.
+   *  @deprecated v3: use `verificationCoverage` for coverage; use `decisiveness` for agent confidence. */
   confidence: number
+  /** v3：验证覆盖率 (verifiedCount / filesModified)，独立于果断度。
+   *  与 `confidence` 同值，语义正确命名。驱动 pressure.verificationDebt。
+   *  computeSensorium 始终提供；手动构造 Sensorium 时可选（向后兼容）。
+   *  缺省不可用时消费方应 fallback 到 `confidence`。 */
+  verificationCoverage?: number
+  /** v3：果断度 — 模型执行质量（0-1 连续值，null=无数据）。
+   *  0.4*convergenceScore + 0.6*momentum。只读排查型会话为 null。
+   *  computeSensorium 始终提供；手动构造 Sensorium 时可选（向后兼容）。 */
+  decisiveness?: number | null
   /** Tool diversity: unique tools / total calls in sliding window */
   complexity: number
   /** Cross-session file familiarity: avg pheromone strength (default 0.5) */
@@ -105,6 +117,8 @@ export interface SensoriumInput {
   gitChangeRate?: number
   /** Filesystem event rate (0-1) from fs-watcher — 原则③ external Zeitgeber */
   fsEventRate?: number
+  /** v3：当前轮收敛评分 (ConvergenceResult.score, 0-1)。缺失时 decisiveness 为 null。 */
+  convergenceScore?: number | null
 }
 
 // ─── Strategy Profile ───────────────────────────────────────────────
@@ -155,7 +169,11 @@ function computePressure(
   pr: PressureResult,
   evidence: SensoriumInput['evidenceState'],
 ): number {
-  const contextPressure = clamp(pr.ratio)
+  // v3：contextPressure 优先用相对压力（pressureRelative，历史 p90 归一化），
+  // 仅在 PressureMonitor 历史不足（tokenHistory<5，pressureRelative=undefined）
+  // 时回落绝对 ratio。绝对阈值在 ctxRatio 均值 ~10% 时永远锁死在 0.05 量级，
+  // 相对压力让"超过近期基线"也能触发高压（见计划二节/五节决策⑤）。
+  const contextPressure = clamp(pr.pressureRelative ?? pr.ratio)
   const verificationDebt = evidence.filesModified > 0
     ? clamp((evidence.filesModified - evidence.verifiedCount) / Math.max(evidence.filesModified, 5))
     : 0
@@ -173,6 +191,28 @@ function computePressure(
 function computeConfidence(evidence: SensoriumInput['evidenceState']): number {
   if (evidence.filesModified <= 0) return 1.0
   return clamp(evidence.verifiedCount / evidence.filesModified)
+}
+
+/**
+ * v3：验证覆盖率 — 即旧 computeConfidence 的语义归位。
+ * 独立于果断度，驱动 pressure.verificationDebt。
+ */
+function computeVerificationCoverage(evidence: SensoriumInput['evidenceState']): number {
+  if (evidence.filesModified <= 0) return 1.0
+  return clamp(evidence.verifiedCount / evidence.filesModified)
+}
+
+/**
+ * v3：果断度 — 模型执行质量。
+ * 0.4*convergenceScore + 0.6*momentum。
+ * convergenceScore 为 null/undefined 时返回 null（无数据不评分）。
+ */
+function computeDecisiveness(
+  convergenceScore: number | null | undefined,
+  momentum: number,
+): number | null {
+  if (convergenceScore == null) return null
+  return clamp(0.4 * convergenceScore + 0.6 * momentum)
 }
 
 function computeComplexity(toolHistory: string[]): number {
@@ -282,10 +322,14 @@ function computeStability(
  * All dimensions are clamped to [0, 1].
  */
 export function computeSensorium(input: SensoriumInput): Sensorium {
+  const momentum = computeMomentum(input.predictionAcc)
+  const coverage = computeVerificationCoverage(input.evidenceState)
   return {
-    momentum: computeMomentum(input.predictionAcc),
+    momentum,
     pressure: computePressure(input.pressureResult, input.evidenceState),
-    confidence: computeConfidence(input.evidenceState),
+    confidence: coverage,
+    verificationCoverage: coverage,
+    decisiveness: computeDecisiveness(input.convergenceScore, momentum),
     complexity: computeComplexity(input.toolCallHistory),
     freshness: computeFreshness(input.pheromones, input.gitChangeRate, input.fsEventRate),
     stability: computeStability(input.doomLevel, input.predictionAcc, input.toolCallHistory, input.evidenceState),
@@ -295,6 +339,7 @@ export function computeSensorium(input: SensoriumInput): Sensorium {
       confidence: input.evidenceState.filesModified > 0 ? 'measured' : 'vacuous',
       momentum: input.predictionAcc.predictions.length > 0 ? 'measured' : 'no-data',
       stability: input.evidenceState.filesModified > 0 ? 'measured' : 'partial',
+      decisiveness: input.convergenceScore != null ? 'measured' : 'no-data',
     },
   }
 }
@@ -421,8 +466,9 @@ export function computeStrategy(s: Sensorium): StrategyProfile {
     reasoningEffort,
     explorationBreadth,
     commitThreshold,
-    // P1b：momentum 无预测样本时是 0 回退值，不是实测停滞——不能作为升级证据
-    shouldEscalate: s.confidence < 0.3 && s.momentum < 0.2 && s.quality?.momentum !== 'no-data',
+    // v3：shouldEscalate 恒 false — 旧条件 (confidence < 0.3 && momentum < 0.2) 由
+    // 验证覆盖率驱动，不是真正的果断度信号。自动模型升级改为人工决策。
+    shouldEscalate: false,
     thetaCycleInterval: s.complexity > 0.5 ? 3 : 7,
   }
 }

@@ -29,7 +29,17 @@ const TOKEN_RE = /[a-zA-Z_][a-zA-Z0-9_]{1,}|[\u4e00-\u9fff]+/g
 export function tokenize(text: string): string[] {
   const tokens: string[] = []
   for (const match of text.toLowerCase().matchAll(TOKEN_RE)) {
-    tokens.push(match[0]!)
+    const tok = match[0]!
+    if (tok.charCodeAt(0) >= 0x4e00) {
+      // CJK 连续段按字符 bigram 切分。整段当单 token 时（2026-07-20 recall
+      // 空转根因），查询"前缀缓存"与语料"前缀缓存命中率…"是两个不同词项，
+      // 纯中文查询几乎必然 0 命中——bigram 让两侧共享"前缀/缀缓/缓存"词项。
+      // 索引与查询走同一函数，切分天然一致。
+      if (tok.length === 1) tokens.push(tok)
+      else for (let i = 0; i < tok.length - 1; i++) tokens.push(tok.slice(i, i + 2))
+    } else {
+      tokens.push(tok)
+    }
   }
   return tokens
 }

@@ -6,7 +6,7 @@ import type { CouncilPlan, CouncilDraft, SeatContribution } from '../council-pla
 
 const draft: CouncilDraft = { objective: 'mission X', items: [{ id: 'T1', title: 'Task1', detail: 'd1' }] }
 const contributions: SeatContribution[] = [
-  { authority: 'tianquan', summary: '权衡完成', additions: [{ id: 'A1', title: 'addA', detail: 'detailA' }], risks: [], challenges: ['前提成立吗?'], alternatives: [{ proposal: '事件溯源', recommend: false, rationale: '成本过高' }], modelUsed: 'deepseek-v4' },
+  { authority: 'tianquan', summary: '权衡完成', additions: [{ id: 'A1', title: 'addA', detail: 'detailA' }], risks: [], challenges: [{ text: '前提成立吗?' }], alternatives: [{ proposal: '事件溯源', recommend: false, rationale: '成本过高' }], modelUsed: 'deepseek-v4' },
   { authority: 'tianfu', summary: '风险审完', additions: [], risks: [{ claim: '缺回滚', severity: 'high', mitigation: '加 rollback', itemId: 'T1' }], challenges: [], alternatives: [] },
 ]
 function makePlan(): CouncilPlan {

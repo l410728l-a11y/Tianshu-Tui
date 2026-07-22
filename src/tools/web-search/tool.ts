@@ -39,33 +39,33 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
   return {
     definition: {
       name: 'web_search',
-      description: `Search the web for real-time information. Results include titles, URLs, and content summaries.
+      description: `搜索 Web 获取实时信息。结果包含标题、URL 和内容摘要。
 
-### When to search
-- Current/time-sensitive facts (latest releases, breaking changes, today's status)
-- A specific library/version/API/error you don't recognize or can't recall precisely
-- Anything that may have changed since your training cutoff
-- Unrecognized capitalized names (products, tools, packages): an unfamiliar name is more likely a real thing that postdates training than something to guess at — search rather than confabulate
+### 何时搜索
+- 当前/时效性事实（最新发布、breaking changes、今日状态）
+- 你不认识或记不准的特定库/版本/API/报错
+- 任何可能在你训练截止后发生变化的内容
+- 不认识的首字母大写名称（产品、工具、包）：陌生名字更可能是训练之后才出现的真实事物，而不是可以臆测的对象——搜索，不要编造
 
-### When NOT to search
-- Stable facts, language syntax, or well-established concepts you already know
-- Code already present in this repo — use grep/read_file/semantic_search instead
+### 何时不要搜索
+- 稳定事实、语言语法，或你已掌握的成熟概念
+- 本仓库已有的代码——改用 grep/read_file/semantic_search
 
-### Using results (attribution and copyright)
-- Synthesize and paraphrase in your own words; cite the source URL for non-obvious claims
-- Keep any direct quote short (under ~15 words) and use at most one quote per source
-- Never reproduce article paragraphs, song lyrics, or poems verbatim
-- Follow web_fetch to read a full page when a snippet is insufficient`,
+### 使用结果（署名与版权）
+- 用自己的话综合转述；非显而易见的论断要注明来源 URL
+- 直接引用保持简短（约 15 词以内），每个来源最多引用一处
+- 绝不要逐字复制文章段落、歌词或诗歌
+- 摘要不够用时，用 web_fetch 读取完整页面`,
       input_schema: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'The search query string',
+            description: '搜索查询字符串',
           },
           count: {
             type: 'number',
-            description: 'Number of results to return (default: 10, max: 20)',
+            description: '返回结果数量（默认：10，最大：20）',
           },
         },
         required: ['query'],

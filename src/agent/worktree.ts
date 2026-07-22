@@ -1,4 +1,4 @@
-import { spawnGitSync } from '../tools/spawn-git.js'
+import { spawnGitSync, spawnGit } from '../tools/spawn-git.js'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -95,12 +95,41 @@ function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr
     cwd,
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 120_000,
   })
   return {
     ok: result.status === 0,
     stdout: typeof result.stdout === 'string' ? result.stdout : '',
     stderr: typeof result.stderr === 'string' ? result.stderr : '',
   }
+}
+
+/**
+ * Async variant of git() for callers on the main event loop (VSW snapshot
+ * build). `git worktree add` is a full-tree checkout — seconds on large repos —
+ * and must not block the TUI. Same timeout semantics as the sync helper.
+ */
+async function gitAsync(cwd: string, args: string[], timeout = 120_000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const child = spawnGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+  const out: Buffer[] = []
+  const err: Buffer[] = []
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill('SIGTERM') }, timeout)
+    child.stdout?.on('data', (b: Buffer) => out.push(b))
+    child.stderr?.on('data', (b: Buffer) => err.push(b))
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve({
+        ok: code === 0,
+        stdout: Buffer.concat(out).toString('utf-8'),
+        stderr: Buffer.concat(err).toString('utf-8'),
+      })
+    })
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      reject(e)
+    })
+  })
 }
 
 function branchExists(cwd: string, branch: string): boolean {
@@ -156,10 +185,27 @@ export function createWorktreeAt(cwd: string, wtPath: string, commitish: string)
   return { path: wtPath, branch: '(detached)' }
 }
 
+/** Async createWorktreeAt — same contract, event loop stays free during checkout. */
+export async function createWorktreeAtAsync(cwd: string, wtPath: string, commitish: string): Promise<CreatedWorktree> {
+  mkdirSync(dirname(wtPath), { recursive: true })
+  const result = await gitAsync(cwd, buildDetachedWorktreeArgs(wtPath, commitish))
+  if (!result.ok) {
+    try { rmSync(wtPath, { recursive: true, force: true }) } catch {}
+    throw new Error(`failed to create detached git worktree at ${wtPath} for ${commitish}`)
+  }
+  return { path: wtPath, branch: '(detached)' }
+}
+
 export function removeWorktree(cwd: string, wtPath: string, branch?: string, opts?: { keepBranch?: boolean }): void {
   git(cwd, ['worktree', 'remove', '--force', wtPath])
   if (branch && !opts?.keepBranch) git(cwd, ['branch', '-D', branch])
   // Clean up owner marker so the reaper doesn't try to reap an already-removed worktree
+  try { rmSync(join(wtPath, OWNER_FILE), { force: true }) } catch {}
+}
+
+/** Async removeWorktree — same contract, event loop stays free during removal. */
+export async function removeWorktreeAsync(cwd: string, wtPath: string): Promise<void> {
+  await gitAsync(cwd, ['worktree', 'remove', '--force', wtPath])
   try { rmSync(join(wtPath, OWNER_FILE), { force: true }) } catch {}
 }
 

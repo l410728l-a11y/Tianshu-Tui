@@ -1612,6 +1612,7 @@ export class TuiApp {
         toolUseCount: w.toolUseCount,
         tokenCount: w.tokenCount,
         unread: w.unread && w.terminal,
+        failureReason: w.failureReason,
       })
       byParent.set(w.parentToolId, arr)
     }
@@ -2986,7 +2987,9 @@ export class TuiApp {
     if (w.toolUseCount > 0) stats.push(`${w.toolUseCount} 工具`)
     if (w.tokenCount > 0) stats.push(`${formatTokenCount(w.tokenCount)} tok`)
     const statsStr = stats.length > 0 ? ` · ${stats.join(' · ')}` : ''
-    const summary = w.activity ? ` — ${w.activity.slice(0, 60)}` : ''
+    // 压平嵌入换行：activity 是自由文本（review evidence 用 \n 拼接），
+    // 通知行的 ` — 摘要` 设计是单行。
+    const summary = w.activity ? ` — ${w.activity.replace(/\s+/g, ' ').trim().slice(0, 60)}` : ''
     const ok = w.status === 'passed'
     const glyph = ok ? '✓' : w.status === 'failed' ? '✗' : '⊗'
     const verb = ok ? '完成' : w.status === 'failed' ? '失败' : w.status === 'blocked' ? '受阻' : '升级'

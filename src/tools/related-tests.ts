@@ -129,20 +129,20 @@ async function findSourceForTest(file: string, cwd: string): Promise<string[]> {
 
 const DEFINITION = {
   name: 'related_tests' as const,
-  description: `Find test files related to a given source file.
+  description: `查找与给定源文件相关的测试文件。
 
-### Usage
-- Use after editing a source file to find which tests to run
-- Use before editing to understand what tests exist for a file
-- Returns list of matching test file paths
+### 用法
+- 编辑源文件后，用它确定需要跑哪些测试
+- 编辑前，用它了解该文件已有哪些测试
+- 返回匹配的测试文件路径列表
 
-### Examples
-Good: related_tests(file="src/tools/bash.ts") — find tests for bash tool
-Good: related_tests(file="src/api/client.ts") — find tests for API client`,
+### 示例
+Good: related_tests(file="src/tools/bash.ts") — 找 bash 工具的测试
+Good: related_tests(file="src/api/client.ts") — 找 API client 的测试`,
   input_schema: {
     type: 'object' as const,
     properties: {
-      file: { type: 'string', description: 'Source file path relative to cwd' },
+      file: { type: 'string', description: '相对 cwd 的源文件路径' },
     },
     required: ['file'],
   },

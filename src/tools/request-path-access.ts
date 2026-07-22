@@ -18,18 +18,17 @@ import { grantPath, type GrantMode } from './path-grants.js'
 export const REQUEST_PATH_ACCESS_TOOL: Tool = {
   definition: {
     name: 'request_path_access',
-    description: `Request user permission to access a path OUTSIDE the current workspace.
+    description: `请求用户授权访问当前工作区之外的路径。
 
-Use for batch/directory grants or bash-based out-of-workspace work. On approval
-the directory subtree becomes readable/writable for this session (persist with
-remember=true). For single out-of-workspace file reads/writes, calling
-read_file/write_file directly triggers the same inline prompt.`,
+用于批量/目录级授权，或基于 bash 的工作区外操作。审批通过后，该目录子树
+在本会话内可读/可写（用 remember=true 持久化）。对单个工作区外文件的
+读写，直接调用 read_file/write_file 会触发同样的内联提示。`,
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute or ~-relative path (file or directory) outside the workspace to grant access to.' },
-        mode: { type: 'string', enum: ['read', 'write'], description: "Access level. 'write' implies read. Defaults to 'write'." },
-        remember: { type: 'boolean', description: 'Persist the grant for THIS workspace across sessions. Defaults to false (session-only).' },
+        path: { type: 'string', description: '要授权访问的工作区外路径（文件或目录），绝对路径或 ~ 相对路径。' },
+        mode: { type: 'string', enum: ['read', 'write'], description: "访问级别。'write' 隐含读取权限。默认 'write'。" },
+        remember: { type: 'boolean', description: '为当前工作区跨会话持久化此授权。默认 false（仅本会话）。' },
       },
       required: ['path'],
     },

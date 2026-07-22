@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestEnabled, type PlanModeSuggestInput, type StructureFlowPlanAdvisoryInput } from '../plan-mode-advisor.js'
+import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildPlanModeAutoEnterAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestEnabled, planModeSuggestMode, type PlanModeSuggestInput, type StructureFlowPlanAdvisoryInput } from '../plan-mode-advisor.js'
 import type { DisciplineEligibility } from '../discipline-eligibility.js'
 import { extractTaskContract } from '../../context/task-contract.js'
 
@@ -100,6 +100,39 @@ describe('buildPlanModeSuggestAdvisory', () => {
   })
 })
 
+describe('buildPlanModeAutoEnterAdvisory', () => {
+  it('instructs autonomous enter_mode with todo-tracked investigation, no ask-first', () => {
+    const text = buildPlanModeAutoEnterAdvisory('system 级改动面')
+    assert.ok(text.includes('enter_mode'))
+    assert.ok(text.includes('无需先问用户'))
+    assert.ok(!text.includes('ask_user_question'), 'auto 变体不再指令先问用户')
+    assert.ok(text.includes('todo'), '调研清单约定')
+    assert.ok(text.includes('提交审批'), '末项 todo 固定为提交审批')
+    assert.ok(text.includes('delegate_batch'))
+    assert.ok(text.includes('system 级改动面'))
+  })
+})
+
+describe('planModeSuggestMode', () => {
+  it('defaults to auto; ask/off honored from env', () => {
+    const prev = process.env.RIVET_PLAN_MODE_SUGGEST
+    try {
+      delete process.env.RIVET_PLAN_MODE_SUGGEST
+      assert.equal(planModeSuggestMode(), 'auto')
+      process.env.RIVET_PLAN_MODE_SUGGEST = 'ask'
+      assert.equal(planModeSuggestMode(), 'ask')
+      process.env.RIVET_PLAN_MODE_SUGGEST = '0'
+      assert.equal(planModeSuggestMode(), 'off')
+      process.env.RIVET_PLAN_MODE_SUGGEST = 'off'
+      assert.equal(planModeSuggestMode(), 'off')
+      assert.equal(planModeSuggestEnabled(), false)
+    } finally {
+      if (prev === undefined) delete process.env.RIVET_PLAN_MODE_SUGGEST
+      else process.env.RIVET_PLAN_MODE_SUGGEST = prev
+    }
+  })
+})
+
 // ─── P2 阴阳调度：structure-flow plan advisory ──────────────────────
 
 describe('buildStructureFlowPlanAdvisory', () => {
@@ -117,8 +150,9 @@ describe('buildStructureFlowPlanAdvisory', () => {
     const result = buildStructureFlowPlanAdvisory(sfInput())
     assert.ok(result)
     assert.equal(result.key, 'structure-flow-plan:enter:unknown-domain')
-    assert.ok(result.content.includes('ask_user_question'))
     assert.ok(result.content.includes('enter_mode'))
+    assert.ok(result.content.includes('todo'), '指引先建调研 todo')
+    assert.ok(!result.content.includes('ask_user_question'), '不再指令先问用户')
   })
 
   it('同 reason 已发过（firedKeys 命中）→ null（one-shot 去重）', () => {

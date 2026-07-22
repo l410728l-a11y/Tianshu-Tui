@@ -102,3 +102,70 @@ describe('council telemetry — append-only', () => {
     assert.doesNotThrow(() => recordCouncilSession(undefined, e))
   })
 })
+
+// ── Phase 2: 分歧度遥测 —— 回答「同模型戴星域面具是不是自我对话」────────────
+function contribution(authority: string, modelUsed?: string, round?: number) {
+  return {
+    authority, summary: `${authority}-view`, additions: [], risks: [],
+    challenges: [], alternatives: [],
+    ...(modelUsed ? { modelUsed } : {}),
+    ...(round ? { round } : {}),
+  }
+}
+
+describe('council telemetry — 模型构成 + 分歧度（Phase 2）', () => {
+  it('modelsUsed 去重排序、heterogeneous 按唯一模型数判定', () => {
+    const plan = fakePlan('x', 'h1', 10)
+    plan.contributions = [
+      contribution('tianquan', 'deepseek-v4-pro'),
+      contribution('tianfu', 'glm-4.6'),
+      contribution('tianxuan', 'deepseek-v4-pro'),
+    ]
+    const e = buildCouncilSessionEvent({ sessionId: 's1', plan, timestamp: 100 })
+    assert.deepEqual(e.modelsUsed, ['deepseek-v4-pro', 'glm-4.6'])
+    assert.equal(e.heterogeneous, true)
+  })
+
+  it('同模型议事会 → heterogeneous=false；缺 modelUsed 的席位不计入', () => {
+    const plan = fakePlan('x', 'h1', 10)
+    plan.contributions = [
+      contribution('tianquan', 'deepseek-v4-pro'),
+      contribution('tianfu', 'deepseek-v4-pro'),
+      contribution('tianxuan'),
+    ]
+    const e = buildCouncilSessionEvent({ sessionId: 's1', plan, timestamp: 100 })
+    assert.deepEqual(e.modelsUsed, ['deepseek-v4-pro'])
+    assert.equal(e.heterogeneous, false)
+  })
+
+  it('divergenceScore = 冲突数/首轮席位数（上限 1）；r2 贡献不计入分母', () => {
+    const plan = fakePlan('x', 'h1', 10) // fakePlan 自带 1 条冲突
+    plan.contributions = [
+      contribution('tianquan', 'm1'),
+      contribution('tianfu', 'm2'),
+      contribution('tianquan', 'm1', 2), // r2 反驳稿，不计分母
+    ]
+    const e = buildCouncilSessionEvent({ sessionId: 's1', plan, timestamp: 100 })
+    assert.equal(e.divergenceScore, 0.5)
+  })
+
+  it('零首轮贡献 → divergenceScore=0（不除零）；冲突过多截断为 1', () => {
+    const empty = fakePlan('x', 'h1', 10)
+    empty.contributions = []
+    assert.equal(buildCouncilSessionEvent({ sessionId: 's1', plan: empty, timestamp: 100 }).divergenceScore, 0)
+
+    const noisy = fakePlan('x', 'h1', 10)
+    noisy.contributions = [contribution('tianquan', 'm1')]
+    noisy.aggregate.conflicts = [
+      { description: 'c1', left: 'l', right: 'r', key: 'k1', status: 'open' },
+      { description: 'c2', left: 'l', right: 'r', key: 'k2', status: 'open' },
+    ]
+    assert.equal(buildCouncilSessionEvent({ sessionId: 's1', plan: noisy, timestamp: 100 }).divergenceScore, 1)
+  })
+
+  it('pillars 标记透传（缺省 false）', () => {
+    const plan = fakePlan('x', 'h1', 10)
+    assert.equal(buildCouncilSessionEvent({ sessionId: 's1', plan, timestamp: 100 }).pillarsMode, false)
+    assert.equal(buildCouncilSessionEvent({ sessionId: 's1', plan, timestamp: 100, pillars: true }).pillarsMode, true)
+  })
+})

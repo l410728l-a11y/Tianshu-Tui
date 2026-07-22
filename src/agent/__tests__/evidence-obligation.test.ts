@@ -316,3 +316,25 @@ describe('classifyEvidenceTool (single classification source, evidence-gate migr
     assert.equal(classifyEvidenceTool({ tool: 'todo_write' }), null)
   })
 })
+
+// ── 误告警抑制：文档/配置变更不触发 bugfix RED 义务 ──
+
+import { isDocOrConfigOnly } from '../turn-step-producer.js'
+
+describe('isDocOrConfigOnly', () => {
+  it('returns true for all .md files', () => {
+    assert.equal(isDocOrConfigOnly(['README.md', 'docs/spec.md']), true)
+  })
+  it('returns true for .json/.yaml/.toml/.css/.html', () => {
+    assert.equal(isDocOrConfigOnly(['config.json', 'theme.css', 'index.html']), true)
+  })
+  it('returns false for mixed code + doc', () => {
+    assert.equal(isDocOrConfigOnly(['src/agent/loop.ts', 'docs/plan.md']), false)
+  })
+  it('returns false for .ts source files', () => {
+    assert.equal(isDocOrConfigOnly(['src/agent/loop.ts']), false)
+  })
+  it('returns false for empty array', () => {
+    assert.equal(isDocOrConfigOnly([]), false)
+  })
+})

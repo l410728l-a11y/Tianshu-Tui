@@ -231,14 +231,15 @@ export const agentSchema = z.object({
   maxTurns: z.number().int().nonnegative().default(200),
   mode: z.enum(['code', 'ask', 'plan']).default('code'),
   autoReasoning: z.boolean().default(true),
-  /** 默认星域（auto | kaiyang | tianshu | …）。新会话的初始星域将由此配置项决定。 */
-  defaultDomain: z.string().default('kaiyang'),
+  /** 默认星域（auto | tianshu | kaiyang | …）。新会话的初始星域将由此配置项决定；
+   *  'auto' 表示不钉定，由会话首条消息按关键词路由（见 domainKeywordRouting）。 */
+  defaultDomain: z.string().default('auto'),
   /**
    * 会话 Auto 星域是否按消息关键词匹配换域。
-   * 默认 false：Auto 固定落到 DEFAULT_DOMAIN（开阳），其它域仅手动切换。
-   * 显式 true 可恢复旧的 per-message matchDomain 行为。
+   * 默认 true：Auto 按首条消息 matchDomain，未命中回退 DEFAULT_DOMAIN（天枢）。
+   * 显式 false 时 Auto 固定落到 DEFAULT_DOMAIN，其它域仅手动切换。
    */
-  domainKeywordRouting: z.boolean().default(false),
+  domainKeywordRouting: z.boolean().default(true),
   /**
    * 重启后一键续跑的兜底模型（可选）。续跑严格沿用会话原模型（前缀缓存亲和）；
    * 仅当原模型不可用且此项配置了可用模型时才切换续跑（UI 明示缓存将重建）。

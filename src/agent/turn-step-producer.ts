@@ -13,7 +13,7 @@ import { mapQueriedPheromones } from './pheromone-map.js'
 import { getGitInjectedContext } from '../prompt/volatile-git.js'
 import { detectWorktreeReality, type InjectedWorktreeContext } from './worktree-reality.js'
 import { advanceContractStatus, classifyPlanMethodology, classifyTaskDepth, classifyTurnMode, contractStatusFromPhaseClass, extractTaskContract, mergeFollowUpIntoContract, type TurnMode } from '../context/task-contract.js'
-import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestEnabled } from './plan-mode-advisor.js'
+import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildPlanModeAutoEnterAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestMode } from './plan-mode-advisor.js'
 import { skillRegistry } from '../skills/skill-loader.js'
 import { renderMemoryBlock } from '../memory/unified-memory.js'
 import { parseMentions, renderMentionContext } from '../tui/mention-parser.js'
@@ -123,6 +123,18 @@ export function combineMemoryBlocks(agentCrafted: string | null, full: string | 
 export function buildTanlangExplorationAdvisory(userInput: string, gist?: string): string | null {
   if (!EXPLORATION_SIGNAL_RE.test(userInput)) return null
   return `【贪狼·胶囊】检测到勘探/盘点型任务。${gist ?? '能力勘探/系统联合方法论已封存'}——动手前调用 recall_capsule("贪狼") 取完整方法（能力非成本框架、陈旧度判据、半接诊断到行号）。`
+}
+
+
+/**
+ * 判断 scope 文件列表是否全部为文档/配置/非代码文件。
+ * bugfix 义务的 RED 复现不适用于此类变更——纯注释、文档、配置修改无需复现测试。
+ */
+export function isDocOrConfigOnly(targets: string[]): boolean {
+  return targets.length > 0 && targets.every(t =>
+    /\.(md|json|ya?ml|toml|css|html)$/.test(t) ||
+    /^docs\//.test(t) ||
+    /^\.rivet\//.test(t))
 }
 
 /** Map StarPhase values to PromptEngine phaseClass strings. */
@@ -380,13 +392,16 @@ export class TurnStepProducer {
       if (turnMode === 'task') {
         const targets = this.self.taskContract.scope.mentionedFiles
         if (routeKinds?.includes('bug_fix')) {
-          // bugfix → RED 复现优先（动作矩阵第一列）。high：final gate 参与方。
-          this.self.obligations.upsert({
-            family: 'bugfix',
-            claim: `缺陷已被 RED 复现并修复：${this.self.taskContract.objective}`,
-            targets,
-            risk: 'high',
-          })
+          // 跳过纯文档/注释/配置变更——RED 复现不适用于非代码任务。
+          if (!isDocOrConfigOnly(targets)) {
+            // bugfix → RED 复现优先（动作矩阵第一列）。high：final gate 参与方。
+            this.self.obligations.upsert({
+              family: 'bugfix',
+              claim: `缺陷已被 RED 复现并修复：${this.self.taskContract.objective}`,
+              targets,
+              risk: 'high',
+            })
+          }
         }
         if (routeKinds?.includes('refactor')) {
           // 重构的风险形态是回归。medium：提供 baseline_diff 升级阶梯与
@@ -427,9 +442,11 @@ export class TurnStepProducer {
       if (this.self._taskDepthLayer) {
         this.self.planTraceCoordinator.openTrace(this.self.taskContract.id, this.self._taskDepthLayer)
       }
-      // 主动 plan mode 建议：多模块任务（full 方法论）在动手前先经 ask_user_question
-      // 征询用户是否进入计划模式（每 contract one-shot；RIVET_PLAN_MODE_SUGGEST=0 禁用）。
-      if (planModeSuggestEnabled()) {
+      // 主动 plan mode 建议：多模块任务（full 方法论）默认指令主控直接 enter_mode
+      // 自主进入（每 contract one-shot；RIVET_PLAN_MODE_SUGGEST=ask 回到先问用户，
+      // =0/off 禁用）。
+      const planSuggestMode = planModeSuggestMode()
+      if (planSuggestMode !== 'off') {
         const suggestion = shouldSuggestPlanMode({
           turnMode,
           contract: this.self.taskContract,
@@ -445,9 +462,14 @@ export class TurnStepProducer {
             priority: 0.9,
             category: 'discipline',
             tier: 'constitutional',
-            content: buildPlanModeSuggestAdvisory(suggestion.reason),
+            content: planSuggestMode === 'ask'
+              ? buildPlanModeSuggestAdvisory(suggestion.reason)
+              : buildPlanModeAutoEnterAdvisory(suggestion.reason),
             ttl: 1,
-            expect: { kind: 'tool_appears', tools: ['ask_user_question'], withinTurns: 1 },
+            expect: planSuggestMode === 'ask'
+              ? { kind: 'tool_appears', tools: ['ask_user_question'], withinTurns: 1 }
+              // 模型可合法选择先建 todo 再 enter（回执指引的顺序），给 2 轮窗口。
+              : { kind: 'tool_appears', tools: ['plan'], withinTurns: 2 },
             channel: 'system-reminder',
           })
         }
@@ -662,12 +684,21 @@ export class TurnStepProducer {
     // at the moment it is committed to the session tail.
     // Wave 1 SR 账本修正：回调确认送达/丢弃，避免 SessionContext cap
     // 拦截的条目仍被计入 rendered/delivered（采纳率分母污染）。
-    for (const { key, content } of this.self.advisoryBus.drainSystemReminders()) {
-      const ok = this.self.session.appendSystemReminderAndReport(content)
+    // W2：失败条目 requeue 回 bus 参与下轮 drain（有界携带），替代永久丢弃。
+    // P2 修复：discipline 条目在额度耗尽时留在 bus 不取出（不消耗 carry）——
+    // 等下一用户轮额度恢复后自然送达。carry 上限只约束"有额度但仍失败"的异常路径。
+    // functional/user 照常排空。
+    for (const { key, content, srClass } of this.self.advisoryBus.drainSystemReminders()) {
+      // P2: discipline 额度耗尽时不尝试注入——条目留在 bus（skipCarry，不消耗配额）
+      if (srClass === 'discipline' && !this.self.session.hasDisciplineSrQuota()) {
+        this.self.advisoryBus.requeueSr(key, content, srClass, true)
+        continue
+      }
+      const ok = this.self.session.appendSystemReminderAndReport(content, srClass)
       if (ok) {
         this.self.advisoryBus.confirmSrDelivered(key)
       } else {
-        this.self.advisoryBus.confirmSrDropped(key)
+        this.self.advisoryBus.requeueSr(key, content, srClass)
       }
       this.self.pressureMonitor.recordCvmInjection(Math.ceil(content.length / 4), 'system-reminder')
     }
@@ -743,8 +774,11 @@ export class TurnStepProducer {
         turn,
         sensorium: s ? {
           momentum: r2(s.momentum), pressure: r2(s.pressure), confidence: r2(s.confidence),
+          verificationCoverage: r2(s.verificationCoverage ?? s.confidence),
           complexity: r2(s.complexity), freshness: r2(s.freshness), stability: r2(s.stability ?? 0),
         } : null,
+        confidenceMeasured: s?.quality?.confidence === 'measured',
+        decisivenessMeasured: s?.decisiveness != null,
         ctxRatio: r2(pressureResult.ratio),
         cvmOverheadRatio: Math.round(pressureResult.cvmOverheadRatio * 10_000) / 10_000,
         throttled: pressureResult.shouldThrottleCvm,
@@ -1002,6 +1036,7 @@ export class TurnStepProducer {
       thetaTelemetry: this.self.thetaTelemetry,
       thetaCheckInFlight: this.self.thetaCheckInFlight,
       baselineFingerprint: this.self.baselineFingerprint,
+      convergenceScore: this.self.latestConvergenceResult?.score ?? null,
     }, {
       emitPhaseChange: (phase, detail) => { callbacks.onPhaseChange?.(phase, detail) },
       emitDecisionShift: (shift) => {

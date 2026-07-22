@@ -579,6 +579,53 @@ export function setToolPresetConfig(input: { preset?: unknown }): ToolPresetConf
   return { preset: cfg.tools.preset ?? 'minimal' }
 }
 
+// --- Default star domain (new-session initial domain + Auto keyword routing) ---
+
+export interface DefaultDomainConfigSnapshot {
+  /** 'auto' 或星域 id（tianshu / kaiyang / …）。 */
+  defaultDomain: string
+  /** Auto 是否按首条消息关键词匹配换域（未命中回退天枢）。 */
+  domainKeywordRouting: boolean
+}
+
+/** Snapshot of the default star-domain config for the desktop/TUI settings UI. */
+export function getDefaultDomainConfig(): DefaultDomainConfigSnapshot {
+  const cfg = loadConfig()
+  return {
+    defaultDomain: cfg.agent.defaultDomain ?? 'auto',
+    domainKeywordRouting: cfg.agent.domainKeywordRouting !== false,
+  }
+}
+
+/**
+ * Persist default star domain / Auto keyword routing. Takes effect at the
+ * NEXT session — session domain is pinned before the first request and stays
+ * stable within a session (prefix-cache anchor).
+ *
+ * 域 id 的有效性由调用方（config route 持有 starDomainRegistry）校验；
+ * 这里只做形状校验，config 层不反向依赖 agent 层。
+ */
+export function setDefaultDomainConfig(input: { defaultDomain?: unknown; domainKeywordRouting?: unknown }): DefaultDomainConfigSnapshot {
+  const cfg = loadConfig()
+  if (input.defaultDomain !== undefined) {
+    if (typeof input.defaultDomain !== 'string' || input.defaultDomain.trim() === '') {
+      throw new Error('defaultDomain must be a non-empty string ("auto" or a star-domain id)')
+    }
+    cfg.agent.defaultDomain = input.defaultDomain.trim()
+  }
+  if (input.domainKeywordRouting !== undefined) {
+    if (typeof input.domainKeywordRouting !== 'boolean') {
+      throw new Error('domainKeywordRouting must be a boolean')
+    }
+    cfg.agent.domainKeywordRouting = input.domainKeywordRouting
+  }
+  saveConfig(cfg)
+  return {
+    defaultDomain: cfg.agent.defaultDomain ?? 'auto',
+    domainKeywordRouting: cfg.agent.domainKeywordRouting !== false,
+  }
+}
+
 // --- Vision model bridge (multimodal image recognition) ---
 
 const visionModelConfigSchema = z.object({

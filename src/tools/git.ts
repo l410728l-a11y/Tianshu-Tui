@@ -368,6 +368,25 @@ export async function getFileDiff(cwd: string, path: string, baseRef = 'HEAD'): 
 }
 
 /**
+ * Fetch a file's full content at `baseRef` (session task baseline). Used by
+ * editor clients (VS Code extension) to render a native two-pane diff: the
+ * left side is this base snapshot, the right side is the live working file.
+ * Returns `exists:false` for files not present at the base (newly added).
+ */
+export async function getFileAtBase(
+  cwd: string,
+  path: string,
+  baseRef = 'HEAD',
+): Promise<{ exists: boolean; content: string }> {
+  const rel = normalizeProjectRelativePath(cwd, path)
+  if (!rel) throw new Error(`Invalid file path: ${path}`)
+  const base = safeBaseRef(baseRef)
+  const shown = await runGitSafe(['show', `${base}:${rel}`], cwd)
+  if (!shown.ok) return { exists: false, content: '' }
+  return { exists: true, content: shown.output }
+}
+
+/**
  * `git diff --no-index /dev/null file` emits headers referencing the literal
  * paths ("/dev/null" and the file path without a/ b/ prefixes). Rewrite the
  * `+++` header to the conventional `b/<rel>` form so the desktop diff parser
@@ -388,30 +407,30 @@ function normalizeNoIndexHeader(diff: string, rel: string): string {
 export const GIT_TOOL: Tool = {
   definition: {
     name: 'git',
-    description: `Structured git operations. Actions:
-- status: Show working tree status, current branch, and file changes
-- diff_summary: Show diff stats for staged and unstaged changes
-- commit: Commit only this session's modified files when available; otherwise commit already staged changes only
-- log: Show recent commit history (default 20, configurable with maxCount)
-- log_graph: Show ASCII branch/merge graph across all local and remote refs
-- stash: Stash current working directory changes
+    description: `结构化 git 操作。Actions:
+- status: 显示工作树状态、当前分支和文件改动
+- diff_summary: 显示已暂存与未暂存改动的 diff 统计
+- commit: 有本会话修改的文件时只提交这些文件；否则只提交已暂存的改动
+- log: 显示最近提交历史（默认 20 条，可用 maxCount 配置）
+- log_graph: 显示覆盖所有本地与远程引用的 ASCII 分支/合并图
+- stash: 暂存当前工作目录改动
 
-For complex git operations (branch, merge, rebase, push, pull), use the bash tool instead.`,
+复杂 git 操作（branch、merge、rebase、push、pull）改用 bash 工具。`,
     input_schema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: [...ACTIONS],
-          description: 'The git operation to perform',
+          description: '要执行的 git 操作',
         },
         message: {
           type: 'string',
-          description: 'Commit message (required for commit action)',
+          description: '提交信息（commit action 必填）',
         },
         maxCount: {
           type: 'number',
-          description: 'Maximum number of log entries (default 20, for log action)',
+          description: 'log 条目最大数量（默认 20，用于 log action）',
         },
       },
       required: ['action'],

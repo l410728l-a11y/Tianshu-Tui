@@ -234,6 +234,18 @@ export class RepoLock {
       this.release()
     }
   }
+
+  /** Async variant: acquire → try await fn → finally release.
+   *  The sync withLock cannot be used with async fns — it would release the
+   *  lock before the first await inside fn completes. */
+  async withLockAsync<T>(fn: () => Promise<T>): Promise<T> {
+    this.acquire()
+    try {
+      return await fn()
+    } finally {
+      this.release()
+    }
+  }
 }
 
 /** Default VSW worktree-registry lock path for a repo. */

@@ -23,6 +23,7 @@ import type { PheromoneDeposit } from '../../context/stigmergy.js'
 import { createHash } from 'node:crypto'
 import { VERIFY_BASH_RE } from './self-verify-hook.js'
 import { WRITE_TOOL_NAMES, extractWriteFilePaths } from '../../tools/write-tool-helpers.js'
+import { renderRouteAnnotation, STALL_ROUTE_TABLE } from '../failure-taxonomy.js'
 
 export interface DeadEndDetectorDeps {
   advisoryBus: Pick<AdvisoryBus, 'submit'>
@@ -157,7 +158,7 @@ export function createDeadEndDetectorHook(
             priority: 0.7,
             category: 'dead_end',
             tier: 'operational',
-            content: `同一文件 ${file} 已 ${s.cycles} 次「编辑→验证失败」且中间无一次通过——这是盲改信号。停止在原处继续改:先用 read_file/grep/git diff 重新诊断失败根因,或回退本轮改动换一条实现路径,或把改动拆成更小的可验证步骤。`,
+            content: `同一文件 ${file} 已 ${s.cycles} 次「编辑→验证失败」且中间无一次通过——这是盲改信号。停止在原处继续改:先用 read_file/grep/git diff 重新诊断失败根因,或回退本轮改动换一条实现路径,或把改动拆成更小的可验证步骤。 ${renderRouteAnnotation(STALL_ROUTE_TABLE['verify-loop'])}`,
             ttl: 2,
             // 采纳 = 停止盲改转向诊断类动作(2 轮内出现 read/grep 等)
             expect: { kind: 'tool_appears', tools: DIAGNOSIS_TOOLS, withinTurns: 2 },

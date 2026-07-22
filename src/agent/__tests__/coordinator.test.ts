@@ -531,6 +531,56 @@ describe('DelegationCoordinator', () => {
     assert.ok(run.results.every(r => r.status === 'passed'))
   })
 
+  it('delegateBatch 透传 tierFloor 到 WorkOrder（瑶光门 batch 路径——曾只传 modelOverride 丢 tierFloor）', async () => {
+    const capturedFloors: Array<string | undefined> = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => ({
+        order,
+        client: {} as StreamClient,
+        promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+        toolRegistry: workerRegistry,
+        cwd: '/repo',
+        maxTurns: 2,
+        contextWindow: card.contextWindow,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      }),
+      runWorker: async config => {
+        capturedFloors.push(config.order.tierFloor)
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    await coordinator.delegateBatch([
+      {
+        parentTurnId: 'council:seat-tianfu',
+        objective: 'Guardrail seat review with a strong-tier floor declared.',
+        kind: 'plan',
+        profile: 'council_expert',
+        scope: {},
+        authority: 'tianfu',
+        tierFloor: 'strong',
+      },
+      {
+        parentTurnId: 'council:seat-tianxuan',
+        objective: 'Explorer seat review without any tier floor.',
+        kind: 'plan',
+        profile: 'council_expert',
+        scope: {},
+        authority: 'tianxuan',
+      },
+    ])
+
+    assert.deepEqual(capturedFloors.sort(), ['strong', undefined].sort(), 'tierFloor 必须进 WorkOrder（声明 strong 的席位不得被静默降档）')
+  })
+
   it('A3: a dependent of a failed worker is reported as blocked, never silently dropped', async () => {
     const ran: string[] = []
     const coordinator = new DelegationCoordinator({

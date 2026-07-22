@@ -49,7 +49,7 @@ export interface AgentConfigInput {
   autoDelegateEnabled?: boolean
   autoReasoning?: boolean
   crossSessionEnabled?: boolean
-  /** Session Auto keyword routing; default false via createMainAgentConfigInput. */
+  /** Session Auto keyword routing; default true（未命中回退天枢）. */
   domainKeywordRouting?: boolean
   goalJudge?: { enabled?: boolean; maxRuns?: number; browser?: boolean }
   auth?: AuthProvider
@@ -216,7 +216,7 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     intentRetrievalRouter: input.intentRetrievalRouter,
     llmSpeculation: input.llmSpeculation,
     autoDelegateEnabled: input.autoDelegateEnabled,
-    domainKeywordRouting: input.domainKeywordRouting ?? false,
+    domainKeywordRouting: input.domainKeywordRouting ?? true,
     goalJudge: input.goalJudge,
     allProviders: input.allProviders,
     autoReasoning: input.autoReasoning ?? true,

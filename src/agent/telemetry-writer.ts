@@ -34,6 +34,21 @@ export const PERF_SUMMARY_KIND = 'perf-summary'
  *  多少、哪些 source 缺数据"。full 全量 facts 记录仍由 RIVET_DEBUG_TELEMETRY
  *  opt-in。 */
 export const COGNITIVE_FRAME_LITE_KIND = 'cognitive-frame-lite'
+/** P4 前置（2026-07-20 数据回读）：advisory 采纳核销账本。单行小记录
+ *  （key/outcome/expectKind/turn 号），不默认落盘则 P4 晋级证据源 2
+ *  （advisory readback）永远干涸——实测 9 个 session 零数据。 */
+export const ADVISORY_OUTCOME_KIND = 'advisory-outcome'
+/** holdout 反事实组（shadow 扣留判定），与投递组分 kind 便于回放对照。 */
+export const ADVISORY_HOLDOUT_KIND = 'advisory-holdout'
+
+/** RIVET_DEBUG_TELEMETRY 未开时仍放行的轻量 kind 白名单（每条单行 <200B）。 */
+const LITE_KINDS: ReadonlySet<string> = new Set([
+  VITALS_LITE_KIND,
+  PERF_SUMMARY_KIND,
+  COGNITIVE_FRAME_LITE_KIND,
+  ADVISORY_OUTCOME_KIND,
+  ADVISORY_HOLDOUT_KIND,
+])
 
 export function createTelemetryWriter(cwd: string, sessionId?: string): TelemetryWriter {
   // W5（incident 20b9714e）：完整遥测仍由 RIVET_DEBUG_TELEMETRY opt-in，但
@@ -50,7 +65,7 @@ export function createTelemetryWriter(cwd: string, sessionId?: string): Telemetr
   return {
     write(snapshot: TelemetryRecord) {
       const kind = (snapshot as { kind?: string }).kind
-      if (!full && kind !== VITALS_LITE_KIND && kind !== PERF_SUMMARY_KIND && kind !== COGNITIVE_FRAME_LITE_KIND) return
+      if (!full && (kind === undefined || !LITE_KINDS.has(kind))) return
       const line = JSON.stringify(snapshot)
       const shouldTrim = ++writesSinceTrim >= TRIM_CHECK_EVERY
       if (shouldTrim) writesSinceTrim = 0

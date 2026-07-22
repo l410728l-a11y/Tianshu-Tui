@@ -107,6 +107,11 @@ export interface PlanExecutorRun {
     /** 波间硬门禁结果（非末波评估；空串 = 未评估或禁用）。 */
     waveGateNote: string
   }
+  /** 波间硬门禁结构化结果（从 evaluateWaveGate 返回值直接构造），
+   *  供桌面端渲染 gate 失败卡。非末波且评估后才有值。 */
+  gate?: { wave: number; passed: boolean; failures: string[] }
+  /** review gate 审查全文/证据（截 ~1000 字），供桌面端展开阅读。 */
+  reviewDetail?: string
 }
 
 /** Join a list, truncating to `n` entries with a trailing elision count so a
@@ -414,6 +419,7 @@ export async function executePlan(opts: PlanExecutorOptions, deps: PlanExecutorD
   // 结果存会话级 store；失败不在此处抛错（本波成果已产出，留给下一波入口拦），
   // 但 note 必须留痕让主控立刻看到。
   let waveGateNote = ''
+  let gate: PlanExecutorRun['gate'] | undefined
   if (isWaveGateEnabled() && !isLastWave && summary.run) {
     try {
       const taskById = new Map(summary.tasks.map(task => [task.id, task]))
@@ -433,6 +439,13 @@ export async function executePlan(opts: PlanExecutorOptions, deps: PlanExecutorD
         waveGateNote = `\n\n${formatWaveGate(record).join('\n')}`
         if (!record.passed) {
           waveGateNote += `\n⛔ 下一波派发将被硬拦，先修复失败项。逃生阀：RIVET_WAVE_GATE=0。`
+        }
+        gate = {
+          wave: record.wave,
+          passed: record.passed,
+          failures: record.checks
+            .filter(c => c.status === 'failed' || (c.blocking && c.status !== 'passed'))
+            .map(c => `${c.command}${c.detail ? ` — ${c.detail}` : ''}`),
         }
       }
     } catch {
@@ -488,5 +501,10 @@ export async function executePlan(opts: PlanExecutorOptions, deps: PlanExecutorD
     summary,
     reviewVerdict,
     notes: { reviewNote, scopeHealthNote, impactNote, deliverySynthesis, waveGateNote },
+    gate,
+    // P4 fix: reviewVerdict is just a single enum word (e.g. "verified") — the
+    // real content with evidence is reviewNote. Strip leading newlines for the
+    // inline panel display.
+    ...(reviewNote ? { reviewDetail: reviewNote.replace(/^\n+/, '').slice(0, 1000) } : {}),
   }
 }

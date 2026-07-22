@@ -47,15 +47,15 @@ export const AST_GREP_TOOL: Tool = {
   definition: {
     name: 'ast_grep',
     description:
-      'Search code by AST structure (not text). Use ast-grep patterns like `function $NAME($$$) { $$$ }` to find syntax nodes. Returns file:line:column with matched text. For TypeScript/JavaScript/Tsx/Html/Css.',
+      '按 AST 结构（而非文本）搜索代码。用 ast-grep 模式（如 `function $NAME($$$) { $$$ }`）匹配语法节点。返回 file:line:column 及匹配文本。支持 TypeScript/JavaScript/Tsx/Html/Css。',
     input_schema: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'ast-grep pattern (e.g. "function $NAME($$$) { $$$ }") or rule object' },
-        paths: { type: 'array', items: { type: 'string' }, description: 'Files or directories to search' },
-        lang: { type: 'string', description: 'Language: TypeScript, Tsx, JavaScript, Html, Css' },
-        limit: { type: 'integer', description: 'Max matches (default 50)' },
-        includeMeta: { type: 'boolean', description: 'Include meta-variable bindings' },
+        pattern: { type: 'string', description: 'ast-grep 模式（如 "function $NAME($$$) { $$$ }"）或 rule 对象' },
+        paths: { type: 'array', items: { type: 'string' }, description: '要搜索的文件或目录' },
+        lang: { type: 'string', description: '语言：TypeScript、Tsx、JavaScript、Html、Css' },
+        limit: { type: 'integer', description: '最大匹配数（默认 50）' },
+        includeMeta: { type: 'boolean', description: '是否附带元变量绑定' },
       },
       required: ['pattern'],
     },

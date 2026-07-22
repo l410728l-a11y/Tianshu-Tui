@@ -87,20 +87,20 @@ export async function createDocument(input: CreateDocumentInput): Promise<{ path
 export const CREATE_DOCUMENT_TOOL: Tool = {
   definition: {
     name: 'create_document',
-    description: `Create a basic user-facing document at an external or project path.
+    description: `在外部或项目路径创建基础用户文档。
 
-First-version scope: plain text, Markdown, HTML, and Word-openable .doc (HTML document saved with .doc extension). Use export_file/open_path for raw binary assets or opening the result.
+初版范围：纯文本、Markdown、HTML，以及 Word 可打开的 .doc（以 .doc 扩展名保存的 HTML 文档）。用 export_file/open_path 处理原始二进制资产或打开结果。
 
-Examples:
-Good: create_document(destination_path="~/Desktop/report.doc", title="Report", content="Summary...")
-Good: create_document(destination_path="H:\\zhuomian\\白嫖gpt\\notes.md", content="# Notes\\n...")`,
+示例：
+Good: create_document(destination_path="~/Desktop/report.doc", title="报告", content="摘要...")
+Good: create_document(destination_path="H:\\zhuomian\\白嫖gpt\\notes.md", content="# 笔记\\n...")`,
     input_schema: {
       type: 'object',
       properties: {
-        destination_path: { type: 'string', description: 'Destination file path. May be outside the project.' },
-        title: { type: 'string', description: 'Optional document title.' },
-        content: { type: 'string', description: 'Document body text.' },
-        format: { type: 'string', enum: ['txt', 'md', 'html', 'doc'], description: 'Optional output format. Defaults from file extension.' },
+        destination_path: { type: 'string', description: '目标文件路径。可在项目之外。' },
+        title: { type: 'string', description: '可选文档标题。' },
+        content: { type: 'string', description: '文档正文。' },
+        format: { type: 'string', enum: ['txt', 'md', 'html', 'doc'], description: '可选输出格式。默认由文件扩展名推断。' },
       },
       required: ['destination_path', 'content'],
     },

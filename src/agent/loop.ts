@@ -66,6 +66,7 @@ import { compactPolicyRatios } from '../compact/constants.js'
 import { SessionStateManager } from './session-state.js'
 import { isStarSoulEnabled } from './star-soul-gate.js'
 import { debugLog } from '../utils/debug.js'
+import { renderRouteAnnotation, STALL_ROUTE_TABLE } from './failure-taxonomy.js'
 import { TurnStreamController } from './turn-stream.js'
 import { type CognitiveSeason } from './cognitive-season.js'
 import { createVigorState } from './vigor.js'
@@ -173,7 +174,7 @@ export class AgentLoop {
   /** 证据义务状态机（evidence-driven reasoning loop）——与 evidence 同寿命。 */
   obligations: ObligationTracker
   /** Obligation final gate 遥测（auto-continue 触发/误触发/诚实受阻计数，postSession 落 meta）。 */
-  obligationGateStats = { continued: 0, misfires: 0, honestBlocked: 0 }
+  obligationGateStats = { continued: 0, misfires: 0, honestBlocked: 0, suppressed: 0 }
   compactFailures: CompactCircuitBreakerState = { consecutiveFailures: 0 }
   recentToolHistory: ToolHistoryEntry[] = []
   /** Component C (typecheck-reminder): a .ts/.tsx file was written this session. */
@@ -410,10 +411,11 @@ export class AgentLoop {
    * 每次 run 结束覆盖上一条。写失败不致命（观测辅助，永不阻断）。
    */
   /** Obligation final gate 遥测计数（turn-orchestrator 回调；postSession 落 meta）。 */
-  recordObligationGateEvent(event: 'continued' | 'misfire' | 'honest_blocked'): void {
+  recordObligationGateEvent(event: 'continued' | 'misfire' | 'honest_blocked' | 'suppressed'): void {
     if (event === 'continued') this.obligationGateStats.continued += 1
     else if (event === 'misfire') this.obligationGateStats.misfires += 1
-    else this.obligationGateStats.honestBlocked += 1
+    else if (event === 'honest_blocked') this.obligationGateStats.honestBlocked += 1
+    else this.obligationGateStats.suppressed += 1
   }
 
   recordStopReason(r: StopReason): void {
@@ -1014,10 +1016,11 @@ export class AgentLoop {
 
   bindSessionDomain(taskDescription: string): void {
     if (this.sessionDomain !== undefined) return
-    // domainKeywordRouting 默认 false：Auto 固定开阳，不按消息 matchDomain。
+    // domainKeywordRouting 默认 true：Auto 按消息 matchDomain，未命中回退天枢；
+    // 显式 false 时固定落到 DEFAULT_DOMAIN。
     this.sessionDomain = isStarSoulEnabled()
       ? buildActiveDomain(taskDescription, {
-          keywordRouting: this.config.domainKeywordRouting === true,
+          keywordRouting: this.config.domainKeywordRouting !== false,
         })
       : null
     this.config.promptEngine.setActiveDomain(this.withDomainKnowledge(this.sessionDomain))
@@ -1860,7 +1863,7 @@ export class AgentLoop {
     // 风险阈值（计划纪律）。有活动才写，闲置会话不长 meta。
     try {
       const og = this.obligationGateStats
-      if (og.continued > 0 || og.misfires > 0 || og.honestBlocked > 0) {
+      if (og.continued > 0 || og.misfires > 0 || og.honestBlocked > 0 || og.suppressed > 0) {
         this.persist?.updateMetadata({ obligationGate: og })
       }
     } catch { /* meta 摘要是观测辅助 — 永不阻断 */ }
@@ -2322,7 +2325,8 @@ export class AgentLoop {
             priority: 0.65,
             tier: 'operational',
             category: 'discipline',
-            content: convergenceCheck.injectedMessage,
+            content: convergenceCheck.injectedMessage +
+              ` ${renderRouteAnnotation(STALL_ROUTE_TABLE[this.consecutiveNoToolTurns >= 2 ? 'no-tool-stall' : 'strategy-stall'])}`,
             // 谓词映射表（P1a + W3）：
             // - 无工具僵局变体：任意工具调用即打破僵局。
             // - 诊断态变体（W3）："核实后收束"的行为签名 = 后续轮出现认知型

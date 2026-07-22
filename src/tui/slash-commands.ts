@@ -117,6 +117,7 @@ const HELP_TEXT = `Available commands:
 /council <task> [--seats id1,id2,...] [--rounds 1-2] — Convene a star-domain council (single round; --rounds 2 enables a rebuttal round)
 /review — Manually trigger L2 review (single adversarial verifier) on current changes via deliver_task
 /review max — Manually trigger L3 review (Review Squadron, 5 inspectors) on current changes via deliver_task
+/review off|on|status — 会话级关闭/恢复/查看自动审查门（off 只抑制自动审查省 token，手动 /review 始终可用）
 (auto: every non-trivial deliver_task commit runs a single Wiring inspector — short budget, never blocks on infra failure)
 /sensorium — Show 天枢 3D self-awareness state
 /dream — Distill session decisions into project memory
@@ -215,6 +216,8 @@ export interface SlashHandlerContext {
   /** Mutable ref to the current GoalTracker. Set when /goal creates a tracker;
    *  read by deliver_task's B1Context for auto-review gating. */
   goalTrackerRef?: { current: import('../agent/goal-tracker.js').GoalTracker | null }
+  /** 会话级审查门开关：/review off|on 写入；deliver_task 经 isAutoReviewOff 读取。 */
+  reviewGateRef?: { current: 'auto' | 'off' }
 }
 
 /** 收集当前工作区未提交的改动文件（unstaged + staged + untracked）。 */
@@ -409,13 +412,22 @@ export function resolveAppPromptInput(
   if (custom) return { prompt: custom }
   const skillPrompt = resolveSkillPrompt(input, cwd)
   if (skillPrompt !== null) return { prompt: skillPrompt }
-  // /review [max] [focus description] — map to deliver_task instruction for the agent
-  const reviewMatch = input.match(/^\/review(?:\s+(max))?(?:\s+(.*))?$/i)
+  // /review off|on|status 是 TUI 本地会话开关——本路径（server/headless 映射层）没有
+  // refs 可写。明确告知，而不是把 "off" 误当 focus 触发一次审查（白烧 worker token）。
+  if (/^\/review\s+(?:off|on|status)\s*$/i.test(input)) {
+    return { prompt: `User typed "${input}". /review off|on|status is a TUI-local session toggle (auto-review gate) that this surface cannot flip. To disable auto review here, set review.skipAuto in config (desktop: Settings → Routing); manual /review [max] keeps working either way.` }
+  }
+  // /review [max|l1|l2|l3] [focus description] — map to deliver_task instruction for the agent
+  const reviewMatch = input.match(/^\/review(?:\s+(max|l1|l2|l3))?(?:\s+(.*))?$/i)
   if (reviewMatch) {
-    const isMax = !!reviewMatch[1]
+    const kw = reviewMatch[1]?.toLowerCase()
     const focusText = reviewMatch[2]?.trim()
-    const level = isMax ? 'L3' : 'L2'
-    const levelLabel = level === 'L3' ? 'L3 Review Squadron (5 inspectors)' : 'L2 adversarial verifier'
+    const level: 'L1' | 'L2' | 'L3' = kw === 'max' || kw === 'l3' ? 'L3' : kw === 'l1' ? 'L1' : 'L2'
+    const levelLabel = level === 'L3'
+      ? 'L3 Review Squadron (5 inspectors)'
+      : level === 'L1'
+        ? 'L1 nudge (review-discipline reminder, zero review workers)'
+        : 'L2 adversarial verifier'
     const focusInstruction = focusText ? ` Focus specifically on: ${focusText}.` : ''
     return { prompt: `Run code review on the current uncommitted changes: call deliver_task with commit=true and review_level="${level}". This triggers ${levelLabel}.${focusInstruction}` }
   }
@@ -752,10 +764,38 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     async handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
       const cmd = parts[0]!.toLowerCase()
-      // /review [max] [focus] — 独立审查入口（不经过 deliver_task）。
+      // /review off|on|status — 会话级自动审查门开关（即时生效，不写配置）。
+      // off 只抑制 deliver_task 提交后的系统自动审查：主控照常测试/验证/提交，
+      // 不再自动 spawn 审查 worker（省 token）；手动 /review [max] 不受影响。
+      const sub = parts[1]?.toLowerCase()
+      if (sub === 'off' || sub === 'on' || sub === 'status') {
+        const gateRef = ctx.reviewGateRef
+        if (!gateRef) {
+          pushStatic(createLogEntry({ type: 'system', content: '当前环境不支持会话级审查门开关；请用配置 review.skipAuto（持久，新会话生效）。' }))
+          setIsStreaming(false)
+          return true
+        }
+        if (sub === 'status') {
+          const state = gateRef.current === 'off' ? '已关闭（off）' : '开启（auto）'
+          pushStatic(createLogEntry({ type: 'system', content: `审查门状态：${state}。/review off 关闭自动审查，/review on 恢复；手动 /review [max] 始终可用。` }))
+        } else {
+          gateRef.current = sub === 'off' ? 'off' : 'auto'
+          pushStatic(createLogEntry({ type: 'system', content: sub === 'off'
+            ? '⏸ 自动审查门已关闭（本会话）：主控照常测试/验证/提交，不再自动 spawn 审查 worker。手动 /review [max] 仍可用；/review on 恢复。'
+            : '▶ 自动审查门已恢复（本会话）：交付后将按既有规则自动路由审查。' }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+      // /review [max|l1|l2|l3] [focus] — 独立审查入口（不经过 deliver_task）。
       // 当 ctx.runReview 可用时直接调 routeReviewWorkflow；否则 fallback 到旧路径。
-      const isMax = parts[1]?.toLowerCase() === 'max'
-      const focus = parts.slice(isMax ? 2 : 1).join(' ').trim()
+      const levelKw = parts[1]?.toLowerCase()
+      const forceLevel = levelKw === 'max' || levelKw === 'l3' ? 'L3' as const
+        : levelKw === 'l1' ? 'L1' as const
+        : levelKw === 'l2' ? 'L2' as const
+        : undefined
+      const isMax = forceLevel === 'L3'
+      const focus = parts.slice(forceLevel ? 2 : 1).join(' ').trim()
 
       if (!ctx.runReview) {
         // Fallback: 让 resolveAppPromptInput 映射为 deliver_task 指令
@@ -780,12 +820,14 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         files: dirtyFiles,
         crossModule: isCrossModule(dirtyFiles),
         isFix: isFixContext(focus || ''),
-        ...(isMax ? { forceLevel: 'L3' as const } : {}),
+        ...(forceLevel ? { forceLevel } : {}),
       }
 
       const mode: ReviewMode = 'manual'
-      const budgetSec = Math.round(reviewWorkflowBudgetMs(mode, isMax ? 'L3' : undefined) / 1000)
-      const levelLabel = isMax ? 'L3 Squadron (5 inspectors)' : 'auto-classify'
+      const budgetSec = forceLevel === 'L1'
+        ? 0
+        : Math.round(reviewWorkflowBudgetMs(mode, forceLevel === 'L3' ? 'L3' : forceLevel === 'L2' ? 'L2' : undefined) / 1000)
+      const levelLabel = forceLevel === 'L3' ? 'L3 Squadron (5 inspectors)' : forceLevel ?? 'auto-classify'
       pushStatic(createLogEntry({ type: 'system', content: `⏳ 审查启动中 (${levelLabel}, ≤${budgetSec}s)...\n` }))
 
       try {
@@ -1270,7 +1312,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         const matched = allDomains.find(d => d.id === sub || d.name === parts[1] || d.id === parts[1]?.toLowerCase())
         if (matched) {
           const midSession = ctx.agent.getSessionTurnCount() > 0
-          const domain = { id: matched.id, name: matched.name, volatileBlock: matched.volatileBlock, motto: matched.motto }
+          const domain = { id: matched.id, name: matched.name, volatileBlock: matched.volatileBlock, motto: matched.motto, courageThreshold: matched.courageThreshold }
           ctx.agent.setSessionDomain(domain)
           ctx.onDomainChange?.(domain.name)
           pushStatic(createLogEntry({ type: 'system', content: `星域切换: ${domain.name} (${domain.id})\n${domain.motto}\n\n${domain.volatileBlock}` }))
@@ -3435,6 +3477,7 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
         : undefined,
       submitToAgent: (prompt: string) => { app.submitText(prompt) },
       goalTrackerRef: ctx.refs.goalTrackerRef,
+      reviewGateRef: ctx.refs.reviewGateRef,
       surfacePush: (id: string) => { app.activateOverlay(id) },
       setChoicePanelKind: (kind) => { app.choicePanelKind = kind },
       surfacePop: () => { app.deactivateOverlay() },

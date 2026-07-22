@@ -19,6 +19,9 @@ export interface PlanItem {
   detail: string
   /** 该条目涉及的文件（席位用只读工具定位后结构化输出）。W-C7 桥接 team 分波用；缺省视为全局任务。 */
   files?: string[]
+  /** 提案席位 authority；草案条目为 'draft'。aggregateCouncil 填充（问责血缘，
+   *  编译进 UnifiedTaskNode.metadata.proposedBy，Phase 3 失败复议按此召回提案席）。 */
+  proposedBy?: string
 }
 
 export interface CouncilDraft {
@@ -42,12 +45,24 @@ export interface SeatAlternative {
   targetItemId?: string
 }
 
+/** 席位质疑 —— 结构化 challenge。blocking 级是否决语义的载体（Da'at 编译门）。 */
+export interface SeatChallenge {
+  text: string
+  /** blocking = 否决级：未化解（r2 concede/revise）前编译层拒绝产出 UnifiedPlan。
+   *  缺省 advisory（记录性质疑，主控待裁）。 */
+  severity?: 'advisory' | 'blocking'
+  /** 可验证验收命令（白名单形状则 wave-gate 波间直接执行）——编译进任务 verification。 */
+  gate?: string
+  /** 针对的草案/新增条目 id；缺省为全局质疑（gate 挂到所有任务）。 */
+  itemId?: string
+}
+
 export interface SeatContribution {
   authority: string
   summary: string
   additions: PlanItem[]
   risks: SeatRisk[]
-  challenges: string[]
+  challenges: SeatChallenge[]
   alternatives: SeatAlternative[]
   /** 实际生效模型（遥测/shadow 用，本轮可缺）。 */
   modelUsed?: string
@@ -79,6 +94,10 @@ export interface CouncilConflict {
   status: 'open' | 'resolved' | 'persisted'
   /** resolved 时的化解依据（来自让步/折中席位的 argument）。 */
   resolution?: string
+  /** blocking challenge 登记的冲突 —— 否决判定专用：未 resolved 前编译层拒绝产出计划。 */
+  severity?: 'blocking'
+  /** 冲突针对的条目 id（addition 碰撞时填）——r2 收敛后回写 mergedItems 的定位依据。 */
+  itemId?: string
 }
 
 export interface CouncilAggregate {
@@ -93,7 +112,17 @@ export interface CouncilPlan {
   contributions: SeatContribution[]
   aggregate: CouncilAggregate
   finalPlanMarkdown: string
-  meta: { round: number; convenedAt: number; objectiveHash: string }
+  meta: {
+    round: number
+    convenedAt: number
+    objectiveHash: string
+    /** 贡献解析失败（含单席重试）的席位 authority。缺省 = 全部成功。
+     *  这些席位以 [contribution_failed] 空贡献留痕，未参与合并裁决。 */
+    failedSeats?: string[]
+    /** 柱级退化检测结果（advisory 留痕，结构同 council-qliphoth 的 QliphothFlag——
+     *  内核不反向依赖检测模块，此处用结构化形状）。 */
+    qliphoth?: Array<{ kind: string; pillar: string; seat: string; detail: string }>
+  }
 }
 
 /** 空白/缺字段 id —— 用它做包含匹配会退化为永真，必须显式拦截。 */
@@ -135,9 +164,9 @@ export function aggregateCouncil(
 ): CouncilAggregate {
   const decisions: CouncilDecision[] = []
   const conflicts: CouncilConflict[] = []
-  const mergedItems: PlanItem[] = draft.items.map(i => ({ ...i }))
+  const mergedItems: PlanItem[] = draft.items.map(i => ({ ...i, proposedBy: i.proposedBy ?? 'draft' }))
 
-  const addConflict = (c: { description: string; left: string; right: string }): void => {
+  const addConflict = (c: { description: string; left: string; right: string; itemId?: string }): void => {
     const full: CouncilConflict = { ...c, key: stableConflictKey(c.left, c.right), status: 'open' }
     if (!conflicts.some(ex => sameConflict(ex, full))) conflicts.push(full)
   }
@@ -162,11 +191,11 @@ export function aggregateCouncil(
           decisions.push({ id, source: c.authority, kind: 'addition', title: add.title, rationale: `duplicate of existing item ${add.id}`, verdict: 'deferred', conflictWith: add.id })
         } else {
           decisions.push({ id, source: c.authority, kind: 'addition', title: add.title, rationale: `id ${add.id} collides with differing detail`, verdict: 'deferred', conflictWith: add.id })
-          addConflict({ description: `Addition conflict on ${add.id}`, left: existing.detail, right: add.detail })
+          addConflict({ description: `Addition conflict on ${add.id}`, left: existing.detail, right: add.detail, itemId: add.id })
         }
         return
       }
-      mergedItems.push({ ...add })
+      mergedItems.push({ ...add, proposedBy: c.authority })
       decisions.push({ id, source: c.authority, kind: 'addition', title: add.title, rationale: add.detail, verdict: 'accepted' })
     })
 
@@ -184,9 +213,21 @@ export function aggregateCouncil(
       decisions.push({ id, source: c.authority, kind: 'risk', title: `Risk: ${risk.claim.slice(0, 80)}`, rationale: risk.mitigation, verdict: 'accepted', ...(conflictWith ? { conflictWith } : {}) })
     })
 
-    // ── challenges ── 主控待裁的开放问题。
+    // ── challenges ── 主控待裁的开放问题；blocking 级同时登记为否决冲突，
+    // 走既有 open→resolved/persisted 状态机（r2 concede/revise 可化解）。
     c.challenges.forEach((ch, n) => {
-      decisions.push({ id: `${c.authority}:challenge:${n}`, source: c.authority, kind: 'challenge', title: `Challenge: ${ch.slice(0, 80)}`, rationale: ch, verdict: 'deferred' })
+      decisions.push({ id: `${c.authority}:challenge:${n}`, source: c.authority, kind: 'challenge', title: `Challenge: ${ch.text.slice(0, 80)}`, rationale: ch.text, verdict: 'deferred' })
+      if (ch.severity === 'blocking') {
+        conflicts.push({
+          description: `Blocking challenge from ${c.authority}`,
+          left: ch.text,
+          right: draft.objective,
+          // key 含席位+序号：同文否决来自不同席位是两条独立冲突，各自表态化解。
+          key: stableConflictKey(ch.text, `blocking:${c.authority}:${n}`),
+          status: 'open',
+          severity: 'blocking',
+        })
+      }
     })
 
     // ── alternatives ── recommend → accepted，否则 rejected（必须带理由）。
@@ -196,6 +237,31 @@ export function aggregateCouncil(
   }
 
   return { decisions, mergedItems, conflicts }
+}
+
+/** r2 收敛回写：resolved 冲突（带 itemId）把化解依据注记进对应条目 detail。
+ *  纯函数——修复「persisted 冲突不回写 mergedItems」的现状断层：r2 的收敛结果
+ *  此前只留在 conflicts 表，执行图看不见。 */
+export function applyResolutionsToMergedItems(
+  mergedItems: PlanItem[],
+  conflicts: CouncilConflict[],
+): PlanItem[] {
+  const resolutionByItem = new Map<string, string>()
+  for (const cf of conflicts) {
+    if (cf.status === 'resolved' && cf.itemId && cf.resolution) {
+      resolutionByItem.set(cf.itemId, cf.resolution)
+    }
+  }
+  if (resolutionByItem.size === 0) return mergedItems.map(i => ({ ...i }))
+  return mergedItems.map(item => {
+    const res = resolutionByItem.get(item.id)
+    return res ? { ...item, detail: `${item.detail}\n[r2 收敛] ${res}` } : { ...item }
+  })
+}
+
+/** 否决判定：未化解（open/persisted）的 blocking 冲突。非空时编译层拒绝产出 UnifiedPlan。 */
+export function unresolvedBlockingConflicts(aggregate: CouncilAggregate): CouncilConflict[] {
+  return aggregate.conflicts.filter(c => c.severity === 'blocking' && c.status !== 'resolved')
 }
 
 /**

@@ -139,8 +139,8 @@ export interface AgentConfig {
    *  收敛检测以 v2 状态为准；缺省回退 v1（EvidenceState 推导）。 */
   deliveryGateV2?: (currentDirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
   /**
-   * 会话 Auto 是否按消息关键词匹配换域。默认 false（发版）：Auto 固定开阳。
-   * 显式 true 恢复 per-message matchDomain。
+   * 会话 Auto 是否按消息关键词匹配换域。默认 true：按首条消息 matchDomain，
+   * 未命中回退天枢。显式 false 时 Auto 固定落到 DEFAULT_DOMAIN。
    */
   domainKeywordRouting?: boolean
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. Disabled by default. */
@@ -285,4 +285,13 @@ export interface AgentCallbacks {
   onAutonomyCheckpoint?: (info: AutonomyCheckpointInfo) => void
   /** T4 — structured per-worker delegation status/progress (subagent panel). */
   onDelegationActivity?: (activity: DelegationActivity) => void
+  /**
+   * E4 — optional client tool-landing delegation. Return null to fail-back to
+   * local execution (no client / capability miss / timeout). A resolved
+   * DelegateResult becomes the tool_result; reject uses isError=false.
+   */
+  onToolDelegate?: (
+    kind: 'apply_edit' | 'terminal_exec',
+    payload: Record<string, unknown>,
+  ) => Promise<{ content: string; isError?: boolean; uiContent?: string; status?: 'ok' | 'rejected' } | null>
 }

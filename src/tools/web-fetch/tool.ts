@@ -41,15 +41,15 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
   return {
     definition: {
       name: 'web_fetch',
-      description: `Fetch content from a URL and return it as text. Useful for reading documentation, API references, or issue pages.
-		Returns the page content converted to plain text (HTML tags stripped). Content is truncated to ~50K characters.
-		Requires user approval since it makes network requests.`,
+      description: `抓取 URL 内容并以文本返回。适合阅读文档、API 参考或 issue 页面。
+		返回转换为纯文本的页面内容（已剥离 HTML 标签）。内容截断至约 50K 字符。
+		因发起网络请求，需要用户审批。`,
       input_schema: {
         type: 'object',
         properties: {
           url: {
             type: 'string',
-            description: 'The URL to fetch',
+            description: '要抓取的 URL',
           },
         },
         required: ['url'],

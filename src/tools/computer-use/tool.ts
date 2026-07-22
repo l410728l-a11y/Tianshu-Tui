@@ -514,69 +514,69 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
   return {
     definition: {
       name: 'computer_use',
-      description: `Operate desktop graphical apps (macOS and Windows): inspect an app's accessibility tree, click/scroll/drag elements, type text, send key combos, focus apps. Use ONLY when CLI tools, MCP servers, or structured integrations can't do the job (e.g. a native app with no API, a GUI-only setting, or reproducing a UI-only bug) — prefer structured tools whenever available.
+      description: `操作桌面图形应用（macOS 和 Windows）：检查应用的可访问性树、点击/滚动/拖拽元素、输入文本、发送组合键、聚焦应用。仅当 CLI 工具、MCP 服务或结构化集成无法完成任务时使用（如无 API 的原生应用、纯 GUI 设置、或复现 UI-only bug）——有结构化工具时优先用结构化工具。
 
-Every action on an app requires human approval unless that app is already granted "always allow". Screenshots are saved as viewable artifacts; the accessibility tree (text) is what you reason over. When the active model supports vision, the snapshot screenshot is also attached to the conversation as an image.
+对应用的每个操作都需要人工审批，除非该应用已被授予"始终允许"。截图保存为可查看的 artifact；可访问性树（文本）是你的推理依据。当活跃模型支持视觉时，快照截图也会作为图片附加到对话中。
 
-Actions:
-- check_permissions: report system capability/permission status (no approval).
-- list_apps: list visible apps.
-- snapshot(app): return the app's numbered accessibility tree + save a screenshot artifact. If the UI has not changed since the last snapshot, returns a short "unchanged" note instead of repeating the tree. Electron apps (QQ, WeChat, VS Code…) populate their tree a few seconds after the first snapshot — the tool warms up and retries automatically; a huge tree may come back marked "partial" (refs are still valid; use find/wait_for for deeper content). NEVER conclude an app is invisible from one sparse snapshot — snapshot again or use find first.
-- find(app, query): snapshot but return ONLY tree lines matching the query (role/title/value, case-insensitive) with their ancestor chain. Preferred over snapshot for large UIs (browsers) — same refs, far less output.
-- wait_for(app, text, gone?, timeout_ms?): poll the UI until a tree line containing "text" appears (or disappears with gone:true). Returns the matching lines with clickable refs. Use after actions that trigger loads/animations instead of blind wait+snapshot loops.
-- click(app, ref|x,y): left-click a snapshot element ref (preferred) or coordinates.
-- double_click(app, ref|x,y) / right_click(app, ref|x,y): double / context click.
-- scroll(app, direction, amount?, ref|x,y?): scroll the view under the target (default: window center).
-- drag(app, from_ref|from_x+from_y, to_ref|to_x+to_y): press-drag-release.
-- type(app, text): type text into the focused field (short ASCII text; use paste_text for long text, set_value to write a specific field). Non-ASCII text (Chinese/emoji) automatically routes through clipboard paste — immune to the active input method (IME), but overwrites the clipboard.
-- set_value(app, ref, text): write a value directly into a text-like control (text field, search box) — no focus juggling. Errors if the control doesn't accept value writes; fall back to click + type/paste_text.
-- key(app, combo): send a key combo like "cmd+s" or "return" (on Windows, cmd maps to Ctrl).
-- wait(duration_ms): pause up to 5000ms for animations/loads (no approval). Prefer wait_for when you know what you're waiting for.
-- focus_app(app): bring an app to the foreground.
-- launch_app(app): start an app that is not running (focuses it if already running).
-- menu_select(app, menu_path): pick a menu-bar item by path, e.g. "File > Export > PNG".
-- paste_text(app, text): put text on the clipboard and paste it (fast + reliable for long/multiline text; overwrites the clipboard).
+操作：
+- check_permissions：报告系统能力/权限状态（无需审批）。
+- list_apps：列出可见应用。
+- snapshot(app)：返回应用的编号可访问性树 + 保存截图 artifact。如果 UI 自上次快照以来没有变化，返回简短"未变化"提示而非重复整棵树。Electron 应用（QQ、微信、VS Code…）在首次快照后几秒才会填充树——工具会自动预热并重试；超大树可能标记为"部分"（ref 仍然有效；用 find/wait_for 获取更深内容）。绝不要因为一次稀疏快照就断定应用不可见——再拍一次快照或先用 find。
+- find(app, query)：快照但仅返回匹配查询的树行（角色/标题/值，不区分大小写）及其祖先链。对大型 UI（浏览器）优于 snapshot——同样的 ref，少得多的输出。
+- wait_for(app, text, gone?, timeout_ms?)：轮询 UI 直到含"text"的树行出现（或 gone:true 时消失）。返回匹配行及可点击的 ref。在触发加载/动画的操作后使用，而不是盲 wait+snapshot 循环。
+- click(app, ref|x,y)：左键点击快照元素 ref（推荐）或坐标。
+- double_click(app, ref|x,y) / right_click(app, ref|x,y)：双击/右键点击。
+- scroll(app, direction, amount?, ref|x,y?)：在目标下滚动视图（默认：窗口中心）。
+- drag(app, from_ref|from_x+from_y, to_ref|to_x+to_y)：按住拖拽释放。
+- type(app, text)：向聚焦字段输入文本（短 ASCII 文本；长文本用 paste_text，写特定字段用 set_value）。非 ASCII 文本（中文/emoji）自动走剪贴板粘贴——不受当前输入法（IME）影响，但会覆盖剪贴板。
+- set_value(app, ref, text)：直接向文本控件（文本框、搜索框）写入值——无需焦点切换。如果控件不支持值写入则报错；回退到 click + type/paste_text。
+- key(app, combo)：发送组合键如 "cmd+s" 或 "return"（Windows 上 cmd 映射为 Ctrl）。
+- wait(duration_ms)：暂停最多 5000ms 等待动画/加载（无需审批）。知道等什么时优先用 wait_for。
+- focus_app(app)：将应用带到前台。
+- launch_app(app)：启动未运行的应用（已在运行时则聚焦它）。
+- menu_select(app, menu_path)：按路径选择菜单栏项，如 "File > Export > PNG"。
+- paste_text(app, text)：将文本放入剪贴板并粘贴（长/多行文本快速可靠；覆盖剪贴板）。
 
-Browser fast path: Chrome-family targets (Chrome/Chromium/Edge/Brave) automatically use a DevTools (CDP) backend when available — snapshots are sub-second and clicks/typing work even when the window is occluded. launch_app on a browser starts a dedicated automation profile (sign-ins persist across sessions). Browser-only actions:
-- navigate(app, url): go to a URL, or "back" / "forward" / "reload".
-- read_page(app): full page text (innerText) — no tree-node cap; use for reading articles/long content.
-- js_eval(app, expression): run JavaScript in the page and return the result (always needs approval).
-- tabs(app, tab_op, tab?, url?): list/activate/new/close browser tabs (tab is the 1-based index from list).
-- browser_adopt(endpoint): attach to a Chrome you started with --remote-debugging-port (always needs approval).
+浏览器快速路径：Chrome 系目标（Chrome/Chromium/Edge/Brave）在有 DevTools（CDP）后端可用时自动使用——快照秒级完成，窗口被遮挡时点击/输入仍有效。对浏览器 launch_app 会启动专用自动化 profile（登录态跨会话保留）。浏览器专属操作：
+- navigate(app, url)：导航到 URL，或 "back" / "forward" / "reload"。
+- read_page(app)：完整页面文本（innerText）——无树节点上限；用于阅读文章/长内容。
+- js_eval(app, expression)：在页面中运行 JavaScript 并返回结果（始终需要审批）。
+- tabs(app, tab_op, tab?, url?)：列出/激活/新建/关闭浏览器标签页（tab 是 list 中的 1-based 索引）。
+- browser_adopt(endpoint)：附加到你用 --remote-debugging-port 启动的 Chrome（始终需要审批）。
 
-Feedback loop: after each mutating action the tool re-reads the UI and appends how it changed (added/removed elements). When the UI changed, the ref cache is refreshed — refs shown in that diff are immediately clickable, refs from before the action are stale. If a targeted ref went stale, the tool re-snapshots and retries automatically when exactly one element still matches the same role+title; otherwise it refreshes the cache and asks you to re-target.`,
+反馈循环：每次变更操作后工具会重新读取 UI 并附加变化摘要（新增/移除的元素）。UI 变化时 ref 缓存会刷新——diff 中显示的 ref 立即可点击，操作之前的 ref 已失效。如果目标 ref 失效，工具会在恰好一个元素仍匹配相同 role+title 时自动重拍快照并重试；否则刷新缓存并请你重新选择目标。`,
       input_schema: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
             enum: ['check_permissions', 'list_apps', 'snapshot', 'find', 'wait_for', 'click', 'double_click', 'right_click', 'scroll', 'drag', 'type', 'set_value', 'key', 'wait', 'focus_app', 'launch_app', 'menu_select', 'paste_text', 'navigate', 'read_page', 'js_eval', 'tabs', 'browser_adopt'],
-            description: 'What to do.',
+            description: '要执行的操作。',
           },
-          app: { type: 'string', description: 'Target app name (required for all actions except list_apps/check_permissions/wait).' },
-          ref: { type: 'number', description: 'Snapshot element ref to target (click/scroll/set_value; from the latest snapshot).' },
-          x: { type: 'number', description: 'X coordinate (screen pixels) when no ref is given.' },
-          y: { type: 'number', description: 'Y coordinate (screen pixels) when no ref is given.' },
-          text: { type: 'string', description: 'Text to type (type), paste (paste_text), write (set_value), or wait for in the tree (wait_for).' },
-          query: { type: 'string', description: 'Filter string matched against tree lines (find action).' },
-          gone: { type: 'boolean', description: 'wait_for: wait for the text to DISAPPEAR instead of appear.' },
-          timeout_ms: { type: 'number', description: 'wait_for deadline in ms (default 5000, capped at 15000).' },
-          menu_path: { type: 'string', description: 'Menu path separated by ">", e.g. "File > Export > PNG" (menu_select action).' },
-          combo: { type: 'string', description: 'Key combo like "cmd+s", "shift+cmd+4", "return" (key action; cmd maps to Ctrl on Windows).' },
-          direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Scroll direction (scroll action).' },
-          amount: { type: 'number', description: 'Scroll magnitude in wheel lines, 1-50 (default 5).' },
-          from_ref: { type: 'number', description: 'Drag start: snapshot ref.' },
-          from_x: { type: 'number', description: 'Drag start X (when no from_ref).' },
-          from_y: { type: 'number', description: 'Drag start Y (when no from_ref).' },
-          to_ref: { type: 'number', description: 'Drag end: snapshot ref.' },
-          to_x: { type: 'number', description: 'Drag end X (when no to_ref).' },
-          to_y: { type: 'number', description: 'Drag end Y (when no to_ref).' },
-          duration_ms: { type: 'number', description: 'Wait duration in ms, capped at 5000 (wait action).' },
-          url: { type: 'string', description: 'URL to open (navigate / tabs new). navigate also accepts "back", "forward", "reload".' },
-          expression: { type: 'string', description: 'JavaScript to evaluate in the page (js_eval action).' },
-          tab_op: { type: 'string', enum: ['list', 'activate', 'new', 'close'], description: 'Tab operation (tabs action; default list).' },
-          tab: { type: 'number', description: '1-based tab index from tabs list (tabs activate/close).' },
-          endpoint: { type: 'string', description: 'DevTools endpoint like "localhost:9222" or an http/ws URL (browser_adopt action).' },
+          app: { type: 'string', description: '目标应用名称（除 list_apps/check_permissions/wait 外所有操作必需）。' },
+          ref: { type: 'number', description: '目标快照元素 ref（click/scroll/set_value；来自最新快照）。' },
+          x: { type: 'number', description: 'X 坐标（屏幕像素），无 ref 时使用。' },
+          y: { type: 'number', description: 'Y 坐标（屏幕像素），无 ref 时使用。' },
+          text: { type: 'string', description: '要输入（type）、粘贴（paste_text）、写入（set_value）的文本，或在树中等待（wait_for）。' },
+          query: { type: 'string', description: '匹配树行的过滤字符串（find 操作）。' },
+          gone: { type: 'boolean', description: 'wait_for：等待文本消失而非出现。' },
+          timeout_ms: { type: 'number', description: 'wait_for 截止毫秒数（默认 5000，上限 15000）。' },
+          menu_path: { type: 'string', description: '菜单路径，用 ">" 分隔，如 "File > Export > PNG"（menu_select 操作）。' },
+          combo: { type: 'string', description: '组合键如 "cmd+s"、"shift+cmd+4"、"return"（key 操作；Windows 上 cmd 映射为 Ctrl）。' },
+          direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: '滚动方向（scroll 操作）。' },
+          amount: { type: 'number', description: '滚动幅度，滚轮行数 1-50（默认 5）。' },
+          from_ref: { type: 'number', description: '拖拽起点：快照 ref。' },
+          from_x: { type: 'number', description: '拖拽起点 X（无 from_ref 时）。' },
+          from_y: { type: 'number', description: '拖拽起点 Y（无 from_ref 时）。' },
+          to_ref: { type: 'number', description: '拖拽终点：快照 ref。' },
+          to_x: { type: 'number', description: '拖拽终点 X（无 to_ref 时）。' },
+          to_y: { type: 'number', description: '拖拽终点 Y（无 to_ref 时）。' },
+          duration_ms: { type: 'number', description: '等待时长毫秒数，上限 5000（wait 操作）。' },
+          url: { type: 'string', description: '要打开的 URL（navigate / tabs new）。navigate 也接受 "back"、"forward"、"reload"。' },
+          expression: { type: 'string', description: '要在页面中执行的 JavaScript（js_eval 操作）。' },
+          tab_op: { type: 'string', enum: ['list', 'activate', 'new', 'close'], description: '标签页操作（tabs 操作；默认 list）。' },
+          tab: { type: 'number', description: '来自 tabs list 的 1-based 标签索引（tabs activate/close）。' },
+          endpoint: { type: 'string', description: 'DevTools 端点，如 "localhost:9222" 或 http/ws URL（browser_adopt 操作）。' },
         },
         required: ['action'],
       },

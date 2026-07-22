@@ -33,6 +33,61 @@ export const DEFAULT_COUNCIL_SEATS: readonly CouncilSeat[] = [
   { authority: 'tianxuan', charter: '探索：方案空间与替代路径' },
 ]
 
+// ── 三柱对抗拓扑（织命议事会 Phase 2）─────────────────────────────────────
+// 卡巴拉结构机制：扩张与约束必须分属独立席位，禁止同席「又给又砍」；
+// 平衡柱是第三算子（合成裁决），不是折中平均。
+
+export type CouncilPillar = 'expansion' | 'constraint' | 'balance'
+
+/** 星域 → 柱归属。未列出的 authority（自定义域）不参与柱级检测。 */
+const PILLAR_OF_AUTHORITY: Record<string, CouncilPillar> = {
+  // 扩张柱：激进方案、空位方案、前提质疑
+  pojun: 'expansion',
+  tianji: 'expansion',
+  tianxuan: 'expansion',
+  // 约束柱：风险称量、边界防守、变更守护
+  tianquan: 'constraint',
+  huagai: 'constraint',
+  tianfu: 'constraint',
+  tianliang: 'constraint',
+  // 平衡柱：合成裁决（唯一）
+  yaoguang: 'balance',
+}
+
+export function pillarOf(authority: string): CouncilPillar | undefined {
+  return PILLAR_OF_AUTHORITY[authority]
+}
+
+/** 三柱旗舰席位（council max，`pillars:true` 启用）——制度化对抗结构：
+ *  扩张柱（破军激进 + 天机质疑）× 约束柱（天权称量 + 华盖否决）× 平衡柱（瑶光合成）。
+ *  约束柱与平衡柱带瑶光门（strong 硬地板）：否决与合成的质量不容降档。 */
+export const THREE_PILLAR_COUNCIL_SEATS: readonly CouncilSeat[] = [
+  { authority: 'pojun', charter: '扩张柱·锋刃：给出最大杠杆的激进方案与被主流忽视的空位方案，宁可激进后被砍，不可平庸。' },
+  { authority: 'tianji', charter: '扩张柱·天机：质疑草案的隐含前提，给出替代路径；每条质疑附可验证依据。' },
+  { authority: 'tianquan', charter: '约束柱·称量：架构层次、优先级与代价称量；对过度设计与范围膨胀提出 challenge。', tierHint: 'strong', noDowngrade: true },
+  { authority: 'huagai', charter: '约束柱·华盖：边界防守与否决审查——发现不可接受的风险时发 blocking challenge（附具体依据与化解条件），并为关键断言声明 gate 验收命令。', tierHint: 'strong', noDowngrade: true },
+  { authority: 'yaoguang', charter: '平衡柱·瑶光：合成裁决——产出「扩张与约束双方仍有效」的单一方案，禁止两边各砍一半的折中平均；为最终方案声明验收 gate。', tierHint: 'strong', noDowngrade: true },
+]
+
+/** 配置席位按 authority 覆盖三柱席的 provider/model/tierHint（异构模型接线）：
+ *  用户在 agent.council.seats 里给某星域配了专属模型时，pillars 模式沿用该绑定。
+ *  未匹配的配置席忽略；柱席章程与结构不受覆盖影响。 */
+export function mergeSeatOverrides(
+  pillarSeats: readonly CouncilSeat[],
+  overrides: readonly CouncilSeat[],
+): CouncilSeat[] {
+  return pillarSeats.map(seat => {
+    const o = overrides.find(x => x.authority === seat.authority)
+    if (!o) return { ...seat }
+    return {
+      ...seat,
+      ...(o.tierHint ? { tierHint: o.tierHint } : {}),
+      ...(o.noDowngrade !== undefined ? { noDowngrade: o.noDowngrade } : {}),
+      ...(o.provider && o.model ? { provider: o.provider, model: o.model } : {}),
+    }
+  })
+}
+
 export interface CouncilSeatRoute {
   authority: string
   /** 最终生效 tier。 */

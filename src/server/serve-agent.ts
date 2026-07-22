@@ -37,9 +37,11 @@ import { runCouncil, runCouncilDebate, type CouncilInput } from '../agent/counci
 import type { CouncilSeat } from '../agent/council/council-routing.js'
 import { renderCouncilPlan, summarizeCouncilPlan } from '../agent/council/council-render.js'
 import { DEFAULT_COUNCIL_SEATS } from '../agent/council/council-routing.js'
-import { councilPlanToUnifiedPlan } from '../agent/council/council-to-plan.js'
+import { compileCouncilPlan } from '../agent/council/council-to-plan.js'
+import { sealPlan } from '../agent/council/council-seal.js'
+import { extractObligations, attachObligations } from '../agent/council/council-obligations.js'
 import { serializeUnifiedPlan, deserializeUnifiedPlan, type UnifiedPlan } from '../agent/unified-plan.js'
-import { recordCouncilSession } from '../agent/council/council-telemetry.js'
+import { buildCouncilSessionEvent, recordCouncilSession } from '../agent/council/council-telemetry.js'
 import { persistCouncilRoutingShadow } from '../agent/council/council-routing.js'
 import type { PlanItem } from '../agent/council/council-plan.js'
 import type { McpManager } from '../mcp/manager.js'
@@ -234,6 +236,14 @@ export function forgetSessionStores(sessionId: string): void {
   sessionStoresById.delete(sessionId)
 }
 
+/** Late-bound review-gate ref for the session-manager's getReviewGate /
+ *  setReviewGate. Undefined when no stores exist yet (idle / rehydrated
+ *  session whose agent hasn't been built) — the manager's session override
+ *  still applies once stores are built (applySelections re-push). */
+export function resolveReviewGateRef(sessionId: string): { current: 'auto' | 'off' } | undefined {
+  return sessionStoresById.get(sessionId)?.stores.refs.reviewGateRef
+}
+
 function buildSessionStores(
   ctx: ServeContext,
   cwd: string,
@@ -293,6 +303,9 @@ function buildSessionStores(
       ? () => shared.sameCwdRunningCount?.(cwd, sessionId) ?? 0
       : undefined,
     goalTrackerRef: { current: null },
+    // 会话级审查门开关：初始值取 review.skipAuto 配置快照。sidecar 无 /review off
+    // 本地命令，运行期不变更（桌面端经 Settings 修改配置后新会话生效）。
+    reviewGateRef: { current: ctx.config.agent.review.skipAuto ? 'off' : 'auto' },
     // 插件 hooks/commands：sidecar 暂不加载插件（TUI bootstrap 专属装配链），
     // 保持空数组与 RuntimeRefs 契约对齐——消费方按空集处理，不影响会话。
     pluginHooks: [],
@@ -727,6 +740,10 @@ async function conveneCouncilOnCoordinator(
         kind: r.kind,
         profile: r.profile,
         scope: r.scope,
+        // 席位路由字段透传：曾在此处丢弃，桌面路由的异构席/瑶光门失效。
+        authority: r.authority,
+        ...(r.modelOverride ? { modelOverride: r.modelOverride } : {}),
+        ...(r.tierFloor ? { tierFloor: r.tierFloor } : {}),
       }))
       const run = await coordinator.delegateBatch(
         delegationReqs,
@@ -743,9 +760,13 @@ async function conveneCouncilOnCoordinator(
   const runner = councilInput.maxRounds && councilInput.maxRounds >= 2 ? runCouncilDebate : runCouncil
   const plan = await runner(councilInput, deps)
   const planMarkdown = renderCouncilPlan(plan)
-  const outputRaw = plan.aggregate.mergedItems.length > 0
-    ? [planMarkdown, '', '```council-plan-json', serializeUnifiedPlan(councilPlanToUnifiedPlan(plan)), '```'].join('\n')
-    : planMarkdown
+  // Da'at 编译门（与 council_convene 工具同款）：否决态不嵌可执行 planJson。
+  const compiled = plan.aggregate.mergedItems.length > 0 ? compileCouncilPlan(plan) : undefined
+  const outputRaw = compiled?.ok && compiled.plan
+    ? [planMarkdown, '', '```council-plan-json', serializeUnifiedPlan(sealPlan(attachObligations(compiled.plan, extractObligations(plan)))), '```'].join('\n')
+    : compiled && !compiled.ok
+      ? [planMarkdown, '', '## ⛔ 议事会否决（blocking challenge 未化解）', ...compiled.vetoes.map(v => `- ${v.description}: ${v.left}`)].join('\n')
+      : planMarkdown
   const savedArtifactId = await agent.artifactStore?.save({
     tool: 'council_convene',
     target: `council:${plan.meta.objectiveHash}`,
@@ -754,22 +775,13 @@ async function conveneCouncilOnCoordinator(
     sections: [],
   })
   try {
-    recordCouncilSession(refs.meridianIndexer?.getDb(), {
-      schemaVersion: 1,
+    // 复用 buildCouncilSessionEvent（与 council_convene 工具同一构造器），
+    // 避免手工展开字段随 schema 演进漂移（Phase 2 新增分歧度指标即此教训）。
+    recordCouncilSession(refs.meridianIndexer?.getDb(), buildCouncilSessionEvent({
       sessionId: refs.sessionId ?? 'unknown',
-      objective: plan.objective,
-      objectiveHash: plan.meta.objectiveHash,
-      seats: plan.seats,
-      roundsRun: plan.meta.round,
-      decisionCount: plan.aggregate.decisions.length,
-      acceptedCount: plan.aggregate.decisions.filter((d) => d.verdict === 'accepted').length,
-      rejectedCount: plan.aggregate.decisions.filter((d) => d.verdict === 'rejected').length,
-      deferredCount: plan.aggregate.decisions.filter((d) => d.verdict === 'deferred').length,
-      conflictCount: plan.aggregate.conflicts.length,
-      mergedItemCount: plan.aggregate.mergedItems.length,
-      convenedAt: plan.meta.convenedAt,
+      plan,
       timestamp: Date.now(),
-    })
+    }))
   } catch {
     // 遥测失败不影响交付
   }

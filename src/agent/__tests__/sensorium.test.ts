@@ -333,6 +333,8 @@ describe('computeStrategy', () => {
       momentum: 0.5,
       pressure: 0.3,
       confidence: 0.7,
+      verificationCoverage: 0.7,
+      decisiveness: null,
       complexity: 0.3,
       freshness: 0.5,
       stability: 0.8,
@@ -405,8 +407,11 @@ describe('computeStrategy', () => {
     const normal = makeSensorium({ confidence: 0.5, momentum: 0.5 })
     assert.equal(computeStrategy(normal).shouldEscalate, false)
 
+    // v3: shouldEscalate is now always false — automatic model escalation is disabled.
+    // The old trigger condition (confidence < 0.3 && momentum < 0.2) was driven by
+    // a misnamed coverage metric, not actual agent confidence.
     const escalateCase = makeSensorium({ confidence: 0.2, momentum: 0.1 })
-    assert.equal(computeStrategy(escalateCase).shouldEscalate, true)
+    assert.equal(computeStrategy(escalateCase).shouldEscalate, false)
   })
 
   it('does not escalate when only one condition met', () => {
@@ -444,5 +449,117 @@ describe('computeStrategy', () => {
     assert.equal(typeof profile.commitThreshold, 'number')
     assert.equal(typeof profile.shouldEscalate, 'boolean')
     assert.equal(typeof profile.thetaCycleInterval, 'number')
+  })
+
+  // ─── v3: shouldEscalate 恒 false ──────────────────────────────────
+
+  it('shouldEscalate is always false regardless of confidence/momentum (v3)', () => {
+    // Low confidence + low momentum — the old trigger
+    assert.equal(computeStrategy(makeSensorium({ confidence: 0.1, momentum: 0.1 })).shouldEscalate, false)
+    // High confidence + high momentum
+    assert.equal(computeStrategy(makeSensorium({ confidence: 0.9, momentum: 0.9 })).shouldEscalate, false)
+    // Boundary: exactly at old threshold
+    assert.equal(computeStrategy(makeSensorium({ confidence: 0.29, momentum: 0.19 })).shouldEscalate, false)
+  })
+})
+
+// ─── v3 decisiveness + verificationCoverage ────────────────────────
+
+describe('computeSensorium v3 fields', () => {
+  function baseInput(overrides: Partial<SensoriumInput> = {}): SensoriumInput {
+    return {
+      predictionAcc: { windowSize: 10, predictions: [true, true, false], consecutiveCorrect: 2 },
+      pressureResult: { tier: 0, shouldCompact: false, thrashing: false, fastGrowth: false, growthRate: 0, cvmOverheadRatio: 0, shouldThrottleCvm: false, ratio: 0.2 },
+      evidenceState: { filesModified: 5, verifiedCount: 3 },
+      toolCallHistory: ['bash', 'read_file'],
+      pheromones: [],
+      doomLevel: 'none',
+      ...overrides,
+    }
+  }
+
+  it('verificationCoverage = verifiedCount / filesModified', () => {
+    const s = computeSensorium(baseInput({ evidenceState: { filesModified: 5, verifiedCount: 3 } }))
+    assert.equal(s.verificationCoverage, 0.6)
+  })
+
+  it('verificationCoverage = 1.0 when no files modified (vacuous truth)', () => {
+    const s = computeSensorium(baseInput({ evidenceState: { filesModified: 0, verifiedCount: 0 } }))
+    assert.equal(s.verificationCoverage, 1.0)
+  })
+
+  it('confidence still exists as deprecated alias for verificationCoverage', () => {
+    const s = computeSensorium(baseInput({ evidenceState: { filesModified: 4, verifiedCount: 2 } }))
+    assert.equal(s.confidence, s.verificationCoverage)
+    assert.equal(s.confidence, 0.5)
+  })
+
+  it('decisiveness = 0.4*convergenceScore + 0.6*momentum', () => {
+    const s = computeSensorium(baseInput({ convergenceScore: 0.8 }))
+    // momentum = 2/3 ≈ 0.667
+    const expected = 0.4 * 0.8 + 0.6 * (2 / 3)
+    assert.ok(Math.abs(s.decisiveness! - expected) < 0.01, `expected ~${expected.toFixed(3)}, got ${s.decisiveness}`)
+  })
+
+  it('decisiveness is null when convergenceScore is null/undefined (no data)', () => {
+    const s = computeSensorium(baseInput())
+    // convergenceScore defaults to undefined → decisiveness null
+    assert.equal(s.decisiveness, null)
+  })
+
+  it('decisiveness is null when convergenceScore is explicitly null', () => {
+    const s = computeSensorium(baseInput({ convergenceScore: null }))
+    assert.equal(s.decisiveness, null)
+  })
+
+  it('quality.decisiveness is no-data when convergenceScore absent', () => {
+    const s = computeSensorium(baseInput())
+    assert.equal(s.quality!.decisiveness, 'no-data')
+  })
+
+  it('quality.decisiveness is measured when convergenceScore present', () => {
+    const s = computeSensorium(baseInput({ convergenceScore: 0.7 }))
+    assert.equal(s.quality!.decisiveness, 'measured')
+  })
+
+  it('verificationCoverage clamps to 0-1 range', () => {
+    const s = computeSensorium(baseInput({ evidenceState: { filesModified: 2, verifiedCount: 10 } }))
+    assert.equal(s.verificationCoverage, 1.0)
+  })
+})
+
+// ─── v3: pressureRelative 接线 + 冷启动边界 ───────────────────────
+
+describe('computePressure pressureRelative wiring (v3)', () => {
+  function prInput(pr: Partial<SensoriumInput['pressureResult']>, evidence = { filesModified: 0, verifiedCount: 0 }): SensoriumInput {
+    return {
+      predictionAcc: { windowSize: 10, predictions: [true], consecutiveCorrect: 1 },
+      pressureResult: { tier: 0, shouldCompact: false, thrashing: false, fastGrowth: false, growthRate: 0, cvmOverheadRatio: 0, shouldThrottleCvm: false, ratio: 0.1, ...pr },
+      evidenceState: evidence,
+      toolCallHistory: [],
+      pheromones: [],
+      doomLevel: 'none',
+    }
+  }
+
+  it('uses pressureRelative over absolute ratio when present (低 ctxRatio 不再被 0.5 锁死)', () => {
+    // ratio 绝对值仅 0.1（0.50*0.1=0.05 贡献），但 pressureRelative=0.9（相对历史高压）
+    // → 应反映相对高压而非绝对低压
+    const s = computeSensorium(prInput({ ratio: 0.1, pressureRelative: 0.9 }))
+    // 0.50*0.9 = 0.45，远高于 0.50*0.1=0.05
+    assert.ok(s.pressure > 0.4, `expected relative pressure to dominate, got ${s.pressure}`)
+  })
+
+  it('falls back to absolute ratio when pressureRelative is undefined (history < 5)', () => {
+    const s = computeSensorium(prInput({ ratio: 0.3, pressureRelative: undefined }))
+    // 0.50*0.3 = 0.15
+    assert.ok(Math.abs(s.pressure - 0.15) < 0.001, `expected 0.15, got ${s.pressure}`)
+  })
+
+  it('cold-start: zero history → p90 clamp 0.01 → non-zero ratio saturates pressureRelative to 1.0', () => {
+    // 冷启动边界：历史全 0，p90=0→clamp 0.01，任何非零 ratio → pressureRelative≈1.0
+    // 该测试锚定这个饱和行为是有意的（相对压力在冷启动时保守报高，不漏报）
+    const s = computeSensorium(prInput({ ratio: 0.05, pressureRelative: 1.0 }))
+    assert.ok(s.pressure >= 0.5, `cold-start saturation should give high pressure, got ${s.pressure}`)
   })
 })

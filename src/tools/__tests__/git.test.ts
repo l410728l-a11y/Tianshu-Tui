@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
-import { GIT_TOOL, getWorkingTreeFiles, getFileDiff } from '../git.js'
+import { GIT_TOOL, getWorkingTreeFiles, getFileDiff, getFileAtBase } from '../git.js'
 
 const TMP = join(import.meta.dirname, '.git-test-tmp')
 
@@ -306,6 +306,21 @@ describe('getWorkingTreeFiles / getFileDiff (desktop changes tab)', () => {
     const diff = await getFileDiff(TMP2, 'base.txt', baseline)
     assert.ok(diff.includes('-base'), 'baseline diff shows old content')
     assert.ok(diff.includes('+base changed'), 'baseline diff shows committed change')
+  })
+
+  it('returns base content for a tracked file and exists=false for a new one', async () => {
+    writeFileSync(join(TMP2, 'base.txt'), 'base changed\n')
+    writeFileSync(join(TMP2, 'fresh.txt'), 'new\n')
+    const tracked = await getFileAtBase(TMP2, 'base.txt')
+    assert.equal(tracked.exists, true)
+    assert.equal(tracked.content, 'base\n')
+    const fresh = await getFileAtBase(TMP2, 'fresh.txt')
+    assert.equal(fresh.exists, false)
+    assert.equal(fresh.content, '')
+  })
+
+  it('getFileAtBase rejects path traversal', async () => {
+    await assert.rejects(() => getFileAtBase(TMP2, '../outside.txt'), /Invalid file path/)
   })
 
   it('falls back to HEAD for a malicious or malformed base ref', async () => {

@@ -36,7 +36,7 @@ function fakeSnapshotFactory(path: string) {
     builds: 1,
     refreshes: 0,
     destroyed: false,
-    refresh() { this.refreshes++; return { appliedDiff: true, materialized: [], missing: [] } },
+    async refresh() { this.refreshes++; return { appliedDiff: true, materialized: [], missing: [] } },
     destroy() { this.destroyed = true },
   }
   return snap
@@ -55,118 +55,137 @@ function baseInit(over: Partial<Parameters<typeof createVerificationSnapshotMana
   }
 }
 
-describe('VerificationSnapshotManager', () => {
-  it('returns null (in-place) for a clean single session', () => {
+describe('VerificationSnapshotManager', async () => {
+  it('returns null (in-place) for a clean single session', async () => {
     const mgr = createVerificationSnapshotManager(baseInit({
       createSnapshot: () => { throw new Error('should not build') },
       computeRef: () => 'ref',
     }))
-    assert.equal(mgr.prepare(['src/a.ts']), null)
+    assert.equal(await mgr.prepare(['src/a.ts']), null)
     assert.equal(mgr.lastDecision()?.mode, 'in-place')
     assert.equal(mgr.currentSnapshotRef(), undefined)
   })
 
-  it('lazily builds a snapshot when baseline is dirty and reuses it when ref is unchanged', () => {
+  it('lazily builds a snapshot when baseline is dirty and reuses it when ref is unchanged', async () => {
     let snap: FakeSnapshot | null = null
     const mgr = createVerificationSnapshotManager(baseInit({
       preExistingDirtyCount: 2,
-      createSnapshot: (init) => { snap = fakeSnapshotFactory(join(init.baseCwd, '.rivet', 'vsw', init.sessionId)); return snap },
+      createSnapshot: async (init) => { snap = fakeSnapshotFactory(join(init.baseCwd, '.rivet', 'vsw', init.sessionId)); return snap },
       computeRef: () => 'ref-stable',
     }))
 
-    const p1 = mgr.prepare(['src/a.ts'])
+    const p1 = await mgr.prepare(['src/a.ts'])
     assert.ok(p1)
     assert.equal(p1!.snapshotRef, 'ref-stable')
     assert.equal(p1!.decision.mode, 'snapshot')
     assert.equal(snap!.builds, 1)
 
     // Same owned content → same ref → reuse, no rebuild.
-    const p2 = mgr.prepare(['src/a.ts'])
+    const p2 = await mgr.prepare(['src/a.ts'])
     assert.ok(p2)
     assert.equal(snap!.builds, 1)
     assert.equal(snap!.refreshes, 0)
   })
 
-  it('refreshes the snapshot when the owned diff (ref) changes', () => {
+  it('refreshes the snapshot when the owned diff (ref) changes', async () => {
     let snap: FakeSnapshot | null = null
     let ref = 'ref-1'
     const mgr = createVerificationSnapshotManager(baseInit({
       sameCwdRunningSessions: () => 1,
-      createSnapshot: (init) => { snap = fakeSnapshotFactory(init.baseCwd); return snap },
+      createSnapshot: async (init) => { snap = fakeSnapshotFactory(init.baseCwd); return snap },
       computeRef: () => ref,
     }))
-    mgr.prepare(['src/a.ts'])
+    await mgr.prepare(['src/a.ts'])
     assert.equal(snap!.refreshes, 0)
     ref = 'ref-2'
-    mgr.prepare(['src/a.ts', 'src/b.ts'])
+    await mgr.prepare(['src/a.ts', 'src/b.ts'])
     assert.equal(snap!.refreshes, 1)
     assert.equal(mgr.currentSnapshotRef(), 'ref-2')
   })
 
-  it('destroy tears down the live snapshot', () => {
+  it('destroy tears down the live snapshot', async () => {
     let snap: FakeSnapshot | null = null
     const mgr = createVerificationSnapshotManager(baseInit({
       forceSnapshot: true,
-      createSnapshot: (init) => { snap = fakeSnapshotFactory(init.baseCwd); return snap },
+      createSnapshot: async (init) => { snap = fakeSnapshotFactory(init.baseCwd); return snap },
       computeRef: () => 'r',
     }))
-    mgr.prepare(['src/a.ts'])
+    await mgr.prepare(['src/a.ts'])
     mgr.destroy()
     assert.equal(snap!.destroyed, true)
     assert.equal(mgr.currentSnapshotRef(), undefined)
   })
 
-  it('degrades to in-place (no build) when snapshot wanted but no baselineHead', () => {
+  it('degrades to in-place (no build) when snapshot wanted but no baselineHead', async () => {
     const mgr = createVerificationSnapshotManager(baseInit({
       baselineHead: undefined,
       preExistingDirtyCount: 5,
       createSnapshot: () => { throw new Error('should not build without baseline') },
       computeRef: () => 'r',
     }))
-    assert.equal(mgr.prepare(['src/a.ts']), null)
+    assert.equal(await mgr.prepare(['src/a.ts']), null)
     assert.equal(mgr.lastDecision()?.mode, 'in-place-degraded')
+  })
+
+  it('propagates snapshot build failure so pipeline can catch and degrade', async () => {
+    // When forceSnapshot is true and createSnapshot throws (e.g. git diff
+    // status > 1 due to repo corruption), the error must propagate through
+    // prepare() so the pipeline's catch block can degrade to in-place
+    // rather than silently swallowing the failure.
+    const mgr = createVerificationSnapshotManager(baseInit({
+      forceSnapshot: true,
+      createSnapshot: async () => { throw new Error('VSW overlay: git diff failed for baseline abc123456789: fatal: bad revision') },
+      computeRef: () => 'r',
+    }))
+    await assert.rejects(
+      () => mgr.prepare(['src/a.ts']),
+      /git diff failed/,
+      'snapshot build failure must propagate through prepare()',
+    )
+    // The pipeline-side degrade contract (catch → run in-place) is covered by a
+    // real executeToolUse integration test in tool-pipeline.test.ts.
   })
 
   // C3: failure-attribution retry — prepareRetry forces the snapshot even when
   // §6 policy says in-place (clean baseline, no peers), so a failed in-place
   // verification can be rerun in isolation to attribute the failure.
-  it('prepareRetry force-builds a snapshot that prepare() would skip', () => {
+  it('prepareRetry force-builds a snapshot that prepare() would skip', async () => {
     let snap: FakeSnapshot | null = null
     const mgr = createVerificationSnapshotManager(baseInit({
-      createSnapshot: (init) => { snap = fakeSnapshotFactory(init.baseCwd); return snap },
+      createSnapshot: async (init) => { snap = fakeSnapshotFactory(init.baseCwd); return snap },
       computeRef: () => 'retry-ref',
     }))
-    assert.equal(mgr.prepare(['src/a.ts']), null) // clean single session → in-place
-    const retry = mgr.prepareRetry(['src/a.ts'])
+    assert.equal(await mgr.prepare(['src/a.ts']), null) // clean single session → in-place
+    const retry = await mgr.prepareRetry(['src/a.ts'])
     assert.ok(retry)
     assert.equal(retry!.snapshotRef, 'retry-ref')
     assert.equal(snap!.builds, 1)
     // The retry snapshot is reused by later calls (same session worktree).
-    const again = mgr.prepareRetry(['src/a.ts'])
+    const again = await mgr.prepareRetry(['src/a.ts'])
     assert.equal(again!.path, retry!.path)
     assert.equal(snap!.builds, 1)
     assert.equal(snap!.refreshes, 0)
   })
 
-  it('prepareRetry still degrades when no baselineHead exists (never fake-green)', () => {
+  it('prepareRetry still degrades when no baselineHead exists (never fake-green)', async () => {
     const mgr = createVerificationSnapshotManager(baseInit({
       baselineHead: undefined,
       createSnapshot: () => { throw new Error('should not build') },
       computeRef: () => 'r',
     }))
-    assert.equal(mgr.prepareRetry(['src/a.ts']), null)
+    assert.equal(await mgr.prepareRetry(['src/a.ts']), null)
     assert.equal(mgr.lastDecision()?.mode, 'in-place-degraded')
   })
 })
 
-describe('reapOrphanSnapshots', () => {
+describe('reapOrphanSnapshots', async () => {
   function plantVsw(baseCwd: string, sessionId: string, pid: number): void {
     const dir = join(baseCwd, '.rivet', 'vsw', sessionId)
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, '.vsw-owner.json'), JSON.stringify({ pid, sessionId }), 'utf-8')
   }
 
-  it('reaps dirs whose owner pid is dead, keeps live ones and the current session', () => {
+  it('reaps dirs whose owner pid is dead, keeps live ones and the current session', async () => {
     const baseCwd = makeDir()
     plantVsw(baseCwd, 'dead', 111)
     plantVsw(baseCwd, 'alive', 222)
@@ -187,7 +206,7 @@ describe('reapOrphanSnapshots', () => {
     assert.equal(existsSync(join(baseCwd, '.rivet', 'vsw', 'alive')), true)
   })
 
-  it('keeps dirs with no readable owner marker (fail safe)', () => {
+  it('keeps dirs with no readable owner marker (fail safe)', async () => {
     const baseCwd = makeDir()
     const dir = join(baseCwd, '.rivet', 'vsw', 'no-marker')
     mkdirSync(dir, { recursive: true })
@@ -196,7 +215,7 @@ describe('reapOrphanSnapshots', () => {
     assert.deepEqual(result.kept, ['no-marker'])
   })
 
-  it('returns empty when no vsw root exists', () => {
+  it('returns empty when no vsw root exists', async () => {
     const baseCwd = makeDir()
     const result = reapOrphanSnapshots({ baseCwd })
     assert.deepEqual(result.reaped, [])
@@ -204,7 +223,7 @@ describe('reapOrphanSnapshots', () => {
   })
 })
 
-describe('reapOrphanHandsWorktrees', () => {
+describe('reapOrphanHandsWorktrees', async () => {
   const wtPrefix = 'rivet-wt-reaptest-'
   const createdDirs: string[] = []
   const _savedTmpdir = process.env.TMPDIR
@@ -237,7 +256,7 @@ describe('reapOrphanHandsWorktrees', () => {
     return dir
   }
 
-  it('reaps dead-owner worktrees, keeps alive and current-session ones', () => {
+  it('reaps dead-owner worktrees, keeps alive and current-session ones', async () => {
     // Plant fake rivet-wt-* dirs in the real tmpdir
     plantHandsWorktree(`${wtPrefix}dead`, 99999, 'sess-dead')
     plantHandsWorktree(`${wtPrefix}alive`, process.pid, 'sess-alive')
@@ -263,7 +282,7 @@ describe('reapOrphanHandsWorktrees', () => {
     assert.equal(existsSync(join(tmpdir(), `${wtPrefix}alive`)), true)
   })
 
-  it('keeps worktrees with no owner marker (fail safe)', () => {
+  it('keeps worktrees with no owner marker (fail safe)', async () => {
     const dirName = `${wtPrefix}nomarker`
     const dir = join(tmpdir(), dirName)
     mkdirSync(dir, { recursive: true })

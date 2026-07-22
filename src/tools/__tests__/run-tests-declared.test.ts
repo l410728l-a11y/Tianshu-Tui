@@ -64,7 +64,7 @@ describe('run_tests declared verify.test (A2)', () => {
 
     const params = {
       ...makeParams({}, liveDir),
-      prepareRetrySnapshot: () => ({ path: snapDir, snapshotRef: 'test-ref' }),
+      prepareRetrySnapshot: async () => ({ path: snapDir, snapshotRef: 'test-ref' }),
     }
     const result = await RUN_TESTS_TOOL.execute(params as never)
     assert.equal(result.isError, false, 'snapshot-pass should override live-fail')
@@ -80,7 +80,7 @@ describe('run_tests declared verify.test (A2)', () => {
     }))
     const params = {
       ...makeParams({}, liveDir),
-      prepareRetrySnapshot: () => ({ path: snapDir, snapshotRef: 'test-ref' }),
+      prepareRetrySnapshot: async () => ({ path: snapDir, snapshotRef: 'test-ref' }),
     }
     const result = await RUN_TESTS_TOOL.execute(params as never)
     assert.equal(result.isError, true)

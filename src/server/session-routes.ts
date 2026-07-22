@@ -16,6 +16,8 @@
  *   GET    /sessions/:id/files?q=&limit=                @file mention picker (D2)
  *   GET    /sessions/:id/stream?since=N                live SSE (B3)
  *   POST   /sessions/:id/interventions/:rid/answer     resolve approval (B2)
+ *   POST   /sessions/:id/delegate-capabilities         E4 register/heartbeat client landing kinds
+ *   POST   /sessions/:id/delegate/:rid/result          E4 resolve client landing
  *   GET    /sessions/:id/artifacts                     list (B4)
  *   GET    /sessions/:id/artifacts/:artifactId         read raw (B4)
  *   GET    /sessions/:id/jobs                           list background jobs
@@ -50,6 +52,17 @@ import { loadHooksConfig, VALID_EVENTS } from '../hooks/user-hooks-runner.js'
 import { buildDistillPrompt } from '../prompt/rpa-distill.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
 import { searchSessionTranscripts } from './session-search.js'
+import { listCheckpoints, loadCheckpoint, buildResumeFromCheckpoint } from '../agent/wave-checkpoint.js'
+import { storePlan } from '../agent/plan-store.js'
+import {
+  TIANSHU_PROTOCOL_HEADER,
+  TIANSHU_PROTOCOL_VERSION,
+  parseDelegateKinds,
+} from './delegation-protocol.js'
+
+const PROTOCOL_HEADERS: Record<string, string> = {
+  [TIANSHU_PROTOCOL_HEADER]: String(TIANSHU_PROTOCOL_VERSION),
+}
 
 export type ArtifactKind = 'plan' | 'task-list' | 'walkthrough' | 'diff' | 'screenshot' | 'test-result' | 'markdown' | 'html'
 
@@ -135,9 +148,12 @@ function planSummary(p: PlanDocument) {
 function withAuth(handler: RouteHandler, apiToken?: string): RouteHandler {
   return async (body, params, headers, res) => {
     if (!isAuthorizedRequest({ body, headers }, apiToken)) {
-      return { status: 401, body: { error: 'Unauthorized' } }
+      return { status: 401, body: { error: 'Unauthorized' }, headers: PROTOCOL_HEADERS }
     }
-    return handler(body, params, headers, res)
+    const result = await handler(body, params, headers, res)
+    // handled:true (SSE) sets its own headers; still stamp protocol on REST.
+    if (result.handled) return result
+    return { ...result, headers: { ...PROTOCOL_HEADERS, ...result.headers } }
   }
 }
 
@@ -482,6 +498,27 @@ export function buildSessionRoutes(
         return { status: 404, body: { error: 'Session not found' } }
       }
       return { status: 200, body: { id: params!.id!, name: data.name.trim(), enabled: data.enabled } }
+    }, apiToken),
+
+    // ── PlusMenu: review gate（会话级自动审查门开关）──
+    // Read — 当前模式（override > live refs > 配置默认）。
+    'GET /sessions/:id/review-gate': withAuth((_body, params) => {
+      const mode = manager.getReviewGate(params!.id!)
+      if (mode === undefined) return { status: 404, body: { error: 'Session not found' } }
+      return { status: 200, body: { id: params!.id!, mode } }
+    }, apiToken),
+
+    // Write — auto=恢复系统自动审查；off=抑制自动审查省 token（手动 /review 不受影响，
+    // 交付门的测试/验证/提交环节不受影响）。
+    'POST /sessions/:id/review-gate': withAuth((body, params) => {
+      const data = (body ?? {}) as { mode?: unknown }
+      if (data.mode !== 'auto' && data.mode !== 'off') {
+        return { status: 400, body: { error: 'Missing or invalid "mode" ("auto" | "off")' } }
+      }
+      if (!manager.setReviewGate(params!.id!, data.mode)) {
+        return { status: 404, body: { error: 'Session not found' } }
+      }
+      return { status: 200, body: { id: params!.id!, mode: data.mode } }
     }, apiToken),
 
     // ── Skills install (from .claude/skills) ──
@@ -1030,6 +1067,9 @@ export function buildSessionRoutes(
       if (!res) return { status: 500, body: { error: 'SSE response stream is unavailable' } }
       const id = params!.id!
       const since = Number(params?.since ?? 0) || 0
+      // E4 — optional clientId ties this SSE socket to delegate capabilities so
+      // teardown (onDead / 'close') clears the slot and fail-backs in-flight landings.
+      const clientId = typeof params?.clientId === 'string' ? params.clientId.trim() : ''
       // DEBUG instrumentation (RIVET_DEBUG_RENDER=1): splits /stream latency into
       // "history load" vs "headers flushed vs first event". See
       // docs/dev/render-debug-playbook.md §"骨架屏不消失/会话打开慢".
@@ -1070,10 +1110,14 @@ export function buildSessionRoutes(
         }
         await sendReplayTimeSliced(res, sse, unique)
       }
-      unsubscribe = manager.subscribe(id, (ev) => {
-        if (catchingUp) deferredLive.push(ev)
-        else sse.send(ev.type, ev)
-      })
+      unsubscribe = manager.subscribe(
+        id,
+        (ev) => {
+          if (catchingUp) deferredLive.push(ev)
+          else sse.send(ev.type, ev)
+        },
+        clientId ? { clientId } : undefined,
+      )
       // The async replay above yields the loop, so events may have been
       // appended between the snapshot and the subscribe — back-fill them now.
       // Subscribe first, then defer listener fan-out while the gap is sent with
@@ -1102,6 +1146,39 @@ export function buildSessionRoutes(
         sse.close()
       })
       return { status: 200, handled: true }
+    }, apiToken),
+
+    // E4 — register / heartbeat client landing capabilities (apply_edit, terminal_exec).
+    'POST /sessions/:id/delegate-capabilities': withAuth((body, params) => {
+      const data = (body ?? {}) as { clientId?: unknown; kinds?: unknown }
+      if (typeof data.clientId !== 'string' || !data.clientId.trim()) {
+        return { status: 400, body: { error: 'Missing or invalid "clientId"' } }
+      }
+      const kinds = parseDelegateKinds(data.kinds)
+      if (!manager.registerDelegateCapabilities(params!.id!, data.clientId.trim(), kinds)) {
+        return { status: 404, body: { error: 'Session not found' } }
+      }
+      return { status: 200, body: { ok: true, kinds, ttlMs: 60_000 } }
+    }, apiToken),
+
+    // E4 — client posts landing result (or reject with isError:false).
+    'POST /sessions/:id/delegate/:requestId/result': withAuth((body, params) => {
+      const data = (body ?? {}) as { content?: unknown; isError?: unknown; uiContent?: unknown; status?: unknown }
+      if (typeof data.content !== 'string') {
+        return { status: 400, body: { error: 'Missing or invalid "content" (string)' } }
+      }
+      const ok = manager.answerDelegation(params!.id!, params!.requestId!, {
+        content: data.content,
+        isError: data.isError === true,
+        uiContent: typeof data.uiContent === 'string' ? data.uiContent : undefined,
+        status: data.status === 'rejected' ? 'rejected' : data.status === 'ok' ? 'ok' : undefined,
+      })
+      if (!ok) {
+        const rec = manager.getSession(params!.id!)
+        if (!rec) return { status: 404, body: { error: 'Session not found' } }
+        return { status: 409, body: { error: 'Delegation request gone (timed out or already resolved)' } }
+      }
+      return { status: 200, body: { ok: true } }
     }, apiToken),
 
     'POST /sessions/:id/interventions/:requestId/answer': withAuth((body, params) => {
@@ -1440,6 +1517,17 @@ export function buildSessionRoutes(
       return { status: 200, body: { diff } }
     }, apiToken),
 
+    // Full file content at the session's task baseline — lets editor clients
+    // (VS Code extension) render a native two-pane diff without shipping git
+    // plumbing to the client. exists=false → file was added after the baseline.
+    'GET /sessions/:id/git/file-base': withAuth(async (_body, params) => {
+      const path = params?.path
+      if (!path || typeof path !== 'string') return { status: 400, body: { error: 'Missing path param' } }
+      const result = await manager.getSessionFileAtBase(String(params?.id ?? ''), path)
+      if (result === null) return { status: 404, body: { error: 'Session not found' } }
+      return { status: 200, body: result }
+    }, apiToken),
+
     // Change landing — commit everything in the session cwd (server-direct).
     'POST /sessions/:id/git/commit': withAuth(async (body, params) => {
       const message = typeof (body as { message?: unknown })?.message === 'string'
@@ -1519,6 +1607,36 @@ export function buildSessionRoutes(
         return { status: 502, body: { ok: false, error: result.stderr.trim() || 'gh review submission failed' } }
       }
       return { status: 200, body: { ok: true } }
+    }, apiToken),
+
+    // ── W3: Team checkpoint / resume ──
+    // GET: list checkpoints for a session's cwd so the desktop can show
+    // available checkpoints in the "Resume" card.
+    'GET /sessions/:id/team-checkpoints': withAuth((_body, params) => {
+      const rec = manager.getSession(params!.id!)
+      if (!rec) return { status: 404, body: { error: 'Session not found' } }
+      const checkpoints = listCheckpoints(rec.cwd)
+      return { status: 200, body: { checkpoints } }
+    }, apiToken),
+
+    // POST: resume a team from a checkpoint. Loads the checkpoint, rebuilds
+    // a plan, stores it via plan-store, and injects a resume kickoff prompt
+    // so the next bare team_orchestrate call auto-consumes it.
+    'POST /sessions/:id/team-resume': withAuth(async (body, params) => {
+      const rec = manager.getSession(params!.id!)
+      if (!rec) return { status: 404, body: { error: 'Session not found' } }
+      const data = (body ?? {}) as { groupId?: string }
+      if (!data.groupId || typeof data.groupId !== 'string') {
+        return { status: 400, body: { error: 'Missing or invalid groupId' } }
+      }
+      const cp = loadCheckpoint(rec.cwd, data.groupId)
+      if (!cp) return { status: 404, body: { error: `Checkpoint ${data.groupId} not found` } }
+      const resume = buildResumeFromCheckpoint(cp)
+      if (!resume) return { status: 200, body: { resumed: false, message: 'All tasks completed — nothing to resume.' } }
+      storePlan(resume.planJson, params!.id!)
+      const ok = manager.run(params!.id!, resume.prompt)
+      if (!ok) return { status: 409, body: { error: 'Session is missing or already running' } }
+      return { status: 200, body: { resumed: true, message: resume.prompt } }
     }, apiToken),
   }
 

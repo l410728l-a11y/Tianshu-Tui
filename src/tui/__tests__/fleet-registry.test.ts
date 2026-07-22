@@ -52,6 +52,38 @@ test('FleetRegistry: blocked/escalated 归入 failed panelStatus', () => {
   assert.deepEqual(views.map(v => v.status).sort(), ['blocked', 'escalated'])
 })
 
+// ─── 7cf506eb 后续：completed 状态（审查拦截）在 TUI 端的归约 ───
+
+test('FleetRegistry: completed（审查拦截）是终态，panelStatus=done，不卡 active', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_rev', 'tool_a', 'reviewer'), 1000)
+  fleet.apply({ workOrderId: 'wo_rev', parentToolId: 'tool_a', status: 'completed', failureReason: 'review-findings', progressLine: '审查门发现问题 (L2)' }, 2000)
+  // completed 是终态——不该留在 active（否则永远像"还在跑"）
+  assert.equal(fleet.getActiveWorkers(9999).length, 0)
+  const w = fleet.getWorkerById('wo_rev', 9999)!
+  assert.equal(w.status, 'completed')
+  assert.equal(w.terminal, true)
+  assert.equal(w.panelStatus, 'done')
+  assert.equal(w.elapsedMs, 1000, 'elapsed 应冻结在终态，不随 now 增长')
+})
+
+test('FleetRegistry: completed 透传 failureReason=review-findings（TUI warn 着色数据源）', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_r2', 'tool_a', 'reviewer'), 0)
+  fleet.apply({ workOrderId: 'wo_r2', parentToolId: 'tool_a', status: 'completed', failureReason: 'review-findings' }, 100)
+  const w = fleet.getWorkerById('wo_r2', 200)!
+  assert.equal(w.failureReason, 'review-findings')
+})
+
+test('FleetRegistry: failed（infra 崩溃）透传 failureReason=review-infra', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_r3', 'tool_a', 'reviewer'), 0)
+  fleet.apply({ workOrderId: 'wo_r3', parentToolId: 'tool_a', status: 'failed', failureReason: 'review-infra' }, 100)
+  const w = fleet.getWorkerById('wo_r3', 200)!
+  assert.equal(w.status, 'failed')
+  assert.equal(w.failureReason, 'review-infra')
+})
+
 test('FleetRegistry: 分组进度按 parentToolId 计数派生', () => {
   const fleet = new FleetRegistry()
   fleet.apply(running('wo1', 'batchTool'), 0)

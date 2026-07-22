@@ -1,0 +1,13 @@
+{
+  "name": "tianshu-update-mirror",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker — 反代 GitHub release 给天枢桌面端 updater, 避免国内运营商/火山引擎拦截。",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

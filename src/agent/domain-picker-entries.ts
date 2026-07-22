@@ -71,9 +71,9 @@ export function buildDomainPickerEntries(
     {
       key: 'auto',
       name: 'Auto',
-      motto: '等同开阳',
-      meta: 'zìdòng · 关键词路由已关闭',
-      essence: '会话 Auto 关键词路由默认关闭，固定落到开阳；其它星域请手动选择。',
+      motto: '按任务匹配',
+      meta: 'zìdòng · 关键词自动匹配星域',
+      essence: '根据每条消息内容自动匹配最合适的星域方法论；未命中时回退天枢。',
       // null (env kill switch) has no picker entry → also reflect as Auto-selected.
       current: current === undefined || current === null,
       uiPersona: { separator: 'thin', accent: 'primary', glyph: '❂' },

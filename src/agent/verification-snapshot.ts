@@ -23,10 +23,11 @@
  * @module verification-snapshot
  */
 
-import { spawnGitSync } from '../tools/spawn-git.js'
-import { existsSync, rmSync } from 'node:fs'
+import { spawnGit } from '../tools/spawn-git.js'
+import { existsSync, rmSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs'
 import { isAbsolute, join, relative } from 'node:path'
-import { createWorktreeAt, removeWorktree } from './worktree.js'
+import { tmpdir } from 'node:os'
+import { createWorktreeAtAsync, removeWorktree, removeWorktreeAsync } from './worktree.js'
 import { materializeScope } from './worktree-scope.js'
 import { RepoLock, worktreeRegistryLockPath } from './repo-lock.js'
 import { provisionSnapshotDeps } from './snapshot-deps.js'
@@ -60,7 +61,7 @@ export interface VerificationSnapshot {
   /** Baseline commit-ish this snapshot is pinned to. */
   readonly baselineHead: string
   /** Rebuild the tree at baseline.head + the given owned diff. */
-  refresh(ownedFiles: string[]): OverlayResult
+  refresh(ownedFiles: string[]): Promise<OverlayResult>
   /** Remove the worktree (git worktree remove) and scrub the directory. */
   destroy(): void
 }
@@ -71,19 +72,63 @@ interface GitResult {
   stderr: string
 }
 
-function git(cwd: string, args: string[], input?: string): GitResult {
-  const result = spawnGitSync(args, {
-    cwd,
-    encoding: 'utf-8',
-    input,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    maxBuffer: 64 * 1024 * 1024,
-  })
-  return {
-    status: typeof result.status === 'number' ? result.status : 1,
-    stdout: typeof result.stdout === 'string' ? result.stdout : '',
-    stderr: typeof result.stderr === 'string' ? result.stderr : '',
+/**
+ * Async git spawn — collects stdout/stderr with timeout and maxBuffer.
+ * Replaces the sync git() for snapshot build paths so the main event loop
+ * never blocks on worktree creation, diff, or apply.
+ */
+async function gitAsync(
+  cwd: string,
+  args: string[],
+  opts?: { timeout?: number; maxBuffer?: number },
+): Promise<GitResult> {
+  const timeout = opts?.timeout ?? 60_000
+  const maxBuffer = opts?.maxBuffer ?? 64 * 1024 * 1024
+  const child = spawnGit(args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+
+  const chunks: { stdout: Buffer[]; stderr: Buffer[]; total: number } = {
+    stdout: [],
+    stderr: [],
+    total: 0,
   }
+
+  return new Promise<GitResult>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM')
+    }, timeout)
+
+    const onData = (buf: Buffer) => {
+      chunks.total += buf.length
+      if (chunks.total > maxBuffer) {
+        clearTimeout(timer)
+        child.kill('SIGTERM')
+        reject(new Error(`gitAsync maxBuffer (${maxBuffer}) exceeded`))
+      }
+    }
+
+    child.stdout?.on('data', (buf: Buffer) => {
+      chunks.stdout.push(buf)
+      onData(buf)
+    })
+    child.stderr?.on('data', (buf: Buffer) => {
+      chunks.stderr.push(buf)
+      onData(buf)
+    })
+
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve({
+        status: code ?? (child.killed ? 143 : 1),
+        stdout: Buffer.concat(chunks.stdout).toString('utf-8'),
+        stderr: Buffer.concat(chunks.stderr).toString('utf-8'),
+      })
+    })
+
+    child.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+  })
 }
 
 /** Where a session's snapshot worktree lives. .rivet/ is gitignored. */
@@ -101,12 +146,12 @@ function toRepoRelative(baseCwd: string, filePath: string): string | null {
   return rel
 }
 
-function overlayOwnedDiff(
+async function overlayOwnedDiff(
   baseCwd: string,
   worktreePath: string,
   baselineHead: string,
   ownedFiles: string[],
-): OverlayResult {
+): Promise<OverlayResult> {
   const rels: string[] = []
   const abs: string[] = []
   for (const f of ownedFiles) {
@@ -121,14 +166,29 @@ function overlayOwnedDiff(
     // Diff baseline.head against the live working tree for owned paths only.
     // Captures tracked modifications and deletions; untracked-new files do not
     // appear here (git diff ignores untracked) — they go through materializeScope.
-    const diff = git(baseCwd, ['diff', '--no-color', baselineHead, '--', ...rels])
+    const diff = await gitAsync(baseCwd, ['diff', '--no-color', baselineHead, '--', ...rels])
+    if (diff.status !== 0) {
+      throw new Error(`VSW overlay: git diff failed for baseline ${baselineHead.slice(0, 12)}: ${diff.stderr.trim()}`)
+    }
     const patch = diff.stdout
     if (patch.trim().length > 0) {
-      const applied = git(worktreePath, ['apply', '--whitespace=nowarn'], patch)
-      if (applied.status !== 0) {
-        throw new Error(`VSW overlay: git apply failed in ${worktreePath}: ${applied.stderr.trim()}`)
+      // Write patch to a temp file instead of stdin to avoid the spawnSync
+      // pipe deadlock: when the patch exceeds the OS pipe buffer, the parent
+      // write blocks waiting for the child to drain, while the child (git apply)
+      // blocks reading stdin waiting for EOF.
+      const tmpDir = mkdtempSync(join(tmpdir(), 'vsw-apply-'))
+      const patchFile = join(tmpDir, 'owned.patch')
+      try {
+        writeFileSync(patchFile, patch, 'utf-8')
+        const applied = await gitAsync(worktreePath, ['apply', '--whitespace=nowarn', patchFile])
+        if (applied.status !== 0) {
+          throw new Error(`VSW overlay: git apply failed in ${worktreePath}: ${applied.stderr.trim()}`)
+        }
+        appliedDiff = true
+      } finally {
+        try { unlinkSync(patchFile) } catch { /* best-effort */ }
+        try { rmSync(tmpDir, { recursive: true, force: true }) } catch { /* best-effort */ }
       }
-      appliedDiff = true
     }
   }
 
@@ -151,23 +211,37 @@ function destroyAt(baseCwd: string, worktreePath: string): void {
   }
 }
 
+/** Async destroyAt for the build path — same best-effort contract. */
+async function destroyAtAsync(baseCwd: string, worktreePath: string): Promise<void> {
+  try {
+    await removeWorktreeAsync(baseCwd, worktreePath)
+  } catch {
+    // best-effort — fall through to directory scrub
+  }
+  try {
+    if (existsSync(worktreePath)) rmSync(worktreePath, { recursive: true, force: true })
+  } catch {
+    // best-effort
+  }
+}
+
 /**
  * Build a verification snapshot. Any stale worktree at the same path is removed
  * first. Throws if git worktree creation or overlay fails (no fake green).
  */
-export function createVerificationSnapshot(init: VerificationSnapshotInit): VerificationSnapshot {
+export async function createVerificationSnapshot(init: VerificationSnapshotInit): Promise<VerificationSnapshot> {
   const path = snapshotPath(init.baseCwd, init.sessionId)
   const lock = init.lock ?? new RepoLock({ lockPath: worktreeRegistryLockPath(init.baseCwd) })
 
-  function build(ownedFiles: string[]): OverlayResult {
+  async function build(ownedFiles: string[]): Promise<OverlayResult> {
     // Only the .git/worktrees registry mutations (remove + add) need cross-session
     // serialization; the per-session overlay writes into our private worktree dir
     // and stays outside the lock to keep the held section short.
-    lock.withLock(() => {
-      destroyAt(init.baseCwd, path)
-      createWorktreeAt(init.baseCwd, path, init.baselineHead)
+    await lock.withLockAsync(async () => {
+      await destroyAtAsync(init.baseCwd, path)
+      await createWorktreeAtAsync(init.baseCwd, path, init.baselineHead)
     })
-    const overlay = overlayOwnedDiff(init.baseCwd, path, init.baselineHead, ownedFiles)
+    const overlay = await overlayOwnedDiff(init.baseCwd, path, init.baselineHead, ownedFiles)
     // Wire snapshot deps: symlink node_modules/.venv from base repo for tests.
     const deps = provisionSnapshotDeps(init.baseCwd, path)
     if (deps.warnings.length > 0) {
@@ -176,12 +250,12 @@ export function createVerificationSnapshot(init: VerificationSnapshotInit): Veri
     return overlay
   }
 
-  build(init.ownedFiles)
+  await build(init.ownedFiles)
 
   return {
     path,
     baselineHead: init.baselineHead,
-    refresh(ownedFiles: string[]): OverlayResult {
+    async refresh(ownedFiles: string[]): Promise<OverlayResult> {
       // P1: full rebuild at baseline.head. Avoids the git-clean/info-exclude
       // interaction that an in-place incremental refresh would have to handle;
       // incremental refresh of only changed files is a P2+ optimization.

@@ -248,8 +248,7 @@ describe('AgentLoop — multi-turn tool_use', () => {
       }),
     } as unknown as StreamClient
 
-    // 关键词路由是被测特性——0d557061 起会话默认钉开阳、Auto 路由默认关
-    // （loop.ts `domainKeywordRouting === true` 才启用），本测试必须显式打开。
+    // 关键词路由是被测特性（默认开，未命中回退天枢）；显式传 true 使意图自明。
     const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: registry, maxTurns: 2, contextWindow: 1_000_000, domainKeywordRouting: true, compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' } }, session, TEST_CWD)
 
     await agent.run('探索一个新的实验性 POC', makeCallbacks())

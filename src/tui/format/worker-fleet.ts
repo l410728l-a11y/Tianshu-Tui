@@ -28,6 +28,7 @@ function statusGlyph(status: FleetWorkerView['status']): string {
   switch (status) {
     case 'running': return '◐'
     case 'passed': return '✓'
+    case 'completed': return '✓'
     case 'failed': return '✗'
     case 'blocked': return '⊗'
     case 'escalated': return '↑'
@@ -39,6 +40,7 @@ function statusWord(status: FleetWorkerView['status']): string {
   switch (status) {
     case 'running': return '执行中'
     case 'passed': return '完成'
+    case 'completed': return '完成'
     case 'failed': return '失败'
     case 'blocked': return '受阻'
     case 'escalated': return '升级'
@@ -47,11 +49,14 @@ function statusWord(status: FleetWorkerView['status']): string {
 
 const WIDE = { ambiguousAsWide: true }
 
-/** 状态 → 主题色键：与主区/侧栏共用，保证宽窄屏切换时颜色不突变。 */
-function statusColorKey(status: FleetWorkerView['status']): keyof RivetTheme {
+/** 状态 → 主题色键：与主区/侧栏共用，保证宽窄屏切换时颜色不突变。
+ *  completed + review-findings（审查拦截）→ warning 黄，区别于系统失败的 error 红。 */
+function statusColorKey(status: FleetWorkerView['status'], failureReason?: string): keyof RivetTheme {
+  if (status === 'completed' && failureReason === 'review-findings') return 'warning'
   switch (status) {
     case 'running': return 'primary'
     case 'passed': return 'success'
+    case 'completed': return 'success'
     case 'failed': return 'error'
     default: return 'warning'
   }
@@ -59,7 +64,10 @@ function statusColorKey(status: FleetWorkerView['status']): keyof RivetTheme {
 
 function truncate(text: string, max: number): string {
   if (max <= 0) return ''
-  return text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text
+  // 压平空白：activity/summary 是自由文本，嵌入 \n 会让 live region 单行
+  // 占多个显示行，破坏 LiveEngine 行数追踪（输入框重影）。渲染层兜底压平。
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat
 }
 
 /**
@@ -265,7 +273,7 @@ export function formatWorkerFleetSettled(
     const summary = w.activity ? ` — ${w.activity}` : ''
     const budget = Math.max(0, rule - plain.length - 1)
     const text = summary ? `${plain}${truncate(summary, budget)}` : plain
-    lines.push(color(text, theme[statusColorKey(w.status)] as string))
+    lines.push(color(text, theme[statusColorKey(w.status, w.failureReason)] as string))
   }
   if (overflow > 0) {
     lines.push(color(` └─ …(+${overflow})`, theme.muted))
@@ -294,7 +302,7 @@ export function formatWorkerRow(worker: FleetWorkerView, theme: RivetTheme, widt
   const star = authorityStarName(worker.authority)
   const labelBase = star ? `${star} · ${profileLabel(worker.profile)}` : profileLabel(worker.profile)
   const elapsed = formatElapsed(worker.elapsedMs)
-  const colorKey = statusColorKey(worker.status)
+  const colorKey = statusColorKey(worker.status, worker.failureReason)
   // theme[colorKey] 在类型上是 string | 函数（部分主题键是 formatter），但语义色键
   // （primary/success/error/warning/muted/dim）恒为 ANSI 字符串。断言为 string 即可。
   const accent = theme[colorKey] as string
@@ -308,10 +316,12 @@ export function formatWorkerRow(worker: FleetWorkerView, theme: RivetTheme, widt
   const activityBudget = width - headW - tailW - 2
   let activity = ''
   if (worker.activity && activityBudget >= 6) {
+    // 同 truncate：压平嵌入换行，live region 单行槽位不得携带 \n。
+    const flat = worker.activity.replace(/\s+/g, ' ').trim()
     const ellipsisW = displayWidth('…', WIDE)
-    activity = ' ' + (displayWidth(worker.activity, WIDE) > activityBudget
-      ? `${truncateToDisplayWidth(worker.activity, activityBudget - ellipsisW, WIDE)}…`
-      : worker.activity)
+    activity = ' ' + (displayWidth(flat, WIDE) > activityBudget
+      ? `${truncateToDisplayWidth(flat, activityBudget - ellipsisW, WIDE)}…`
+      : flat)
   }
   return color(`${head}${activity}${tail}`, accent)
 }

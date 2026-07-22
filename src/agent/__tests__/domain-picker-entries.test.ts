@@ -9,8 +9,8 @@ test('Auto is current when selection is undefined', () => {
   assert.equal(entries[0]!.current, true)
   // First domain entry follows Auto directly (Off removed).
   assert.notEqual(entries[1]!.key, 'off')
-  assert.match(entries[0]!.essence, /开阳/)
-  assert.match(entries[0]!.meta, /关键词路由已关闭/)
+  assert.match(entries[0]!.essence, /回退天枢/)
+  assert.match(entries[0]!.meta, /关键词自动匹配/)
 })
 
 test('Off option is removed — no picker entry has key "off"', () => {
@@ -25,7 +25,7 @@ test('null selection (env kill switch) reflects as Auto-current (no Off entry)',
 })
 
 test('a pinned domain is the only current entry', () => {
-  const pinned: ActiveStarDomain = { id: 'tianshu', name: '天枢', volatileBlock: '...', motto: 'm' }
+  const pinned: ActiveStarDomain = { id: 'tianshu', name: '天枢', volatileBlock: '...', motto: 'm', courageThreshold: 0.65 }
   const entries = buildDomainPickerEntries(pinned)
   const current = entries.filter((e) => e.current)
   assert.equal(current.length, 1)

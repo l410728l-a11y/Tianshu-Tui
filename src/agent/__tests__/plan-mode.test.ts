@@ -173,7 +173,11 @@ describe('checkPlanMode', () => {
   })
 
   it('every PLAN_MODE_ALLOWED_TOOLS entry resolves to a registered tool', () => {
-    const defaultNames = createDefaultToolRegistry([], { desktopTools: true, browserTool: true })
+    // 白名单是 preset 无关的静态上界（plan mode 只读安全集）；注册按 preset 裁剪
+    // （minimal 不含 inspect_project/related_tests 等 EXTENDED 工具）。因此孤儿
+    // 检查必须对最大工具全集（full）断言——否则随环境 preset 漂移误报。
+    // 运行时无害：未注册的工具根本调不到，白名单死项不产生行为。
+    const defaultNames = createDefaultToolRegistry([], { desktopTools: true, browserTool: true, preset: 'full' })
       .getDefinitions()
       .map(d => d.name)
     const interactiveNames = [

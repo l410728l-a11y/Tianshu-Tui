@@ -46,6 +46,8 @@ export type SessionEventType =
   | 'checkpoint'
   | 'approval_required'
   | 'approval_resolved'
+  // E4 — client tool delegation (apply_edit / terminal_exec). data: ToolDelegateEventData.
+  | 'tool_delegate'
   | 'intent_note'
   | 'delegation'
   | 'artifact'

@@ -5,16 +5,16 @@ import { createEmbeddingProvider } from '../search/embedding-provider.js'
 export const SEMANTIC_SEARCH_TOOL: Tool = {
   definition: {
     name: 'semantic_search',
-    description: `Search the codebase by meaning. Uses a hybrid of BM25 (lexical) and embedding-based vector search (RRF-fused) when an embedding provider is configured, and degrades to BM25 offline.
+    description: `按语义搜索代码库。配置了 embedding provider 时，混合使用 BM25（词法）与 embedding 向量检索（RRF 融合）；离线时降级为纯 BM25。
 
-Use when grep/glob cannot find code by concept (e.g. "authentication middleware", "session persistence").
-Rebuild the index with /index or by setting rebuild: true if results seem stale.`,
+当 grep/glob 无法按概念找到代码（如 "authentication middleware"、"session persistence"）时使用。
+结果疑似过期时，用 /index 或设 rebuild: true 重建索引。`,
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Natural language or keyword query' },
-        limit: { type: 'integer', description: 'Max results (default 10)' },
-        rebuild: { type: 'boolean', description: 'Force rebuild index before search' },
+        query: { type: 'string', description: '自然语言或关键词查询' },
+        limit: { type: 'integer', description: '最大结果数（默认 10）' },
+        rebuild: { type: 'boolean', description: '搜索前强制重建索引' },
       },
       required: ['query'],
     },

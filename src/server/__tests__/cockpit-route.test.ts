@@ -67,7 +67,7 @@ const FIXTURE_SNAPSHOT: CockpitSnapshot = {
     speculation: null,
     cacheDiagnostic: null,
     reasoningEffort: 'medium',
-    starDomain: 'Auto(开阳)',
+    starDomain: 'Auto(天枢)',
   },
   mcp: { servers: [], totalTools: 0, connectedServers: 0 },
   advisory: {

@@ -32,6 +32,10 @@ const scaleWarnedSlugs = new Set<string>()
 // one-shot 软拦同款模式：首拦给出章节要求，同 title 重提交放行。
 const falsificationWarnedSlugs = new Set<string>()
 const FALSIFICATION_HEADING_RE = /^#{2,5}\s*.*(反证|复现|falsification|reproduction)/im
+// 需求提炼门禁：计划开头必须有用用户原话提炼需求的章节——防止计划直接跳进
+// 方案而误解意图。one-shot 软拦同款模式。
+const requirementWarnedSlugs = new Set<string>()
+const REQUIREMENT_DISTILL_HEADING_RE = /^#{2,5}\s*.*(需求提炼|需求理解|requirements?(\s+(distillation|summary))?)/im
 const MERMAID_FENCE = /```\s*mermaid/i
 const MISSING_DIAGRAM_SKELETON = `\`\`\`mermaid
 flowchart TD
@@ -42,9 +46,8 @@ flowchart TD
 \`\`\``
 
 // ── 计划规模门禁（层2）──
-// 「flash 出大计划 → 一口气执行 → 重构丢功能」事故链的规模环节：任务数或涉及
-// 文件数超阈值的计划，必须显式声明 wave 分波结构 + 每波验证命令，否则 one-shot
-// 软拦（同事实锚点门禁模式：首次拦截给出改法，同 title 重提交放行）。
+// 任务数或涉及文件数超阈值的计划，必须显式声明 wave 分波结构 + 每波验证命令，
+// 否则 one-shot 软拦（同事实锚点门禁模式：首次拦截给出改法，同 title 重提交放行）。
 
 export const PLAN_SCALE_TASK_THRESHOLD = 8
 export const PLAN_SCALE_FILE_THRESHOLD = 15
@@ -76,10 +79,7 @@ const ONLY_DOTS_RE = /^(\.{3,}|…+|-\s*\.{3,})\s*$/m
  * A section is "empty" when its heading is followed (across blank lines only)
  * by a heading at the SAME or SHALLOWER level. A deeper heading means the
  * section's body is structured into subsections — the normal markdown pattern
- * `## 实现` → `### 任务 1`. The old regex flagged that as empty and wedged
- * plan submit in an unfixable rejection loop (session 91840816: a fully
- * fleshed-out draft rejected twice because its parent headings had ###
- * children).
+ * `## 实现` → `### 任务 1`.
  */
 function hasEmptySection(content: string): boolean {
   const lines = content.split('\n')
@@ -214,73 +214,74 @@ function formatChanges(result: PlanCloseResult): string[] {
 export const PLAN_TOOL: Tool = {
   definition: {
     name: 'plan',
-    description: `Unified plan lifecycle tool — submit a plan for approval, or close completed tasks.
+    description: `统一计划生命周期工具——提交计划供用户审批，或关闭已完成任务。
 
-### Plan file status
-\`.rivet/plans/*.md\` files carry a status marker: \`> **Status: APPROVED/REJECTED/EXECUTED**\`. When scanning existing plans:
-- **REJECTED** plans are dismissed by the user — do NOT re-submit, re-propose, or remind the user about them unless explicitly asked.
-- **EXECUTED** plans are done — reference them for context but don't re-process.
-- **APPROVED** plans are in progress — continue execution.
-- Only **submitted** (no status marker) plans await user action.
+### 计划文件状态
+\`.rivet/plans/*.md\` 文件带状态标记行：\`> **Status: APPROVED/REJECTED/EXECUTED**\`。扫描既有计划时：
+- **REJECTED** 计划已被用户否决——不要重新提交、重新提议或提醒用户，除非用户明确要求。
+- **EXECUTED** 计划已完成——可作上下文参考，不要重复处理。
+- **APPROVED** 计划执行中——继续执行。
+- 只有**已提交待批**（无状态标记）的计划等待用户操作。
 
 ### Action: submit
-Submit a completed implementation plan for user approval. The plan is persisted to \`.rivet/plans/<slug>.md\`.
+提交一份完成的实现计划供用户审批。计划持久化到 \`.rivet/plans/<slug>.md\`。
 
-The \`plan\` field must be a concrete, ready-to-implement design document. Do NOT submit outlines, skeletons, or placeholder text such as "TODO", "FIXME", "TBD", "待补充", or section headers with no content. Plans that are mostly placeholders will be rejected and you will be asked to continue planning.
+\`plan\` 字段必须是具体、可直接实施的设计文档。不要提交大纲、骨架或占位文本（如 "TODO"、"FIXME"、"TBD"、"待补充"，或只有标题没有正文的章节）。大部分内容是占位符的计划会被驳回，你需要继续完善规划。
 
-Submit gates — self-check BEFORE submitting; all unmet gates are reported in ONE rejection, fix then resubmit with the same title (each soft gate blocks only once):
-1. At least one \`\`\`mermaid diagram (architecture / data flow).
-2. A heading-level 反证/复现 section — a \`##\` heading containing "反证" or "复现" (mentioning it in a list does not count) with plan-time evidence for key claims.
-3. Scale: >8 checkbox tasks or >15 referenced files requires \`### Wave N\` wave structure + a verification command per wave.
-4. No placeholder clusters / empty sections / dots-only paragraphs (hard gate — resubmit does NOT bypass it).
-5. Cited file:line anchors must match the current working tree (mark genuinely new files as 新增).
-Never pass a "[plan persisted to …]" pointer copied from message history as \`plan\` — it is a display placeholder, not content, and does NOT mean the plan was saved. It will be rejected.
+提交门禁——提交前自检；所有未达标项会在一次驳回中全部列出，补完后用相同 title 重提（每项软门禁只拦一次）：
+0. 计划开头（H1 之后）有标题级「需求提炼」章节——用用户原话提炼需求（目标 + 非目标），审批先审意图再审方案。
+1. 至少一张 \`\`\`mermaid 图（架构图或数据流图）。
+2. 标题级「反证/复现」章节——\`##\` 标题含"反证"或"复现"（在列表里提到不算），附关键断言的计划期证据。
+3. 规模：checkbox 任务 >8 或引用文件 >15 时，必须 \`### Wave N\` 分波结构 + 每波验证命令。
+4. 无占位符簇/空章节/纯省略号段落（硬门禁——重提不豁免）。
+5. 引用的 file:line 锚点必须与当前工作树一致（确实新建的文件标注「新增」）。
+绝不要把消息历史里的 "[plan persisted to …]" 指针当作 \`plan\` 传入——那只是显示占位符，不是内容，也不代表计划已保存。会被驳回。
 
-Omit \`plan\` to submit from the active plan file (plan mode draft). Write the plan incrementally with write_file/edit_file first.
+省略 \`plan\` 字段则从活动计划文件（plan mode 草稿）提交。先用 write_file/edit_file 把计划增量写入草稿。
 
-When the plan contains multiple approaches, pass \`options\` (up to 3) so the user can choose at approval time.
+计划包含多个方案时，传 \`options\`（最多 3 个）供用户在审批时选择。
 
 ### Action: close
-Preview or apply implementation plan closure updates. Defaults to preview mode (no writes). Set apply=true to update the plan file.
+预览或应用计划闭环更新。默认预览模式（不写盘）。设 apply=true 才写回计划文件。
 
-Only supports Markdown files under docs/superpowers/plans/ or .rivet/plans/.
+仅支持 docs/superpowers/plans/ 或 .rivet/plans/ 下的 Markdown 文件。
 
 ### Action: enter_mode
-Enter plan mode yourself (write tools become blocked; a plan draft file is created). Use ONLY after the user explicitly agreed to plan first (e.g. answered "进入计划模式" to your ask_user_question). Idempotent when already planning. The user approves the submitted plan via an in-conversation approval card (desktop) or /plan-approve (TUI); after all tasks complete, \`plan close\` with apply=true marks the plan EXECUTED and exits plan mode automatically.`,
+自主进入计划模式，先规划再动手（写工具将被禁用；会创建计划草稿文件）。命中以下任一情况时主动使用：新功能实现、多文件（>2-3 个）改动、存在多个有效方案、架构决策、需求不清需要先探索。不要用于：单点小修、用户已给出详细逐步指令的任务、纯研究/问答。进入**无需用户确认**——用户的审批门在计划提交时，不在进入时。已在规划中时重复调用幂等。用户通过会话内审批卡（桌面端）或 /plan-approve（TUI）批准提交的计划；全部任务完成后 \`plan close\` apply=true 会把计划标记为 EXECUTED 并自动退出计划模式。`,
     input_schema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: ['submit', 'close', 'enter_mode'],
-          description: 'submit: create a plan for user approval. close: close completed plan tasks. enter_mode: enter plan mode (after user confirmation).',
+          description: 'submit: 提交计划供用户审批。close: 关闭已完成任务。enter_mode: 自主进入计划模式（进入无需用户确认）。',
         },
         // ── submit fields ──
-        title: { type: 'string', description: '[submit] Short descriptive plan title (used for file slug)' },
-        plan: { type: 'string', description: '[submit] Full plan in Markdown. Omit to read from active plan file in plan mode.' },
+        title: { type: 'string', description: '[submit] 简短描述性计划标题（用于生成文件 slug）' },
+        plan: { type: 'string', description: '[submit] 完整计划 Markdown。省略则从 plan mode 活动计划文件读取。' },
         options: {
           type: 'array',
           items: {
             type: 'object',
             properties: {
-              label: { type: 'string', description: 'Short name for this approach (append "(Recommended)" if preferred)' },
-              description: { type: 'string', description: 'Brief summary of trade-offs' },
+              label: { type: 'string', description: '方案短名（推荐项追加 "(Recommended)"）' },
+              description: { type: 'string', description: '取舍简要说明' },
             },
             required: ['label', 'description'],
           },
-          description: '[submit] When the plan has 2-3 distinct approaches, list them for user selection at approval.',
+          description: '[submit] 计划含 2-3 个不同方案时列出，供用户审批时选择。',
         },
         // ── close fields ──
-        file_path: { type: 'string', description: '[close] Path to the plan Markdown file under docs/superpowers/plans/' },
-        tasks: { type: 'string', description: '[close] Task selection such as 1, 1-3, 1,3-4, or all' },
-        apply: { type: 'boolean', description: '[close] Write changes to the file (default false preview mode)' },
+        file_path: { type: 'string', description: '[close] docs/superpowers/plans/ 下的计划 Markdown 路径' },
+        tasks: { type: 'string', description: '[close] 任务选择，如 1、1-3、1,3-4 或 all' },
+        apply: { type: 'boolean', description: '[close] 写回计划文件（默认 false 预览模式）' },
         verifiedCommands: {
           type: 'array', items: { type: 'string' },
-          description: '[close] Verification commands to include in the closure summary',
+          description: '[close] 闭环摘要中包含的验证命令',
         },
-        deliveryState: { type: 'string', enum: ['GREEN', 'YELLOW', 'RED'], description: '[close] Delivery gate state' },
-        note: { type: 'string', description: '[close] Optional closure note' },
-        updateClosure: { type: 'boolean', description: '[close] Whether to upsert execution status and closure (default true)' },
+        deliveryState: { type: 'string', enum: ['GREEN', 'YELLOW', 'RED'], description: '[close] 交付门状态' },
+        note: { type: 'string', description: '[close] 可选闭环备注' },
+        updateClosure: { type: 'boolean', description: '[close] 是否 upsert 执行状态与闭环（默认 true）' },
       },
       required: ['action'],
     },
@@ -315,9 +316,10 @@ Enter plan mode yourself (write tools become blocked; a plan draft file is creat
 // ── enter_mode implementation ──
 
 /**
- * 模型自主进入 plan mode（主动 Plan Mode 建议链路的确认后动作）。
- * 只进不出：退出计划模式仍归用户（approve/toggle），避免模型自行逃出只读沙箱。
- * worker/非 agent 上下文没有 enterPlanMode ref → fail-closed 报错。
+ * 模型自主进入 plan mode（对齐 kimi-code EnterPlanMode：进入无需用户确认，
+ * 审批门在 submit 时）。只进不出：退出计划模式仍归用户（approve/toggle），
+ * 避免模型自行逃出只读沙箱。worker/非 agent 上下文没有 enterPlanMode ref →
+ * fail-closed 报错。
  */
 function planEnterModeExecute(params: ToolCallParams): ToolResult {
   if (!params.enterPlanMode) {
@@ -332,14 +334,15 @@ function planEnterModeExecute(params: ToolCallParams): ToolResult {
     }
     return {
       content: [
-        'Entered plan mode — write tools are now blocked except the plan draft.',
-        activePlanFilePath ? `Plan draft: ${activePlanFilePath}` : '',
+        '已进入计划模式——写工具已禁用（计划草稿文件除外）。',
+        activePlanFilePath ? `计划草稿: ${activePlanFilePath}` : '',
         '',
-        'Next steps:',
-        '1. Research first: for multi-module tasks, dispatch 2-4 read-only code_scout workers in parallel via delegate_batch (split by module/file domain), then synthesize the findings.',
-        '2. Write the plan incrementally to the draft file with write_file/edit_file.',
-        '3. 瑶光反证 (required section, submit-gated): reproduce key claims AT PLAN TIME — re-read cited code AFTER the design is drafted, run_tests for RED evidence on bugfixes, or delegate profile=adversarial_verifier authority=yaoguang. Unreproducible inferences go in as 待验证假设, not conclusions.',
-        '4. Submit with plan action=submit (omit the plan field to submit from the draft). Submit gates: a ```mermaid diagram, a heading-level 反证/复现 section, and ### Wave N structure when >8 tasks/>15 files — all unmet gates are reported in one rejection. After submission the user approves via an in-conversation approval card; never ask the user to type /plan-approve or any command.',
+        '下一步：',
+        '1. 先用 todo 建调研清单（3-6 项：摸清各模块现状、外部调研、设计收敛），最后一项固定为「汇总写计划并用 plan action=submit 提交审批」；逐项勾掉推进。计划正文只写计划文件，不进 todo。',
+        '2. 调研：多模块任务用 delegate_batch 一次并行派 2-4 个只读 code_scout（按模块/文件域切分），汇总发现。',
+        '3. 用 write_file/edit_file 把计划增量写入草稿——开头（H1 之后）先写「## 需求提炼」：用用户原话提炼需求目标与非目标（submit 门禁）。',
+        '4. 瑶光反证（必需章节，submit 门禁）：关键断言在计划期复现——设计定稿后回读引用代码到 file:line、bugfix 跑 run_tests 拿 RED 证据、或派 profile=adversarial_verifier authority=yaoguang。复现不了的推论写为待验证假设，不当结论。',
+        '5. 用 plan action=submit 提交（省略 plan 字段即从草稿提交）。提交门禁：标题级「需求提炼」章节、一张 ```mermaid 图、标题级「反证/复现」章节、>8 任务/>15 文件时 ### Wave N 分波——所有未达标项一次驳回列全。提交后用户通过会话内审批卡批准；不要让用户手输 /plan-approve 或任何命令。',
       ].filter(Boolean).join('\n'),
     }
   } catch (err) {
@@ -396,10 +399,8 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
 
   // 指针回传门禁（硬性，先于一切软门禁）：arg post-processor 会把历史里的
   // plan 字段改写成 "[plan persisted to …]" 显示指针——包括被门禁拒绝、实际
-  // 并未落盘的提交。模型复用该指针重提时（2026-07-18 事故：两份计划文件被写
-  // 成指针、正文只留在草稿里），必须在这里拦下。write_file/edit_file/hash_edit
-  // 同款防线；plan 工具此前漏接（pointer-guard.ts 里 PLAN_POINTER_PREFIX 早已
-  // 注册，本函数从未调用）。
+  // 并未落盘的提交。模型复用该指针重提时必须在这里拦下。
+  //（write_file/edit_file/hash_edit 同款防线，pointer-guard.ts 中 PLAN_POINTER_PREFIX 已注册。）
   const matchedPointer = detectPointerPlaceholder(planContent as string)
   if (matchedPointer) {
     return {
@@ -438,9 +439,19 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   // 软门禁聚合：全部检查一次跑完，一次拒绝列全所有缺口。串行 early-return
   // 曾让一份计划被逐条拦 4 轮（规模→mermaid→反证），每轮拒绝还在历史里多留
   // 一个谎称"已持久化"的指针（见上方指针门禁）。one-shot 软拦语义不变：每项
-  // 按 slug 只拦一次，同 title 重提即放行（模型自判不适用场景，永不死锁——
-  // 91840816 教训）。
+  // 按 slug 只拦一次，同 title 重提即放行。
   const blocks: string[] = []
+
+  // 需求提炼门禁：审批先审意图再审方案——计划开头必须有用用户原话提炼的
+  // 需求章节（目标 + 非目标），防止误解意图后直接跳进设计。
+  if (!REQUIREMENT_DISTILL_HEADING_RE.test(fullContent) && !requirementWarnedSlugs.has(slug)) {
+    requirementWarnedSlugs.add(slug)
+    blocks.push([
+      '缺「需求提炼」章节——在计划开头（H1 之后）补一个标题含"需求提炼"的 ## 级章节，用用户原话提炼需求：',
+      '- **目标**：用户要达成什么（尽量引用/贴近用户原话，不要改写成官方套话）',
+      '- **非目标**：明确不做什么（边界外但容易被误并入的事项）',
+    ].join('\n'))
+  }
 
   if (!MERMAID_FENCE.test(planBody) && !warnedSlugs.has(slug)) {
     warnedSlugs.add(slug)
@@ -453,9 +464,8 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
     ].join('\n'))
   }
 
-  // 瑶光反证门禁：计划期复现，不是执行期才验。快思考事故（49fd1dfd 一族）的
-  // 根源是设计阶段发明的断言（"deltaStable 会生效""块名是 cognitive-mirror"）
-  // 从未回到代码/运行时复现。
+  // 瑶光反证门禁：计划期复现，不是执行期才验。设计阶段发明的断言
+  // 必须回到代码/运行时复现。
   if (!FALSIFICATION_HEADING_RE.test(fullContent) && !falsificationWarnedSlugs.has(slug)) {
     falsificationWarnedSlugs.add(slug)
     blocks.push([
@@ -525,8 +535,7 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   }
 
   // 产出模型留痕：记录本计划由哪个模型写出（H1 前标记行，PlanDocument 解析为
-  // model/modelTier）。低阶模型产出的计划在审批面（/plan-approve + 桌面 PlanPanel）
-  // 显示复核警告——掐断「flash 出大计划无人知晓」的事故链源头。
+  // model/modelTier）。低阶模型产出的计划在审批面显示复核警告。
   const producerModel = params.sessionModel?.trim()
   const producerTier = producerModel ? inferModelTierFromName(producerModel) : null
   const contentToPersist = producerModel

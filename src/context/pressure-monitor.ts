@@ -13,6 +13,9 @@ export interface PressureResult {
   cvmOverheadRatio: number
   /** Should CVM throttle its injections to reduce overhead? */
   shouldThrottleCvm: boolean
+  /** v3：相对压力 — 当前 ratio 相对于历史 p90 的归一化值 (0-1)。
+   *  tokenHistory < 5 条时为 undefined。下游可用此替代绝对阈值 0.5 判定高压。 */
+  pressureRelative?: number
 }
 
 /** Minimum ratio delta between consecutive checks to flag fast growth. */
@@ -22,6 +25,13 @@ const FAST_GROWTH_THRESHOLD = 0.15
 const CVM_OVERHEAD_THRESHOLD = 0.05
 /** CVM overhead ceiling: hard stop at 8% — skip all non-essential injections. */
 const CVM_OVERHEAD_CEILING = 0.08
+
+/** 90th percentile of a non-empty number array. */
+function p90(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b)
+  const idx = Math.floor(sorted.length * 0.9)
+  return sorted[Math.min(idx, sorted.length - 1)]!
+}
 
 /**
  * W2-B1: egress metering source tags. Every injected request byte is charged
@@ -69,6 +79,14 @@ export class PressureMonitor {
     const growthRate = ratio - prevRatio
     const fastGrowth = growthRate >= FAST_GROWTH_THRESHOLD
 
+    // ── Relative pressure: current ratio vs historical p90 ──
+    // 绝对阈值 0.5 在 ctxRatio 均值 ~10% 时永远不触发（见计划二节）。
+    // 相对压力以近期历史为基线，当前 ratio 超过 p90 时 pressureRelative → 1.0。
+    const historyRatios = this.tokenHistory.map(h => h.tokens / this.contextWindow)
+    const pressureRelative = historyRatios.length >= 5
+      ? Math.min(1, ratio / Math.max(p90(historyRatios), 0.01))
+      : undefined
+
     // Record for next comparison
     this.tokenHistory = [...this.tokenHistory, { turn: currentTurn, tokens: estimatedTokens }].slice(-20)
 
@@ -89,6 +107,7 @@ export class PressureMonitor {
       growthRate,
       cvmOverheadRatio,
       shouldThrottleCvm: cvmOverheadRatio >= CVM_OVERHEAD_THRESHOLD,
+      pressureRelative,
     }
   }
 

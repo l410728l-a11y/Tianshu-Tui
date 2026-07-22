@@ -147,6 +147,9 @@ export interface RuntimeRefs {
   /** Mutable ref to the current GoalTracker. Set by slash-commands /goal,
    *  read by deliver_task B1Context for auto-review gating. */
   goalTrackerRef: { current: import('./agent/goal-tracker.js').GoalTracker | null }
+  /** 会话级审查门开关：TUI /review off|on 写入，deliver_task B1Context 经
+   *  isAutoReviewOff 读取。初始值取 review.skipAuto 配置（配置成为会话默认）。 */
+  reviewGateRef: { current: 'auto' | 'off' }
   /** Plugin-contributed hooks (absolute script paths). initializePlugins fills
    *  this; the user-hooks bridge reads it at fire time so plugin hooks are
    *  picked up even though plugins load after agent assembly. */
@@ -570,7 +573,9 @@ export function createInteractiveToolRegistry(
   // W5 session_vitals: EXTENDED layer（interactive 装配，不占 kernel budget）。
   // 只读自查工具——模型写"系统状态"类结论前的取证入口（incident 20b9714e）。
   // 工具定义跟版本发布上车（新定义 = 前缀一次性 miss，绝不热更）。
-  reg.register(createSessionVitalsTool(() => refs.getSessionVitals?.() ?? null))
+  if (presetIncludes(toolPreset, 'session_vitals')) {
+    reg.register(createSessionVitalsTool(() => refs.getSessionVitals?.() ?? null))
+  }
   // PAL attack_case：攻坚案件账本——竞争假设 + 判别探针 + 证据结算。
   // preset full 才含（零使用率的重工具，2026-07-19 工具审计降级）。
   if (presetIncludes(toolPreset, 'attack_case')) {
@@ -659,6 +664,7 @@ export function createInteractiveToolRegistry(
     isGoalAchieved: () => refs.goalTrackerRef.current?.isGoalAchieved() ?? false,
     getLastVerdict: () => refs.goalTrackerRef.current?.getLastVerdict() ?? null,
     reviewConfig: config.agent.review,
+    isAutoReviewOff: () => refs.reviewGateRef.current === 'off',
     meridianIndexer: refs.meridianIndexer,
     getTaskContract: () => refs.getTaskContract?.(),
     getImpactedTests: () => refs.getImpactedTests?.() ?? [],
@@ -670,10 +676,12 @@ export function createInteractiveToolRegistry(
   })))
 
   // update_goal — model-driven goal lifecycle control (paused/blocked/complete)
-  reg.register(createUpdateGoalTool(
-    () => refs.goalTrackerRef.current,
-    () => ({ sessionId: refs.sessionId ?? undefined, cwd }),
-  ))
+  if (presetIncludes(toolPreset, 'update_goal')) {
+    reg.register(createUpdateGoalTool(
+      () => refs.goalTrackerRef.current,
+      () => ({ sessionId: refs.sessionId ?? undefined, cwd }),
+    ))
+  }
 
   return { registry: reg }
 }
@@ -1735,6 +1743,7 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     banditState: null,
     promptEngine: null,
     goalTrackerRef: { current: null },
+    reviewGateRef: { current: config.agent.review.skipAuto ? 'off' : 'auto' },
     pluginHooks: [],
     pluginCommands: [],
     // TUI 单会话：复用全局 defaultStore，沿用其 setTodoSession/loadTodos 持久化与

@@ -1,5 +1,9 @@
 import type { PostToolRuntimeHook, RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
 import type { AdvisoryBus } from '../advisory-bus.js'
+import { renderRouteAnnotation, STALL_ROUTE_TABLE } from '../failure-taxonomy.js'
+
+/** edit-failure 的恢复路由标注——统一从 STALL_ROUTE_TABLE 取值，单源不漂移。 */
+const EDIT_FAILURE_ANNOTATION = renderRouteAnnotation(STALL_ROUTE_TABLE['edit-stuck'])
 
 /**
  * Edit-Failure Recovery Hook — postTool detection of consecutive edit failures
@@ -48,7 +52,7 @@ export function createEditFailureRecoveryHook(deps: EditFailureRecoveryHookDeps)
           priority: 0.62,
           category: 'repair',
           tier: 'operational',
-          content: `已连续 ${count} 次编辑 ${filePath} 失败。自动恢复建议：1) 调用 undo 撤销最近一次写入；2) 用 read_file 重新读取当前内容；3) 改用 apply_patch（统一 diff）或 write_file（全量覆写）完成修改，避免继续用 edit_file/hash_edit 原地修补。`,
+          content: `已连续 ${count} 次编辑 ${filePath} 失败。自动恢复建议：1) 调用 undo 撤销最近一次写入；2) 用 read_file 重新读取当前内容；3) 改用 apply_patch（统一 diff）或 write_file（全量覆写）完成修改，避免继续用 edit_file/hash_edit 原地修补。 ${EDIT_FAILURE_ANNOTATION}`,
           ttl: 1,
           expect: {
             kind: 'tool_appears',

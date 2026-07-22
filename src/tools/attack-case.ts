@@ -39,56 +39,56 @@ import { NEEDLE_PLACEHOLDER, proposeProbeCandidates } from '../agent/probe-candi
 const DEFINITION: ToolDefinition = {
   name: 'attack_case',
   description:
-    'Problem-attack case ledger for hard bugs: declare competing hypotheses and discriminating probes, then settle probe predicates with evidence. Use when a problem resists 2+ fix attempts or a repro is unclear. Flow: open (bind an anchor fact) → hypothesize (2+ rival explanations with targets) → plan_probe (machine-checkable expectation + per-hypothesis supports/refutes direction) → run the probe with normal tools (or delegate_task in parallel — parallel probes score bonus points) → observe (settle predicate with evidenceRef). Effective actions earn points: informative probe +2, refuting a hypothesis +3 (elimination is progress), supporting +3, reproduction +1, parallel-delegated probe +2, case converged +5. Scores come only from reducer-derived evidence, and the receipt shows your running total. status shows the hypothesis board; close ends the case.',
+    '疑难 bug 的攻坚案件账本：宣告竞争假设与判别探针，然后用证据结算探针谓词。当问题经受 2+ 次修复尝试仍未解决、或复现路径不清时使用。流程：open（绑定锚事实）→ hypothesize（2+ 条带 targets 的竞争解释）→ plan_probe（机器可判定的 expectation + 每条假设的 supports/refutes 方向）→ 用常规工具执行探针（或用 delegate_task 并行——并行探针有加分）→ observe（带 evidenceRef 结算谓词）。有效动作得分：有信息量的探针 +2，淘汰一条假设 +3（排除即进展），证实 +3，复现 +1，并行委派探针 +2，案件收敛 +5。分数只来自 reducer 推导的证据，回执会显示累计总分。status 显示假设看板；close 结案。',
   input_schema: {
     type: 'object',
     properties: {
       op: {
         type: 'string',
         enum: ['open', 'hypothesize', 'plan_probe', 'observe', 'status', 'close'],
-        description: 'Case operation.',
+        description: '案件操作。',
       },
-      case_id: { type: 'string', description: 'Case id (required for all ops except open/status).' },
+      case_id: { type: 'string', description: '案件 id（除 open/status 外所有操作必填）。' },
       anchor: {
         type: 'object',
-        description: 'open: the anchor fact this case binds to. No anchor, no case.',
+        description: 'open: 本案绑定的锚事实。无锚不开案。',
         properties: {
           kind: { type: 'string', enum: ['obligation', 'trace_step', 'failure_pattern', 'user_report'] },
-          ref: { type: 'string', description: 'e.g. obligation id, failing test path, error signature, user words.' },
+          ref: { type: 'string', description: '如 obligation id、失败测试路径、错误签名、用户原话。' },
         },
         required: ['kind', 'ref'],
       },
-      problem: { type: 'string', description: 'open: one-sentence problem statement.' },
+      problem: { type: 'string', description: 'open: 一句话问题陈述。' },
       hypotheses: {
         type: 'array',
-        description: 'hypothesize: rival explanations. Each MUST name concrete targets (files/symbols).',
+        description: 'hypothesize: 竞争解释。每条必须指明具体 targets（文件/符号）。',
         items: {
           type: 'object',
           properties: {
             claim: { type: 'string' },
             targets: { type: 'array', items: { type: 'string' } },
-            user_fact: { type: 'boolean', description: 'True ONLY when the hypothesis stems from new facts the user just provided. Required to reopen a needs_user case; self-generated guesses cannot revive it.' },
+            user_fact: { type: 'boolean', description: '仅当假设源于用户刚提供的新事实时为 true。重开 needs_user 案件的必要条件；自己生成的猜测无法复活案件。' },
           },
           required: ['claim', 'targets'],
         },
       },
       probes: {
         type: 'array',
-        description: 'plan_probe: discriminating probes with machine-checkable expectations.',
+        description: 'plan_probe: 带机器可判定 expectation 的判别探针。',
         items: {
           type: 'object',
           properties: {
             hypothesis_ids: { type: 'array', items: { type: 'string' } },
-            kind: { type: 'string', enum: ['read', 'grep', 'lsp', 'micro_probe', 'targeted_test', 'baseline_diff', 'instrument', 'simulate', 'ask_user'], description: 'Probe style. instrument = wrap/measure the target and cross-check actual values against an independently-derived invariant (settle via command_output_matches). simulate = replay the scenario in a minimal environment model (settle via test_outcome / command_output_matches).' },
-            target: { type: 'string', description: 'File/test/command target of the probe.' },
+            kind: { type: 'string', enum: ['read', 'grep', 'lsp', 'micro_probe', 'targeted_test', 'baseline_diff', 'instrument', 'simulate', 'ask_user'], description: '探针类型。instrument = 包裹/测量目标，把实际值与独立推导的不变量交叉核对（经 command_output_matches 结算）。simulate = 在最小环境模型里重放场景（经 test_outcome / command_output_matches 结算）。' },
+            target: { type: 'string', description: '探针的目标文件/测试/命令。' },
             expectation: {
               type: 'object',
               description:
-                'Machine-checkable predicate. One of: {kind:"pattern_found"|"pattern_absent", path, needle} | {kind:"test_outcome", target, expect:"pass"|"fail"} | {kind:"tool_error_class", tool, errorClass} | {kind:"command_output_matches", commandIncludes, outputPattern}.',
+                '机器可判定谓词。取其一：{kind:"pattern_found"|"pattern_absent", path, needle} | {kind:"test_outcome", target, expect:"pass"|"fail"} | {kind:"tool_error_class", tool, errorClass} | {kind:"command_output_matches", commandIncludes, outputPattern}。',
             },
             per_hypothesis: {
               type: 'array',
-              description: 'Effect direction per hypothesis. if_false defaults to neutral (absence is not refutation unless the hypothesis predicts presence).',
+              description: '每条假设的效果方向。if_false 缺省为 neutral（缺席不等于反驳，除非该假设预测了存在）。',
               items: {
                 type: 'object',
                 properties: {
@@ -104,17 +104,17 @@ const DEFINITION: ToolDefinition = {
           required: ['hypothesis_ids', 'kind', 'target', 'expectation', 'per_hypothesis'],
         },
       },
-      probe_id: { type: 'string', description: 'observe: which probe to settle.' },
+      probe_id: { type: 'string', description: 'observe: 要结算的探针。' },
       predicate_outcome: {
         type: 'string',
         enum: ['true', 'false', 'unobservable'],
-        description: 'observe: did the expectation predicate hold? unobservable = probe ran but predicate could not be evaluated.',
+        description: 'observe: expectation 谓词是否成立？unobservable = 探针已运行但谓词无法判定。',
       },
       evidence_ref: {
         type: 'string',
-        description: 'observe: evidence pointer — tool:<name>:<turn> | worker:<orderId> | obligation:<id>. Required for true/false. Refs are VERIFIED against real records: fabricated worker/obligation refs are rejected; tool refs outside the recent history window settle state but score zero.',
+        description: 'observe: 证据指针——tool:<name>:<turn> | worker:<orderId> | obligation:<id>。true/false 必填。引用会与真实记录核验：伪造的 worker/obligation 引用会被拒绝；超出最近历史窗口的 tool 引用可结算状态但零分。',
       },
-      resolution: { type: 'string', enum: ['converged', 'abandoned', 'resolved_externally'], description: 'close: why the case ends.' },
+      resolution: { type: 'string', enum: ['converged', 'abandoned', 'resolved_externally'], description: 'close: 结案原因。' },
     },
     required: ['op'],
   },

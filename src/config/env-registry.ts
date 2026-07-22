@@ -1,0 +1,674 @@
+/**
+ * env-registry.ts — RIVET_* 环境变量注册表（自动生成）。
+ *
+ * name/defaultHint/files 由 scripts/gen-env-registry.ts 生成，勿手改；
+ * description 字段人工维护，重新生成时按 name 保留。
+ * 最后生成：2026-07-20T16:28:06.231Z
+ * 共 108 个变量。
+ *
+ * 每个条目含：名称 / 默认值提示 / 引用文件 / 简要说明。
+ * 当源码中新增 RIVET_* 引用但注册表未同步时，
+ * assembly-audit.test.ts 的 env completeness 测试会失败（双向检查）。
+ */
+
+export interface EnvRegistryEntry {
+  /** 环境变量名（含 RIVET_ 前缀） */
+  name: string
+  /** 从源码 ??/|| 推断的默认值，若无则为空 */
+  defaultHint: string
+  /** 引用该变量的源文件列表（相对 src/） */
+  files: string[]
+  /** 简要说明（人工维护，重新生成时保留） */
+  description: string
+}
+
+export const ENV_REGISTRY: EnvRegistryEntry[] = [
+  {
+    name: 'RIVET_ADVISORY_HOLDOUT',
+    defaultHint: '',
+    files: ['agent/loop.ts'],
+    description: 'advisory holdout 对照组开关（P1a 核销闭环）',
+  },
+  {
+    name: 'RIVET_ADVISORY_LIFT_CONSUMER',
+    defaultHint: '',
+    files: ['agent/loop.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_AMBIGUOUS_WIDTH',
+    defaultHint: '\'\'',
+    files: ['tui/width.ts', 'tui/engine/__tests__/live-engine-ghost-render.test.ts', 'tui/__tests__/width.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_AMNESIA_SHADOW',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_APPLY_PATCH_VERIFY',
+    defaultHint: '',
+    files: ['tools/apply-patch.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_ASCII_UI',
+    defaultHint: '',
+    files: ['tui/term-caps.ts', 'tui/engine/__tests__/app-core.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_AST_EDIT_VERIFY',
+    defaultHint: '',
+    files: ['tools/ast-edit.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_AST_EXCLUDE',
+    defaultHint: '',
+    files: ['tools/ast-shared.ts', 'tools/__tests__/ast-shared.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_ASYNC_COPILOT',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_BROWSER_ALLOWLIST',
+    defaultHint: '\'\'',
+    files: ['tools/browser.ts', 'tools/browser-debug/tool.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_BROWSER_DEBUG',
+    defaultHint: '',
+    files: ['bootstrap.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_BROWSER_URL',
+    defaultHint: '',
+    files: ['tools/browser-debug/tool.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_BUNDLED_PLUGINS_DIR',
+    defaultHint: '',
+    files: ['server/plugin-api.ts', 'server/__tests__/plugin-api.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_BUNDLED_SKILLS_DIR',
+    defaultHint: '',
+    files: ['skills/skill-loader.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CLAIM_AUDIT',
+    defaultHint: '',
+    files: ['agent/claim-audit.ts', 'agent/__tests__/claim-audit.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_COMPUTER_USE',
+    defaultHint: '',
+    files: ['bootstrap.ts', 'main.ts', 'server/config-routes.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_COMPUTER_USE_AUTOMOUNT',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CONFIG_PATH',
+    defaultHint: '',
+    files: ['tui/__tests__/slash-commands.test.ts', 'config/paths.ts', 'config/__tests__/config-cli.test.ts', 'config/__tests__/layered-config.test.ts', 'config/__tests__/manager-editor.test.ts', 'config/__tests__/manager-fetch-search.test.ts', 'config/__tests__/manager-permission-dirs.test.ts', 'config/__tests__/manager-provider.test.ts', 'config/__tests__/manager-routing.test.ts', 'config/__tests__/manager-shell.test.ts', 'config/__tests__/manager-ui.test.ts', 'config/__tests__/manager-vision-model.test.ts', 'config/__tests__/provider-wizard.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CONTROL_PLANE',
+    defaultHint: '',
+    files: ['agent/control-plane-adapters.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CPU_POOL',
+    defaultHint: '',
+    files: ['workers/cpu-pool.ts', 'workers/__tests__/cpu-pool.test.ts', 'server/__tests__/disable-cpu-pool.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CROSS_SESSION_INJECT',
+    defaultHint: '',
+    files: ['agent/turn-step-producer.ts', 'agent/__tests__/cross-session-killswitch.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CU_CDP',
+    defaultHint: '',
+    files: ['tools/computer-use/tool.ts', 'tools/computer-use/__tests__/tool.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CU_CDP_URL',
+    defaultHint: '',
+    files: ['tools/computer-use/cdp/chrome.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CU_COM',
+    defaultHint: '',
+    files: ['tools/computer-use/windows-uia-com.ts', 'tools/computer-use/__tests__/windows-driver.test.ts', 'tools/computer-use/__tests__/windows-uia-com.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CU_FEEDBACK',
+    defaultHint: '',
+    files: ['tools/computer-use/tool.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CU_HOST',
+    defaultHint: '',
+    files: ['tools/computer-use/script-host.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_CVM_VECTOR',
+    defaultHint: '',
+    files: ['agent/hooks/cognitive-capsule-router.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEAD_END_DETECTOR',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG',
+    defaultHint: '',
+    files: ['utils/debug.ts', 'api/__tests__/openai-client-tool-stream-log.test.ts', 'agent/__tests__/tool-pipeline.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG_ORPHAN',
+    defaultHint: '',
+    files: ['context/resume-preflight.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG_RAW_SSE',
+    defaultHint: '',
+    files: ['api/openai-client.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG_RENDER',
+    defaultHint: '',
+    files: ['server/session-routes.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG_TELEMETRY',
+    defaultHint: '',
+    files: ['tui/engine/perf-monitor.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG_TOOL_INPUT',
+    defaultHint: '',
+    files: ['agent/tool-pipeline.ts', 'agent/__tests__/tool-pipeline.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DEBUG_TOOL_STREAM',
+    defaultHint: '',
+    files: ['api/openai-client.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DESKTOP_DIR',
+    defaultHint: 'join(rivetHome(',
+    files: ['config/paths.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_DESKTOP_SESSION_DIR',
+    defaultHint: 'join(desktopDir(',
+    files: ['config/paths.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_EDIT_SMART_ROUTING',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_EMBEDDING_API_KEY',
+    defaultHint: 'env.DEEPSEEK_API_KEY',
+    files: ['search/embedding-provider.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_EMBEDDING_BASE_URL',
+    defaultHint: '(env.OPENAI_API_KEY ? \'https://api.opena',
+    files: ['search/embedding-provider.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_EMBEDDING_MODEL',
+    defaultHint: '\'text-embedding-3-small\'',
+    files: ['search/embedding-provider.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_EMBEDDING_TIMEOUT',
+    defaultHint: '\'\'',
+    files: ['search/embedding-provider.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_ESBUILD_LOAD_TIMEOUT',
+    defaultHint: '\'\'',
+    files: ['tools/syntax-check.ts', 'tools/__tests__/syntax-check.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_EXTERNAL_CLAIM_TRACKING',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_FETCH_PIN',
+    defaultHint: '',
+    files: ['tools/net/http-fetch.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_FORCE_RECOVERY_CLI',
+    defaultHint: '',
+    files: ['main.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_GATE_BLOCK_GUARD',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_GENERAL_LEDGER_REMINDER',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_GIT_CLEAR_GUARD',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_HOME',
+    defaultHint: '',
+    files: ['tui/__tests__/updater.test.ts', 'server/__tests__/config-routes.test.ts', 'server/__tests__/mcp-hot-add.test.ts', 'server/__tests__/mcp-inject-tools.test.ts', 'server/__tests__/plugin-api.test.ts', 'server/__tests__/project-docs-routes.test.ts', 'server/__tests__/session-manager.test.ts', 'server/__tests__/session-routes.test.ts', 'server/__tests__/worker-log-route.test.ts', 'plugins/__tests__/design-plugin-lib.test.ts', 'plugins/__tests__/plugin-installer.test.ts', 'plugins/__tests__/plugin-loader.test.ts', 'mcp/oauth/__tests__/connector.test.ts', 'config/paths.ts', 'cli/__tests__/prompt-version-warning.test.ts', 'api/deepseek-platform-client.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_HYPERLINKS',
+    defaultHint: '',
+    files: ['tui/engine/ansi.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_IMPORT_RESOURCE',
+    defaultHint: '',
+    files: ['tools/default-registry.ts', 'tools/__tests__/tool-preset.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_INTENT_ANCHOR',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_INTENT_ANCHOR_STALE',
+    defaultHint: '',
+    files: ['agent/hooks/__tests__/intent-anchor-hook.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_INTENT_ANCHOR_TURNS',
+    defaultHint: '',
+    files: ['agent/hooks/__tests__/intent-anchor-hook.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_JOB_MAX_MS',
+    defaultHint: '\'\'',
+    files: ['tools/job-store.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_LANGUAGE_ANCHOR',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_LEAVE_MARK',
+    defaultHint: '',
+    files: ['tools/default-registry.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_MCP_LOG_BYTES',
+    defaultHint: '\'\'',
+    files: ['mcp/log-buffer.ts', 'mcp/__tests__/log-buffer.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_MCP_OAUTH_CLIENT_ID',
+    defaultHint: '\'\'',
+    files: ['tui/slash-commands.ts', 'mcp/manager.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_MCP_RECONNECT',
+    defaultHint: '',
+    files: ['mcp/manager.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_MEMORY_LIMIT_BYTES',
+    defaultHint: '',
+    files: ['agent/resource-sensor.ts', 'agent/__tests__/resource-sensor.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NEW_SESSION',
+    defaultHint: '',
+    files: ['bootstrap.ts', 'main.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NO_AUTO_RESUME',
+    defaultHint: '',
+    files: ['bootstrap.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NO_CROSS_SESSION',
+    defaultHint: '',
+    files: ['agent/loop.ts', 'agent/turn-step-producer.ts', 'agent/__tests__/cross-session-killswitch.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NO_EMBEDDINGS',
+    defaultHint: '',
+    files: ['search/embedding-provider.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NO_SANDBOX',
+    defaultHint: '',
+    files: ['tools/sandbox-profile.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NO_UPDATE_CHECK',
+    defaultHint: '',
+    files: ['main.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_NOTIFY_BELL',
+    defaultHint: '',
+    files: ['tui/engine/app.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_OAUTH_TIMEOUT',
+    defaultHint: '\'\'',
+    files: ['auth/oauth-auth.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_OUTPUT_SANITIZE',
+    defaultHint: '',
+    files: ['agent/tool-execution.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PAL',
+    defaultHint: '',
+    files: ['tools/attack-case.ts', 'agent/hooks/problem-attack-hook.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PARENT_PID',
+    defaultHint: '',
+    files: ['server/serve.ts', 'server/__tests__/parent-watchdog.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PLAN_MODE_SUGGEST',
+    defaultHint: '',
+    files: ['agent/plan-mode-advisor.ts', 'agent/__tests__/plan-mode-advisor.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PLAYBOOK_INJECT',
+    defaultHint: '',
+    files: ['agent/context-injection.ts', 'agent/__tests__/playbook-injection-revival.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PRO',
+    defaultHint: '',
+    files: ['server/__tests__/recordings-distill-route.test.ts', 'config/pro-license.ts', 'config/__tests__/pro-license.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PROBE_TRACKING',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_PY_SYNTAX_TIMEOUT',
+    defaultHint: '\'\'',
+    files: ['tools/syntax-check.ts', 'tools/__tests__/syntax-check.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_REASONING_SPIRAL_GUARD',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_REGRESSION_BISECT',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_RELIABILITY_OVERRIDE',
+    defaultHint: '',
+    files: ['agent/loop.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_RENDER_VERIFY',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts', 'agent/deliver-task.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_REPO_GRAPH',
+    defaultHint: '',
+    files: ['bootstrap.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_RESUME',
+    defaultHint: '',
+    files: ['bootstrap.ts', 'main.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_RESUME_ID',
+    defaultHint: '',
+    files: ['bootstrap.ts', 'main.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_REVIEW_DISCIPLINE',
+    defaultHint: '',
+    files: ['config/review-discipline-config.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_RTK',
+    defaultHint: '',
+    files: ['tools/bash.ts', 'tools/__tests__/bash.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SANDBOX',
+    defaultHint: '',
+    files: ['tools/sandbox-profile.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SANDBOX_WRITABLE',
+    defaultHint: '',
+    files: ['tools/sandbox-profile.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SEARCH_POD',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SERVE_TIMING',
+    defaultHint: '',
+    files: ['server/serve.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SERVER_TOKEN',
+    defaultHint: '',
+    files: ['server/serve.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SESSION_DIR',
+    defaultHint: '',
+    files: ['server/__tests__/serve-restore-history.test.ts', 'server/__tests__/session-routes.test.ts', 'config/paths.ts', 'agent/__tests__/handoff-persist.test.ts', 'agent/__tests__/loop-factory.test.ts', 'agent/__tests__/persist-integration.test.ts', 'agent/__tests__/session-persist.test.ts', 'agent/__tests__/speculation-stats-meta.test.ts', 'agent/__tests__/tool-pipeline.test.ts', '__tests__/bootstrap.test.ts', '__tests__/switch-agent-session.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_SIDECAR_ENTRY',
+    defaultHint: '',
+    files: ['server/plugin-api.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TDD_GATE',
+    defaultHint: '\'\'',
+    files: ['agent/tdd-gate.ts', 'agent/__tests__/tdd-gate.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TEST',
+    defaultHint: '',
+    files: ['agent/coordinator.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TEST_PRESENCE_GATE',
+    defaultHint: '',
+    files: ['agent/test-presence.ts', 'agent/__tests__/deliver-task.test.ts', 'agent/__tests__/test-presence.test.ts', 'agent/__tests__/wave-gate.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TOOL_PRESET',
+    defaultHint: '',
+    files: ['tools/tool-preset.ts', 'tools/__tests__/tool-preset.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TURN_BUDGET_WARN',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TYPECHECK_GATE',
+    defaultHint: '',
+    files: ['agent/typecheck-gate.ts', 'agent/__tests__/typecheck-gate.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TYPECHECK_REPO_WIDE',
+    defaultHint: '',
+    files: ['agent/typecheck-gate.ts', 'agent/__tests__/typecheck-gate.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_VERSION',
+    defaultHint: '\'0.0.0-dev\'',
+    files: ['server/serve.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_VSW',
+    defaultHint: '',
+    files: ['bootstrap.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WAVE_GATE',
+    defaultHint: '',
+    files: ['agent/wave-gate.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WORKER_WRITE_GATE',
+    defaultHint: '',
+    files: ['agent/worker-write-gate.ts', 'agent/__tests__/hands-session.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WRAPUP_ANXIETY_GUARD',
+    defaultHint: '',
+    files: ['agent/create-runtime-hooks.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WRITE_OVERWRITE_GUARD',
+    defaultHint: '',
+    files: ['tools/write-file.ts', 'tools/__tests__/write-file.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WRITE_PROBE',
+    defaultHint: '',
+    files: ['context/write-evidence-probe.ts', 'context/__tests__/write-evidence-probe.test.ts'],
+    description: '',
+  },
+]

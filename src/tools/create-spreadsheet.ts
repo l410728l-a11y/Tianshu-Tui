@@ -107,25 +107,25 @@ export async function createSpreadsheet(input: CreateSpreadsheetInput): Promise<
 export const CREATE_SPREADSHEET_TOOL: Tool = {
   definition: {
     name: 'create_spreadsheet',
-    description: `Create a basic spreadsheet/table at an external or project path.
+    description: `在外部或项目路径创建基础电子表格/数据表。
 
-First-version scope: CSV, TSV, HTML, and Excel-openable .xls (HTML table saved with .xls extension). Use open_path to open the result in the OS default app.
+初版范围：CSV、TSV、HTML，以及 Excel 可打开的 .xls（以 .xls 扩展名保存的 HTML 表格）。用 open_path 在 OS 默认应用中打开结果。
 
-Examples:
-Good: create_spreadsheet(destination_path="~/Desktop/report.csv", headers=["Name","Score"], rows=[["A", 10]])
-Good: create_spreadsheet(destination_path="H:\\zhuomian\\白嫖gpt\\report.xls", title="Report", headers=["Name"], rows=[["天枢"]])`,
+示例：
+Good: create_spreadsheet(destination_path="~/Desktop/report.csv", headers=["姓名","分数"], rows=[["A", 10]])
+Good: create_spreadsheet(destination_path="H:\\zhuomian\\白嫖gpt\\report.xls", title="报告", headers=["姓名"], rows=[["天枢"]])`,
     input_schema: {
       type: 'object',
       properties: {
-        destination_path: { type: 'string', description: 'Destination file path. May be outside the project.' },
-        title: { type: 'string', description: 'Optional spreadsheet/table title.' },
-        headers: { type: 'array', items: { type: ['string', 'number', 'boolean', 'null'] }, description: 'Optional header row.' },
+        destination_path: { type: 'string', description: '目标文件路径。可在项目之外。' },
+        title: { type: 'string', description: '可选表格标题。' },
+        headers: { type: 'array', items: { type: ['string', 'number', 'boolean', 'null'] }, description: '可选表头行。' },
         rows: {
           type: 'array',
           items: { type: 'array', items: { type: ['string', 'number', 'boolean', 'null'] } },
-          description: 'Spreadsheet rows. Each row is an array of cells.',
+          description: '表格行。每行是一个单元格数组。',
         },
-        format: { type: 'string', enum: ['csv', 'tsv', 'html', 'xls'], description: 'Optional output format. Defaults from file extension.' },
+        format: { type: 'string', enum: ['csv', 'tsv', 'html', 'xls'], description: '可选输出格式。默认由文件扩展名推断。' },
       },
       required: ['destination_path', 'rows'],
     },

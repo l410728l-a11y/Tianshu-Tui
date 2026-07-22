@@ -28,20 +28,20 @@ function fmtLine(job: JobSnapshot): string {
 export const JOB_TOOL: Tool = {
   definition: {
     name: 'job',
-    description: `Inspect and control background jobs started by bash(run_in_background).
+    description: `查看和控制由 bash(run_in_background) 启动的后台任务。
 
 Actions:
-- list: show all background jobs for this session (status, elapsed, last output line).
-- await: block until a job exits, its output matches \`pattern\` (regex), or \`timeout\` elapses. Use this before depending on a background result (e.g. wait for a dev server "Ready" or an install to finish).
-- logs: return the captured output of a job.
-- kill: terminate a running job.`,
+- list: 列出本会话所有后台任务（状态、已运行时长、最后一行输出）。
+- await: 阻塞直到任务退出、输出命中 \`pattern\`（正则）或 \`timeout\` 到时。依赖后台结果前先用它（例如等 dev server 输出 "Ready" 或 install 完成）。
+- logs: 返回任务捕获的输出。
+- kill: 终止运行中的任务。`,
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'await', 'logs', 'kill'], description: 'What to do' },
-        id: { type: 'string', description: 'Job id (required for await/logs/kill)' },
-        pattern: { type: 'string', description: 'await only: regex matched against output; resolves early on a hit (e.g. "Ready|listening|compiled")' },
-        timeout: { type: 'integer', description: 'await only: max ms to block (default 120000, max 600000)' },
+        action: { type: 'string', enum: ['list', 'await', 'logs', 'kill'], description: '要执行的操作' },
+        id: { type: 'string', description: '任务 id（await/logs/kill 必填）' },
+        pattern: { type: 'string', description: '仅 await：对输出匹配的正则；命中即提前返回（如 "Ready|listening|compiled"）' },
+        timeout: { type: 'integer', description: '仅 await：最长阻塞毫秒数（默认 120000，上限 600000）' },
       },
       required: ['action'],
     },

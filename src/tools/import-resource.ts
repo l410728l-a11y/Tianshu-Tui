@@ -145,25 +145,25 @@ export const IMPORT_RESOURCE_TOOL: Tool = {
   definition: {
     name: 'import_resource',
     description:
-      'Import external resources into the project workspace so other tools can access them.' +
-      '\n\nSupports:' +
-      '\n- Local file paths (absolute): /tmp/design.png, ~/Desktop/spec.pdf' +
-      '\n- Local directories: /path/to/external/project' +
-      '\n- GitHub repos: github.com/user/repo, https://github.com/user/repo' +
-      '\n- HTTP/HTTPS URLs: downloads the content' +
-      '\n\nAfter import, the resource is available at a project-local path under .rivet/external/.' +
-      '\nOther tools (read_file, grep, glob) can then access it normally.' +
-      '\nRequires approval since it accesses resources outside the project.',
+      '把外部资源导入项目工作区，供其他工具访问。' +
+      '\n\n支持：' +
+      '\n- 本地文件路径（绝对路径）：/tmp/design.png, ~/Desktop/spec.pdf' +
+      '\n- 本地目录：/path/to/external/project' +
+      '\n- GitHub 仓库：github.com/user/repo, https://github.com/user/repo' +
+      '\n- HTTP/HTTPS URL：下载对应内容' +
+      '\n\n导入后，资源位于项目内的 .rivet/external/ 路径下。' +
+      '\n其他工具（read_file、grep、glob）即可正常访问。' +
+      '\n因会访问项目外部资源，需要审批。',
     input_schema: {
       type: 'object',
       properties: {
         source: {
           type: 'string',
-          description: 'The resource to import. Can be an absolute local path, a GitHub URL, or an HTTP/HTTPS URL.',
+          description: '要导入的资源。可以是本地绝对路径、GitHub URL 或 HTTP/HTTPS URL。',
         },
         ref: {
           type: 'string',
-          description: 'For GitHub repos: branch, tag, or commit to checkout. Defaults to the default branch.',
+          description: 'GitHub 仓库专用：要检出的 branch、tag 或 commit。默认使用默认分支。',
         },
       },
       required: ['source'],

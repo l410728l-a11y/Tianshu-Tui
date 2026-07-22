@@ -88,13 +88,28 @@ export interface ErrorDiagnosisHookDeps {
   obligations?: Pick<import('../obligation-tracker.js').ObligationTracker, 'recordFailureSignal'>
 }
 
+const EDIT_TOOLS = new Set(['edit_file', 'hash_edit', 'write_file', 'ast_edit'])
+
 export function createErrorDiagnosisHook(deps: ErrorDiagnosisHookDeps): PostToolRuntimeHook {
   let lastFiredTurn = -1
+  /** 编辑工具失败计数——用于去重：同文件 ≥2 次编辑失败时跳过 error-diagnosis，
+   *  因为 edit-failure-recovery-hook 已给出更具体的恢复建议。自维护计数独立于
+   *  hook 注册顺序——不依赖 peekPendingKeys，避免静默的顺序耦合。 */
+  const editFailCounts = new Map<string, number>()
 
   return {
     phase: 'postTool',
     name: 'error-diagnosis',
     run(ctx: RuntimeHookContext, tool: RuntimeToolEvent): void {
+      // 编辑工具成功时重置失败计数——必须在 isError 检查之前，
+      // 因为成功事件 .isError=false 会被提前返回。
+      const failureTarget = typeof tool.input?.file_path === 'string'
+        ? tool.input.file_path as string
+        : tool.target
+      if (EDIT_TOOLS.has(tool.name) && tool.success && failureTarget) {
+        editFailCounts.delete(failureTarget)
+      }
+
       // Only fire on errors
       if (!tool.isError) return
       // Only when failureClass is available
@@ -102,10 +117,17 @@ export function createErrorDiagnosisHook(deps: ErrorDiagnosisHookDeps): PostTool
       // Unknown class — no diagnosis to give
       if (tool.failureClass === 'unknown') return
       // 义务归账不受每轮 1 条诊断的节流约束——状态推进和文案节流是两回事。
-      const failureTarget = typeof tool.input?.file_path === 'string'
-        ? tool.input.file_path as string
-        : tool.target
       deps.obligations?.recordFailureSignal(tool.failureClass, failureTarget)
+
+      // 去重：编辑工具失败 ≥2 次同文件时，edit-failure-recovery 已/将给出
+      // 更具体的恢复建议。此计数独立于 edit-failure-recovery-hook，不依赖
+      // 注册顺序——两个 hook 各自维护 failCounts，但去重阈值一致（≥2）。
+      if (EDIT_TOOLS.has(tool.name) && failureTarget) {
+        const count = (editFailCounts.get(failureTarget) ?? 0) + 1
+        editFailCounts.set(failureTarget, count)
+        if (count >= 2) return
+      }
+
       // At most 1 diagnosis per turn
       if (ctx.snapshot.turn === lastFiredTurn) return
 

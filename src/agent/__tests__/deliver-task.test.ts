@@ -39,9 +39,13 @@ function makeContext(opts: {
   declaredCheckRunner?: import('../typecheck-gate.js').DeclaredCommandRunner
   taskContract?: import('../../context/task-contract.js').TaskContract
   inventorySearcher?: import('../regression-inventory.js').InventorySearcher
+  obligationGateRunner?: import('../council/council-obligations.js').GateRunner
   impactedTests?: string[]
   palConvergedCases?: import('../problem-attack-loop.js').ConvergedCaseEntry[]
   palNeedsUserCases?: Array<{ caseId: string; problem: string; minimalQuestion: string }>
+  reviewConfig?: import('../../config/schema.js').ReviewConfig
+  isAutoReviewOff?: boolean
+  goalAchieved?: boolean
 }) {
   const baseline = createWorktreeBaseline({
     branch: 'feat/b1',
@@ -78,9 +82,13 @@ function makeContext(opts: {
     declaredCheckRunner: opts.declaredCheckRunner,
     getTaskContract: opts.taskContract ? () => opts.taskContract : undefined,
     inventorySearcher: opts.inventorySearcher,
+    obligationGateRunner: opts.obligationGateRunner,
     getImpactedTests: opts.impactedTests ? () => opts.impactedTests! : undefined,
     getPalConvergedCases: opts.palConvergedCases ? () => opts.palConvergedCases! : undefined,
     getPalNeedsUserCases: opts.palNeedsUserCases ? () => opts.palNeedsUserCases! : undefined,
+    reviewConfig: opts.reviewConfig,
+    isAutoReviewOff: opts.isAutoReviewOff !== undefined ? () => opts.isAutoReviewOff! : undefined,
+    isGoalAchieved: opts.goalAchieved !== undefined ? () => opts.goalAchieved! : undefined,
   }))
 
   const params: ToolCallParams = {
@@ -365,10 +373,10 @@ describe('deliver-task — semantic task delivery tool', () => {
   it('describes complex spec checklist audit in the tool schema', () => {
     const description = toolDescription()
 
-    assert.match(description, /Complex spec delivery checklist/)
-    assert.match(description, /fact-flow graph verified/)
-    assert.match(description, /condition matrix verified/)
-    assert.match(description, /counterexample tests verified/)
+    assert.match(description, /复杂 spec 交付清单/)
+    assert.match(description, /事实流图已验证/)
+    assert.match(description, /条件矩阵已验证/)
+    assert.match(description, /反例测试已验证/)
   })
 
   it('denoises junk external files: capped list + summary count (C-fix)', async () => {
@@ -625,6 +633,107 @@ describe('deliver-task — semantic task delivery tool', () => {
     assert.ok(outcomes[0]!.lines.some(l => /审查通过 \(L2\)/.test(l)), 'verdict must land in post-commit queue')
   })
 
+  it('off 模式（review.skipAuto）：系统自动审查被抑制，不 spawn 审查 worker', async () => {
+    let routeCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => { routeCalls++; return { tier: 'auto', verdict: 'verified', evidence: 'ok', rounds: 1 } },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+      reviewConfig: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+    })
+
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'feat: scoped delivery' } })
+    await settleDetachedReview()
+
+    assert.equal(result.isError ?? false, false, 'off 模式不影响交付/提交本身')
+    assert.equal(routeCalls, 0, 'off 模式下不得路由自动审查')
+    assert.match(result.content, /自动审查已跳过/)
+  })
+
+  it('off 模式下显式 review_level 永远放行（skipAuto 不拦手动 /review）', async () => {
+    let routeCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => { routeCalls++; return { tier: 'L2', verdict: 'verified', evidence: 'ran: npx tsc --noEmit → ok', rounds: 1 } },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+      reviewConfig: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+    })
+
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'fix: scoped delivery', review_level: 'L2' } })
+    await settleDetachedReview()
+
+    assert.equal(routeCalls, 1, '显式 review_level 是用户明确意图，必须绕过 off 抑制')
+    assert.doesNotMatch(result.content, /自动审查已跳过/)
+  })
+
+  it('off 模式（isAutoReviewOff 会话开关）：自动审查被抑制', async () => {
+    let routeCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => { routeCalls++; return { tier: 'auto', verdict: 'verified', evidence: 'ok', rounds: 1 } },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+      isAutoReviewOff: true,
+    })
+
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'feat: scoped delivery' } })
+    await settleDetachedReview()
+
+    assert.equal(routeCalls, 0)
+    assert.match(result.content, /自动审查已跳过/)
+  })
+
+  it('off 模式（isAutoReviewOff）+ 显式 review_level → 放行', async () => {
+    let routeCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => { routeCalls++; return { tier: 'L2', verdict: 'verified', evidence: 'ok', rounds: 1 } },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+      isAutoReviewOff: true,
+    })
+
+    await tool.execute({ ...params, input: { commit: true, message: 'fix: scoped delivery', review_level: 'L2' } })
+    await settleDetachedReview()
+
+    assert.equal(routeCalls, 1, '会话 off 不得拦截显式手动审查')
+  })
+
+  it('off 模式下 goal-achieved 不再自动升 L3 终审', async () => {
+    let routeCalls = 0
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      routeReviewWorkflow: async () => { routeCalls++; return { tier: 'L3', verdict: 'verified', evidence: 'ok', rounds: 0 } },
+      reviewDeps: {} as ReviewRouterDeps,
+      commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
+      reviewConfig: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+      goalAchieved: true,
+    })
+
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'feat: goal complete' } })
+    await settleDetachedReview()
+
+    assert.equal(routeCalls, 0, 'goal-achieved L3 是系统触发，off 模式一并抑制（用户可 /review max 手动终审）')
+    assert.match(result.content, /自动审查已跳过/)
+  })
+
   it('detached review outcome carries the commit reference for attribution', async () => {
     const { tool, params } = makeContext({
       taskId: 't1',
@@ -686,7 +795,7 @@ describe('deliver-task — semantic task delivery tool', () => {
     const cases: Array<{ outcome: ReviewOutcome; status: DelegationActivity['status']; failureReason?: string; progress: RegExp }> = [
       {
         outcome: { tier: 'L2', verdict: 'rejected', escalated: true, rounds: 3, evidence: 'still broken' },
-        status: 'failed', failureReason: 'review-findings', progress: /审查门发现问题 \(L2\)/,
+        status: 'completed', failureReason: 'review-findings', progress: /审查门发现问题 \(L2\)/,
       },
       {
         outcome: { tier: 'auto', verdict: 'inconclusive', evidence: 'review DID NOT run (infra failure): timed out', rounds: 1, infraFailures: [{ kind: 'timeout', claim: 'x' }] },
@@ -728,11 +837,13 @@ describe('deliver-task — semantic task delivery tool', () => {
     const { tool, params } = makeContext({ taskId: 't1', ownedFiles: [] })
     const timeoutMs = tool.timeoutMs!
     // Readiness check: ownership query, no blocking stages.
-    assert.equal(timeoutMs({ ...params, input: {} }), 30_000)
-    // Commit: file I/O + git, no typecheck/review stages inside.
-    assert.equal(timeoutMs({ ...params, input: { commit: true } }), 60_000)
+    assert.equal(timeoutMs({ ...params, input: {} }), 60_000)
+    // Commit: file I/O + git, no typecheck/review stages inside. 180s（而非
+    // 60s）：满载机器 + 多会话大工作区上 60s 超时导致模型退回裸 git 提交
+    //（2026-07-21 损毁提交事故），提交是终态动作，宁可慢不可断。
+    assert.equal(timeoutMs({ ...params, input: { commit: true } }), 180_000)
     // Explicit review_level no longer adds budget — review is detached.
-    assert.equal(timeoutMs({ ...params, input: { commit: true, review_level: 'L2' } }), 60_000)
+    assert.equal(timeoutMs({ ...params, input: { commit: true, review_level: 'L2' } }), 180_000)
   })
 
   it('routes non-fix code commits through ReviewRouter as objective review assistance', async () => {
@@ -1535,6 +1646,75 @@ Do not declare a streamed response duplicate in the middle of the stream.
       const result = await tool.execute(params)
 
       assert.doesNotMatch(result.content, /回归清单/)
+    })
+  })
+
+  // ── Norns 义务账：议事会契约随附义务的交付前核验（Phase 3）──
+  describe('council obligation ledger verification', () => {
+    function storedPlanWith(obligations: import('../council/council-obligations.js').ObligationEntry[]): string {
+      return JSON.stringify({
+        version: 1, objective: 'council plan', source: 'manual', createdAt: 1,
+        tasks: [{ id: 'T1', title: 't', objective: 'o', profile: 'implementer', kind: 'patch_proposal', files: [], dependsOn: [], riskTier: 'low' }],
+        obligations,
+      })
+    }
+
+    it('会话存有带义务账的契约 → 交付报告核验：gate 执行 + manual 项披露要求', async () => {
+      const sessionId = `deliver-obligations-${Date.now()}`
+      const { storePlan, clearPlan } = await import('../plan-store.js')
+      storePlan(storedPlanWith([
+        { id: 'advisory_gate:0', kind: 'advisory_gate', text: '类型必须过', source: 'tianquan', gate: 'npx tsc --noEmit' },
+        { id: 'deferred_decision:1', kind: 'deferred_decision', text: '暂缓项「备选B」待裁', source: 'tianfu' },
+      ]), sessionId)
+      try {
+        const ran: string[] = []
+        const { tool, params } = makeContext({
+          taskId: 't1',
+          ownedFiles: ['src/a.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+          obligationGateRunner: cmd => { ran.push(cmd); return { ok: true } },
+        })
+        const result = await tool.execute({ ...params, sessionId })
+        assert.deepEqual(ran, ['npx tsc --noEmit'], '白名单 gate 应真实执行')
+        assert.match(result.content, /议事会义务账核验/)
+        assert.match(result.content, /✅ \[tianquan\] 类型必须过/)
+        assert.match(result.content, /📒 \[tianfu\] 暂缓项/)
+        assert.match(result.content, /逐项披露/)
+      } finally {
+        clearPlan(sessionId)
+      }
+    })
+
+    it('gate 未过 → 强警告（advisory 不阻断交付）', async () => {
+      const sessionId = `deliver-obligations-fail-${Date.now()}`
+      const { storePlan, clearPlan } = await import('../plan-store.js')
+      storePlan(storedPlanWith([
+        { id: 'advisory_gate:0', kind: 'advisory_gate', text: '测试必须过', source: 'huagai', gate: 'npm test' },
+      ]), sessionId)
+      try {
+        const { tool, params } = makeContext({
+          taskId: 't1',
+          ownedFiles: ['src/a.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+          obligationGateRunner: () => ({ ok: false, detail: '2 failed' }),
+        })
+        const result = await tool.execute({ ...params, sessionId })
+        assert.match(result.content, /❌ \[huagai\] 测试必须过/)
+        assert.match(result.content, /验收 gate 未通过/)
+        assert.equal(result.isError, undefined, '义务账是 advisory，绝不让交付失败')
+      } finally {
+        clearPlan(sessionId)
+      }
+    })
+
+    it('无存储契约或零义务 → 零输出', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't1',
+        ownedFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      })
+      const result = await tool.execute({ ...params, sessionId: `deliver-obligations-none-${Date.now()}` })
+      assert.doesNotMatch(result.content, /义务账/)
     })
   })
 

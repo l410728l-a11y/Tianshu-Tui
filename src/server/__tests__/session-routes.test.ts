@@ -841,6 +841,80 @@ test('PlusMenu read routes 404 on a missing session', async () => {
   }
 })
 
+// ── PlusMenu: review gate ─────────────────────────────────────────
+
+function setupReviewGate() {
+  const agents: ModelFakeAgent[] = []
+  /** 模拟 serve-agent 的 sessionStoresById：agent 构建后存在的 live refs。 */
+  const gateRefs = new Map<string, { current: 'auto' | 'off' }>()
+  const manager = new RuntimeSessionManager({
+    createAgent: () => { const a = new ModelFakeAgent(); agents.push(a); return a },
+    defaultCwd: '/tmp/work',
+    resolveReviewGateRef: (id) => gateRefs.get(id),
+    defaultReviewGate: 'auto',
+  })
+  const router = createRouter(buildSessionRoutes(manager, TOKEN))
+  return { manager, agents, router, gateRefs }
+}
+
+test('GET /review-gate returns default auto; POST off/auto round-trips', async () => {
+  const { router } = setupReviewGate()
+  const s = await router('POST', '/sessions', {}, AUTH)
+  const id = (s.body as { id: string }).id
+
+  const before = await router('GET', `/sessions/${id}/review-gate`, {}, AUTH)
+  assert.equal(before.status, 200)
+  assert.equal((before.body as { mode: string }).mode, 'auto')
+
+  const off = await router('POST', `/sessions/${id}/review-gate`, { mode: 'off' }, AUTH)
+  assert.equal(off.status, 200)
+  const after = await router('GET', `/sessions/${id}/review-gate`, {}, AUTH)
+  assert.equal((after.body as { mode: string }).mode, 'off')
+
+  const on = await router('POST', `/sessions/${id}/review-gate`, { mode: 'auto' }, AUTH)
+  assert.equal(on.status, 200)
+  const restored = await router('GET', `/sessions/${id}/review-gate`, {}, AUTH)
+  assert.equal((restored.body as { mode: string }).mode, 'auto')
+})
+
+test('POST /review-gate validates mode; 404 on missing session', async () => {
+  const { router } = setupReviewGate()
+  const s = await router('POST', '/sessions', {}, AUTH)
+  const id = (s.body as { id: string }).id
+
+  const bad = await router('POST', `/sessions/${id}/review-gate`, { mode: 'nope' }, AUTH)
+  assert.equal(bad.status, 400)
+  const missing = await router('POST', `/sessions/${id}/review-gate`, {}, AUTH)
+  assert.equal(missing.status, 400)
+
+  const ghostGet = await router('GET', '/sessions/ghost/review-gate', {}, AUTH)
+  assert.equal(ghostGet.status, 404)
+  const ghostPost = await router('POST', '/sessions/ghost/review-gate', { mode: 'off' }, AUTH)
+  assert.equal(ghostPost.status, 404)
+})
+
+test('setReviewGate 现写 live refs；agent 重建后 override 经 applySelections 重放', async () => {
+  const { manager, router, gateRefs } = setupReviewGate()
+  const s = await router('POST', '/sessions', { prompt: 'go' }, AUTH)
+  const id = (s.body as { id: string }).id
+
+  // agent 已构建（prompt 触发），模拟 stores 里的 live ref
+  const refA: { current: 'auto' | 'off' } = { current: 'auto' }
+  gateRefs.set(id, refA)
+
+  const off = await router('POST', `/sessions/${id}/review-gate`, { mode: 'off' }, AUTH)
+  assert.equal(off.status, 200)
+  assert.equal(refA.current, 'off', 'override 必须现写 live refs，deliver_task 立即感知')
+
+  // 模拟 switchModel 重建：stores 换成全新 refs（回退配置默认 auto），
+  // applySelections 必须把用户 override 重放进去
+  const refB: { current: 'auto' | 'off' } = { current: 'auto' }
+  gateRefs.set(id, refB)
+  const internal = (manager as unknown as { sessions: Map<string, unknown> }).sessions.get(id)
+  ;(manager as unknown as { applySelections(s: unknown): void }).applySelections(internal)
+  assert.equal(refB.current, 'off', '重建后的新 refs 必须重放 override，否则 Off 静默失效')
+})
+
 test('GET /skills/installable lists .claude candidates; POST /skills/install copies without hot-loading', async () => {
   const { router } = setupPlus()
   const cwd = mkdtempSync(join(tmpdir(), 'skill-install-route-'))

@@ -12,7 +12,7 @@ const settle = async () => {
   await new Promise((r) => setImmediate(r))
   await new Promise((r) => setTimeout(r, 10))
 }
-import { RuntimeSessionManager, type ManagedAgent, type ModelOption, type DelegateActivityUpdate } from '../session-manager.js'
+import { RuntimeSessionManager, extractObjective, type ManagedAgent, type ModelOption, type DelegateActivityUpdate } from '../session-manager.js'
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 import type { Artifact } from '../../artifact/types.js'
 import type { OaiMessage } from '../../api/oai-types.js'
@@ -1331,4 +1331,28 @@ test('delta coalescing: shutdownAll drains pending buffers', async () => {
 
   const evs = manager['sessions'].get(s.id)!.events.filter((e) => e.type === 'text_delta')
   assert.deepEqual(evs.map((e) => e.data.text), ['kept', ' also kept'])
+})
+
+test('extractObjective: top-level objective preferred', () => {
+  assert.equal(extractObjective({ objective: 'find bugs' }), 'find bugs')
+  assert.equal(extractObjective({ prompt: 'scan auth' }), 'scan auth')
+})
+
+test('extractObjective: delegate_batch tasks[] summarized', () => {
+  const o = extractObjective({
+    tasks: [
+      { objective: 'scout auth flow' },
+      { objective: 'check rate limits' },
+      { objective: 'verify tokens' },
+      { objective: 'extra task' },
+    ],
+  })
+  assert.match(o, /scout auth flow/)
+  assert.match(o, /check rate limits/)
+  assert.match(o, /\+1 more/)
+})
+
+test('extractObjective: empty when no usable fields', () => {
+  assert.equal(extractObjective({}), '')
+  assert.equal(extractObjective({ tasks: [{ profile: 'code_scout' }] }), '')
 })

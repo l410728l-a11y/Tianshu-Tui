@@ -40,6 +40,7 @@ export function computeOwnedDiff(baseCwd: string, baselineHead: string, ownedFil
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
   })
   if (result.status !== 0) return ''
   return typeof result.stdout === 'string' ? result.stdout : ''
