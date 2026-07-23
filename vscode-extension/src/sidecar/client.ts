@@ -4,7 +4,19 @@
  * SSE 断线自动以 lastSeq 重连（server 的 GET /stream?since=N 重放尾部），
  * 事件经回调直接透传给 webview 桥——客户端不做业务解释，保持薄。
  */
-import type { ApprovalAnswer, CreateSessionRequest, DomainEntry, ModelEntry, SessionEvent, SessionRecord, WorkingTreeFile } from './protocol.js'
+import type {
+  ApprovalAnswer,
+  CreateSessionRequest,
+  DomainEntry,
+  ModelEntry,
+  PlanDocument,
+  ProviderConfigList,
+  SessionEvent,
+  SessionRecord,
+  SetupCustomProviderRequest,
+  SetupProviderRequest,
+  WorkingTreeFile,
+} from './protocol.js'
 
 export class SidecarClient {
   private readonly baseUrl: string
@@ -118,6 +130,46 @@ export class SidecarClient {
       `/sessions/${encodeURIComponent(id)}/files?q=${encodeURIComponent(q)}&limit=${limit}`,
     )
     return body.files
+  }
+
+  /** 首启引导 — provider 配置面（与桌面 Settings 同一 REST）。 */
+  listProviders(): Promise<ProviderConfigList> {
+    return this.request('GET', '/config/providers')
+  }
+
+  /** 预设 provider 一步配置（key + makeDefault 同请求）。 */
+  setupProvider(req: SetupProviderRequest): Promise<{ ok: boolean; providerName: string }> {
+    return this.request('POST', '/config/providers', req)
+  }
+
+  /** OpenAI 兼容自定义端点配置。 */
+  setupCustomProvider(req: SetupCustomProviderRequest): Promise<{ ok: boolean; providerName: string }> {
+    return this.request('POST', '/config/providers/custom', req)
+  }
+
+  /** Plan mode — 计划正文（原生审批卡数据源）。 */
+  async readPlan(id: string, slug: string): Promise<PlanDocument> {
+    const body = await this.request<{ plan: PlanDocument }>(
+      'GET',
+      `/sessions/${encodeURIComponent(id)}/plans/${encodeURIComponent(slug)}`,
+    )
+    return body.plan
+  }
+
+  approvePlan(id: string, slug: string, selectedApproach?: string): Promise<{ ok: boolean }> {
+    return this.request(
+      'POST',
+      `/sessions/${encodeURIComponent(id)}/plans/${encodeURIComponent(slug)}/approve`,
+      selectedApproach ? { selectedApproach } : {},
+    )
+  }
+
+  rejectPlan(id: string, slug: string, comment?: string): Promise<{ ok: boolean }> {
+    return this.request(
+      'POST',
+      `/sessions/${encodeURIComponent(id)}/plans/${encodeURIComponent(slug)}/reject`,
+      comment ? { comment } : {},
+    )
   }
 
   /** E4 — register / heartbeat client landing capabilities. */

@@ -27,6 +27,7 @@ export type KnownEventType =
   | 'steer_queued'
   | 'plan_mode'
   | 'plan_submitted'
+  | 'plan_draft'
   | 'user_question'
   | 'model_switched'
   | 'domain_changed'
@@ -94,4 +95,54 @@ export interface DomainEntry {
   motto: string
   meta: string
   current: boolean
+}
+
+/** GET /config/providers — 已配置的 provider 条目。 */
+export interface ProviderListItem {
+  name: string
+  label: string
+  baseUrl?: string
+  isDefault: boolean
+  keyStatus: { source: 'inline' | 'env' | 'none'; ref: string }
+  models: { id: string; alias?: string; supportsVision?: boolean }[]
+  isPreset: boolean
+}
+
+/** GET /config/providers — 尚未配置的预设候选。 */
+export interface UnconfiguredPreset {
+  key: string
+  label: string
+  defaultModelId: string
+}
+
+export interface ProviderConfigList {
+  providers: ProviderListItem[]
+  unconfigured: UnconfiguredPreset[]
+}
+
+/** POST /config/providers（预设 setup，一步带 key + 设默认）。 */
+export interface SetupProviderRequest {
+  providerName: string
+  apiKey?: string
+  baseUrl?: string
+  makeDefault?: boolean
+}
+
+/** POST /config/providers/custom（OpenAI 兼容自定义端点）。 */
+export interface SetupCustomProviderRequest {
+  providerName: string
+  baseUrl: string
+  apiKey?: string
+  makeDefault?: boolean
+  model: { id: string; alias?: string }
+}
+
+/** GET /sessions/:id/plans/:slug — plan mode 计划文档（server plan-store 镜像子集）。 */
+export interface PlanDocument {
+  slug: string
+  title: string
+  content: string
+  status: 'submitted' | 'approved' | 'executed' | 'rejected'
+  options?: { id: string; label: string }[]
+  model?: string
 }
