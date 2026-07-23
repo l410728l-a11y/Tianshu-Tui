@@ -56,41 +56,6 @@ test('未知事件类型透传忽略（向后兼容）', () => {
   assert.equal(s.items.length, 1)
 })
 
-test('plan_submitted 带 slug 出计划卡，同 slug 状态更新原位刷新', () => {
-  const s1 = feed([
-    { type: 'plan_submitted', data: { slug: 'p-1', title: '重构计划', status: 'submitted' } },
-  ])
-  assert.deepEqual(s1.items[0], { kind: 'plan', slug: 'p-1', title: '重构计划', status: 'submitted' })
-
-  const s2 = reduceEvent(s1, {
-    seq: 9, ts: 9, type: 'plan_submitted',
-    data: { slug: 'p-1', title: '重构计划', status: 'rejected' },
-  })
-  assert.equal(s2.items.length, 1)
-  assert.deepEqual(s2.items[0], { kind: 'plan', slug: 'p-1', title: '重构计划', status: 'rejected' })
-})
-
-test('plan_submitted 无 slug 时回退 info 提示（旧内核兼容）', () => {
-  const s = feed([{ type: 'plan_submitted', data: {} }])
-  assert.equal(s.items[0]?.kind, 'info')
-})
-
-test('plan_draft 置起草指示，submit / 退出 plan mode 时清除', () => {
-  const s1 = feed([
-    { type: 'plan_mode', data: { state: 'planning' } },
-    { type: 'plan_draft', data: { slug: 'p-1' } },
-  ])
-  assert.equal(s1.planDrafting, true)
-
-  const submitted = reduceEvent(s1, {
-    seq: 9, ts: 9, type: 'plan_submitted', data: { slug: 'p-1', title: 'T', status: 'submitted' },
-  })
-  assert.equal(submitted.planDrafting, false)
-
-  const exited = reduceEvent(s1, { seq: 9, ts: 9, type: 'plan_mode', data: { state: 'off' } })
-  assert.equal(exited.planDrafting, false)
-})
-
 test('text_delta 中插入 tool 后新 delta 开新气泡', () => {
   const s = feed([
     { type: 'text_delta', data: { text: '前' } },

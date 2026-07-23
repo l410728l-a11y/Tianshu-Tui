@@ -27,10 +27,6 @@ type InboundMsg =
   | { type: 'setDomain'; sessionId: string; key: string }
   | { type: 'queryFiles'; sessionId: string; q: string; reqId: number }
   | { type: 'openFile'; path: string; line?: number }
-  | { type: 'listProviders' }
-  | { type: 'setupProvider'; providerName: string; apiKey: string; baseUrl?: string; custom?: boolean; modelId?: string }
-  | { type: 'readPlan'; sessionId: string; slug: string }
-  | { type: 'planDecision'; sessionId: string; slug: string; decision: 'approve' | 'reject'; comment?: string }
 
 export class CockpitProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'tianshu.cockpit'
@@ -131,59 +127,6 @@ export class CockpitProvider implements vscode.WebviewViewProvider {
         }
         case 'openFile': {
           await this.openWorkspaceFile(msg.path, msg.line)
-          break
-        }
-        case 'listProviders': {
-          // 旧内核可能无 /config 路由——失败回 null，webview 不弹错误、不挡对话
-          try {
-            const config = await client.listProviders()
-            this.post({ type: 'providers', config })
-          } catch {
-            this.post({ type: 'providers', config: null })
-          }
-          break
-        }
-        case 'setupProvider': {
-          // key 只在此桥内经手一次，不回发 webview、不落宿主状态。
-          try {
-            if (msg.custom) {
-              if (!msg.baseUrl || !msg.modelId) throw new Error('自定义端点需要 baseUrl 和模型 ID')
-              await client.setupCustomProvider({
-                providerName: msg.providerName,
-                baseUrl: msg.baseUrl,
-                ...(msg.apiKey ? { apiKey: msg.apiKey } : {}),
-                makeDefault: true,
-                model: { id: msg.modelId },
-              })
-            } else {
-              await client.setupProvider({
-                providerName: msg.providerName,
-                apiKey: msg.apiKey,
-                makeDefault: true,
-              })
-            }
-            // 保存后复核生效（sidecar 侧写盘 + 重读有时序），再放行座舱
-            const config = await client.listProviders()
-            this.post({ type: 'providerSetupResult', ok: true })
-            this.post({ type: 'providers', config })
-          } catch (err) {
-            this.post({ type: 'providerSetupResult', ok: false, message: (err as Error).message })
-          }
-          break
-        }
-        case 'readPlan': {
-          const plan = await client.readPlan(msg.sessionId, msg.slug)
-          this.post({ type: 'plan', sessionId: msg.sessionId, plan })
-          break
-        }
-        case 'planDecision': {
-          try {
-            if (msg.decision === 'approve') await client.approvePlan(msg.sessionId, msg.slug)
-            else await client.rejectPlan(msg.sessionId, msg.slug, msg.comment)
-            this.post({ type: 'planDecisionResult', sessionId: msg.sessionId, slug: msg.slug, decision: msg.decision, ok: true })
-          } catch (err) {
-            this.post({ type: 'planDecisionResult', sessionId: msg.sessionId, slug: msg.slug, decision: msg.decision, ok: false, message: (err as Error).message })
-          }
           break
         }
       }

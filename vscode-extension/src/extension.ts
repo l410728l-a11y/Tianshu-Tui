@@ -20,15 +20,6 @@ let output: vscode.OutputChannel | undefined
 let delegation: DelegationExecutor | undefined
 let statusBar: StatusBarController | undefined
 let globalStorageDir = ''
-/** 崩溃自动重拉：连续尝试计数（进程稳定运行超过窗口即清零）。 */
-let restartAttempts = 0
-let restartTimer: ReturnType<typeof setTimeout> | undefined
-/** disposeSidecar 主动 kill 时置位，onExit 据此跳过自动重拉。 */
-let expectedExit = false
-
-const MAX_RESTART_ATTEMPTS = 3
-/** 进程存活超过此时长视为「曾经健康」，重拉计数清零（防 crash-loop 计数永不归零）。 */
-const STABLE_UPTIME_MS = 60_000
 
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel('天枢 Sidecar')
@@ -161,7 +152,7 @@ async function ensureClient(provider: CockpitProvider, cwd: string | undefined):
           void vscode.window
             .showErrorMessage('未找到 rivet CLI（天枢内核）。', '安装说明', '打开设置')
             .then((pick) => {
-              if (pick === '安装说明') void vscode.env.openExternal(vscode.Uri.parse('https://github.com/huiliyi37/Tianshu-Tui#install'))
+              if (pick === '安装说明') void vscode.env.openExternal(vscode.Uri.parse('https://github.com/tianshu-ai/Tianshu-Tui#install'))
               if (pick === '打开设置') void vscode.commands.executeCommand('workbench.action.openSettings', 'tianshu.cliPath')
             })
         }
@@ -169,34 +160,12 @@ async function ensureClient(provider: CockpitProvider, cwd: string | undefined):
         statusBar?.setSidecarState('dead', (err as Error).message)
         throw err
       }
-      const startedAt = Date.now()
       sidecar.onExit((code) => {
         output?.appendLine(`[tianshu] sidecar exited (code ${code})`)
+        provider.notifySidecarState('dead', `内核进程退出（code ${code}）`)
+        statusBar?.setSidecarState('dead', `内核进程退出（code ${code}）`)
         clientPromise = undefined
         sidecar = undefined
-        if (expectedExit) {
-          expectedExit = false
-          return
-        }
-        // 稳定运行过一段时间的进程崩溃 → 视为新一轮故障，从头计数
-        if (Date.now() - startedAt > STABLE_UPTIME_MS) restartAttempts = 0
-        if (restartAttempts < MAX_RESTART_ATTEMPTS) {
-          restartAttempts++
-          const delay = 1000 * 3 ** (restartAttempts - 1) // 1s / 3s / 9s
-          const msg = `内核重启中（第 ${restartAttempts}/${MAX_RESTART_ATTEMPTS} 次）…`
-          output?.appendLine(`[tianshu] auto-restart in ${delay}ms (attempt ${restartAttempts}/${MAX_RESTART_ATTEMPTS})`)
-          provider.notifySidecarState('starting', msg)
-          statusBar?.setSidecarState('starting', msg)
-          restartTimer = setTimeout(() => {
-            restartTimer = undefined
-            ensureClient(provider, cwd).catch(() => {
-              // 启动失败已在 ensureClient 内落 dead 状态；等下一次退避或人工重启
-            })
-          }, delay)
-          return
-        }
-        provider.notifySidecarState('dead', `内核进程退出（code ${code}），自动重启 ${MAX_RESTART_ATTEMPTS} 次未恢复`)
-        statusBar?.setSidecarState('dead', `内核进程退出（code ${code}）`)
       })
       provider.notifySidecarState('ready')
       statusBar?.setSidecarState('ready')
@@ -207,12 +176,6 @@ async function ensureClient(provider: CockpitProvider, cwd: string | undefined):
 }
 
 function disposeSidecar(): void {
-  if (restartTimer) {
-    clearTimeout(restartTimer)
-    restartTimer = undefined
-  }
-  restartAttempts = 0
-  if (sidecar) expectedExit = true
   delegation?.detach()
   sidecar?.dispose()
   sidecar = undefined

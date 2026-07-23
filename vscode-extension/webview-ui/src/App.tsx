@@ -1,16 +1,13 @@
-import { useEffect, useMemo, useReducer, useRef, useState, useCallback, type DragEvent } from 'react'
+import { useEffect, useReducer, useRef, useState, useCallback, type DragEvent } from 'react'
 import {
   onHostMessage,
   send,
   type DomainEntry,
   type HostMsg,
   type ModelEntry,
-  type PlanDocument,
-  type ProviderConfigList,
   type SessionEvent,
   type SessionRecord,
 } from './bridge.js'
-import { renderMarkdown } from './markdown.js'
 import { initialChatState, reduceEvent, type ChatState, type ChatItem, type QuestionSpec } from './model.js'
 
 type SidecarState = 'starting' | 'ready' | 'dead'
@@ -35,12 +32,6 @@ export function App() {
   const fileReqRef = useRef(0)
   const [chat, dispatch] = useReducer(chatReducer, initialChatState)
   const bottomRef = useRef<HTMLDivElement>(null)
-  // undefined=探测中 / null=内核无 config 路由（不挡对话）/ list=已知配置面
-  const [providerConfig, setProviderConfig] = useState<ProviderConfigList | null | undefined>(undefined)
-  const [plans, setPlans] = useState<Record<string, PlanDocument>>({})
-  const [planDecisions, setPlanDecisions] = useState<Record<string, string>>({})
-  // SSE 曾经连上过（用于区分「首连中」与「断线重连中」）
-  const everLiveRef = useRef(false)
 
   useEffect(() => {
     const off = onHostMessage((msg: HostMsg) => {
@@ -56,21 +47,17 @@ export function App() {
         case 'sessionAttached':
           setActiveId(msg.sessionId)
           dispatch({ type: 'reset' })
-          everLiveRef.current = false
           send({ type: 'listPickers', sessionId: msg.sessionId })
           break
         case 'event':
           dispatch({ type: 'event', ev: msg.event })
           break
         case 'streamState':
-          if (msg.live) everLiveRef.current = true
           setLive(msg.live)
           break
         case 'sidecarState':
           setSidecar(msg.state)
           setSidecarDetail(msg.detail ?? '')
-          // 内核就绪即探测 provider 配置（首启无 key → Setup 卡）
-          if (msg.state === 'ready') send({ type: 'listProviders' })
           break
         case 'pickers':
           setModels(msg.models)
@@ -82,23 +69,9 @@ export function App() {
         case 'error':
           setErrorBanner(msg.message)
           break
-        case 'providers':
-          setProviderConfig(msg.config)
-          break
-        case 'plan':
-          setPlans((prev) => ({ ...prev, [msg.plan.slug]: msg.plan }))
-          break
-        case 'planDecisionResult':
-          if (msg.ok) {
-            setPlanDecisions((prev) => ({ ...prev, [msg.slug]: msg.decision }))
-          } else {
-            setErrorBanner(msg.message ?? '计划操作失败')
-          }
-          break
       }
     })
     send({ type: 'ready' })
-    send({ type: 'listProviders' })
     return off
   }, [])
 
@@ -113,12 +86,6 @@ export function App() {
   }, [chat.items])
 
   const running = chat.status === 'running'
-  // 有任何一个 provider 有可用 key 即视为已配置；null（旧内核）不挡对话
-  const needsSetup =
-    providerConfig !== undefined &&
-    providerConfig !== null &&
-    !providerConfig.providers.some((p) => p.keyStatus.source !== 'none')
-  const reconnecting = sidecar === 'ready' && !!activeId && !live && everLiveRef.current
 
   const submit = useCallback(
     (text: string) => {
@@ -161,25 +128,14 @@ export function App() {
           models={models}
           domains={domains}
           planMode={chat.planMode}
-          planDrafting={chat.planDrafting}
           running={running}
-          approvalMode={sessions.find((s) => s.id === activeId)?.approvalMode ?? 'manual'}
-          onApprovalMode={(mode) => {
-            send({ type: 'setApprovalMode', sessionId: activeId, mode })
-            setSessions((prev) => prev.map((s) => (s.id === activeId ? { ...s, approvalMode: mode } : s)))
-          }}
         />
       )}
       {sidecar === 'dead' && (
         <div className="banner error">内核不可用：{sidecarDetail || '进程已退出'}（命令面板 → 天枢: 重启内核）</div>
       )}
-      {sidecar === 'starting' && sidecarDetail && <div className="banner">{sidecarDetail}</div>}
-      {reconnecting && <div className="banner">连接断开，重连中…</div>}
       {errorBanner && <div className="banner error">{errorBanner}</div>}
       {chat.todos.length > 0 && <TodoPanel todos={chat.todos} />}
-      {needsSetup ? (
-        <SetupCard config={providerConfig} />
-      ) : (
       <div className="messages">
         {chat.items.length === 0 && (
           <div className="empty">
@@ -187,22 +143,13 @@ export function App() {
           </div>
         )}
         {chat.items.map((item, i) => (
-          <Item
-            key={i}
-            item={item}
-            sessionId={activeId}
-            running={running}
-            streaming={running && i === chat.items.length - 1}
-            plans={plans}
-            planDecisions={planDecisions}
-          />
+          <Item key={i} item={item} sessionId={activeId} running={running} />
         ))}
         <div ref={bottomRef} />
       </div>
-      )}
       <Composer
         running={running}
-        disabled={sidecar === 'dead' || needsSetup}
+        disabled={sidecar === 'dead'}
         fileHits={fileHits}
         onQueryFiles={queryFiles}
         onClearFiles={() => setFileHits([])}
@@ -241,21 +188,12 @@ function Header(props: {
   )
 }
 
-const APPROVAL_MODES: { value: string; label: string; hint: string }[] = [
-  { value: 'manual', label: '手动审批', hint: '每个敏感操作都需确认' },
-  { value: 'auto-safe', label: '自动·安全', hint: '只读/安全操作自动放行，写操作仍需确认' },
-  { value: 'auto-accept', label: '自动接受', hint: '全部自动放行（信任当前任务时使用）' },
-]
-
 function Toolbar(props: {
   sessionId: string
   models: ModelEntry[]
   domains: DomainEntry[]
   planMode: string
-  planDrafting: boolean
   running: boolean
-  approvalMode: string
-  onApprovalMode: (mode: string) => void
 }) {
   const currentModel = props.models.find((m) => m.current)
   const currentDomain = props.domains.find((d) => d.current)
@@ -295,132 +233,7 @@ function Toolbar(props: {
           </option>
         ))}
       </select>
-      <select
-        value={APPROVAL_MODES.some((m) => m.value === props.approvalMode) ? props.approvalMode : 'manual'}
-        title="审批模式"
-        onChange={(e) => props.onApprovalMode(e.target.value)}
-      >
-        {APPROVAL_MODES.map((m) => (
-          <option key={m.value} value={m.value} title={m.hint}>
-            {m.label}
-          </option>
-        ))}
-      </select>
-      {props.planMode === 'planning' && (
-        <span className="badge plan">📋 Plan Mode{props.planDrafting ? ' · 起草中…' : ''}</span>
-      )}
-    </div>
-  )
-}
-
-/**
- * 首启 Setup 引导卡：选 provider 预设 + 填 API key，一步配好默认模型。
- * key 只经 postMessage 一次性交宿主调 REST，不进 webview 状态持久化。
- */
-function SetupCard({ config }: { config: ProviderConfigList }) {
-  const CUSTOM = '__custom__'
-  // 候选：未配置的预设 + 已配置但无 key 的 provider
-  const presets = useMemo(() => {
-    const noKey = config.providers
-      .filter((p) => p.keyStatus.source === 'none')
-      .map((p) => ({ key: p.name, label: p.label }))
-    const fresh = config.unconfigured.map((u) => ({ key: u.key, label: u.label }))
-    const seen = new Set<string>()
-    return [...noKey, ...fresh].filter((p) => !seen.has(p.key) && seen.add(p.key))
-  }, [config])
-
-  const [provider, setProvider] = useState(presets[0]?.key ?? CUSTOM)
-  const [apiKey, setApiKey] = useState('')
-  const [baseUrl, setBaseUrl] = useState('')
-  const [modelId, setModelId] = useState('')
-  const [customName, setCustomName] = useState('custom')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    return onHostMessage((msg: HostMsg) => {
-      if (msg.type === 'providerSetupResult') {
-        setBusy(false)
-        if (!msg.ok) setError(msg.message ?? '保存失败')
-        // 成功时宿主会紧跟重发 providers，App 层 needsSetup 自动翻转放行
-      }
-    })
-  }, [])
-
-  const isCustom = provider === CUSTOM
-  const canSave = !busy && (isCustom ? !!(customName.trim() && baseUrl.trim() && modelId.trim()) : !!apiKey.trim())
-
-  const save = () => {
-    if (!canSave) return
-    setError('')
-    setBusy(true)
-    if (isCustom) {
-      send({
-        type: 'setupProvider',
-        providerName: customName.trim(),
-        apiKey: apiKey.trim(),
-        baseUrl: baseUrl.trim(),
-        modelId: modelId.trim(),
-        custom: true,
-      })
-    } else {
-      send({ type: 'setupProvider', providerName: provider, apiKey: apiKey.trim() })
-    }
-    setApiKey('')
-  }
-
-  return (
-    <div className="messages">
-      <div className="setup-card">
-        <h3>欢迎使用天枢</h3>
-        <p>还没有可用的 API key。选择一个模型提供商完成配置，即可开始对话（配置写入 ~/.rivet，与 CLI 端共用）。</p>
-        <label>
-          提供商
-          <select value={provider} onChange={(e) => setProvider(e.target.value)} disabled={busy}>
-            {presets.map((p) => (
-              <option key={p.key} value={p.key}>
-                {p.label}
-              </option>
-            ))}
-            <option value={CUSTOM}>自定义端点（OpenAI 兼容）</option>
-          </select>
-        </label>
-        {isCustom && (
-          <>
-            <label>
-              名称
-              <input value={customName} onChange={(e) => setCustomName(e.target.value)} placeholder="my-provider" disabled={busy} />
-            </label>
-            <label>
-              Base URL
-              <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" disabled={busy} />
-            </label>
-            <label>
-              模型 ID
-              <input value={modelId} onChange={(e) => setModelId(e.target.value)} placeholder="例如 deepseek-chat / qwen3:32b" disabled={busy} />
-            </label>
-          </>
-        )}
-        <label>
-          API key{isCustom ? '（本地端点可留空）' : ''}
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder="sk-…"
-            disabled={busy}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') save()
-            }}
-          />
-        </label>
-        {error && <div className="banner error">{error}</div>}
-        <div className="actions">
-          <button className="approve" onClick={save} disabled={!canSave}>
-            {busy ? '保存中…' : '保存并开始'}
-          </button>
-        </div>
-      </div>
+      {props.planMode === 'planning' && <span className="badge plan">📋 Plan Mode</span>}
     </div>
   )
 }
@@ -454,27 +267,12 @@ function toolFilePath(input: unknown): string | undefined {
   return undefined
 }
 
-function Item({
-  item,
-  sessionId,
-  running,
-  streaming,
-  plans,
-  planDecisions,
-}: {
-  item: ChatItem
-  sessionId?: string
-  running: boolean
-  /** 该条是否为流式尾巴——流式中保持纯文本，完成后才 markdown 化（避免逐帧重排）。 */
-  streaming: boolean
-  plans: Record<string, PlanDocument>
-  planDecisions: Record<string, string>
-}) {
+function Item({ item, sessionId, running }: { item: ChatItem; sessionId?: string; running: boolean }) {
   switch (item.kind) {
     case 'user':
       return <div className="msg user">{item.text}</div>
     case 'assistant':
-      return streaming ? <div className="msg assistant">{item.text}</div> : <AssistantMarkdown text={item.text} />
+      return <div className="msg assistant">{item.text}</div>
     case 'thinking':
       return (
         <details className="msg thinking">
@@ -536,104 +334,9 @@ function Item({
       )
     case 'question':
       return <QuestionCard toolUseId={item.toolUseId} questions={item.questions} sessionId={sessionId} running={running} />
-    case 'plan':
-      return (
-        <PlanCard
-          slug={item.slug}
-          title={item.title}
-          status={item.status}
-          sessionId={sessionId}
-          plan={plans[item.slug]}
-          decision={planDecisions[item.slug]}
-        />
-      )
     case 'info':
       return <div className="msg info">{item.text}</div>
   }
-}
-
-function AssistantMarkdown({ text }: { text: string }) {
-  const html = useMemo(() => renderMarkdown(text), [text])
-  return <div className="msg assistant md" dangerouslySetInnerHTML={{ __html: html }} />
-}
-
-/**
- * Plan 审批卡：plan_submitted 帧出卡 → 展开时按需拉正文（GET /plans/:slug）
- * → 批准/驳回走 plans REST。驳回意见组装为普通文本输入。
- */
-function PlanCard(props: {
-  slug: string
-  title: string
-  status: string
-  sessionId?: string
-  plan?: PlanDocument
-  decision?: string
-}) {
-  const [rejecting, setRejecting] = useState(false)
-  const [comment, setComment] = useState('')
-  const requested = useRef(false)
-
-  const fetchPlan = () => {
-    if (requested.current || props.plan || !props.sessionId) return
-    requested.current = true
-    send({ type: 'readPlan', sessionId: props.sessionId, slug: props.slug })
-  }
-
-  const decided = props.decision ?? (props.status !== 'submitted' ? props.status : undefined)
-  const html = useMemo(() => (props.plan ? renderMarkdown(props.plan.content) : ''), [props.plan])
-
-  return (
-    <div className="msg plan-card">
-      <div className="plan-head">
-        📋 <b>{props.title || props.slug}</b>
-        <span className={`badge plan-status ${decided ?? 'submitted'}`}>
-          {decided === 'approve' || decided === 'approved' || decided === 'executed'
-            ? '✓ 已批准'
-            : decided === 'reject' || decided === 'rejected'
-              ? '✗ 已驳回'
-              : '待审批'}
-        </span>
-      </div>
-      <details onToggle={(e) => (e.target as HTMLDetailsElement).open && fetchPlan()}>
-        <summary>查看计划正文</summary>
-        {props.plan ? <div className="md" dangerouslySetInnerHTML={{ __html: html }} /> : <div className="empty">加载中…</div>}
-      </details>
-      {!decided && props.sessionId && (
-        <div className="actions">
-          {rejecting ? (
-            <>
-              <input
-                value={comment}
-                placeholder="驳回意见（可选，会作为修订反馈回传）"
-                onChange={(e) => setComment(e.target.value)}
-              />
-              <button
-                className="deny"
-                onClick={() =>
-                  send({ type: 'planDecision', sessionId: props.sessionId!, slug: props.slug, decision: 'reject', comment: comment.trim() || undefined })
-                }
-              >
-                确认驳回
-              </button>
-              <button onClick={() => setRejecting(false)}>取消</button>
-            </>
-          ) : (
-            <>
-              <button
-                className="approve"
-                onClick={() => send({ type: 'planDecision', sessionId: props.sessionId!, slug: props.slug, decision: 'approve' })}
-              >
-                批准并执行
-              </button>
-              <button className="deny" onClick={() => setRejecting(true)}>
-                驳回…
-              </button>
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  )
 }
 
 /**
