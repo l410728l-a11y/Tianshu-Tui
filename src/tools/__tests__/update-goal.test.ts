@@ -37,7 +37,7 @@ describe('createUpdateGoalTool', () => {
     const tool = createUpdateGoalTool(() => null)
     const result = await tool.execute(makeParams({ status: 'complete' }, null))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('No active goal'))
+    assert.ok(result.content.includes('当前没有可更新的目标'))
   })
 
   it('sets status to blocked when goal is active', async () => {
@@ -71,7 +71,7 @@ describe('createUpdateGoalTool', () => {
     const tool = createUpdateGoalTool(() => tracker)
     const result = await tool.execute(makeParams({ status: 'paused' }, tracker))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('cannot update') || result.content.includes('not active'))
+    assert.ok(result.content.includes('无法通过 update_goal 更新') || result.content.includes('not active'))
   })
 
   it('returns error for missing status field', async () => {

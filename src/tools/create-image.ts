@@ -39,7 +39,7 @@ function wrapSvg(inner: string, width?: number, height?: number): string {
 
 export function renderImage(input: CreateImageInput): { content: string; format: ImageFormat } {
   const raw = input.svg ?? ''
-  if (raw.trim().length === 0) throw new Error('svg content is required')
+  if (raw.trim().length === 0) throw new Error('svg 内容为必填项')
   const inner = extractSvgInner(raw)
   const svg = /^<svg\b/i.test(inner) ? inner + '\n' : wrapSvg(inner, input.width, input.height)
   return { format: 'svg', content: svg }
@@ -47,10 +47,10 @@ export function renderImage(input: CreateImageInput): { content: string; format:
 
 export async function createImage(input: CreateImageInput): Promise<{ path: string; bytes: number; format: ImageFormat }> {
   if (typeof input.destination_path !== 'string' || input.destination_path.trim().length === 0) {
-    throw new Error('destination_path is required')
+    throw new Error('destination_path 为必填项')
   }
   if (typeof input.svg !== 'string' || input.svg.trim().length === 0) {
-    throw new Error('svg is required')
+    throw new Error('svg 为必填项')
   }
   const rendered = renderImage(input)
   const exported = await exportFile({ destination_path: input.destination_path, content: rendered.content })
@@ -84,10 +84,10 @@ Good: create_image(destination_path="~/Desktop/chart.svg", svg="<rect x=\\"10\\"
   async execute(params) {
     try {
       const result = await createImage(params.input as CreateImageInput)
-      return { content: `Created ${result.format} image (${result.bytes} bytes): ${result.path}` }
+      return { content: `已创建 ${result.format} 图片（${result.bytes} 字节）：${result.path}` }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${msg}`, isError: true }
+      return { content: `错误：${msg}`, isError: true }
     }
   },
 

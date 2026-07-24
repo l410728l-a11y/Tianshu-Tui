@@ -72,6 +72,28 @@ const DEFAULT_WINDOW: Record<AdvisoryExpectation['kind'], number> = {
   file_touched: 1,
   // 探针清理合法地可以晚几轮（修完再清）——窗口放宽
   pattern_absent: 4,
+  // 改道需要至少一轮新动作：送达轮 + 1
+  course_changed: 2,
+}
+
+/** course_changed 前置对照窗（轮）——须 ≤ EVENT_RETENTION_TURNS 减最大观察窗 */
+const COURSE_PRE_WINDOW_TURNS = 3
+
+/** 工具族映射——course_changed 粗签名的第一维。未列出的工具以自身名为族。 */
+const TOOL_FAMILY: ReadonlyMap<string, string> = new Map([
+  ['edit_file', 'edit'], ['write_file', 'edit'], ['hash_edit', 'edit'],
+  ['apply_patch', 'edit'], ['ast_edit', 'edit'],
+  ['read_file', 'read'], ['read_section', 'read'], ['grep', 'read'],
+  ['glob', 'read'], ['list_dir', 'read'], ['file_info', 'read'],
+  ['run_tests', 'verify'], ['typecheck', 'verify'], ['lsp_diagnostics', 'verify'],
+])
+
+/** 粗签名：read/edit 族的 target 是文件路径 → 文件面进签名；
+ *  其余（bash 命令文本等）只看族——命令文本逐字比对太细，会把
+ *  "换了个参数重跑同一条死路"误判为改道。 */
+function courseSignature(e: ObservedToolEvent): string {
+  const family = TOOL_FAMILY.get(e.name) ?? e.name
+  return family === 'read' || family === 'edit' ? `${family}:${e.target}` : family
 }
 
 /** verify_attempted 认可的工具（与 self-verify/CCR 的 VERIFY 家族同源） */
@@ -372,6 +394,14 @@ export class AdvisoryReadback {
         )
       case 'file_touched':
         return windowEvents.some(e => expect.paths.some(p => e.target.includes(p)))
+      case 'course_changed': {
+        // 改道 = 观察窗内出现前置对照窗未见过的 (工具族×文件面) 粗签名。
+        // 前置窗空（no-tool 僵局）→ 任意工具事件即改道。
+        const preEvents = this.events.filter(e => e.turn >= from - COURSE_PRE_WINDOW_TURNS && e.turn < from)
+        if (preEvents.length === 0) return windowEvents.length > 0
+        const preSigs = new Set(preEvents.map(courseSignature))
+        return windowEvents.some(e => !preSigs.has(courseSignature(e)))
+      }
     }
   }
 

@@ -38,22 +38,21 @@ export interface CourageHookConfig {
 
 const DEFAULT_COOLDOWN_TURNS = 5
 const DEFAULT_COURAGE_THRESHOLD = 0.5
-const RISK_SIGNALS = ['error', 'fail', 'failed', 'warning', 'type error', 'not found', 'deprecated']
 
 type CourageToolHistoryEntry = Pick<ToolHistoryEntry, 'tool' | 'target' | 'status'>
 
-function includesRiskSignal(entry: CourageToolHistoryEntry): boolean {
-  const haystack = `${entry.tool} ${entry.target}`.toLowerCase()
-  return RISK_SIGNALS.some(signal => haystack.includes(signal))
-}
-
+// B2/M9（2026-07-23 信号互扰治理）：计险只认 status==='failed'。
+// 此前对 `tool + target` 做 error/fail/warning 等结果词子串匹配——本仓库大量
+// 文件名含这些词（failure-classifier.ts、error-diagnosis-hook.ts…），成功读取
+// 它们被误判为风险；grep pattern、bash 命令文本同理。status 源自 isError
+// （bash 非零退出码已计入），是唯一无噪证据源。'running'（进行中）不计险。
 export function shouldTriggerCourage(
   toolHistory: CourageToolHistoryEntry[],
   threshold: number = DEFAULT_COURAGE_THRESHOLD,
 ): boolean {
   if (toolHistory.length === 0) return false
   const recent = toolHistory.slice(-3)
-  const riskCount = recent.filter(entry => entry.status === 'failed' || includesRiskSignal(entry)).length
+  const riskCount = recent.filter(entry => entry.status === 'failed').length
   return riskCount / Math.max(recent.length, 1) >= threshold
 }
 

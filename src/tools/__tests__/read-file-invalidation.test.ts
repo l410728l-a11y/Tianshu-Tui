@@ -74,7 +74,7 @@ describe('read history invalidation after edits', () => {
       new_string: 'CHANGED LINE 50'.padEnd(80, ' '),
     }, 'sessA'))
     assert.ok(!edit.isError, `edit must succeed: ${edit.content}`)
-    assert.ok(edit.content.includes('Applied edit'), 'plain success (no false stale)')
+    assert.ok(edit.content.includes('已编辑'), 'plain success (no false stale)')
 
     const r2 = await READ_FILE_TOOL.execute(params({ file_path: fp }, 'sessA'))
     assert.ok(!r2.content.startsWith('[read-ref]'), 'must not return [read-ref] after edit')
@@ -139,7 +139,7 @@ describe('read history invalidation after edits', () => {
       old_string: 'line 10'.padEnd(80, ' '),
       new_string: 'EDIT ONE'.padEnd(80, ' '),
     }, 'sessA'))
-    assert.ok(!e1.isError && !e1.content.includes('modified externally'), `first edit plain success: ${e1.content}`)
+    assert.ok(!e1.isError && !e1.content.includes('外部修改'), `first edit plain success: ${e1.content}`)
 
     // Second edit WITHOUT re-reading: 表2 was updated by the first edit, so
     // the staleness check must not fire on our own write.
@@ -167,7 +167,7 @@ describe('read history invalidation after edits', () => {
       new_string: 'RECOVERED'.padEnd(80, ' '),
     }, 'sessA'))
     assert.ok(!edit.isError, `stale-recovery should re-apply: ${edit.content}`)
-    assert.ok(edit.content.includes('modified externally'), `must report external modification: ${edit.content}`)
+    assert.ok(edit.content.includes('外部修改'), `must report external modification: ${edit.content}`)
   })
 
   it('read_section reports staleness after external modification', async () => {
@@ -259,7 +259,7 @@ describe('in-process concurrent session isolation', () => {
       new_string: 'B TRIES TOO'.padEnd(80, ' '),
     }, 'sessB'))
     assert.ok(editB.isError, 'B edit must fail (content gone)')
-    assert.ok(!editB.content.includes('you previously edited'), `B did not edit this file: ${editB.content.slice(0, 160)}`)
+    assert.ok(!editB.content.includes('你在当前会话中曾编辑过'), `B did not edit this file: ${editB.content.slice(0, 160)}`)
   })
 
   it('position-only hash_edit hard-reject is session-scoped', async () => {
@@ -280,7 +280,7 @@ describe('in-process concurrent session isolation', () => {
       anchors: ['L5'],
       new_string: 'A POS EDIT'.padEnd(80, ' '),
     }, 'sessA'))
-    assert.ok(hA.isError && hA.content.includes('position-only anchors blocked'), 'A blocked (edited in own session)')
+    assert.ok(hA.isError && hA.content.includes('仅位置锚点'), 'A blocked (edited in own session)')
 
     // B did NOT edit → no hard reject (drift warning at most)
     const hB = await HASH_EDIT_TOOL.execute(params({
@@ -288,7 +288,7 @@ describe('in-process concurrent session isolation', () => {
       anchors: ['L5'],
       new_string: 'B POS EDIT'.padEnd(80, ' '),
     }, 'sessB'))
-    assert.ok(!hB.content.includes('position-only anchors blocked'), `B must not be blocked by A's edit: ${hB.content.slice(0, 160)}`)
+    assert.ok(!hB.content.includes('仅位置锚点'), `B must not be blocked by A's edit: ${hB.content.slice(0, 160)}`)
   })
 })
 

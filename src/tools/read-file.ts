@@ -388,6 +388,37 @@ const BINARY_EXTENSIONS = new Set([
   '.db', '.sqlite', '.sqlite3',
 ])
 
+/** 图片文件 → MIME。这些扩展从 BINARY_EXTENSIONS 里分流：不再报 binary 错误，
+ *  而是 base64 编码后经 ToolResult.images 通道返回——pipeline 按当前模型
+ *  supportsVision 决定是否转发给模型（非视觉模型自动丢弃，行为与安全期一致）。 */
+const IMAGE_EXTENSIONS = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.gif', 'image/gif'],
+  ['.webp', 'image/webp'],
+  ['.bmp', 'image/bmp'],
+])
+
+/** 图片体积上限：base64 膨胀 1.33×，超过即拒绝并指向缩放/OCR 绕行路径。 */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+async function readImageFile(filePath: string, ext: string, sizeBytes: number) {
+  if (sizeBytes > MAX_IMAGE_BYTES) {
+    return {
+      content: `Error: image too large (${(sizeBytes / 1048576).toFixed(1)}MB，上限 5MB)。避免 base64 爆上下文——请先缩放/裁剪（如 sips -Z 1600 ${filePath} 或 magick ${filePath} -resize 1600x），或用 tesseract OCR 提取文字。`,
+      isError: true,
+    }
+  }
+  const buf = await readFile(filePath)
+  const mime = IMAGE_EXTENSIONS.get(ext)!
+  const dataUrl = `data:${mime};base64,${buf.toString('base64')}`
+  return {
+    content: `read_file: ${filePath} 是图片（${mime}，${sizeBytes} bytes），已作为视觉附件附上——请直接查看图片内容作答（视觉模型可见；非视觉模型该附件会被自动丢弃）。`,
+    images: [dataUrl],
+  }
+}
+
 function buildLogPreviewContent(filePath: string, content: string): string {
   const lines = content.split('\n')
   const headCount = Math.min(LOG_PREVIEW_LINES, lines.length)
@@ -605,7 +636,8 @@ export const READ_FILE_TOOL: Tool = {
 - offset/limit 只用于已知子区间（如第 800-900 行），不要拿它当长文件的绕行手段
 - 超过约 2000 行的文件返回 PARTIAL 视图并附导航提示
 - 不要重读未变更的文件——此前结果仍在上下文里
-- file_paths 一次调用最多读 5 个文件`,
+- file_paths 一次调用最多读 5 个文件
+- 图片文件（png / jpg / jpeg / gif / webp / bmp）会作为视觉附件返回——视觉模型可直接查看图片内容作答（如扫描件、截图、图表），无需先 OCR；非视觉模型该附件自动丢弃`,
     input_schema: {
       type: 'object',
       properties: {
@@ -687,6 +719,14 @@ export const READ_FILE_TOOL: Tool = {
         }
       }
     } catch { /* fall through to real read; e.g. invalid path → let readFilePayload error normally */ }
+
+    // ── 图片文件分流：base64 经 ToolResult.images 通道返回（pipeline 按
+    // supportsVision 决定是否转发；非视觉模型自动丢弃）。必须在 readFilePayload
+    // 的 binary 拒绝之前分流。file_paths 多读分支暂不走此路径。
+    const imageExt = canonical ? extname(canonical).toLowerCase() : ''
+    if (canonical && IMAGE_EXTENSIONS.has(imageExt)) {
+      return await readImageFile(canonical, imageExt, currentSizeBytes ?? 0)
+    }
 
     // ── 重复读取检测 ──
     // 检测本轮是否已读过同一文件且未变更，若是则在前端注入提醒。

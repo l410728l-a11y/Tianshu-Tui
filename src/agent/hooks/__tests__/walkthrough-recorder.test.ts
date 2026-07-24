@@ -35,7 +35,7 @@ test('extractWalkthroughStep captures browser_debug steps (2026-07-15)', () => {
     name: 'browser_debug',
     success: true,
     input: { action: 'navigate', url: 'http://localhost:3000' },
-    resultContent: 'Navigated to http://localhost:3000/. Captured 12 network request(s), 0 console error(s).',
+    resultContent: '已导航至 http://localhost:3000/. 已捕获 12 条网络请求、0 条控制台错误。',
   }
   const navStep = extractWalkthroughStep(nav, META)
   assert.ok(navStep)
@@ -47,7 +47,7 @@ test('extractWalkthroughStep captures browser_debug steps (2026-07-15)', () => {
     name: 'browser_debug',
     success: true,
     input: { action: 'screenshot' },
-    resultContent: 'Captured screenshot of http://localhost:3000/ → artifact browser_screenshot:aa11\nSaved: /tmp/x.png',
+    resultContent: '截图于 http://localhost:3000/ → artifact browser_screenshot:aa11\n已保存：/tmp/x.png',
   }
   const shotStep = extractWalkthroughStep(shot, { ...META, index: 2 })
   assert.ok(shotStep)

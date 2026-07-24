@@ -344,7 +344,7 @@ describe('attack_case 工具 — H2 证据验真与 8.6 fail-closed', () => {
       predicate_outcome: 'true', evidence_ref: 'worker:fabricated-order-99',
     }))
     assert.equal(r.isError, true)
-    assert.match(r.content, /no completed worker/)
+    assert.match(r.content, /没有.*已完成 worker/)
     assert.equal(store.getCase(caseId)!.hypotheses.find(h => h.id === h1)!.status, 'candidate', '假设未被伪证翻转')
     assert.equal(store.getCase(caseId)!.score, 0)
   })
@@ -357,7 +357,7 @@ describe('attack_case 工具 — H2 证据验真与 8.6 fail-closed', () => {
       predicate_outcome: 'true', evidence_ref: 'obligation:ob-nonexistent',
     }))
     assert.equal(r.isError, true)
-    assert.match(r.content, /no such obligation/)
+    assert.match(r.content, /账本中无此义务/)
   })
 
   it('P1-A：自由文本引用 → 硬拒（自由文本不是证据）', async () => {
@@ -368,7 +368,7 @@ describe('attack_case 工具 — H2 证据验真与 8.6 fail-closed', () => {
       predicate_outcome: 'true', evidence_ref: 'I checked it myself, trust me',
     }))
     assert.equal(r.isError, true)
-    assert.match(r.content, /must be tool:/)
+    assert.match(r.content, /须为 tool:/)
   })
 
   it('H2 降级：tool: 引用超出历史窗口 → 状态结算但零分 + unverified 留痕', async () => {
@@ -408,7 +408,7 @@ describe('attack_case 工具 — H2 证据验真与 8.6 fail-closed', () => {
     })
     const r = await tool.execute(params({ op: 'open', anchor: { kind: 'obligation', ref: 'ob-fake' }, problem: 'p' }))
     assert.equal(r.isError, true)
-    assert.match(r.content, /not found in the obligation ledger/)
+    assert.match(r.content, /在义务账本中不存在/)
     assert.equal(store.activeCases().length, 0)
   })
 

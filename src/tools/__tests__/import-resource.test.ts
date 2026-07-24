@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync, readlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { IMPORT_RESOURCE_TOOL, parseGitHubUrl, isSafeGitRef } from '../import-resource.js'
+import { IMPORT_RESOURCE_TOOL, parseGitHubUrl, isSafeGitRef, setHttpFetchForTests } from '../import-resource.js'
 import type { ToolCallParams } from '../types.js'
 
 function makeParams(input: Record<string, unknown>, cwd: string): ToolCallParams {
@@ -66,7 +66,7 @@ describe('import_resource', () => {
         assert.equal(result.isError, undefined)
 
         // Should contain the local path
-        assert.match(result.content, /Imported:/)
+        assert.match(result.content, /已导入：/)
         assert.match(result.content, /\.rivet\/external\//)
 
         // File should be accessible — check the import directory exists
@@ -87,8 +87,8 @@ describe('import_resource', () => {
       try {
         const result = await IMPORT_RESOURCE_TOOL.execute(makeParams({ source: externalDir }, tmpCwd))
         assert.equal(result.isError, undefined)
-        assert.match(result.content, /Type: directory/)
-        assert.match(result.content, /Linked as junction/)
+        assert.match(result.content, /类型：directory/)
+        assert.match(result.content, /junction/)
       } finally {
         rmSync(externalDir, { recursive: true, force: true })
       }
@@ -99,13 +99,13 @@ describe('import_resource', () => {
         makeParams({ source: '/nonexistent/path/file.txt' }, tmpCwd),
       )
       assert.equal(result.isError, true)
-      assert.match(result.content, /does not exist/)
+      assert.match(result.content, /路径不存在/)
     })
 
     it('returns error for empty source', async () => {
       const result = await IMPORT_RESOURCE_TOOL.execute(makeParams({ source: '' }, tmpCwd))
       assert.equal(result.isError, true)
-      assert.match(result.content, /source is required/)
+      assert.match(result.content, /source 为必填项/)
     })
 
     it('expands ~ to HOME', async () => {
@@ -128,21 +128,22 @@ describe('import_resource', () => {
     })
 
     it('downloads a text file via httpFetchGuarded', async () => {
-      const originalFetch = globalThis.fetch
-      globalThis.fetch = async () =>
-        new Response('downloaded content', {
-          status: 200,
-          headers: { 'content-type': 'text/plain' },
-        })
+      // httpFetchGuarded 使用 undici，globalThis.fetch mock 无效；经测试注入点短路。
+      setHttpFetchForTests(async () => ({
+        status: 200,
+        finalUrl: 'http://example.com/file.txt',
+        contentType: 'text/plain',
+        bytes: new TextEncoder().encode('downloaded content'),
+      }))
       try {
         const result = await IMPORT_RESOURCE_TOOL.execute(
           makeParams({ source: 'http://example.com/file.txt' }, tmpCwd),
         )
         assert.equal(result.isError, undefined)
-        assert.match(result.content, /Imported:/)
+        assert.match(result.content, /已导入：/)
         assert.match(result.content, /downloaded content/)
       } finally {
-        globalThis.fetch = originalFetch
+        setHttpFetchForTests(null)
       }
     })
 
@@ -195,7 +196,7 @@ describe('import_resource', () => {
         makeParams({ source: 'github.com/owner/repo', ref: '--upload-pack=touch /tmp/pwn' }, tmpCwd),
       )
       assert.equal(result.isError, true)
-      assert.match(result.content, /invalid git ref/i)
+      assert.match(result.content, /无效的 git ref/i)
     })
   })
 

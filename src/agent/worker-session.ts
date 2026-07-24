@@ -15,6 +15,7 @@ import {
   type WorkOrder,
   type WorkerResult,
 } from './work-order.js'
+import { toolArgSummary } from '../tui/tool-label.js'
 import { buildWorkerPrompt, buildWorkerRepairPrompt } from './worker-prompts.js'
 import { buildWorkerKnowledgeBlock } from './worker-knowledge.js'
 import { buildDomainKnowledgeBlock } from './domain-knowledge-block.js'
@@ -101,6 +102,18 @@ export interface WorkerSessionConfig {
  *  `retry` 事件在 API 层内部瞬时重试的每次 attempt 起始上报——重试中的健康
  *  请求必须喂 liveness，否则被 stall sweep 误判为静默（慢 ≠ 死）。 */
 export type WorkerActivityKind = 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+
+/** tool_use 活动行:`name(关键参数)`。toolArgSummary 覆盖常见工具;未覆盖的
+ *  回退到常见参数键,再退到裸名。所有消费方(桌面 feed/TUI mirror)按纯文本展示。 */
+export function summarizeToolUseLine(name: string, input: unknown): string {
+  const rec = input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
+  let arg = toolArgSummary(name, rec)
+  if (!arg) {
+    const cand = rec.file_path ?? rec.path ?? rec.pattern ?? rec.query ?? rec.url ?? rec.command ?? rec.objective
+    if (typeof cand === 'string' && cand) arg = cand.length > 50 ? `${cand.slice(0, 49)}…` : cand
+  }
+  return arg ? `${name}(${arg})` : name
+}
 
 export interface WorkerTranscript {
   text: string
@@ -230,7 +243,9 @@ async function runOnce(
         ;(transcript.bashCommands ??= []).push(command)
         bashCommandById.set(id, command)
       }
-      onActivity?.('tool_use', name)
+      // 活动流带关键参数(name(arg))——桌面委派 UI / TUI worker mirror 直接展示,
+      // 光秃工具名无法回答"它在读哪个文件/跑什么命令"。
+      onActivity?.('tool_use', summarizeToolUseLine(name, input))
     },
     onToolResult: (id, name, result, isError) => {
       transcript.toolResults.push(name)

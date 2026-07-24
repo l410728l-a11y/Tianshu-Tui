@@ -64,6 +64,7 @@ export type KeyName =
   | 'ctrl_p'
   | 'ctrl_r'
   | 'ctrl_t'
+  | 'ctrl_v'
   | 'ctrl_b'
   | 'ctrl_f'
   | 'ctrl_x'
@@ -111,6 +112,7 @@ const CTRL_CODES: Record<number, KeyName> = {
   0x12: 'ctrl_r',
   0x14: 'ctrl_t',
   0x15: 'ctrl_u',
+  0x16: 'ctrl_v',
   0x17: 'ctrl_w',
   0x18: 'ctrl_x',
   0x1a: 'ctrl_z',
@@ -434,6 +436,13 @@ export class InputHandler {
       // 终端将 Alt+key 编码为 ESC + key。如 Alt+f → \x1Bf。
       if (data.length >= 2 && data[1] !== '[' && data[1] !== 'O') {
         const char = data[1]!
+        // Alt+Enter: ESC + CR → 与 Kitty \x1B[13;3u 对齐为 return + meta
+        if (char === '\r') {
+          return {
+            key: { raw: data.slice(0, 2), char: '', name: 'return', ctrl: false, meta: true, shift: false },
+            consumed: 2,
+          }
+        }
         const isUpper = char >= 'A' && char <= 'Z'
         return {
           key: { raw: data.slice(0, 2), char, name: 'unknown', ctrl: false, meta: true, shift: isUpper },

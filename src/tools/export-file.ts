@@ -26,33 +26,33 @@ function getSourcePath(input: Record<string, unknown>): string | null {
 
 export async function exportFile(input: ExportFileInput): Promise<{ path: string; bytes: number; mode: 'content' | 'copy' }> {
   const destinationPath = getDestinationPath(input as Record<string, unknown>)
-  if (!destinationPath) throw new Error('destination_path is required')
+  if (!destinationPath) throw new Error('destination_path 为必填项')
 
   const hasContent = typeof input.content === 'string'
   const hasSource = typeof input.source_path === 'string' && input.source_path.trim().length > 0
-  if (hasContent === hasSource) throw new Error('Provide exactly one of content or source_path')
+  if (hasContent === hasSource) throw new Error('必须且只能提供 content 或 source_path 之一')
 
   await mkdir(dirname(destinationPath), { recursive: true })
 
   if (hasContent) {
     const encoding = input.encoding ?? 'text'
-    if (encoding !== 'text' && encoding !== 'base64') throw new Error('encoding must be text or base64')
+    if (encoding !== 'text' && encoding !== 'base64') throw new Error('encoding 必须为 text 或 base64')
     const buffer = encoding === 'base64'
       ? Buffer.from(input.content!, 'base64')
       : Buffer.from(input.content!, 'utf-8')
     if (buffer.length > MAX_EXPORT_BYTES) {
-      throw new Error(`Export too large (${(buffer.length / (1024 * 1024)).toFixed(1)}MB); limit is 50MB`)
+      throw new Error(`导出过大（${(buffer.length / (1024 * 1024)).toFixed(1)}MB）；上限为 50MB`)
     }
     await writeFile(destinationPath, buffer)
     return { path: destinationPath, bytes: buffer.length, mode: 'content' }
   }
 
   const sourcePath = getSourcePath(input as Record<string, unknown>)
-  if (!sourcePath) throw new Error('source_path is required')
+  if (!sourcePath) throw new Error('source_path 为必填项')
   const sourceStat = await stat(sourcePath)
-  if (!sourceStat.isFile()) throw new Error('source_path must be a file')
+  if (!sourceStat.isFile()) throw new Error('source_path 必须是文件')
   if (sourceStat.size > MAX_EXPORT_BYTES) {
-    throw new Error(`Export too large (${(sourceStat.size / (1024 * 1024)).toFixed(1)}MB); limit is 50MB`)
+    throw new Error(`导出过大（${(sourceStat.size / (1024 * 1024)).toFixed(1)}MB）；上限为 50MB`)
   }
   await copyFile(sourcePath, destinationPath)
   const destinationStat = await stat(destinationPath)
@@ -91,11 +91,11 @@ Bad: 用 bash 重定向或 echo 往外部路径写文件`,
     try {
       const result = await exportFile(params.input as ExportFileInput)
       return {
-        content: `Exported ${result.bytes} bytes to ${result.path}${result.mode === 'copy' ? ' (copied)' : ''}`,
+        content: `已导出 ${result.bytes} 字节到 ${result.path}${result.mode === 'copy' ? '（已复制）' : ''}`,
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${msg}`, isError: true }
+      return { content: `错误：${msg}`, isError: true }
     }
   },
 

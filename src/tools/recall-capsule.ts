@@ -28,21 +28,21 @@ export function createRecallCapsuleTool(getCwd: () => string): Tool {
       const cwd = getCwd() || params.cwd
       const star = (input.star ?? '').trim()
       if (!star) {
-        return { content: 'recall_capsule: star is required.', isError: true }
+        return { content: 'recall_capsule: 需要提供 star。', isError: true }
       }
 
       const capsule = getCapsuleByStar(cwd, star)
       if (!capsule) {
         const known = listCapsuleStars(cwd)
         return {
-          content: `recall_capsule: no capsule for "${star}". Known stars: ${known.join(', ') || '(none)'}.`,
+          content: `recall_capsule: 没有「${star}」的胶囊。已知星域：${known.join(', ') || '（无）'}。`,
           isError: true,
         }
       }
 
       return {
         content: capsule.block,
-        uiContent: `recall capsule: ${capsule.star} (sealed ${capsule.sealedAt})`,
+        uiContent: `召回胶囊：${capsule.star}（封存于 ${capsule.sealedAt}）`,
         isError: false,
       }
     },

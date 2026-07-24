@@ -159,5 +159,5 @@ test('team_orchestrate reports a clear error when no plan is provided or stored'
   })
 
   assert.equal(result.isError, true)
-  assert.match(result.content, /No plan provided and no stored plan found/)
+  assert.match(result.content, /未提供计划，也未找到已存储的计划/)
 })

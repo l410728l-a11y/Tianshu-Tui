@@ -63,6 +63,16 @@ describe('updateVigor', () => {
     assert.ok(next.vigor > prev.vigor)
   })
 
+  it('probe_miss 减罚：phasic 惩罚为 unknown 的 0.3 倍（A5 信号互扰治理 M3）', () => {
+    const prev = createVigorState()
+    const unknownNext = updateVigor(prev, { toolSuccess: false, failureClass: 'unknown', sensorium: makeSensorium() })
+    const probeNext = updateVigor(prev, { toolSuccess: false, failureClass: 'probe_miss', sensorium: makeSensorium() })
+
+    assert.ok(probeNext.vigor > unknownNext.vigor, '探针脱靶的惩罚必须小于未知失败')
+    assert.ok(Math.abs(probeNext.phasic - 0.3 * unknownNext.phasic) < 1e-9,
+      `probe_miss phasic 应为 unknown 的 0.3 倍，got ${probeNext.phasic} vs ${unknownNext.phasic}`)
+  })
+
   it('lowers tonic vigor after tool failure', () => {
     const prev = createVigorState()
     const next = updateVigor(prev, { toolSuccess: false, sensorium: makeSensorium() })

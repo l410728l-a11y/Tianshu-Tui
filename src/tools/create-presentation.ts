@@ -94,14 +94,14 @@ ${slidesHtml}
 
 export function renderPresentation(input: CreatePresentationInput): { content: string; format: PresentationFormat } {
   if (!Array.isArray(input.slides) || input.slides.length === 0) {
-    throw new Error('slides must be a non-empty array')
+    throw new Error('slides 必须为非空数组')
   }
   return { format: 'ppt', content: renderPresentationHtml(input) }
 }
 
 export async function createPresentation(input: CreatePresentationInput): Promise<{ path: string; bytes: number; format: PresentationFormat }> {
   if (typeof input.destination_path !== 'string' || input.destination_path.trim().length === 0) {
-    throw new Error('destination_path is required')
+    throw new Error('destination_path 为必填项')
   }
   const rendered = renderPresentation(input)
   const exported = await exportFile({ destination_path: input.destination_path, content: rendered.content })
@@ -145,10 +145,10 @@ Good: create_presentation(destination_path="~/Desktop/dark-deck.ppt", title="路
   async execute(params) {
     try {
       const result = await createPresentation(params.input as CreatePresentationInput)
-      return { content: `Created ${result.format} presentation with slides (${result.bytes} bytes): ${result.path}` }
+      return { content: `已创建 ${result.format} 演示文稿（含幻灯片，${result.bytes} 字节）：${result.path}` }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${msg}`, isError: true }
+      return { content: `错误：${msg}`, isError: true }
     }
   },
 

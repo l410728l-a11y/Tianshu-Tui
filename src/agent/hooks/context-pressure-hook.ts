@@ -16,6 +16,10 @@ export interface ContextPressureHookDeps {
   getEstimatedTokens: () => number
   getContextWindow: () => number
   advisoryBus: Pick<AdvisoryBus, 'submit'>
+  /** A4（信号互扰治理 H2）：活跃 goal continuation / 未核销 high 义务在场。
+   *  true 时收束文案合并为"先核销再收束"——不再与续轮机制的"目标尚未达成，
+   *  继续执行"同轮对打。缺省视为无活跃续轮（保持原文案）。 */
+  hasActiveContinuation?: () => boolean
 }
 
 /** Ratio above which the advisory fires. Below 86% split but high enough
@@ -58,9 +62,14 @@ export function createContextPressureHook(deps: ContextPressureHookDeps): AfterP
       // Crossing 86% implies 70% is also spent — don't fire a stale lower tier later.
       if (crossed === PRESSURE_SPLIT_RATIO) firedThresholds.add(PRESSURE_WARN_RATIO)
 
+      const continuationActive = deps.hasActiveContinuation?.() ?? false
       const escalation = crossed === PRESSURE_SPLIT_RATIO
-        ? '已越过 86% 会话分拆线，compact-boundary 随时可能分拆会话——立即收束当前子任务。'
-        : '接近上限时 compact-boundary 会自动分拆会话，但建议你主动收束当前子任务、把后续工作留给新会话。'
+        ? (continuationActive
+          ? '已越过 86% 会话分拆线，compact-boundary 随时可能分拆会话——当前有未核销的目标/义务：先用最短路径核销（验证/交付已完成部分）再收束，不要开启与目标无关的新支线。'
+          : '已越过 86% 会话分拆线，compact-boundary 随时可能分拆会话——立即收束当前子任务。')
+        : (continuationActive
+          ? '接近上限时 compact-boundary 会自动分拆会话。当前有未核销的目标/义务：优先核销（验证/交付已完成部分）再收束，把与目标无关的后续工作留给新会话。'
+          : '接近上限时 compact-boundary 会自动分拆会话，但建议你主动收束当前子任务、把后续工作留给新会话。')
       deps.advisoryBus.submit({
         key: 'context-pressure',
         priority: crossed === PRESSURE_SPLIT_RATIO ? 0.6 : 0.5,

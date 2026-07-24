@@ -61,6 +61,9 @@ const CHINA_PRESET: Omit<Required<MirrorsConfig>, 'enabled'> = {
   pypi: 'tsinghua',
   go: 'goproxy_cn',
   rust: 'tsinghua',
+  autoFallback: true,
+  fallbackMemoryMinutes: 10,
+  fallbackTimeoutSec: 60,
 }
 
 function resolveWithPreset(

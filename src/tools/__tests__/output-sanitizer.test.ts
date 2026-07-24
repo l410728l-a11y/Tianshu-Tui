@@ -44,14 +44,14 @@ describe('sanitizeToolOutput 缺口 B', () => {
     assert.match(r.content, /error TS2304/)
     assert.match(r.content, /Found 2 errors/)
     assert.ok(!r.content.includes('compileProgram'))
-    assert.match(r.content, /\[output trimmed: \d+ bytes/)
+    assert.match(r.content, /\[输出已裁剪：去除 \d+ 字节/)
   })
 
   it('tsc 无错误时裁空保底一行摘要', () => {
     const content = pad('Files: 312, Lines of Library: 42310, cached module resolution', 40)
     const r = sanitizeToolOutput('bash', { command: 'tsc --noEmit --diagnostics' }, content)
     assert.ok(r.trimmedBytes > 0)
-    assert.match(r.content, /tsc: no errors reported/)
+    assert.match(r.content, /tsc：未报告错误/)
   })
 
   it('node --test: 裁逐条 ✔ 通过行,保留 ✖ 失败与 ℹ 统计', () => {
@@ -191,7 +191,7 @@ describe('sanitizeToolOutput 缺口 B', () => {
     const lines = r.content.split('\n')
     // 60 lines + trim marker
     assert.ok(lines.length <= 63)
-    assert.match(r.content, /non-diagnostic lines trimmed/)
+    assert.match(r.content, /行非诊断输出/)
     // 尾部 commit 保留（取最后 60 条）
     assert.ok(r.content.includes('commit message number 99'))
   })
@@ -207,7 +207,7 @@ describe('sanitizeToolOutput 缺口 B', () => {
     assert.ok(!r.content.includes('total 9999'))
     const lines = r.content.split('\n')
     assert.ok(lines.length <= 44) // 40 + trim marker + possible trim note
-    assert.match(r.content, /non-diagnostic lines trimmed/)
+    assert.match(r.content, /行非诊断输出/)
     // 尾部条目保留
     assert.ok(r.content.includes('dir_079'))
   })
@@ -230,7 +230,7 @@ describe('sanitizeToolOutput 缺口 B', () => {
     assert.ok(r.trimmedBytes > 0)
     const lines = r.content.split('\n')
     assert.ok(lines.length <= 83)
-    assert.match(r.content, /non-diagnostic lines trimmed/)
+    assert.match(r.content, /行非诊断输出/)
   })
 
   // ── LineFilter: find ──
@@ -243,18 +243,18 @@ describe('sanitizeToolOutput 缺口 B', () => {
     assert.ok(r.trimmedBytes > 0)
     const lines = r.content.split('\n')
     assert.ok(lines.length <= 63)
-    assert.match(r.content, /non-diagnostic lines trimmed/)
+    assert.match(r.content, /行非诊断输出/)
   })
 
   // ── LineFilter: eslint shortCircuit ──
-  it('eslint: short-circuits on clean output', () => {
+  it('eslint: 干净输出时短路', () => {
     const noisePad = pad('noise padding line to exceed MIN_CONTENT_LENGTH', 20)
     const content = `${noisePad}\n✔ No issues found (42 files checked)\n`
     const r = sanitizeToolOutput('bash', { command: 'npx eslint .' }, content)
-    assert.match(r.content, /short-circuit/)
+    assert.match(r.content, /短路/)
   })
 
-  it('eslint: short-circuits on zero errors with warnings', () => {
+  it('eslint: 零错误有警告时短路', () => {
     // "5 problems (0 errors, 5 warnings)" → shortCircuit matches
     const noisePad = pad('noise padding line to exceed MIN_CONTENT_LENGTH threshold', 15)
     const content = [
@@ -266,7 +266,7 @@ describe('sanitizeToolOutput 缺口 B', () => {
       '✖ 5 problems (0 errors, 5 warnings)',
     ].join('\n')
     const r = sanitizeToolOutput('bash', { command: 'npx eslint .' }, content)
-    assert.match(r.content, /short-circuit/)
+    assert.match(r.content, /短路/)
   })
 
   // ── LineFilter: diagnostic line protection ──
@@ -308,7 +308,7 @@ describe('sanitizeToolOutput 缺口 B', () => {
       assert.ok(r.content.includes(e), `missing error: ${e}`)
     }
     // 尾部保留补齐到 maxLines
-    assert.match(r.content, /non-diagnostic lines trimmed/)
+    assert.match(r.content, /行非诊断输出/)
   })
 
   // ── LineFilter: shortCircuit 大面积输入正确工作 ──
@@ -318,8 +318,8 @@ describe('sanitizeToolOutput 缺口 B', () => {
     const content = `${noise}\nRequirement already satisfied: requests in /usr/local/lib\n`
     const r = sanitizeToolOutput('bash', { command: 'pip install requests' }, content)
     assert.ok(r.trimmedBytes > 0)
-    assert.match(r.content, /short-circuit/)
-    // short-circuit 消息应远短于原文
+    assert.match(r.content, /短路/)
+    // 短路 消息应远短于原文
     assert.ok(r.content.length < content.length / 2)
   })
 

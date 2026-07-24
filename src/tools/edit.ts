@@ -103,7 +103,7 @@ export const EDIT_FILE_TOOL: Tool = {
     try {
       filePath = validatePath(params.cwd, params.input.file_path as string, 'write')
     } catch (e) {
-      return { content: `Error: ${e instanceof Error ? e.message : 'Path escapes project directory'}`, isError: true }
+      return { content: `错误：${e instanceof Error ? e.message : '路径逃逸出项目目录'}`, isError: true }
     }
 
     // Pointer-regurgitation guard: reject placeholder text ("[file written to …]",
@@ -130,7 +130,7 @@ export const EDIT_FILE_TOOL: Tool = {
     const regexPattern = detectRegexPattern(oldStringRaw)
     if (regexPattern) {
       return {
-        content: `Error: old_string contains a regex pattern (${regexPattern}).\n\nedit_file uses exact string matching, not regular expressions. The pattern was treated as literal text and will NOT match.\n\nTo fix:\n- Replace regex tokens with literal characters from the file\n- Use grep with the regex to find the actual content, then copy-paste it as old_string\n- For complex patterns, use hash_edit with anchors instead`,
+        content: `错误：old_string 含有正则模式（${regexPattern}）。\n\nedit_file 使用精确字符串匹配，不是正则表达式。该模式被当作字面文本处理，因此不会匹配。\n\n修复方法：\n- 用文件中的字面字符替换正则标记\n- 先用 grep 按正则找到实际内容，再复制粘贴为 old_string\n- 复杂模式请改用带锚点的 hash_edit`,
         isError: true,
       }
     }
@@ -139,7 +139,7 @@ export const EDIT_FILE_TOOL: Tool = {
     try {
       fileStat = await stat(filePath)
     } catch {
-      return { content: `Error: File not found: ${filePath}`, isError: true }
+      return { content: `错误：文件未找到：${filePath}`, isError: true }
     }
 
     // Stale file detection: if the file was modified externally since the
@@ -158,7 +158,7 @@ export const EDIT_FILE_TOOL: Tool = {
       try {
         // OOM guard: check file size before reading (same as normal path above)
         if (fileStat.size > MAX_EDIT_FILE_BYTES) {
-          return { content: `File was modified externally and is now too large (${Math.round(fileStat.size / 1024 / 1024)}MB > ${MAX_EDIT_FILE_BYTES / 1024 / 1024}MB limit) for auto-recovery. Use hash_edit with current anchors instead.`, isError: true }
+          return { content: `文件已被外部修改，且当前过大（${Math.round(fileStat.size / 1024 / 1024)}MB > ${MAX_EDIT_FILE_BYTES / 1024 / 1024}MB 上限），无法自动恢复。请改用带当前锚点的 hash_edit。`, isError: true }
         }
         // Normalize to LF for matching; restore the file's EOL on write-back so a
         // CRLF file stays CRLF instead of degrading into mixed line endings.
@@ -186,10 +186,10 @@ export const EDIT_FILE_TOOL: Tool = {
             const expectedCount = params.input.expected_count as number | undefined
             return await finalizeEdit(params.cwd, filePath, freshContent, newContent, params.sessionId, (warn, ui, changedRanges) => {
               if (expectedCount !== undefined && occurrences !== expectedCount) {
-                const base = `File was modified externally but old_string still matched. Warning: expected ${expectedCount} replacements but only replaced ${occurrences} in ${filePath}. Use grep to verify no instances were missed — different indentation or whitespace can cause partial matches with replace_all.`
+                const base = `文件已被外部修改，但 old_string 仍能匹配。警告：预期替换 ${expectedCount} 处，实际只替换了 ${occurrences} 处（${filePath}）。请用 grep 核实是否有遗漏——缩进或空白差异可能导致 replace_all 只部分匹配。`
                 return { content: base + (warn ? '\n\n' + warn : ''), uiContent: ui, changedRanges }
               }
-              return { content: `File was modified externally but old_string still matched. Re-applied ${occurrences} replacement(s) in ${filePath}${warn ? '\n\n' + warn : ''}`, uiContent: ui, changedRanges }
+              return { content: `文件已被外部修改，但 old_string 仍能匹配。已重新应用 ${occurrences} 处替换（${filePath}）${warn ? '\n\n' + warn : ''}`, uiContent: ui, changedRanges }
             })
           }
           const firstIdx = freshContent.indexOf(oldString)
@@ -208,7 +208,7 @@ export const EDIT_FILE_TOOL: Tool = {
             if ('delegatedRejectOrError' in land) return land.delegatedRejectOrError
           }
           return await finalizeEdit(params.cwd, filePath, freshContent, recovered, params.sessionId, (warn, ui, changedRanges) => ({
-            content: `Applied edit to ${filePath} (file was modified externally but content still matched)${warn ? '\n\n' + warn : ''}`,
+            content: `已编辑 ${filePath}（文件已被外部修改，但内容仍能匹配）${warn ? '\n\n' + warn : ''}`,
             uiContent: ui,
             changedRanges,
           }))
@@ -231,27 +231,27 @@ export const EDIT_FILE_TOOL: Tool = {
           const start = Math.max(0, bestIdx - CONTEXT)
           const end = Math.min(freshLines.length, bestIdx + oldString.split('\n').length + CONTEXT)
           const actualWindow = freshLines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join('\n')
-          const modNote = wasFileEditedBySession(filePath, params.sessionId) ? ' — you previously edited this file in the current session' : ' externally'
+          const modNote = wasFileEditedBySession(filePath, params.sessionId) ? '——你在当前会话中曾编辑过此文件' : '（外部）'
           const fails = incrementEditFailCount(filePath)
-          const gatePrefix = fails >= 3 ? `After ${fails} consecutive edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
+          const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
           return {
-            content: gatePrefix + `File ${filePath} was modified${modNote} since your last read_file. old_string no longer matches.\n\nCurrent content near the expected location (line ${bestIdx + 1}):\n\`\`\`\n${actualWindow}\n\`\`\`\n\nUpdate your old_string to match the current content and retry, or use hash_edit with anchors.`,
+            content: gatePrefix + `自你上次 read_file 以来，文件 ${filePath} 已被修改${modNote}。old_string 已不再匹配。\n\n预期位置附近的当前内容（第 ${bestIdx + 1} 行）：\n\`\`\`\n${actualWindow}\n\`\`\`\n\n请更新 old_string 以匹配当前内容后重试，或改用带锚点的 hash_edit。`,
             isError: true,
           }
         }
 
         // No close match — show file head
         const head = freshLines.slice(0, 30).map((l, i) => `${i + 1}: ${l}`).join('\n')
-        const modNote = wasFileEditedBySession(filePath, params.sessionId) ? ' — you previously edited this file in the current session' : ' externally'
+        const modNote = wasFileEditedBySession(filePath, params.sessionId) ? '——你在当前会话中曾编辑过此文件' : '（外部）'
         const fails = incrementEditFailCount(filePath)
-        const gatePrefix = fails >= 3 ? `After ${fails} consecutive edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
+        const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
         return {
-          content: gatePrefix + `File ${filePath} was modified${modNote} since your last read_file. old_string not found.\n\nFile head:\n\`\`\`\n${head}${freshLines.length > 30 ? `\n... (${freshLines.length} lines total)` : ''}\n\`\`\`\n\nRe-read the file to see full content, or use hash_edit with anchors.`,
+          content: gatePrefix + `自你上次 read_file 以来，文件 ${filePath} 已被修改${modNote}。未找到 old_string。\n\n文件开头：\n\`\`\`\n${head}${freshLines.length > 30 ? `\n...（共 ${freshLines.length} 行）` : ''}\n\`\`\`\n\n请重新读取文件查看完整内容，或改用带锚点的 hash_edit。`,
           isError: true,
         }
       } catch {
         return {
-          content: `Error: File ${filePath} has been modified since your last read_file. Re-read the file to update your view.`,
+          content: `错误：自你上次 read_file 以来，文件 ${filePath} 已被修改。请重新读取文件以更新视图。`,
           isError: true,
         }
       }
@@ -261,7 +261,7 @@ export const EDIT_FILE_TOOL: Tool = {
     if (fileStat.size > MAX_EDIT_FILE_BYTES) {
       const sizeMB = (fileStat.size / 1024 / 1024).toFixed(1)
       return {
-        content: `Error: File too large for edit_file (${sizeMB}MB > ${MAX_EDIT_FILE_BYTES / 1024 / 1024}MB). Use apply_patch with a unified diff for targeted edits, or use bash with sed for simple string replacements on very large files.`,
+        content: `错误：文件过大，超出 edit_file 能力（${sizeMB}MB > ${MAX_EDIT_FILE_BYTES / 1024 / 1024}MB）。定向编辑请用 apply_patch 加 unified diff；超大文件的简单字符串替换可用 bash + sed。`,
         isError: true,
       }
     }
@@ -279,7 +279,7 @@ export const EDIT_FILE_TOOL: Tool = {
     if (replaceAll) {
       if (!content.includes(oldString)) {
         const fails = incrementEditFailCount(filePath)
-        const gatePrefix = fails >= 3 ? `After ${fails} consecutive edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
+        const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
         return {
           content: gatePrefix + buildNotFoundError(filePath, oldString, content),
           isError: true,
@@ -299,11 +299,11 @@ export const EDIT_FILE_TOOL: Tool = {
       const expectedCount = params.input.expected_count as number | undefined
       return await finalizeEdit(params.cwd, filePath, content, newContent, params.sessionId, (warn, ui, changedRanges) => {
         if (expectedCount !== undefined && occurrences !== expectedCount) {
-          const base = `Warning: expected ${expectedCount} replacements but only replaced ${occurrences} in ${filePath}. The file has been modified. Use grep to verify that no instances were missed — different indentation or whitespace can cause partial matches with replace_all.`
+          const base = `警告：预期替换 ${expectedCount} 处，实际只替换了 ${occurrences} 处（${filePath}）。文件已修改。请用 grep 核实是否有遗漏——缩进或空白差异可能导致 replace_all 只部分匹配。`
           return { content: base + (warn ? '\n\n' + warn : ''), uiContent: ui, changedRanges }
         }
         const draftReceipt = formatActivePlanDraftReceipt(params.cwd, filePath, params.activePlanFilePath, newContent.length)
-        const base = draftReceipt ?? `Replaced all ${occurrences} occurrences in ${filePath}`
+        const base = draftReceipt ?? `已替换全部 ${occurrences} 处（${filePath}）`
         return { content: base + (warn ? '\n\n' + warn : ''), uiContent: ui, changedRanges }
       })
     }
@@ -330,8 +330,8 @@ export const EDIT_FILE_TOOL: Tool = {
           // subsequent edits — without this, error accumulates across calls.
           const diff = diffBlock(oldString, fuzzy.matchedText)
           const fuzzyReport = [
-            `Applied edit to ${filePath} (whitespace-tolerant match)`,
-            `[fuzzy] your old_string had whitespace/indentation drift from the file:`,
+            `已编辑 ${filePath}（空白容错匹配）`,
+            `[fuzzy] 你的 old_string 与文件存在空白/缩进漂移：`,
             `[fuzzy] diff:\n${diff}`,
           ].join('\n')
           return {
@@ -342,7 +342,7 @@ export const EDIT_FILE_TOOL: Tool = {
         })
       }
       const fails = incrementEditFailCount(filePath)
-      const gatePrefix = fails >= 3 ? `After ${fails} consecutive edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
+      const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
       return {
         content: gatePrefix + buildNotFoundError(filePath, oldString, content),
         isError: true,
@@ -367,7 +367,7 @@ export const EDIT_FILE_TOOL: Tool = {
     }
     return await finalizeEdit(params.cwd, filePath, content, newContent, params.sessionId, (warn, ui, changedRanges) => {
       const draftReceipt = formatActivePlanDraftReceipt(params.cwd, filePath, params.activePlanFilePath, newContent.length)
-      const base = draftReceipt ?? `Applied edit to ${filePath}`
+      const base = draftReceipt ?? `已编辑 ${filePath}`
       return {
         content: base + (warn ? '\n\n' + warn : ''),
         uiContent: ui,
@@ -419,7 +419,7 @@ async function buildEditSuccessResult(
       const result = await syntaxCheck(filePath, after)
       if (result) warn = result
     } catch (e) {
-      warn = `(syntax-check skipped: ${(e as Error).message})`
+      warn = `(语法检查已跳过： ${(e as Error).message})`
     }
   }
 
@@ -427,8 +427,8 @@ async function buildEditSuccessResult(
     uiContent = await editUiContent(cwd, filePath, before, after, warn || null)
     changedRanges = await computeChangedLineRanges(before, after)
   } catch (e) {
-    if (!warn) warn = `(diff skipped: ${(e as Error).message})`
-    else warn = `${warn}\n(diff skipped: ${(e as Error).message})`
+    if (!warn) warn = `(diff 已跳过： ${(e as Error).message})`
+    else warn = `${warn}\n(diff 已跳过： ${(e as Error).message})`
   }
 
   return { warn, uiContent, changedRanges }
@@ -448,10 +448,10 @@ async function buildDryRunPreview(
   let warn = ''
   try {
     const check = await checkSyntax(filePath, after)
-    if (check.fatal) warn = `SYNTAX ERROR if applied: ${check.fatal}`
+    if (check.fatal) warn = `若应用将出现语法错误：${check.fatal}`
     else if (check.warning) warn = check.warning
   } catch (e) {
-    warn = `(syntax-check skipped: ${(e as Error).message})`
+    warn = `(语法检查已跳过： ${(e as Error).message})`
   }
 
   let diff = ''
@@ -460,10 +460,10 @@ async function buildDryRunPreview(
     diff = await buildFileDiff(relative(cwd, filePath), before, after)
     changedRanges = await computeChangedLineRanges(before, after)
   } catch (e) {
-    warn = warn ? `${warn}\n(diff skipped: ${(e as Error).message})` : `(diff skipped: ${(e as Error).message})`
+    warn = warn ? `${warn}\n(diff 已跳过： ${(e as Error).message})` : `(diff 已跳过： ${(e as Error).message})`
   }
 
-  const content = `Preview (dry_run) for ${filePath} — no changes written:\n\n${diff || '(no textual change)'}` + (warn ? `\n\n${warn}` : '')
+  const content = `预览（dry_run）${filePath} — 未写入任何更改：\n\n${diff || '（无文本变更）'}` + (warn ? `\n\n${warn}` : '')
   return { content, uiContent: diff || undefined, changedRanges }
 }
 
@@ -480,17 +480,18 @@ async function finalizeEdit(
   after: string,
   sessionId: string | undefined,
   buildSuccessResult: (warn: string, uiContent: string | undefined, changedRanges: LineRange[]) => { content: string; uiContent?: string; changedRanges: LineRange[] },
-): Promise<{ content: string; uiContent?: string; changedRanges: LineRange[]; isError?: boolean }> {
+): Promise<{ content: string; uiContent?: string; changedRanges: LineRange[]; isError?: boolean; errorKind?: 'syntax_error' }> {
   const check = await checkSyntax(filePath, after)
   if (check.fatal) {
     const relPath = relative(cwd, filePath)
     const restored = restoreLatestBackup(cwd, relPath)
     const fails = incrementEditFailCount(filePath)
-    const gatePrefix = fails >= 3 ? `After ${fails} consecutive edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
-    const rollbackMsg = restored ? 'The change has been automatically rolled back.' : 'Automatic rollback failed.'
+    const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
+    const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'
     return {
-      content: gatePrefix + `Error: ${check.fatal}\n\n${rollbackMsg}\n\nFix the edit and retry. For complex changes prefer apply_patch with a unified diff.`,
+      content: gatePrefix + `错误：${check.fatal}\n\n${rollbackMsg}\n\n请修复编辑后重试。复杂改动建议优先用 apply_patch 加 unified diff。`,
       isError: true,
+      errorKind: 'syntax_error',
       changedRanges: [],
     }
   }
@@ -535,7 +536,7 @@ function buildNotFoundError(filePath: string, oldString: string, fileContent: st
   // Require a meaningful match: at least 8 chars or 30% of the first line.
   const minScore = Math.max(8, Math.floor(trimmedFirst.length * 0.3))
   if (bestIdx === -1 || bestScore < minScore) {
-    return `Error: old_string not found in ${filePath}. The file does not contain anything closely resembling the first line of old_string. Re-read the file to see its current contents.`
+    return `错误：在 ${filePath} 中未找到 old_string。文件中没有任何内容接近 old_string 的首行。请重新读取文件查看当前内容。`
   }
 
   // Extract a window of the same line count as old_string from the file.
@@ -552,7 +553,7 @@ function buildNotFoundError(filePath: string, oldString: string, fileContent: st
         const expanded = fileLines.slice(start, extend + 1).join('\n')
         const hint = hashEditHint(fileContent, start + 1, extend + 1)
         return hint
-          ? `${formatDiffError(filePath, oldString, expanded, start + 1)}\n\nHint: use hash_edit with these anchors instead:\n  ${hint}`
+          ? `${formatDiffError(filePath, oldString, expanded, start + 1)}\n\n提示：改用这些 hash_edit 锚点：\n  ${hint}`
           : formatDiffError(filePath, oldString, expanded, start + 1)
       }
     }
@@ -560,7 +561,7 @@ function buildNotFoundError(filePath: string, oldString: string, fileContent: st
 
   const hint = hashEditHint(fileContent, start + 1, end)
   return hint
-    ? `${formatDiffError(filePath, oldString, actualWindow, start + 1)}\n\nHint: use hash_edit with these anchors instead:\n  ${hint}`
+    ? `${formatDiffError(filePath, oldString, actualWindow, start + 1)}\n\n提示：改用这些 hash_edit 锚点：\n  ${hint}`
     : formatDiffError(filePath, oldString, actualWindow, start + 1)
 }
 
@@ -592,12 +593,12 @@ function buildMultipleMatchError(filePath: string, oldString: string, fileConten
       const startLine = m.lineNumber
       const endLine = startLine + oldString.split('\n').length - 1
       const anchors = hashEditHint(fileContent, startLine, endLine)
-      const hint = anchors ? `\n  Hint: use hash_edit anchors=["${anchors.split('  ').join('", "')}"]` : ''
-      return `Match ${i + 1} at line ${m.lineNumber}:\n${m.context}${hint}`
+      const hint = anchors ? `\n  提示：使用 hash_edit anchors=["${anchors.split('  ').join('", "')}"]` : ''
+      return `匹配 ${i + 1}（第 ${m.lineNumber} 行）：\n${m.context}${hint}`
     })
     .join('\n\n')
 
-  return `Error: old_string matches multiple locations in ${filePath}. Use replace_all=true to replace every occurrence, or extend old_string with surrounding context to make it unique.\n\nMatches found:\n\n${matchSummary}`
+  return `错误：old_string 在 ${filePath} 中匹配到多处。使用 replace_all=true 替换所有出现处，或为 old_string 补充周围上下文使其唯一。\n\n找到的匹配：\n\n${matchSummary}`
 }
 
 function formatDiffError(filePath: string, oldString: string, actualWindow: string, startLine: number): string {
@@ -605,8 +606,8 @@ function formatDiffError(filePath: string, oldString: string, actualWindow: stri
   const actualLines = actualWindow.split('\n')
 
   const diffLines: string[] = []
-  diffLines.push(`--- expected (your old_string)`)
-  diffLines.push(`+++ actual (file at line ${startLine})`)
+  diffLines.push(`--- 预期（你的 old_string）`)
+  diffLines.push(`+++ 实际（文件第 ${startLine} 行）`)
 
   const maxLen = Math.max(oldLines.length, actualLines.length)
   for (let i = 0; i < maxLen; i++) {
@@ -620,7 +621,7 @@ function formatDiffError(filePath: string, oldString: string, actualWindow: stri
     }
   }
 
-  return `Error: old_string not found in ${filePath}. Closest match found at line ${startLine}:\n\n${diffLines.join('\n')}\n\nFix old_string to match the actual file content (check whitespace, indentation, and line endings) and retry.`
+  return `错误：在 ${filePath} 中未找到 old_string。最接近的匹配在第 ${startLine} 行：\n\n${diffLines.join('\n')}\n\n请修正 old_string 以匹配文件实际内容（检查空白、缩进和换行符）后重试。`
 }
 
 /**
@@ -656,9 +657,9 @@ function diffBlock(expected: string, actual: string, maxDiffs = 5): string {
   }
 
   if (diffs.length === 0) {
-    return '  (lines identical — no diff)'
+    return '  （各行相同——无差异）'
   }
-  const truncated = i + 1 < maxLen ? `\n  … (+${maxLen - i - 1} more lines)` : ''
+  const truncated = i + 1 < maxLen ? `\n  …（另 +${maxLen - i - 1} 行）` : ''
   return diffs.join('\n') + truncated
 }
 

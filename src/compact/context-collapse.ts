@@ -9,6 +9,12 @@
  * across 8 files" (~50 chars). This is 40x compression with high signal retention.
  */
 
+import {
+  RUN_TESTS_EXIT_CODE_RE,
+  RUN_TESTS_FAILED_RE,
+  RUN_TESTS_PASSED_RE,
+} from '../tools/run-tests.js'
+
 export interface CollapsedResult {
   toolName: string
   summary: string
@@ -165,10 +171,10 @@ function collapseWriteResult(toolName: string, content: string, originalTokens: 
 }
 
 export function collapseRunTestsResult(content: string, originalTokens: number): CollapsedResult {
-  // run_tests formatOutput produces "Exit code: N" and "N passed, N failed, N skipped"
-  const passedMatch = content.match(/(\d+)\s+passed/)
-  const failedMatch = content.match(/(\d+)\s+failed/)
-  const exitMatch = content.match(/exit code:\s*(\d+)/i)
+  // run_tests formatOutput：与 RUN_TESTS_*_RE 共享（见 run-tests.ts）
+  const passedMatch = content.match(RUN_TESTS_PASSED_RE)
+  const failedMatch = content.match(RUN_TESTS_FAILED_RE)
+  const exitMatch = content.match(RUN_TESTS_EXIT_CODE_RE)
 
   const passed = passedMatch ? parseInt(passedMatch[1]!, 10) : null
   const failed = failedMatch ? parseInt(failedMatch[1]!, 10) : null

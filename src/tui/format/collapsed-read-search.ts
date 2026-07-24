@@ -68,7 +68,8 @@ export function classifyCollapsibleKind(toolName: string): CollapsibleKind | nul
   if (
     t === 'grep' || t === 'glob' || t === 'semantic_search' ||
     t === 'repo_map' || t === 'repo_graph' ||
-    t === 'related_tests' || t === 'inspect_project' || t === 'ls'
+    t === 'related_tests' || t === 'inspect_project' || t === 'ls' ||
+    t === 'ast_grep'
   ) {
     return 'search'
   }
@@ -110,6 +111,12 @@ export function entryDisplayName(toolName: string, input: Record<string, unknown
   if (t === 'semantic_search') {
     const query = input.query ?? '?'
     return typeof query === 'string' ? query : '?'
+  }
+
+  // ast_grep：显示 "pattern"
+  if (t === 'ast_grep') {
+    const pattern = input.pattern ?? '?'
+    return typeof pattern === 'string' ? pattern : '?'
   }
 
   // file_info / ls：显示路径
@@ -247,15 +254,17 @@ export function formatCollapsedGroup(input: FormatCollapsedGroupInput): string[]
   const elapsedStr = elapsed > 1000 ? `${(elapsed / 1000).toFixed(1)}s` : `${elapsed}ms`
 
   // 摘要行：展开状态指示器 + 摘要 + 耗时
-  const indicator = expanded ? '▼' : '▶'
-  lines.push(color(`${indicator} ${summary} · ${elapsedStr}`, theme.primary))
+  const indicatorStr = color(expanded ? '▼' : '▶', theme.secondary, { bold: true })
+  const summaryStr = color(summary, theme.primary, { bold: true })
+  const elapsedCol = color(`· ${elapsedStr}`, theme.dim)
+  lines.push(`${indicatorStr} ${summaryStr} ${elapsedCol}`)
 
   const completed = group.entries.filter(e => e.completed)
   const hasPending = group.entries.some(e => !e.completed)
 
   if (completed.length === 0) {
     if (hasPending) {
-      lines.push(color('│  (results pending…)', theme.muted))
+      lines.push(`  ${color('│  (results pending…)', theme.dim)}`)
     }
     return lines
   }
@@ -265,21 +274,34 @@ export function formatCollapsedGroup(input: FormatCollapsedGroupInput): string[]
     for (let i = 0; i < completed.length; i++) {
       const entry = completed[i]!
       const isLast = i === completed.length - 1
-      const connector = isLast ? '│  ╰─' : '│  ├─'
-      const childPrefix = isLast ? '│     ' : '│  │  '
+      const connector = color(isLast ? '└─' : '├─', theme.dim)
+      const childPrefix = isLast ? '   ' : '│  '
       const lineCount = entry.content ? entry.content.split('\n').length : 0
-      const lc = lineCount > 0 ? ` (${lineCount}L)` : ''
-      lines.push(`${connector} ${color(entry.displayName, theme.muted)}${lc}`)
+      const lc = lineCount > 0 ? color(` (${lineCount}L)`, theme.dim) : ''
+      const entryNameStr = color(entry.displayName, theme.secondary)
+      
+      lines.push(`  ${connector} ${entryNameStr}${lc}`)
+      
       if (entry.content) {
-        const maxWidth = Math.max(10, (input.columns ?? 80) - childPrefix.length)
+        const maxWidth = Math.max(10, (input.columns ?? 80) - childPrefix.length - 4)
         const previewLines = entry.content.split('\n').slice(0, expanded ? 30 : 3)
         for (const pl of previewLines) {
           const trimmed = displayWidth(pl) > maxWidth ? truncateToDisplayWidth(pl, maxWidth - 2) + '…' : pl
-          lines.push(`${childPrefix}${color(trimmed, theme.muted)}`)
+          // 精细区分代码/搜索匹配行中的「行号」与「正文」
+          const lineNumMatch = trimmed.match(/^(\s*\d+:)(.*)$/)
+          let formattedLine: string
+          if (lineNumMatch) {
+            const lineNum = color(lineNumMatch[1]!, theme.dim)
+            const codeContent = color(lineNumMatch[2]!, theme.assistantColor ?? theme.secondary)
+            formattedLine = `${lineNum}${codeContent}`
+          } else {
+            formattedLine = color(trimmed, theme.assistantColor ?? theme.secondary)
+          }
+          lines.push(`  ${childPrefix} ${formattedLine}`)
         }
         const limit = expanded ? 30 : 3
         if (lineCount > limit) {
-          lines.push(color(`${childPrefix}… +${lineCount - limit} more lines`, theme.muted))
+          lines.push(`  ${childPrefix} ${color(`… +${lineCount - limit} more lines`, theme.dim)}`)
         }
       }
     }
@@ -288,8 +310,8 @@ export function formatCollapsedGroup(input: FormatCollapsedGroupInput): string[]
     const files = completed.map(e => e.displayName).join(', ')
     const maxWidth = Math.max(10, (input.columns ?? 80) - 9)
     const preview = displayWidth(files) > maxWidth ? truncateToDisplayWidth(files, maxWidth - 2) + '…' : files
-    lines.push(`│  ╰─ ${color(preview, theme.muted)}`)
-    lines.push(color(`│     … +${completed.length - 3} more files [Ctrl+O]`, theme.secondary))
+    lines.push(`  └─ ${color(preview, theme.secondary)}`)
+    lines.push(`     ${color(`… +${completed.length - 3} more files`, theme.dim)} ${color('[Ctrl+O]', theme.warning)}`)
   }
 
   return lines

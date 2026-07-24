@@ -164,13 +164,13 @@ export function createRelatedTestsTool(
 
       // Reject absolute paths (incl. Windows `C:\`) — only relative paths within cwd allowed
       if (isAbsolute(file) || file.includes('..')) {
-        return { content: 'Error: file path must be relative to project directory.', isError: true }
+        return { content: '错误：file 路径必须相对于项目目录。', isError: true }
       }
 
       if (isTestFile(file)) {
         const sources = await findSourceForTest(file, params.cwd)
         if (sources.length === 0) {
-          return { content: 'No related source files found.' }
+          return { content: '未找到相关源文件。' }
         }
         return { content: sources.join('\n') }
       }
@@ -189,7 +189,7 @@ export function createRelatedTestsTool(
       // Fallback: hardcoded path heuristics
       const tests = await findTestsForSource(file, params.cwd)
       if (tests.length === 0) {
-        return { content: 'No related tests found.' }
+        return { content: '未找到相关测试。' }
       }
       return { content: tests.join('\n') }
     },

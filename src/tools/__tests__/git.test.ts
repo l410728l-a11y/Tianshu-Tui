@@ -36,7 +36,7 @@ describe('GIT_TOOL', () => {
       cwd: TMP,
     })
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('clean'))
+    assert.ok(result.content.includes('干净'))
   })
 
   it('returns diff summary', async () => {
@@ -114,7 +114,7 @@ describe('GIT_TOOL', () => {
       cwd: TMP,
     })
     assert.equal(result.isError, true)
-    assert.match(result.content, /deliver_task with commit=true/)
+    assert.match(result.content, /deliver_task.*commit=true/)
     assert.equal(execSync('git rev-parse --short HEAD', { cwd: TMP, encoding: 'utf-8' }).trim(), headBefore)
   })
 
@@ -125,7 +125,7 @@ describe('GIT_TOOL', () => {
       cwd: TMP,
     })
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Unknown action'))
+    assert.ok(result.content.includes('未知 action'))
   })
 
   it('requires approval for commit action', () => {
@@ -200,7 +200,7 @@ describe('GIT_TOOL', () => {
       cwd: TMP,
     })
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('Saved'))
+    assert.ok(result.content.includes('已保存'))
   })
 
   it('creates safety ref before stash for reversible recovery (P2)', async () => {
@@ -320,7 +320,7 @@ describe('getWorkingTreeFiles / getFileDiff (desktop changes tab)', () => {
   })
 
   it('getFileAtBase rejects path traversal', async () => {
-    await assert.rejects(() => getFileAtBase(TMP2, '../outside.txt'), /Invalid file path/)
+    await assert.rejects(() => getFileAtBase(TMP2, '../outside.txt'), /无效文件路径/)
   })
 
   it('falls back to HEAD for a malicious or malformed base ref', async () => {

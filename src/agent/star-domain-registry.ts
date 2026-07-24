@@ -108,9 +108,10 @@ export class StarDomainRegistry {
   }
 
   /** Match a task description to the best domain by keyword scoring.
-   *  Returns null if no domain matches (all scores = 0 or tie). */
-  matchDomain(taskDescription: string): string | null {
-    return this.matchDomainDetailed(taskDescription).id
+   *  Returns null if no domain matches (all scores = 0 or tie).
+   *  `pool` 限定参与计分的域 id 集合（缺省 = 全集）——auto 路由收窄用。 */
+  matchDomain(taskDescription: string, pool?: readonly string[]): string | null {
+    return this.matchDomainDetailed(taskDescription, pool).id
   }
 
   /**
@@ -118,7 +119,7 @@ export class StarDomainRegistry {
    * verdict, and optional runner-up. `matchDomain` is a thin `.id` projection —
    * same inputs must keep returning the same id (or null).
    */
-  matchDomainDetailed(taskDescription: string): DomainMatchDetail {
+  matchDomainDetailed(taskDescription: string, pool?: readonly string[]): DomainMatchDetail {
     this.ensureInit()
     // Cap scan length so pathological objectives cannot explode includes() work.
     const lower = taskDescription.slice(0, MAX_MATCH_CHARS).toLowerCase()
@@ -126,6 +127,7 @@ export class StarDomainRegistry {
     const keywordsByDomain = new Map<string, string[]>()
 
     for (const domain of this.domains.values()) {
+      if (pool !== undefined && !pool.includes(domain.id)) continue
       let score = 0
       const matched: string[] = []
       for (const keyword of domain.keywords) {

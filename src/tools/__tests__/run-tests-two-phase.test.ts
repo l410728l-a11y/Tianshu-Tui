@@ -80,8 +80,8 @@ describe('run_tests VSW two-phase', () => {
     assert.ok(result.extraVerifications && result.extraVerifications.length === 1)
     assert.equal(result.extraVerifications![0]!.verificationPhase, 'integration')
     assert.equal(result.extraVerifications![0]!.snapshotRef, 'head+diff123')
-    assert.match(result.content, /Phase A · isolated snapshot/)
-    assert.match(result.content, /Phase B · integration on current HEAD\] passed/)
+    assert.match(result.content, /阶段 A · 隔离快照/)
+    assert.match(result.content, /阶段 B · 当前 HEAD 集成\] 已通过/)
   })
 
   it('Phase A failure governs isError (blocking gate)', async () => {

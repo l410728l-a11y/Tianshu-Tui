@@ -16,6 +16,22 @@ import { getToolArtifactThreshold } from './artifact-threshold.js'
 import { debugLog } from '../utils/debug.js'
 import { loadConfig } from '../config/manager.js'
 import { buildMirrorEnv, rewriteGitHubUrls } from './mirror-env.js'
+import type { MirrorsConfig } from '../config/schema.js'
+
+/**
+ * When autoFallback is enabled, inject git early-fail env vars so that
+ * `git clone https://github.com/...` commands abort quickly on slow
+ * connections (instead of hanging for 2 minutes). This lets the user see
+ * the error and manually try a mirror.
+ */
+function gitCloneEarlyFailEnv(command: string, config: MirrorsConfig): Record<string, string> {
+  if (config.autoFallback === false) return {}
+  if (!/\bgit\b.*\bclone\b.*github\.com/.test(command)) return {}
+  return {
+    GIT_HTTP_LOW_SPEED_LIMIT: '1000',
+    GIT_HTTP_LOW_SPEED_TIME: '15',
+  }
+}
 import { buildNotFoundHint, extractMissingCommand } from './env-check.js'
 import { getResolvedEnv } from './resolved-env.js'
 import { OutputStreamBudget } from './output-stream-budget.js'
@@ -169,6 +185,14 @@ export function classifyBashOutcome(
   return { isError: false }
 }
 
+/** 内部 errorClass → 对外 errorKind 映射。exec-failure 不映射（undefined），
+ *  留给 failure-classifier 的文本正则细分（段错误/信号杀死消息为 shell 原生英文，正则仍可匹配）。 */
+function toErrorKind(cls: 'environment' | 'exec-failure' | 'timeout' | undefined): 'missing_dep' | 'timeout' | undefined {
+  if (cls === 'environment') return 'missing_dep'
+  if (cls === 'timeout') return 'timeout'
+  return undefined
+}
+
 /**
  * 结果装配失败时的降级结果（finish 的 try/catch 兜底用）。导出以锁定契约：
  * 必须含根因、真实退出码、输出尾部，且绝不伪装成命令本身的失败。
@@ -179,9 +203,9 @@ export function buildAssemblyFailureResult(
   outputTail: string,
 ): { content: string; uiContent: string; isError: boolean } {
   return {
-    content: `[bash 内部错误：结果装配失败] ${message}\n` +
-      `[exit=${exitCode}] 命令本身已执行结束——这不是命令失败，是 rivet 组装输出时出错（请把本行原样报告给用户）。原始输出尾部：\n` +
-      `${outputTail || '(no output)'}`,
+    content: `错误：bash 结果装配失败 —— ${message}\n` +
+      `[exit=${exitCode}] 命令本身已执行结束，这不是命令失败，是 rivet 组装输出时出错。原始输出尾部：\n` +
+      `${outputTail || '(无输出)'}`,
     uiContent: `✗ 结果装配失败: ${message.slice(0, 80)}`,
     isError: true,
   }
@@ -388,17 +412,13 @@ export const BASH_TOOL: Tool = {
     name: 'bash',
     description: `执行 shell 命令，用于构建、测试、git 和系统操作。
 
-不要用它读/写/搜索文件——改用专用工具（read_file、grep、glob、edit_file、write_file）。
-
-用 && 串联独立命令。超时默认 120s；更长的命令传 timeout。
-
-长时间运行/不终止的命令（dev server、watcher、install）在后台运行，永远不阻塞循环：传 run_in_background=true，或让自动检测处理已知的长跑命令。后台命令立即返回 job id——用 \`job\` 工具 await(pattern)、读日志或终止它。传 run_in_background=false 可强制命令保持前台运行。`,
+用 && 串联独立命令。长时间运行的命令（dev server、watcher、install）传 run_in_background=true 转入后台，用 job 工具查看/等待/终止。自动检测已知长跑命令也会后台化。`,
     input_schema: {
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的 shell 命令' },
         timeout: { type: 'integer', description: '超时毫秒数（默认 120000）' },
-        run_in_background: { type: 'boolean', description: '在后台分离运行并立即返回 job id（用于 dev server、watcher、install）。已知长跑命令会自动启用；设 false 强制前台运行。' },
+        run_in_background: { type: 'boolean', description: '设为 true 转入后台并返回 job id。自动检测已知长跑命令。' },
       },
       required: ['command'],
     },
@@ -431,7 +451,8 @@ export const BASH_TOOL: Tool = {
     }
     if (wantBackground && params.jobs) {
       const mirrorEnv = buildMirrorEnv(mirrorConfig)
-      const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv }
+      const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
+      const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv }
       const snap = params.jobs.spawn({ command, rawCommand, cwd: params.cwd, env })
       const auto = explicitBg !== true
       const sandboxNote = sandbox.sandboxed && sandbox.note ? `\n${sandbox.note}` : ''
@@ -470,10 +491,11 @@ export const BASH_TOOL: Tool = {
       }
 
       const mirrorEnv = buildMirrorEnv(mirrorConfig)
+      const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
       debugLog(`[bash-spawn] kind=${shell.kind} shell=${shell.cmd} args=${JSON.stringify(shell.args)} cwd=${params.cwd ?? process.cwd()}`)
       const child = track(spawn(shell.cmd, [...shell.args, commandToRun], {
         cwd: params.cwd,
-        env: { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv },
+        env: { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv },
         stdio: ['ignore', 'pipe', 'pipe'],
         // detached: true breaks stdio pipes on Windows cmd.exe — the new
         // console created in detached mode doesn't connect back to the parent's
@@ -627,7 +649,7 @@ export const BASH_TOOL: Tool = {
           const hint = buildNotFoundHint(missing, process.platform)
           modelBody = `环境/配置问题：${reason}。属环境/依赖缺失，非代码缺陷——请修复环境后重试，勿反复重跑相同命令。${hint}`
         } else {
-          modelBody = filtered || (isTimeout ? 'Command timed out' : code === 0 ? '' : `Exit code: ${code}`)
+          modelBody = filtered || (isTimeout ? '命令超时。' : code === 0 ? '' : `退出码：${code}`)
         }
 
         // Use ArtifactStore if available (preferred); otherwise fall back to output-store.
@@ -654,6 +676,7 @@ export const BASH_TOOL: Tool = {
               rawPath,
               isError,
               errorClass,
+              errorKind: toErrorKind(errorClass),
               lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
               rawBytes: totalRawBytes,
               rawLines: totalRawLines,
@@ -688,6 +711,7 @@ export const BASH_TOOL: Tool = {
             rawPath: artifact?.rawPath,
             isError,
             errorClass,
+            errorKind: toErrorKind(errorClass),
             lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
             rawBytes: totalRawBytes,
             rawLines: totalRawLines,
@@ -704,6 +728,7 @@ export const BASH_TOOL: Tool = {
           rawPath,
           isError,
           errorClass,
+          errorKind: toErrorKind(errorClass),
           lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
           rawBytes: totalRawBytes,
           rawLines: totalRawLines,
@@ -764,7 +789,7 @@ export const BASH_TOOL: Tool = {
         uiOutput.dispose()
         const raw = finalStdout + (finalStderr ? '\n' + finalStderr : '')
         resolve({
-          content: raw ? `[aborted] 命令被用户中止，部分输出:\n${raw.slice(-2000)}` : 'Command aborted by user.',
+          content: raw ? `[aborted] 命令被用户中止，部分输出:\n${raw.slice(-2000)}` : '命令被用户中止。',
           uiContent: '⏹ aborted',
           isError: false,
         })
@@ -804,6 +829,7 @@ export const BASH_TOOL: Tool = {
             content: `Shell 执行失败：找不到 shell 二进制 (${diag.cmd})。${hint}`,
             isError: true,
             errorClass: 'environment',
+            errorKind: 'missing_dep',
           })
           return
         }

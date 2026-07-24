@@ -195,4 +195,40 @@ describe('RuntimeSessionManager goal mode', () => {
     assert.equal(await manager.cancelGoal(s.id), null)
     assert.equal(await manager.setGoal(s.id, { goal: 'x', maxIterations: 5, contextWindow: 1000 }), null)
   })
+
+  test('run emits a goal_state baseline snapshot on first user message', async () => {
+    // P2-B Wave 1: wasFirstUser 分支内追加 goal_state 基线快照，
+    // 让 MissionProjector 不再因 goal_state 零出现而空转。
+    const { manager } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, 'hello world')
+
+    // Flush microtasks so the synchronous append calls (user + status + goal_state) complete.
+    await new Promise((r) => setImmediate(r))
+
+    const evs = manager.getEvents(s.id)
+    assert.ok(evs, 'events exist')
+    const goalEvs = evs!.events.filter((e) => e.type === 'goal_state')
+    assert.equal(goalEvs.length, 1, 'exactly one goal_state baseline snapshot')
+    const data = goalEvs[0]!.data as Record<string, unknown>
+    assert.equal(data.status, 'active')
+    assert.equal(data.iteration, 0)
+    assert.equal(typeof data.wallClockElapsedMs, 'number')
+  })
+
+  test('run does NOT emit goal_state baseline on subsequent (non-first) messages', async () => {
+    // Only the FIRST user message should trigger the baseline — not every run.
+    const { manager } = makeManager(sessionDir)
+    const s = manager.createSession({})
+    void manager.run(s.id, 'first message')
+    await new Promise((r) => setImmediate(r))
+
+    // Second run — wasFirstUser should be false.
+    void manager.run(s.id, 'second message')
+    await new Promise((r) => setImmediate(r))
+
+    const evs = manager.getEvents(s.id)
+    const goalEvs = evs!.events.filter((e) => e.type === 'goal_state')
+    assert.equal(goalEvs.length, 1, 'still only 1 goal_state (baseline not re-emitted)')
+  })
 })

@@ -1,5 +1,8 @@
 import { z } from 'zod'
 
+/** 模型可见空清单文案——todo.ts / formatList 共用，勿改成另一份字面量。 */
+export const TODO_EMPTY_RESULT = '暂无待办。请用 write 动作创建清单。'
+
 const VALID_STATUSES = ['pending', 'in_progress', 'completed'] as const
 
 const todoItemSchema = z.object({
@@ -37,9 +40,9 @@ export class TodoStore {
     for (const done of completedNow) {
       const next = incomingById.get(done.id)
       if (!next) {
-        regressed.push(`${done.content} (dropped from list)`)
+        regressed.push(`${done.content}（已从清单移除）`)
       } else if (next.status !== 'completed') {
-        regressed.push(`${done.content} (completed → ${next.status})`)
+        regressed.push(`${done.content}（completed → ${next.status}）`)
       }
     }
     return regressed
@@ -54,7 +57,7 @@ export class TodoStore {
   }
 
   static formatList(todos: TodoItem[]): string {
-    if (todos.length === 0) return 'No todos. Use write action to create a list.'
+    if (todos.length === 0) return TODO_EMPTY_RESULT
     return todos.map(t => {
       const icon = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '►' : '○'
       return `${icon} [${t.id}] ${t.content} (${t.status})`
@@ -64,7 +67,7 @@ export class TodoStore {
   static formatSummary(todos: TodoItem[]): string {
     const completed = todos.filter(t => t.status === 'completed').length
     const total = todos.length
-    const summary = `Updated: ${completed}/${total} completed`
+    const summary = `已更新：${completed}/${total} 已完成`
     const items = todos.map(t => {
       const icon = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '►' : '○'
       return `${icon} [${t.id}] ${t.content}`

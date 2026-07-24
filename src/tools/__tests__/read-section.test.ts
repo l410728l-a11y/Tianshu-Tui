@@ -96,7 +96,8 @@ describe('read_section tool', () => {
       })
 
       assert.ok(result.isError)
-      assert.ok(result.content.includes('not found'))
+      assert.ok(result.content.includes('未找到'))
+      assert.equal(result.errorKind, 'probe_miss')
     } finally {
       cleanup(tempDir)
     }
@@ -115,7 +116,7 @@ describe('read_section tool', () => {
       })
 
       assert.ok(result.isError)
-      assert.ok(result.content.includes('required'))
+      assert.ok(result.content.includes('需要提供'))
     } finally {
       cleanup(tempDir)
     }
@@ -142,7 +143,7 @@ describe('read_section tool', () => {
       })
 
       assert.ok(result.isError)
-      assert.ok(result.content.includes('Invalid section format'))
+      assert.ok(result.content.includes('无效的区段格式'))
     } finally {
       cleanup(tempDir)
     }
@@ -169,7 +170,7 @@ describe('read_section tool', () => {
       })
 
       assert.ok(!result.isError)
-      assert.ok(result.content.includes('out of range'))
+      assert.ok(result.content.includes('超出范围'))
     } finally {
       cleanup(tempDir)
     }
@@ -199,7 +200,7 @@ describe('read_section tool', () => {
       })
 
       assert.ok(result.isError, 'corruption must surface as isError')
-      assert.match(result.content, /corrupted|SHA-256/i, 'error must mention corruption')
+      assert.match(result.content, /损坏|SHA-256/i, 'error must mention corruption')
     } finally {
       cleanup(tempDir)
     }
@@ -215,7 +216,7 @@ describe('read_section tool', () => {
       })
 
       assert.ok(result.isError)
-      assert.match(result.content, /not configured/i)
+      assert.match(result.content, /未配置 artifactStore/)
     } finally {
       cleanup(tempDir)
     }
@@ -279,7 +280,7 @@ describe('read_section file_path branch (任务 B3)', () => {
     })
 
     assert.ok(result.isError)
-    assert.match(result.content, /artifactId or file_path is required/i)
+    assert.match(result.content, /需要提供 artifactId 或 file_path/)
   })
 
   it('returns error when file does not exist', async () => {
@@ -290,7 +291,7 @@ describe('read_section file_path branch (任务 B3)', () => {
     })
 
     assert.ok(result.isError)
-    assert.match(result.content, /Error reading file/i)
+    assert.match(result.content, /错误：读取文件失败/)
   })
 
   it('handles out-of-range line numbers from live file', async () => {
@@ -303,7 +304,7 @@ describe('read_section file_path branch (任务 B3)', () => {
     })
 
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('out of range'))
+    assert.ok(result.content.includes('超出范围'))
   })
 
   it('includes staleness warning when mtime differs from last read_file', async () => {

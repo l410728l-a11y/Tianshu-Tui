@@ -2,6 +2,9 @@ import type { Tool, ToolCallParams } from './types.js'
 import { ensureSemanticIndex } from '../search/semantic-index.js'
 import { createEmbeddingProvider } from '../search/embedding-provider.js'
 
+/** 空结果标记——search-pod-hook 靠 includes 识别；改文案必须与 hook 同步。 */
+export const SEMANTIC_SEARCH_NO_MATCHES_MARKER = '未找到匹配：'
+
 export const SEMANTIC_SEARCH_TOOL: Tool = {
   definition: {
     name: 'semantic_search',
@@ -23,7 +26,7 @@ export const SEMANTIC_SEARCH_TOOL: Tool = {
   async execute(params: ToolCallParams) {
     const query = String(params.input.query ?? '').trim()
     if (!query) {
-      return { content: 'Error: query is required', isError: true }
+      return { content: '错误：需要提供 query', isError: true }
     }
 
     const limit = Math.min(Number(params.input.limit) || 10, 25)
@@ -36,29 +39,29 @@ export const SEMANTIC_SEARCH_TOOL: Tool = {
       const stats = idx.rebuild()
       const { hits, backend } = await idx.searchHybrid(query, limit)
       if (hits.length === 0) {
-        return { content: `Index rebuilt (${stats.indexed} files). No matches for: ${query}` }
+        return { content: `索引已重建（${stats.indexed} 个文件）。${SEMANTIC_SEARCH_NO_MATCHES_MARKER}${query}` }
       }
-      return { content: `Index rebuilt (${stats.indexed} files, ${backend}). Top ${hits.length} matches:\n\n${fmt(hits).join('\n\n---\n\n')}` }
+      return { content: `索引已重建（${stats.indexed} 个文件，${backend}）。前 ${hits.length} 条匹配：\n\n${fmt(hits).join('\n\n---\n\n')}` }
     }
 
     // Auto-incremental update when stale (lazy refresh)
     if (idx.isStale()) {
       const update = idx.incrementalUpdate()
       const note = update.fallbackRebuild
-        ? ` (full rebuild: ${update.reindexed} files)`
-        : ` (${update.reindexed} changed, ${update.removed} removed)`
+        ? `（全量重建：${update.reindexed} 个文件）`
+        : `（${update.reindexed} 个已变更，${update.removed} 个已移除）`
       const { hits, backend } = await idx.searchHybrid(query, limit)
       if (hits.length === 0) {
-        return { content: `Index refreshed${note}. No matches for: ${query}` }
+        return { content: `索引已刷新${note}。${SEMANTIC_SEARCH_NO_MATCHES_MARKER}${query}` }
       }
-      return { content: `Index refreshed${note} (${backend}). Top ${hits.length} matches:\n\n${fmt(hits).join('\n\n---\n\n')}` }
+      return { content: `索引已刷新${note}（${backend}）。前 ${hits.length} 条匹配：\n\n${fmt(hits).join('\n\n---\n\n')}` }
     }
 
     const { hits, backend } = await idx.searchHybrid(query, limit)
     if (hits.length === 0) {
-      return { content: `No semantic matches for: ${query}\nTry rebuild: true or run /index` }
+      return { content: `${SEMANTIC_SEARCH_NO_MATCHES_MARKER}${query}\n可尝试 rebuild: true 或运行 /index` }
     }
-    return { content: `Top ${hits.length} matches (${backend}):\n\n${fmt(hits).join('\n\n---\n\n')}` }
+    return { content: `前 ${hits.length} 条匹配（${backend}）：\n\n${fmt(hits).join('\n\n---\n\n')}` }
   },
 
   requiresApproval: () => false,

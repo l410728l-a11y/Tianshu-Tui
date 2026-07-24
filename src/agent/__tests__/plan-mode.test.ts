@@ -38,6 +38,28 @@ describe('checkPlanMode', () => {
     }
   })
 
+  it('A5: planning 放行 .rivet/scratch/ 下的写入（提示词把探针写成标准出路，不能自打架）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-plan-mode-'))
+    try {
+      const w = checkPlanMode('planning', 'write_file', { cwd: dir, targetFilePath: '.rivet/scratch/probe-1.ts' })
+      assert.equal(w.allowed, true, 'write_file 到 scratch 应放行')
+      const e = checkPlanMode('planning', 'edit_file', { cwd: dir, targetFilePath: '.rivet/scratch/probe-1.ts' })
+      assert.equal(e.allowed, true, 'edit_file 到 scratch 应放行')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('A5: scratch 路径穿越拒绝（resolve 后逃出目录）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-plan-mode-'))
+    try {
+      const r = checkPlanMode('planning', 'write_file', { cwd: dir, targetFilePath: '.rivet/scratch/../../src/foo.ts' })
+      assert.equal(r.allowed, false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('planning state blocks write tools except active plan file', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rivet-plan-mode-'))
     try {

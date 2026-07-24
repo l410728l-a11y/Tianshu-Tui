@@ -89,6 +89,9 @@ export interface RuntimeHookDeps {
   /** 证据义务状态机（evidence-driven reasoning loop）。缺省 → hooks 只发
    *  advisory 不做义务归账（行为与旧版一致）。 */
   obligations?: import('./obligation-tracker.js').ObligationTracker
+  /** A4（信号互扰治理）：goal tracker 是否活跃。收束类 hook（context-pressure/
+   *  turn-budget）据此把文案合并为"先核销再收束"，避免与续轮机制同轮对打。 */
+  getGoalActive?: () => boolean
   /** control plane 信号出口（self-verify 的结构化 verification_required 用）。 */
   submitControlSignal?: (signal: import('./control-plane.js').ControlSignal) => void
   setLoadedPheromones: (pheromones: any) => void
@@ -675,6 +678,14 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     }))
   }
 
+  // A4（信号互扰治理）：收束类 hook 共享的续轮活跃判定——goal tracker 活跃
+  // 或存在未核销的 high 义务（open/attempted）。true 时收束文案合并为
+  // "先核销再收束"，不与 goal continuation / 义务门同轮对打。
+  const hasActiveContinuation = (): boolean =>
+    (deps.getGoalActive?.() ?? false)
+    || (deps.obligations?.getStore().obligations
+      .some(o => o.risk === 'high' && (o.state === 'open' || o.state === 'attempted')) ?? false)
+
   // Turn Budget: preTurn hook — maxTurns 预算进入危险区(剩余 ≤ max(3, 10%))
   // 时预警一次,引导收敛。expect = verify_attempted(采纳 = 先验证手头工作)。
   // Gated by RIVET_TURN_BUDGET_WARN (default on; set to '0' to disable).
@@ -684,6 +695,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       advisoryBus: deps.advisoryBus,
       getMaxTurns: deps.getMaxTurns,
       getRunTurn: deps.getRunTurn,
+      hasActiveContinuation,
     }))
   }
 
@@ -774,6 +786,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       advisoryBus: deps.advisoryBus,
       getEstimatedTokens: deps.getEstimatedTokens,
       getContextWindow: deps.getContextWindow,
+      hasActiveContinuation,
     }))
   }
 

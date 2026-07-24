@@ -131,6 +131,12 @@ const WAIT_FOR_CAP_MS = 15_000
 /** Max matched lines a find/wait_for result will carry. */
 const FIND_MAX_LINES = 40
 
+/**
+ * 快照结果中可访问性树段落前缀——desktop browser-mirror 靠 includes 保留树文本。
+ * 改文案必须与消费方同步（用常量共享，禁止两边各自手抄）。
+ */
+export const COMPUTER_USE_A11Y_TREE_PREFIX = '可访问性树'
+
 interface SnapshotCacheEntry {
   refs: Map<number, SnapshotRef>
   /** Redacted tree text of the last snapshot — dedup baseline. */
@@ -211,11 +217,11 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
     | { ok: false; error: string } {
     const entry = cacheGet(cacheKey(params, app))
     if (!entry) {
-      return { ok: false, error: `No snapshot cached for ${app} in this session — take a snapshot first, then click by ref.` }
+      return { ok: false, error: `本会话尚未缓存 ${app} 的快照——请先 snapshot，再用 ref 点击。` }
     }
     const sr = entry.refs.get(ref)
     if (!sr) {
-      return { ok: false, error: `ref ${ref} is not in the latest ${app} snapshot — re-snapshot and use a current ref.` }
+      return { ok: false, error: `ref ${ref} 不在 ${app} 的最新快照中——请重新 snapshot 并使用当前 ref。` }
     }
     return { ok: true, target: { path: sr.path, role: sr.role || undefined, title: sr.title || undefined }, sr }
   }
@@ -247,18 +253,18 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
               const point = await driver.locate(app, healed.target)
               return { ok: true, point }
             } catch (retryErr) {
-              return { ok: false, error: `Cannot locate ref ${ref}: ${(retryErr as Error).message}` }
+              return { ok: false, error: `无法定位 ref ${ref}：${(retryErr as Error).message}` }
             }
           }
-          return { ok: false, error: `Cannot locate ref ${ref}: ${healed.error}` }
+          return { ok: false, error: `无法定位 ref ${ref}：${healed.error}` }
         }
-        return { ok: false, error: `Cannot locate ref ${ref}: ${(err as Error).message}` }
+        return { ok: false, error: `无法定位 ref ${ref}：${(err as Error).message}` }
       }
     }
     if (typeof x === 'number' && typeof y === 'number') {
       return { ok: true, point: { x, y } }
     }
-    return { ok: false, error: `Provide either "${refKey}" (snapshot ref) or both "${xKey}" and "${yKey}".` }
+    return { ok: false, error: `请提供 "${refKey}"（快照 ref），或同时提供 "${xKey}" 与 "${yKey}"。` }
   }
 
   /**
@@ -287,11 +293,11 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
       if (!previous) {
         // No baseline to diff against (e.g. coordinate click without a prior
         // snapshot) — cache the state and say so without dumping the tree.
-        return { ...result, content: `${result.content}\nPost-action UI state cached (${snap.refs.length} elements) — snapshot to see the tree.` }
+        return { ...result, content: `${result.content}\n操作后 UI 状态已缓存（${snap.refs.length} 个元素）——请 snapshot 查看树。` }
       }
       const diff = diffTreeSummary(previous.lastTree, tree)
       const note = diff.changed
-        ? `${diff.summary}\n(refs refreshed — refs from before this action are stale; use refs from the diff or re-snapshot.)`
+        ? `${diff.summary}\n（refs 已刷新——此操作之前的 ref 已失效；请使用 diff 中的 ref 或重新 snapshot。）`
         : diff.summary
       return { ...result, content: `${result.content}\n${note}` }
     } catch {
@@ -374,9 +380,9 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
       const names = apps.map((a) => a.name).join(', ')
       const first = fuzzy[0]
       if (fuzzy.length > 0 && first) {
-        return `\nDid you mean "${first.name}"? Visible apps: ${names}`
+        return `\n你是指 "${first.name}" 吗？可见应用：${names}`
       }
-      return `\nNo visible app matches "${app}". Visible apps: ${names}`
+      return `\n没有与 "${app}" 匹配的可见应用。可见应用：${names}`
     } catch {
       return ''
     }
@@ -405,13 +411,13 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
       return {
         ok: true,
         target: { path: match.path, role: match.role || undefined, title: match.title || undefined },
-        note: ` (ref was stale — auto-matched the same ${describeElement(sr)} as ref ${match.ref} in a fresh snapshot and retried)`,
+        note: `（ref 已过期——在新快照中自动匹配到相同的 ${describeElement(sr)} 为 ref ${match.ref} 并已重试）`,
       }
     }
-    const why = matches.length === 0 ? 'no element matches' : `${matches.length} elements match`
+    const why = matches.length === 0 ? '没有元素匹配' : `${matches.length} 个元素匹配`
     return {
       ok: false,
-      error: `stale ref could not be auto-healed: ${why} ${describeElement(sr)} now. Ref cache refreshed from a fresh snapshot — use find/snapshot and target a current ref.`,
+      error: `过期 ref 无法自动修复：当前 ${why} ${describeElement(sr)}。已从新快照刷新 ref 缓存——请用 find/snapshot 并选择当前 ref。`,
     }
   }
 
@@ -429,18 +435,18 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
     if (action === 'browser_adopt') {
       const endpoint = params.input.endpoint
       if (typeof endpoint !== 'string' || !endpoint.trim()) {
-        return { content: 'browser_adopt requires "endpoint" (e.g. "localhost:9222" — a Chrome started with --remote-debugging-port).', isError: true }
+        return { content: 'browser_adopt 需要 "endpoint"（如 "localhost:9222"——用 --remote-debugging-port 启动的 Chrome）。', isError: true }
       }
       return { content: await cdp.adopt(endpoint.trim()) }
     }
     if (!app) {
-      return { content: `${action} requires "app" (the browser to operate, e.g. "Google Chrome").`, isError: true }
+      return { content: `${action} 需要 "app"（要操作的浏览器，如 "Google Chrome"）。`, isError: true }
     }
     switch (action) {
       case 'navigate': {
         const url = params.input.url
         if (typeof url !== 'string' || !url.trim()) {
-          return { content: 'navigate requires "url" (a URL, or "back" / "forward" / "reload").', isError: true }
+          return { content: 'navigate 需要 "url"（URL，或 "back" / "forward" / "reload"）。', isError: true }
         }
         const note = await cdp.navigate(url.trim())
         return await withFeedback(cdp, params, app, { content: note })
@@ -450,15 +456,15 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
       case 'js_eval': {
         const expression = params.input.expression
         if (typeof expression !== 'string' || !expression.trim()) {
-          return { content: 'js_eval requires "expression" (JavaScript to evaluate in the page).', isError: true }
+          return { content: 'js_eval 需要 "expression"（要在页面中执行的 JavaScript）。', isError: true }
         }
         const result = await cdp.evalJs(expression)
-        return await withFeedback(cdp, params, app, { content: `js_eval result:\n${result}` })
+        return await withFeedback(cdp, params, app, { content: `js_eval 结果：\n${result}` })
       }
       case 'tabs': {
         const rawOp = params.input.tab_op ?? 'list'
         if (rawOp !== 'list' && rawOp !== 'activate' && rawOp !== 'new' && rawOp !== 'close') {
-          return { content: 'tabs "tab_op" must be one of: list, activate, new, close.', isError: true }
+          return { content: 'tabs 的 "tab_op" 必须是：list、activate、new、close。', isError: true }
         }
         const index = typeof params.input.tab === 'number' ? params.input.tab : undefined
         const url = typeof params.input.url === 'string' ? params.input.url : undefined
@@ -467,7 +473,7 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
         return rawOp === 'list' ? { content: note } : await withFeedback(cdp, params, app, { content: note })
       }
       default:
-        return { content: `Unknown browser action: ${action}`, isError: true }
+        return { content: `未知浏览器操作：${action}`, isError: true }
     }
   }
 
@@ -495,7 +501,7 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
       target = { x, y }
       where = `(${x}, ${y})`
     } else {
-      return { content: 'click requires "ref" (from a snapshot) or both "x" and "y".', isError: true }
+      return { content: 'click 需要 "ref"（来自快照）或同时提供 "x" 与 "y"。', isError: true }
     }
     let healedNote = ''
     try {
@@ -507,8 +513,8 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
       await driver.click(app, healed.target, { button, count })
       healedNote = healed.note
     }
-    const verb = count === 2 ? 'Double-clicked' : button === 'right' ? 'Right-clicked' : 'Clicked'
-    return { content: `${verb} ${where} in ${app}.${healedNote}` }
+    const verb = count === 2 ? '已双击' : button === 'right' ? '已右键点击' : '已点击'
+    return { content: `${verb} ${where}（于 ${app}）。${healedNote}` }
   }
 
   return {
@@ -585,7 +591,7 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
     async execute(params: ToolCallParams): Promise<ToolResult> {
       if (!isSupported) {
         return {
-          content: `computer_use is only available on macOS and Windows. This host is ${platform}.`,
+          content: `computer_use 仅在 macOS 与 Windows 上可用。当前主机为 ${platform}。`,
           isError: true,
         }
       }
@@ -597,14 +603,14 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
         const raw = params.input.duration_ms
         const ms = Math.max(0, Math.min(WAIT_CAP_MS, typeof raw === 'number' ? Math.round(raw) : 1_000))
         await sleep(ms)
-        return { content: `Waited ${ms}ms.` }
+        return { content: `已等待 ${ms}ms。` }
       }
 
       let driver: ComputerUseDriver
       try {
         driver = driverFactory()
       } catch (err) {
-        return { content: `computer_use driver init failed: ${(err as Error).message}`, isError: true }
+        return { content: `computer_use 驱动初始化失败：${(err as Error).message}`, isError: true }
       }
 
       try {
@@ -612,7 +618,7 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
         // fallback exists for navigate/read_page/js_eval/tabs/browser_adopt.
         if (BROWSER_ONLY_ACTIONS.has(action)) {
           if (!cdpEnabled) {
-            return { content: `${action} requires the CDP browser backend, which is disabled (RIVET_CU_CDP=0).`, isError: true }
+            return { content: `${action} 需要 CDP 浏览器后端，但该后端已禁用（RIVET_CU_CDP=0）。`, isError: true }
           }
           return await executeBrowserAction(getCdpDriver(), params, action, app)
         }
@@ -623,21 +629,21 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
             const perm = await driver.checkPermissions()
             return {
               content:
-                `Accessibility: ${perm.accessibility ? 'granted' : 'MISSING'}\n` +
-                `Screen Recording: ${perm.screenRecording ? 'granted' : 'MISSING'}\n${perm.detail}`,
+                `Accessibility：${perm.accessibility ? '已授予' : '缺失'}\n` +
+                `Screen Recording：${perm.screenRecording ? '已授予' : '缺失'}\n${perm.detail}`,
             }
           }
           case 'list_apps': {
             const apps = await driver.listApps()
-            if (apps.length === 0) return { content: 'No visible apps found.' }
+            if (apps.length === 0) return { content: '未找到可见应用。' }
             const lines = apps.map((a) => {
               const title = a.title && a.title !== a.name ? ` — "${a.title}"` : ''
-              return `- ${a.name}${title}${a.frontmost ? ' (frontmost)' : ''}`
+              return `- ${a.name}${title}${a.frontmost ? '（前台）' : ''}`
             })
-            return { content: `Visible apps:\n${lines.join('\n')}` }
+            return { content: `可见应用：\n${lines.join('\n')}` }
           }
           case 'snapshot': {
-            if (!app) return { content: 'snapshot requires "app".', isError: true }
+            if (!app) return { content: 'snapshot 需要 "app"。', isError: true }
             const snap = await driver.snapshot(app)
             let artifactId: string | undefined
             if (snap.screenshotPng && params.artifactStore) {
@@ -663,41 +669,41 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
               refs: new Map(snap.refs.map((r) => [r.ref, r])),
               lastTree: tree,
             })
-            const artifactNote = artifactId ? ` (screenshot → artifact ${artifactId})` : ' (screenshot unavailable)'
+            const artifactNote = artifactId ? ` (screenshot → artifact ${artifactId})` : '（截图不可用）'
             if (unchanged) {
               // Dedup: identical tree → short note, no image re-attachment.
               // Existing refs stay valid (same tree ⇒ same paths).
-              return { content: `Snapshot of ${app}${artifactNote}: UI unchanged since the last snapshot — previous refs remain valid.` }
+              return { content: `${app} 的快照${artifactNote}：自上次快照以来 UI 未变化——先前的 refs 仍然有效。` }
             }
             const images = snap.visionPng
               ? [`data:image/png;base64,${snap.visionPng.toString('base64')}`]
               : undefined
             return {
-              content: `Accessibility tree for ${app}${artifactNote}:\n\n${tree}`,
+              content: `${COMPUTER_USE_A11Y_TREE_PREFIX}（${app}${artifactNote}）：\n\n${tree}`,
               images,
             }
           }
           case 'find': {
-            if (!app) return { content: 'find requires "app".', isError: true }
+            if (!app) return { content: 'find 需要 "app"。', isError: true }
             const query = params.input.query
             if (typeof query !== 'string' || !query.trim()) {
-              return { content: 'find requires a non-empty "query" to match against roles/titles/values.', isError: true }
+              return { content: 'find 需要非空 "query"，用于匹配角色/标题/值。', isError: true }
             }
             const { tree, refs } = await snapshotIntoCache(driver, params, app)
             const { matched, text } = filterTreeLines(tree, query.trim())
             if (matched === 0) {
               return {
-                content: `No elements matching "${query.trim()}" in ${app} (${refs.length} elements scanned). Top-level structure for orientation:\n${treeOutline(tree)}`,
+                content: `在 ${app} 中未找到匹配 "${query.trim()}" 的元素（已扫描 ${refs.length} 个）。顶层结构供定位：\n${treeOutline(tree)}`,
               }
             }
-            const capNote = matched > FIND_MAX_LINES ? `\n(first ${FIND_MAX_LINES} matches shown — narrow the query)` : ''
-            return { content: `Elements matching "${query.trim()}" in ${app} (refs are clickable):\n${text}${capNote}` }
+            const capNote = matched > FIND_MAX_LINES ? `\n（仅显示前 ${FIND_MAX_LINES} 条匹配——请缩小查询）` : ''
+            return { content: `在 ${app} 中匹配 "${query.trim()}" 的元素（refs 可点击）：\n${text}${capNote}` }
           }
           case 'wait_for': {
-            if (!app) return { content: 'wait_for requires "app".', isError: true }
+            if (!app) return { content: 'wait_for 需要 "app"。', isError: true }
             const text = params.input.text
             if (typeof text !== 'string' || !text.trim()) {
-              return { content: 'wait_for requires non-empty "text" to wait for in the UI tree.', isError: true }
+              return { content: 'wait_for 需要非空 "text"，用于在 UI 树中等待。', isError: true }
             }
             const gone = params.input.gone === true
             const rawTimeout = params.input.timeout_ms
@@ -710,37 +716,42 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
               lastTree = tree
               const { matched, text: matchText } = filterTreeLines(tree, needle)
               if (!gone && matched > 0) {
-                return { content: `"${needle}" appeared in ${app} after ${Date.now() - startedAt}ms (refs are clickable):\n${matchText}` }
+                return { content: `"${needle}" 在 ${app} 中于 ${Date.now() - startedAt}ms 后出现（refs 可点击）：\n${matchText}` }
               }
               if (gone && matched === 0) {
-                return { content: `"${needle}" is gone from ${app} (after ${Date.now() - startedAt}ms).` }
+                return { content: `"${needle}" 已从 ${app} 消失（经过 ${Date.now() - startedAt}ms）。` }
               }
               if (Date.now() - startedAt + WAIT_FOR_POLL_MS > deadline) break
               await sleep(WAIT_FOR_POLL_MS)
             }
             if (gone) {
               const { text: stillThere } = filterTreeLines(lastTree, needle)
-              return { content: `wait_for timed out after ${deadline}ms — "${needle}" is still present in ${app}:\n${stillThere}`, isError: true }
+              return {
+                content: `wait_for 在 ${deadline}ms 后超时——"${needle}" 仍存在于 ${app}：\n${stillThere}`,
+                isError: true,
+                errorKind: 'timeout',
+              }
             }
             return {
-              content: `wait_for timed out after ${deadline}ms — "${needle}" did not appear in ${app}. Current top-level structure:\n${treeOutline(lastTree)}\n(ref cache refreshed — find/snapshot for details.)`,
+              content: `wait_for 在 ${deadline}ms 后超时——"${needle}" 未出现在 ${app}。当前顶层结构：\n${treeOutline(lastTree)}\n（ref 缓存已刷新——详情请 find/snapshot。）`,
               isError: true,
+              errorKind: 'timeout',
             }
           }
           case 'click':
-            if (!app) return { content: 'click requires "app".', isError: true }
+            if (!app) return { content: 'click 需要 "app"。', isError: true }
             return await withFeedback(driver, params, app, await executeClick(driver, params, app, 'left', 1))
           case 'double_click':
-            if (!app) return { content: 'double_click requires "app".', isError: true }
+            if (!app) return { content: 'double_click 需要 "app"。', isError: true }
             return await withFeedback(driver, params, app, await executeClick(driver, params, app, 'left', 2))
           case 'right_click':
-            if (!app) return { content: 'right_click requires "app".', isError: true }
+            if (!app) return { content: 'right_click 需要 "app"。', isError: true }
             return await withFeedback(driver, params, app, await executeClick(driver, params, app, 'right', 1))
           case 'scroll': {
-            if (!app) return { content: 'scroll requires "app".', isError: true }
+            if (!app) return { content: 'scroll 需要 "app"。', isError: true }
             const direction = params.input.direction
             if (direction !== 'up' && direction !== 'down' && direction !== 'left' && direction !== 'right') {
-              return { content: 'scroll requires "direction" (up|down|left|right).', isError: true }
+              return { content: 'scroll 需要 "direction"（up|down|left|right）。', isError: true }
             }
             const amount = typeof params.input.amount === 'number' ? params.input.amount : undefined
             let at: { x: number; y: number } | undefined
@@ -750,35 +761,35 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
               at = point.point
             }
             await driver.scroll(app, { direction, amount, at })
-            return await withFeedback(driver, params, app, { content: `Scrolled ${direction}${amount ? ` by ${amount}` : ''} in ${app}${at ? ` at (${Math.round(at.x)}, ${Math.round(at.y)})` : ''}.` })
+            return await withFeedback(driver, params, app, { content: `已在 ${app} 中向 ${direction} 滚动${amount ? ` ${amount}` : ''}${at ? `，位置 (${Math.round(at.x)}, ${Math.round(at.y)})` : ''}。` })
           }
           case 'drag': {
-            if (!app) return { content: 'drag requires "app".', isError: true }
+            if (!app) return { content: 'drag 需要 "app"。', isError: true }
             const from = await resolvePoint(driver, params, app, 'from_ref', 'from_x', 'from_y')
             if (!from.ok) return { content: from.error, isError: true }
             const to = await resolvePoint(driver, params, app, 'to_ref', 'to_x', 'to_y')
             if (!to.ok) return { content: to.error, isError: true }
             await driver.drag(app, from.point, to.point)
-            return await withFeedback(driver, params, app, { content: `Dragged from (${Math.round(from.point.x)}, ${Math.round(from.point.y)}) to (${Math.round(to.point.x)}, ${Math.round(to.point.y)}) in ${app}.` })
+            return await withFeedback(driver, params, app, { content: `已在 ${app} 中从 (${Math.round(from.point.x)}, ${Math.round(from.point.y)}) 拖拽到 (${Math.round(to.point.x)}, ${Math.round(to.point.y)})。` })
           }
           case 'type': {
-            if (!app) return { content: 'type requires "app".', isError: true }
+            if (!app) return { content: 'type 需要 "app"。', isError: true }
             const text = params.input.text
             if (typeof text !== 'string' || text.length === 0) {
-              return { content: 'type requires non-empty "text".', isError: true }
+              return { content: 'type 需要非空 "text"。', isError: true }
             }
             await driver.type(app, text)
-            return await withFeedback(driver, params, app, { content: `Typed ${text.length} character(s) into ${app}.` })
+            return await withFeedback(driver, params, app, { content: `已向 ${app} 输入 ${text.length} 个字符。` })
           }
           case 'set_value': {
-            if (!app) return { content: 'set_value requires "app".', isError: true }
+            if (!app) return { content: 'set_value 需要 "app"。', isError: true }
             const ref = params.input.ref
             const text = params.input.text
             if (typeof ref !== 'number') {
-              return { content: 'set_value requires "ref" (a snapshot element ref).', isError: true }
+              return { content: 'set_value 需要 "ref"（快照元素 ref）。', isError: true }
             }
             if (typeof text !== 'string') {
-              return { content: 'set_value requires "text" (the value to write; may be empty to clear).', isError: true }
+              return { content: 'set_value 需要 "text"（要写入的值；可为空以清空）。', isError: true }
             }
             const resolved = resolveRef(params, app, ref)
             if (!resolved.ok) return { content: resolved.error, isError: true }
@@ -793,56 +804,56 @@ export function createComputerUseTool(options: ComputerUseToolOptions = {}): Too
               healedNote = healed.note
             }
             return await withFeedback(driver, params, app, {
-              content: `Set value of ref ${ref} (${describeElement(resolved.sr)}) to ${text.length} character(s) in ${app}.${healedNote}`,
+              content: `已将 ${app} 中 ref ${ref}（${describeElement(resolved.sr)}）的值设为 ${text.length} 个字符。${healedNote}`,
             })
           }
           case 'key': {
-            if (!app) return { content: 'key requires "app".', isError: true }
+            if (!app) return { content: 'key 需要 "app"。', isError: true }
             const combo = params.input.combo
             if (typeof combo !== 'string' || !combo.trim()) {
-              return { content: 'key requires a "combo" like "cmd+s".', isError: true }
+              return { content: 'key 需要类似 "cmd+s" 的 "combo"。', isError: true }
             }
             await driver.key(app, combo.trim())
-            return await withFeedback(driver, params, app, { content: `Sent ${combo} to ${app}.` })
+            return await withFeedback(driver, params, app, { content: `已向 ${app} 发送 ${combo}。` })
           }
           case 'focus_app': {
-            if (!app) return { content: 'focus_app requires "app".', isError: true }
+            if (!app) return { content: 'focus_app 需要 "app"。', isError: true }
             await driver.focusApp(app)
-            return { content: `Focused ${app}.` }
+            return { content: `已聚焦 ${app}。` }
           }
           case 'launch_app': {
-            if (!app) return { content: 'launch_app requires "app".', isError: true }
+            if (!app) return { content: 'launch_app 需要 "app"。', isError: true }
             await driver.launchApp(app)
-            return await withFeedback(driver, params, app, { content: `Launched ${app} (focused if it was already running).` })
+            return await withFeedback(driver, params, app, { content: `已启动 ${app}（若已在运行则聚焦）。` })
           }
           case 'menu_select': {
-            if (!app) return { content: 'menu_select requires "app".', isError: true }
+            if (!app) return { content: 'menu_select 需要 "app"。', isError: true }
             const menuPath = params.input.menu_path
             if (typeof menuPath !== 'string' || !menuPath.trim()) {
-              return { content: 'menu_select requires "menu_path" like "File > Export > PNG".', isError: true }
+              return { content: 'menu_select 需要类似 "File > Export > PNG" 的 "menu_path"。', isError: true }
             }
             const segments = menuPath.split('>').map((s) => s.trim()).filter(Boolean)
             if (segments.length === 0) {
-              return { content: 'menu_select requires "menu_path" like "File > Export > PNG".', isError: true }
+              return { content: 'menu_select 需要类似 "File > Export > PNG" 的 "menu_path"。', isError: true }
             }
             await driver.menuSelect(app, segments)
-            return await withFeedback(driver, params, app, { content: `Selected menu ${segments.join(' > ')} in ${app}.` })
+            return await withFeedback(driver, params, app, { content: `已在 ${app} 中选择菜单 ${segments.join(' > ')}。` })
           }
           case 'paste_text': {
-            if (!app) return { content: 'paste_text requires "app".', isError: true }
+            if (!app) return { content: 'paste_text 需要 "app"。', isError: true }
             const text = params.input.text
             if (typeof text !== 'string' || text.length === 0) {
-              return { content: 'paste_text requires non-empty "text".', isError: true }
+              return { content: 'paste_text 需要非空 "text"。', isError: true }
             }
             await driver.pasteText(app, text)
-            return await withFeedback(driver, params, app, { content: `Pasted ${text.length} character(s) into ${app} via clipboard (the system clipboard now contains this text).` })
+            return await withFeedback(driver, params, app, { content: `已通过剪贴板向 ${app} 粘贴 ${text.length} 个字符（系统剪贴板现为此文本）。` })
           }
           default:
-            return { content: `Unknown computer_use action: ${action}`, isError: true }
+            return { content: `未知 computer_use 操作：${action}`, isError: true }
         }
       } catch (err) {
         const hint = app ? await appNameHint(driver, app) : ''
-        return { content: `computer_use failed: ${(err as Error).message}${hint}`, isError: true }
+        return { content: `computer_use 失败：${(err as Error).message}${hint}`, isError: true }
       }
     },
 

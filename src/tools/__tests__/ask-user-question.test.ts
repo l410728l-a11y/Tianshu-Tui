@@ -10,7 +10,7 @@ function params(input: Record<string, unknown>): ToolCallParams {
 describe('ASK_USER_QUESTION_TOOL', () => {
   it('returns a placeholder to the model and the question to the UI', async () => {
     const result = await ASK_USER_QUESTION_TOOL.execute(params({ question: 'Which approach?' }))
-    assert.equal(result.content, '[Awaiting your response…]')
+    assert.equal(result.content, '[等待你的回复…]')
     assert.equal(result.uiContent, 'Which approach?')
   })
 
@@ -21,10 +21,10 @@ describe('ASK_USER_QUESTION_TOOL', () => {
     }))
     // With options, the model must see the SAME numbering the user sees — a
     // bare "1" reply is otherwise ambiguous to the model.
-    assert.ok(result.content.startsWith('[Awaiting your response…]'))
+    assert.ok(result.content.startsWith('[等待你的回复…]'))
     assert.ok(result.content.includes('1. Postgres'))
     assert.ok(result.content.includes('2. SQLite'))
-    assert.ok(result.content.includes('bare number'))
+    assert.ok(result.content.includes('裸数字'))
     assert.ok(result.uiContent!.includes('Which database?'))
     assert.ok(result.uiContent!.includes('1. Postgres'))
     assert.ok(result.uiContent!.includes('2. SQLite'))
@@ -71,7 +71,7 @@ describe('ASK_USER_QUESTION_TOOL', () => {
         { prompt: 'Which scope?', options: ['Frontend', 'Backend'], allow_multiple: true },
       ],
     }))
-    assert.ok(result.content.startsWith('[Awaiting your response…]'))
+    assert.ok(result.content.startsWith('[等待你的回复…]'))
     assert.ok(result.content.includes('1. Yes'))
     assert.equal(result.endTurn, true)
     assert.ok(result.uiContent!.includes('1. Enter plan mode?'))

@@ -9,6 +9,7 @@ import { deriveStableWorkOrderId } from '../../agent/coordinator.js'
 import type { WorkerResult } from '../../agent/work-order.js'
 import { validateUnifiedPlan, type UnifiedPlan } from '../../agent/unified-plan.js'
 import { consumePlan } from '../../agent/plan-store.js'
+import { decodeCouncilPanel, COUNCIL_PANEL_UI_PREFIX } from '../../tui/council-panel-model.js'
 import type { ToolCallParams } from '../types.js'
 
 function extractPlanJson(content: string): UnifiedPlan | undefined {
@@ -98,6 +99,20 @@ describe('council_convene 工具', () => {
     assert.ok(res.uiContent!.split('\n').length <= 4)
     assert.match(res.uiContent!, /议事会 · \d+ 席 \d+ 轮/)
     assert.notEqual(res.uiContent, res.content)
+    // ── Wave 2 帧断言：成功路径 uiContent 含 council-panel 帧 ──
+    assert.ok(res.uiContent?.includes(COUNCIL_PANEL_UI_PREFIX), '成功路径 uiContent 应包含 council-panel 帧')
+    const panel = decodeCouncilPanel(res.uiContent!)
+    assert.ok(panel, '帧应可解码为 CouncilPanelModel')
+    assert.equal(panel!.schemaVersion, 1)
+    assert.equal(panel!.objective, 'split loop.ts')
+    assert.ok(panel!.seats.length >= 1, '至少一个席位')
+    for (const s of panel!.seats) {
+      assert.ok(s.authority, '每席应有 authority')
+      assert.equal(s.round, 1)
+      assert.ok(s.modelUsed, '每席应有 modelUsed')
+    }
+    assert.ok(panel!.verdict.accepted >= 0)
+    assert.equal(panel!.pillarsMode, false)
   })
 
   it('per-call seats 带 provider+model → 扇出请求携带 modelOverride（异构议事会）', async () => {
@@ -182,7 +197,7 @@ describe('council_convene 工具', () => {
     assert.equal(tool.isEnabled(), false)
     const res = await tool.execute(paramsWith({ objective: 'x' }))
     assert.equal(calls.requests.length, 0, 'kill switch 必须零派发')
-    assert.match(res.content, /disabled/)
+    assert.match(res.content, /已禁用/)
   })
 
   it('遥测 + 路由 shadow 旁路落盘（不影响返回）', async () => {
@@ -327,6 +342,14 @@ describe('council_convene 工具', () => {
     } as ToolCallParams)
     assert.equal(res.isError, true)
     assert.match(String(res.content), /流会/)
+    // ── Wave 2 降级帧：流会路径 uiContent 含降级 council-panel 帧 ──
+    assert.ok(res.uiContent?.includes(COUNCIL_PANEL_UI_PREFIX), '流会路径应发降级帧')
+    const degraded = decodeCouncilPanel(res.uiContent!)
+    assert.ok(degraded)
+    assert.equal(degraded!.verdict.accepted, 0, '降级帧 verdict 全零')
+    assert.equal(degraded!.verdict.rejected, 0)
+    assert.equal(degraded!.verdict.conflicts, 0)
+    assert.ok(degraded!.seats.length >= 1, '降级帧含席位终态')
     assert.ok(events.find(e => e.workOrderId === 'council:seat-tianquan' && e.status === 'failed'))
     assert.ok(events.find(e => e.workOrderId === 'council:seat-tianfu' && e.status === 'passed'))
     assert.ok(events.find(e => e.workOrderId === 'council:seat-tianquan-retry'), '重试 worker 也须终态')
@@ -486,7 +509,7 @@ describe('council_convene 工具', () => {
     assert.match(res.content, /⛔ 议事会否决/)
     assert.match(res.content, /无回滚方案不得动 schema/)
     assert.ok(!res.content.includes('council-plan-json'), '否决态不得内嵌可执行 planJson')
-    assert.ok(!res.content.includes('Auto-Executed'), '否决态不得 autoExecute')
+    assert.ok(!res.content.includes('已自动执行'), '否决态不得 autoExecute')
     assert.equal(consumePlan(sessionId), null, '否决态不得 storePlan')
     assert.equal(executed, 1, '只有席位扇出，无执行波派发')
   })
@@ -500,7 +523,7 @@ describe('council_convene 工具', () => {
   })
 
   // A4：autoExecute 走 executePlan 完整闭环（波分组 + checkpoint），不再裸 delegateBatch。
-  it('A4：autoExecute → 经 executor.delegateBatch 派发执行波，content 带 Auto-Executed', async () => {
+  it('A4：autoExecute → 经 executor.delegateBatch 派发执行波，content 带 已自动执行', async () => {
     const sessionId = `council-a4-${Date.now()}`
     const cwd = mkdtempSync(join(tmpdir(), 'rivet-council-a4-'))
     const execCalls: DelegationRequest[][] = []
@@ -530,7 +553,7 @@ describe('council_convene 工具', () => {
       assert.equal(res.isError, false)
       assert.equal(execCalls.length, 1, '执行波应经 executor.delegateBatch 派发')
       assert.ok(execCalls[0]!.every(r => r.parentTurnId.includes(':w0')), '执行请求应带波前缀')
-      assert.match(res.content, /## Auto-Executed \(\d+ workers, \d+ waves\)/)
+      assert.match(res.content, /## 已自动执行（\d+ 个 worker，\d+ 波）/)
       // autoExecute 成功时不留存 plan-store（避免 stale 泄漏到后续 bare call）。
       assert.equal(consumePlan(sessionId), null)
     } finally {
@@ -558,7 +581,7 @@ describe('council_convene 工具', () => {
         cwd,
       })
       assert.equal(res.isError, false, '评审产物仍交付')
-      assert.match(res.content, /Auto-Execution Failed/)
+      assert.match(res.content, /自动执行失败/)
       assert.ok(consumePlan(sessionId), '失败时计划回存会话桥供手工续跑')
     } finally {
       rmSync(cwd, { recursive: true, force: true })

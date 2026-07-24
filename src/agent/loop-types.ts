@@ -139,8 +139,9 @@ export interface AgentConfig {
    *  收敛检测以 v2 状态为准；缺省回退 v1（EvidenceState 推导）。 */
   deliveryGateV2?: (currentDirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
   /**
-   * 会话 Auto 是否按消息关键词匹配换域。默认 true：按首条消息 matchDomain，
-   * 未命中回退天枢。显式 false 时 Auto 固定落到 DEFAULT_DOMAIN。
+   * 会话 Auto 是否按消息关键词匹配换域。默认 true：按首条消息在 auto 池
+   * （DOMAIN_AUTO_POOL 五个均衡工程域 + 自定义域）内 matchDomain，未命中
+   * 回退天权。显式 false 时 Auto 固定落到 DEFAULT_DOMAIN（天权）。
    */
   domainKeywordRouting?: boolean
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. Disabled by default. */

@@ -175,7 +175,7 @@ export function checkEvidenceRef(
     const record = store.resolveEvidence(evidenceId, scope)
     if (!record) return null // 未注册，降级
     if (record.status === 'consumed') {
-      return { verdict: 'invalid', reason: `evidence "${ref}" already consumed — each evidence can settle a probe only once` }
+      return { verdict: 'invalid', reason: `证据「${ref}」已被消费——每条证据只能结算一次探针` }
     }
     if (record.status === 'expired') {
       return { verdict: 'unverified' }
@@ -190,9 +190,9 @@ export function checkEvidenceRef(
     if (reg) return reg
     // H4-D4：worker 引用需精确 orderId 已完成（不再仅 hasDelegated）
     const orderId = ref.slice('worker:'.length)
-    if (!orderId) return { verdict: 'invalid', reason: 'worker evidence requires worker:<orderId>' }
+    if (!orderId) return { verdict: 'invalid', reason: 'worker 证据格式为 worker:<orderId>' }
     if (!verifier || !verifier.workerCompleted(orderId)) {
-      return { verdict: 'invalid', reason: `worker evidence "${ref}" rejected: no completed worker with orderId "${orderId}" — dispatch via delegate_task first and wait for completion` }
+      return { verdict: 'invalid', reason: `worker 证据「${ref}」被拒：没有 orderId「${orderId}」的已完成 worker——请先经 delegate_task 派发并等待完成` }
     }
     return { verdict: 'verified' }
   }
@@ -202,7 +202,7 @@ export function checkEvidenceRef(
     // 降级：轻量验真（H2 路径）
     const id = ref.slice('obligation:'.length)
     if (!verifier || !verifier.obligationExists(id)) {
-      return { verdict: 'invalid', reason: `obligation evidence "${ref}" rejected: no such obligation in the ledger` }
+      return { verdict: 'invalid', reason: `义务证据「${ref}」被拒：账本中无此义务` }
     }
     return { verdict: 'verified' }
   }
@@ -211,11 +211,11 @@ export function checkEvidenceRef(
     if (reg) return reg
     // 降级：轻量验真（H2 路径）
     const name = ref.split(':')[1] ?? ''
-    if (!name) return { verdict: 'invalid', reason: 'tool evidence requires tool:<name>[:<turn>]' }
+    if (!name) return { verdict: 'invalid', reason: 'tool 证据格式为 tool:<name>[:<turn>]' }
     if (verifier && verifier.toolRan(name, scope.probeTarget)) return { verdict: 'verified' }
     return { verdict: 'unverified' }
   }
-  return { verdict: 'invalid', reason: `evidence_ref "${ref}" rejected: must be tool:<name>[:<turn>] | worker:<orderId> | obligation:<id>` }
+  return { verdict: 'invalid', reason: `evidence_ref「${ref}」被拒：须为 tool:<name>[:<turn>] | worker:<orderId> | obligation:<id>` }
 }
 
 // ─── 输入校验（schema 之上的结构闸门）──────────────────────────────
@@ -223,34 +223,34 @@ export function checkEvidenceRef(
 const EXPECTATION_KINDS = new Set(['pattern_found', 'pattern_absent', 'test_outcome', 'tool_error_class', 'command_output_matches'])
 
 function parseExpectation(raw: unknown): ProbeExpectation | string {
-  if (!raw || typeof raw !== 'object') return 'expectation must be an object'
+  if (!raw || typeof raw !== 'object') return 'expectation 必须是对象'
   const e = raw as Record<string, unknown>
   const kind = e.kind
   if (typeof kind !== 'string' || !EXPECTATION_KINDS.has(kind)) {
-    return `expectation.kind must be one of: ${[...EXPECTATION_KINDS].join(', ')}`
+    return `expectation.kind 必须是：${[...EXPECTATION_KINDS].join(', ')}`
   }
   const str = (k: string): string | null => (typeof e[k] === 'string' && (e[k] as string).trim() ? e[k] as string : null)
   switch (kind) {
     case 'pattern_found':
     case 'pattern_absent': {
       const path = str('path'); const needle = str('needle')
-      if (!path || !needle) return `${kind} requires path + needle`
+      if (!path || !needle) return `${kind} 需要 path + needle`
       return { kind, path, needle } as ProbeExpectation
     }
     case 'test_outcome': {
       const target = str('target'); const expect = e.expect
-      if (!target || (expect !== 'pass' && expect !== 'fail')) return 'test_outcome requires target + expect(pass|fail)'
+      if (!target || (expect !== 'pass' && expect !== 'fail')) return 'test_outcome 需要 target + expect(pass|fail)'
       return { kind, target, expect }
     }
     case 'tool_error_class': {
       const tool = str('tool'); const errorClass = str('errorClass') ?? str('error_class')
-      if (!tool || !errorClass) return 'tool_error_class requires tool + errorClass'
+      if (!tool || !errorClass) return 'tool_error_class 需要 tool + errorClass'
       return { kind, tool, errorClass }
     }
     default: {
       const commandIncludes = str('commandIncludes') ?? str('command_includes')
       const outputPattern = str('outputPattern') ?? str('output_pattern')
-      if (!commandIncludes || !outputPattern) return 'command_output_matches requires commandIncludes + outputPattern'
+      if (!commandIncludes || !outputPattern) return 'command_output_matches 需要 commandIncludes + outputPattern'
       return { kind: 'command_output_matches', commandIncludes, outputPattern }
     }
   }
@@ -367,9 +367,9 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
       // 8.6 fail-closed：PAL 关闭时工具不得变更任何状态（schema 仍常驻——
       // 工具定义随版本上车字节稳定，行为闸门在 execute 层）。
       const mode = deps.getMode?.() ?? (process.env.RIVET_PAL === 'off' || process.env.RIVET_PAL === '0' ? 'off' : 'shadow')
-      if (mode === 'off') return err('PAL layer disabled (RIVET_PAL=off) — no case state can be changed.')
+      if (mode === 'off') return err('PAL 层已禁用（RIVET_PAL=off）——不能更改任何案件状态。')
       const store = deps.getStore()
-      if (!store) return err('attack layer unavailable in this context.')
+      if (!store) return err('当前上下文无攻坚层可用。')
       const input = params.input
       const op = input.op
       const turn = params.sessionTurnCount ?? 0
@@ -383,7 +383,7 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
             typeof kind !== 'string' || typeof ref !== 'string'
             || !['obligation', 'trace_step', 'failure_pattern', 'user_report'].includes(kind)
           ) {
-            return err('open requires anchor {kind: obligation|trace_step|failure_pattern|user_report, ref}. 没有锚事实就不开案。')
+            return err('open 需要 anchor {kind: obligation|trace_step|failure_pattern|user_report, ref}。没有锚事实就不开案。')
           }
           const problem = typeof input.problem === 'string' ? input.problem : ''
           // 8.3：obligation 锚必须指向义务账本里真实存在的 id——伪造锚开案
@@ -391,7 +391,7 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
           if (kind === 'obligation') {
             const verifier = deps.getVerifier?.() ?? null
             if (verifier && !verifier.obligationExists(ref)) {
-              return err(`anchor obligation "${ref}" not found in the obligation ledger — 用真实义务 id 或换其他锚类型。`)
+              return err(`锚义务「${ref}」在义务账本中不存在——用真实义务 id 或换其他锚类型。`)
             }
           }
           const anchor: AttackAnchor = { kind: kind as AttackAnchor['kind'], ref }
@@ -404,23 +404,23 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
               `单一假设直接验证也可，但竞争假设 + 判别探针的淘汰效率更高。`,
               `预算：假设 ≤${MAX_ACTIVE_HYPOTHESES} 存活 · 探针 ≤${MAX_PROBES_PER_CASE} · 攻坚轮 ≤${MAX_ATTACK_TURNS}。`,
             ].join('\n'),
-            uiContent: `attack case opened: ${r.state.caseId}`,
+            uiContent: `攻坚案件已开：${r.state.caseId}`,
             isError: false,
           }
         }
 
         case 'hypothesize': {
           const caseId = typeof input.case_id === 'string' ? input.case_id : ''
-          if (!caseId) return err('hypothesize requires case_id')
+          if (!caseId) return err('hypothesize 需要 case_id')
           const raw = input.hypotheses
-          if (!Array.isArray(raw) || raw.length === 0) return err('hypothesize requires hypotheses[]')
+          if (!Array.isArray(raw) || raw.length === 0) return err('hypothesize 需要 hypotheses[]')
           const results: string[] = []
           for (const item of raw) {
             const h = item as Record<string, unknown>
             const claim = typeof h.claim === 'string' ? h.claim : ''
             const targets = Array.isArray(h.targets) ? h.targets.filter((t): t is string => typeof t === 'string') : []
-            if (!claim.trim()) { results.push('rejected: empty claim'); continue }
-            if (targets.length === 0) { results.push(`rejected: "${claim}" — 假设必须绑定具体 targets（文件/符号），否则无法设计判别探针`); continue }
+            if (!claim.trim()) { results.push('rejected: 空 claim'); continue }
+            if (targets.length === 0) { results.push(`rejected: 「${claim}」—— 假设必须绑定具体 targets（文件/符号），否则无法设计判别探针`); continue }
             const userFact = h.user_fact === true
             const r = store.apply({ type: 'hypothesis_added', caseId, turn, claim, targets, userFact })
             results.push(r.rejected ? `rejected: ${r.rejected}` : `added: ${r.state.hypotheses[r.state.hypotheses.length - 1]!.id} ${claim}`)
@@ -433,23 +433,23 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
               state ? renderBoard(state, store) : '',
               '下一步：plan_probe 为每对假设设计判别探针（谓词为真/假分别支持或反驳谁）。',
             ].join('\n'),
-            uiContent: `attack hypothesize: ${results.length} item(s)`,
+            uiContent: `攻坚假设：${results.length} 项`,
             isError: results.every(r => r.startsWith('rejected')),
           }
         }
 
         case 'plan_probe': {
           const caseId = typeof input.case_id === 'string' ? input.case_id : ''
-          if (!caseId) return err('plan_probe requires case_id')
+          if (!caseId) return err('plan_probe 需要 case_id')
           const raw = input.probes
-          if (!Array.isArray(raw) || raw.length === 0) return err('plan_probe requires probes[]')
+          if (!Array.isArray(raw) || raw.length === 0) return err('plan_probe 需要 probes[]')
           const results: string[] = []
           for (const item of raw) {
             const p = item as Record<string, unknown>
             const hypothesisIds = Array.isArray(p.hypothesis_ids) ? p.hypothesis_ids.filter((x): x is string => typeof x === 'string') : []
             const kind = typeof p.kind === 'string' ? p.kind as ProbeKind : 'read'
             const target = typeof p.target === 'string' ? p.target : ''
-            if (!target.trim() || hypothesisIds.length === 0) { results.push('rejected: probe requires target + hypothesis_ids'); continue }
+            if (!target.trim() || hypothesisIds.length === 0) { results.push('rejected: 探针需要 target + hypothesis_ids'); continue }
             const expectation = parseExpectation(p.expectation)
             if (typeof expectation === 'string') { results.push(`rejected: ${expectation}`); continue }
             const perRaw = Array.isArray(p.per_hypothesis) ? p.per_hypothesis : []
@@ -460,7 +460,7 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
               const hid = typeof link.hypothesis_id === 'string' ? link.hypothesis_id : ''
               const ifTrue = link.if_true
               if (!hid || (ifTrue !== 'supports' && ifTrue !== 'refutes' && ifTrue !== 'neutral')) {
-                linkError = 'per_hypothesis entries require hypothesis_id + if_true(supports|refutes|neutral)'
+                linkError = 'per_hypothesis 条目需要 hypothesis_id + if_true(supports|refutes|neutral)'
                 break
               }
               const ifFalse = link.if_false
@@ -483,7 +483,7 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
           body.push('执行探针用常规工具（grep/run_tests/read…），结算用 observe 带 evidence_ref。低风险只读探针可 delegate_task 并行跑，不阻塞主线。')
           return {
             content: body.join('\n'),
-            uiContent: `attack plan_probe: ${results.length} item(s)`,
+            uiContent: `攻坚计划探针：${results.length} 项`,
             isError: results.every(r => r.startsWith('rejected')),
           }
         }
@@ -492,9 +492,9 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
           const caseId = typeof input.case_id === 'string' ? input.case_id : ''
           const probeId = typeof input.probe_id === 'string' ? input.probe_id : ''
           const outcome = input.predicate_outcome
-          if (!caseId || !probeId) return err('observe requires case_id + probe_id')
+          if (!caseId || !probeId) return err('observe 需要 case_id + probe_id')
           if (outcome !== 'true' && outcome !== 'false' && outcome !== 'unobservable') {
-            return err('observe requires predicate_outcome(true|false|unobservable)')
+            return err('observe 需要 predicate_outcome(true|false|unobservable)')
           }
           const evidenceRef = typeof input.evidence_ref === 'string' ? input.evidence_ref : undefined
 
@@ -502,7 +502,7 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
           // 未注册降级到轻量验真器；unobservable 无需证据引用。
           let evidenceVerified = true
           if (outcome !== 'unobservable') {
-            if (!evidenceRef) return err('observe with observable outcome requires evidence_ref (tool:<name>[:<turn>] | worker:<orderId> | obligation:<id>)')
+            if (!evidenceRef) return err('可观测结果的 observe 需要 evidence_ref（tool:<name>[:<turn>] | worker:<orderId> | obligation:<id>）')
             const probeTarget = store.getCase(caseId)?.probes.find(p => p.id === probeId)?.target
             const check = checkEvidenceRef(evidenceRef, { caseId, probeId, probeTarget }, store, deps.getVerifier?.() ?? null)
             if (check.verdict === 'invalid') return err(check.reason)
@@ -524,7 +524,7 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
             : ''
           return {
             content: [scoreText, unverifiedNote, '', renderBoard(r.state, store)].filter(Boolean).join('\n'),
-            uiContent: `attack observe: ${probeId} → ${outcome}${r.scored.length ? ` (+${r.scored.reduce((s, e) => s + e.points, 0)})` : ''}`,
+            uiContent: `攻坚观察：${probeId} → ${outcome}${r.scored.length ? ` (+${r.scored.reduce((s, e) => s + e.points, 0)})` : ''}`,
             isError: false,
           }
         }
@@ -533,21 +533,21 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
           const caseId = typeof input.case_id === 'string' ? input.case_id : ''
           if (caseId) {
             const state = store.getCase(caseId)
-            if (!state) return err(`unknown case: ${caseId}`)
-            return { content: renderBoard(state, store), uiContent: `attack status: ${caseId}`, isError: false }
+            if (!state) return err(`未知案件：${caseId}`)
+            return { content: renderBoard(state, store), uiContent: `攻坚状态：${caseId}`, isError: false }
           }
           const active = store.activeCases()
-          if (active.length === 0) return { content: '当前无存活攻坚案件。', uiContent: 'attack status: no active cases', isError: false }
+          if (active.length === 0) return { content: '当前无存活攻坚案件。', uiContent: '攻坚状态：无活跃案件', isError: false }
           return {
             content: active.map(c => renderBoard(c, store)).join('\n\n'),
-            uiContent: `attack status: ${active.length} active case(s)`,
+            uiContent: `攻坚状态：${active.length} 个活跃案件`,
             isError: false,
           }
         }
 
         case 'close': {
           const caseId = typeof input.case_id === 'string' ? input.case_id : ''
-          if (!caseId) return err('close requires case_id')
+          if (!caseId) return err('close 需要 case_id')
           const resolution = input.resolution === 'converged' || input.resolution === 'resolved_externally' ? input.resolution : 'abandoned'
           const r = store.apply({ type: 'case_closed', caseId, turn, resolution })
           if (r.rejected) return err(r.rejected)
@@ -563,13 +563,13 @@ export function createAttackCaseTool(deps: AttackCaseToolDeps): Tool {
           }
           return {
             content: lines.join('\n'),
-            uiContent: `attack case closed: ${caseId}`,
+            uiContent: `攻坚案件已关闭：${caseId}`,
             isError: false,
           }
         }
 
         default:
-          return err(`unknown op: ${String(op)}`)
+          return err(`未知 op：${String(op)}`)
       }
     },
     requiresApproval(): boolean { return false },

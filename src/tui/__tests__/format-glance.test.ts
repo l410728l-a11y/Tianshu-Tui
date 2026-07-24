@@ -50,6 +50,24 @@ describe('formatGlanceBar', () => {
     assert.ok(stripAnsi(high).includes('75%'), 'cache >= 50% should also show (persistent display)')
   })
 
+  it('cacheStatus degraded shows ⚡N%冷 with warning color', () => {
+    const bar = formatGlanceBar({ width: 120, cacheHitRate: 0.35, cacheStatus: 'degraded' }, theme)
+    assert.ok(stripAnsi(bar).includes('⚡35%冷'), 'degraded 应显示 冷 标记')
+  })
+
+  it('cacheStatus stale shows ⚡- dim', () => {
+    // stale with no hitRate → shows ⚡-
+    const bar = formatGlanceBar({ width: 120, cacheStatus: 'stale' }, theme)
+    assert.ok(stripAnsi(bar).includes('⚡-'), 'stale 无数据时显示占位符')
+  })
+
+  it('cacheStatus healthy with high hit rate shows ⚡N% (no extra label)', () => {
+    const bar = formatGlanceBar({ width: 120, cacheHitRate: 0.9, cacheStatus: 'healthy' }, theme)
+    const plain = stripAnsi(bar)
+    assert.ok(plain.includes('⚡90%'), 'healthy 高命中显示百分比')
+    assert.ok(!plain.includes('冷'), 'healthy 无冷标记')
+  })
+
   it('tokens 常驻：即便 < 75% 也显示（G7 token/cost 常显）', () => {
     const normal = formatGlanceBar({ width: 120, estimatedTokens: 50_000, maxTokens: 200_000 }, theme)
     assert.ok(stripAnsi(normal).includes('◧'), 'token ratio < 75% 仍常驻显示')

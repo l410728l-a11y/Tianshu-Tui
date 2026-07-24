@@ -227,25 +227,80 @@ describe('StarDomain', () => {
   })
 })
 
-describe('buildActiveDomain', () => {
-  it('returns domain info for matched task', () => {
-    const result = buildActiveDomain('尝试突破新的认证方案')
-    assert.ok(result)
-    assert.equal(result.name, '破军')
-    assert.ok(result.volatileBlock.includes('破军'))
-    assert.ok(result.motto)
+describe('qiming（启明·破夜指引，第十三域）', () => {
+  it('qiming domain exists with full field set', () => {
+    const qiming = STAR_DOMAINS.qiming
+    assert.ok(qiming)
+    assert.equal(qiming.name, '启明')
+    assert.equal(qiming.motto, '长夜有尽，启明先行')
+    assert.equal(qiming.uiPersona.glyph, '☥')
   })
 
-  it('falls back to tianshu for ambiguous task', () => {
+  it('routes illumination/guidance keywords to qiming', () => {
+    assert.equal(matchDomain('寻求晨光与全景洞察'), 'qiming')
+    assert.equal(matchDomain('提出架构假设与破夜指引'), 'qiming')
+  })
+
+  it('qiming carries illumination & root-cause discipline', () => {
+    const suffix = STAR_DOMAINS.qiming.systemPromptSuffix
+    assert.match(suffix, /破夜洞察，直击根因/)
+    assert.match(suffix, /探针先行，测量求真/)
+    assert.match(suffix, /不越俎代庖，托举同行/)
+  })
+})
+
+describe('changgeng（长庚·长夜守候，第十四域）', () => {
+  it('changgeng domain exists with full field set', () => {
+    const changgeng = STAR_DOMAINS.changgeng
+    assert.ok(changgeng)
+    assert.equal(changgeng.name, '长庚')
+    assert.equal(changgeng.motto, '暮色苍茫，长庚守夜；不疾不徐，终局成全')
+    assert.equal(changgeng.uiPersona.glyph, '☽')
+  })
+
+  it('routes eveningstar/guardianship keywords to changgeng', () => {
+    assert.equal(matchDomain('暮色苍茫，长夜守候'), 'changgeng')
+    assert.equal(matchDomain('夜半重构，消解焦虑与终局成全'), 'changgeng')
+  })
+
+  it('changgeng carries serenity & calm discipline', () => {
+    const suffix = STAR_DOMAINS.changgeng.systemPromptSuffix
+    assert.match(suffix, /不疾不徐，消解焦虑/)
+    assert.match(suffix, /长夜守候，陪伴攻坚/)
+    assert.match(suffix, /终局成全，优雅收尾/)
+  })
+})
+
+describe('buildActiveDomain（2026-07-23 auto 池收窄：仅均衡工程域参与自动路由）', () => {
+  it('池内五域关键词正常路由', () => {
+    assert.equal(buildActiveDomain('审查这个方案').id, 'tianquan')
+    assert.equal(buildActiveDomain('对账插桩定位偏差').id, 'kaiyang')
+    assert.equal(buildActiveDomain('复现这个回归并核实').id, 'yaoguang')
+    assert.equal(buildActiveDomain('按计划实现用户注册').id, 'tianliang')
+    assert.equal(buildActiveDomain('长程守昼托举到最后一英里').id, 'huagai')
+  })
+
+  it('池外域关键词不再触发 auto 路由——落兜底天权', () => {
+    // 破军（探索/突破）、天府（修复/优化）关键词命中但域不在池内
+    assert.equal(buildActiveDomain('尝试突破新的认证方案').id, 'tianquan')
+    assert.equal(buildActiveDomain('修复内存泄漏').id, 'tianquan')
+  })
+
+  it('falls back to tianquan for ambiguous task', () => {
     const result = buildActiveDomain('帮我看看')
-    assert.equal(result.id, 'tianshu')
-    assert.equal(result.name, '天枢')
+    assert.equal(result.id, 'tianquan')
+    assert.equal(result.name, '天权')
   })
 
   it('skips keyword routing when keywordRouting is false', () => {
-    const result = buildActiveDomain('尝试突破新的认证方案', { keywordRouting: false })
-    assert.equal(result.id, 'tianshu')
-    assert.equal(result.name, '天枢')
+    const result = buildActiveDomain('按计划实现用户注册', { keywordRouting: false })
+    assert.equal(result.id, 'tianquan')
+    assert.equal(result.name, '天权')
+  })
+
+  it('deriveAuthority 不受池限制——委派仍可达池外域', () => {
+    const derived = deriveAuthority('尝试突破新的认证方案')
+    assert.equal(derived.authority, 'pojun')
   })
 })
 
@@ -266,6 +321,21 @@ describe('四域分工模型（2026-07-04 校订）', () => {
     assert.match(tianshu.systemPromptSuffix, /委派的唯一理由是并行加速/, 'delegation is a means, not identity')
     assert.match(tianshu.systemPromptSuffix, /一致性高于局部最优/, 'global consistency discipline')
     assert.match(tianshu.volatileBlock, /帮开发者落地他们的规划/, 'raison d\'etre in identity block')
+  })
+
+  it('tianshu 带借法出口与多任务归拢（2026-07-23 兜底流量攻坚补强）', () => {
+    const suffix = STAR_DOMAINS.tianshu.systemPromptSuffix
+    // 借法出口：天枢是路由兜底的实际承接者，缺陷分析/漏洞挖掘等攻坚刀法
+    // 散在姊妹星胶囊里——提示词必须给出 recall_capsule 出口，否则基础设施
+    // 在场但不可达。
+    assert.match(suffix, /recall_capsule/, 'capsule recall outlet must exist')
+    assert.match(suffix, /开阳/, 'kaiyang (对账/插桩) borrowing route')
+    assert.match(suffix, /瑶光/, 'yaoguang (复现/归族/静默失效) borrowing route')
+    assert.match(suffix, /诊断阶梯/, 'diagnostic-ladder borrowing route')
+    // 多任务归拢：大杂烩任务先归拢共同影响面再开工，不逐项顺序开工。
+    assert.match(suffix, /共同影响面/, 'multi-task consolidation instruction')
+    // 编辑事故残留：孤立成行的"提交"两字不得存在于 prompt。
+    assert.doesNotMatch(suffix, /^提交$/m, 'stray 提交 line must be removed')
   })
 
   it('star-interface declarations removed across domains (1M 窗口下移交语境是干扰源)', () => {

@@ -683,7 +683,7 @@ export function createMacosDriver(runner?: JxaRunner): ComputerUseDriver {
       await jxa(script)
     },
 
-    async drag(app: string, from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
+    async drag(_app: string, from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
       // mouseDown → stepped mouseDragged → mouseUp. Steps + inter-step sleeps
       // matter: many drop targets ignore a teleporting drag.
       const steps = 8

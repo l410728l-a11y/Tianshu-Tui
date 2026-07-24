@@ -82,7 +82,7 @@ test('run_tests timeout claims settlement before synchronous child close and fin
   const result = await pending
 
   assert.equal(result.isError, true)
-  assert.match(result.content, /timed out after 50ms/)
+  assert.match(result.content, /50ms 后超时/)
   assert.equal(result.verification?.blockedReason, 'timeout')
   assert.equal(persistCalls, 1, 'raw output must be persisted exactly once')
   assert.equal(decoderEnds, 2, 'stdout and stderr decoders finalize exactly once each')

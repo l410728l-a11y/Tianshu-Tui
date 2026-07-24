@@ -15,6 +15,8 @@ import { serverLogger } from './logger.js'
 import { createRoutes, type ServerState } from './routes.js'
 import { RuntimeSessionManager } from './session-manager.js'
 import { buildSessionRoutes } from './session-routes.js'
+import { buildMissionRoutes } from './mission-routes.js'
+import { MissionStore } from './mission-store.js'
 import { buildHealthRoute } from './health-route.js'
 import { LoopHealthMonitor } from './loop-health.js'
 import { buildScheduleRoutes } from './schedule-routes.js'
@@ -452,6 +454,9 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // ... (goal handles resolver captured on first load — see createAgent below).
   let goalHandlesResolve: typeof import('./serve-agent.js').resolveGoalHandles | null = null
   let reviewGateResolve: typeof import('./serve-agent.js').resolveReviewGateRef | null = null
+  // P1 任务身份化 — Mission 存储：session-manager（创建/隐式关联）与
+  // /missions 路由共享同一实例（内存 cache 一致）。
+  const missionStore = new MissionStore()
   // cold /health does not pay for tools/Meridian/council.
   const sessions = new RuntimeSessionManager({
     createAgent: async (cwd, sessionId, approvalMode, modelId) => {
@@ -500,6 +505,7 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     // 一键续跑兜底模型（可选，用户显式配置）。未配置时原模型不可用的续跑
     // fail-closed —— 绝不静默回退默认模型（跨模型续跑会重建整条前缀缓存）。
     resumeFallbackModel: ctx.config.agent?.resumeFallbackModel,
+    missionStore,
   })
 
   // Wave F: sessions 现已就绪——把真实 sameCwdRunningCount 回写到 SharedRuntime。
@@ -560,6 +566,9 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // Multi-session routes (M0.5 → M3): /sessions/*. R3 rollback routes consult
   // the live registry to build an OwnershipGuard, so thread it in via getter.
   Object.assign(routes, buildSessionRoutes(sessions, apiToken, () => sessionRegistry, ctx.config))
+
+  // Mission routes (P1 任务身份化): /missions/* — 与 session-manager 共享同一 store。
+  Object.assign(routes, buildMissionRoutes(missionStore, apiToken))
 
   // Config routes: provider + API key management for the desktop settings UI.
   Object.assign(routes, buildConfigRoutes(apiToken))

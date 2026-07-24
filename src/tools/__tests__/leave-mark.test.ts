@@ -36,7 +36,7 @@ test('leave_mark requires symbol and summary', async () => {
 test('leave_mark is inert (no throw) without a runtime callback', async () => {
   const res = await LEAVE_MARK_TOOL.execute(params({ symbol: '✦', summary: 'x' }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /no starmap/i)
+  assert.match(res.content, /未挂接星图/)
 })
 
 test('leave_mark is concurrency-safe, enabled, and needs no approval', () => {

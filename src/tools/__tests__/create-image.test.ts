@@ -65,7 +65,7 @@ describe('create_image', () => {
       })
 
       assert.equal(result.isError, undefined)
-      assert.ok(result.content.includes('Created svg image'))
+      assert.ok(result.content.includes('已创建 svg 图片'))
       assert.ok(result.content.includes(destination))
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -80,6 +80,6 @@ describe('create_image', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /svg is required/)
+    assert.match(result.content, /svg 为必填项/)
   })
 })

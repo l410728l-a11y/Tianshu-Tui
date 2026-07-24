@@ -95,10 +95,10 @@ export function renderSpreadsheet(input: CreateSpreadsheetInput): { content: str
 
 export async function createSpreadsheet(input: CreateSpreadsheetInput): Promise<{ path: string; bytes: number; format: SpreadsheetFormat }> {
   if (typeof input.destination_path !== 'string' || input.destination_path.trim().length === 0) {
-    throw new Error('destination_path is required')
+    throw new Error('destination_path 为必填项')
   }
-  if (!Array.isArray(input.rows)) throw new Error('rows is required')
-  if (input.headers !== undefined && !Array.isArray(input.headers)) throw new Error('headers must be an array')
+  if (!Array.isArray(input.rows)) throw new Error('rows 为必填项')
+  if (input.headers !== undefined && !Array.isArray(input.headers)) throw new Error('headers 必须为数组')
   const rendered = renderSpreadsheet(input)
   const exported = await exportFile({ destination_path: input.destination_path, content: rendered.content })
   return { path: exported.path, bytes: exported.bytes, format: rendered.format }
@@ -134,10 +134,10 @@ Good: create_spreadsheet(destination_path="H:\\zhuomian\\白嫖gpt\\report.xls",
   async execute(params) {
     try {
       const result = await createSpreadsheet(params.input as CreateSpreadsheetInput)
-      return { content: `Created ${result.format} spreadsheet (${result.bytes} bytes): ${result.path}` }
+      return { content: `已创建 ${result.format} 电子表格（${result.bytes} 字节）：${result.path}` }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${msg}`, isError: true }
+      return { content: `错误：${msg}`, isError: true }
     }
   },
 

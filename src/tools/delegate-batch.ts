@@ -145,7 +145,7 @@ export function createDelegateBatchTool(
     },
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const parsed = inputSchema.safeParse(params.input)
-      if (!parsed.success) return { content: `Invalid input: ${parsed.error.message}`, isError: true }
+      if (!parsed.success) return { content: `无效输入：${parsed.error.message}`, isError: true, errorKind: 'format_error' }
 
       // Pre-flight: validate file paths are within project root for all tasks
       const outOfProject: { taskIdx: number; paths: string[] }[] = []
@@ -162,10 +162,10 @@ export function createDelegateBatchTool(
           .join('\n')
         return {
           content: [
-            `delegate_batch blocked: ${outOfProject.length} task(s) reference files outside the project directory.`,
+            `delegate_batch 已拦截：${outOfProject.length} 个任务引用了项目目录外的文件。`,
             details,
-            `Workers cannot access files outside the project root (${params.cwd}).`,
-            `If you need to analyze external code, copy it into the project first or use bash to cat the file content inline.`,
+            `Worker 无法访问项目根目录（${params.cwd}）之外的文件。`,
+            `若需分析外部代码，请先复制进项目，或用 bash 把文件内容 cat 进来内联分析。`,
           ].join('\n'),
           isError: true,
         }
@@ -180,16 +180,16 @@ export function createDelegateBatchTool(
         const deps = parsed.data.tasks[i]!.dependsOn
         if (!deps?.length) continue
         for (const d of deps) {
-          if (d === i) badDeps.push(`task[${i}] depends on itself`)
-          else if (d >= taskCount) badDeps.push(`task[${i}] depends on out-of-range index ${d} (batch has ${taskCount} tasks)`)
+          if (d === i) badDeps.push(`task[${i}] 依赖了自身`)
+          else if (d >= taskCount) badDeps.push(`task[${i}] 依赖了越界索引 ${d}（本批共 ${taskCount} 个任务）`)
         }
       }
       if (badDeps.length > 0) {
         return {
           content: [
-            `delegate_batch blocked: invalid dependsOn references.`,
+            `delegate_batch 已拦截：dependsOn 引用无效。`,
             ...badDeps.map(b => `  ${b}`),
-            `dependsOn entries must be 0-based indices of OTHER tasks in the same batch.`,
+            `dependsOn 条目必须是同一批中其他任务的 0-based 索引。`,
           ].join('\n'),
           isError: true,
         }
@@ -250,7 +250,7 @@ export function createDelegateBatchTool(
       if (requests.length > cap) {
         const dropped = requests.slice(cap).map(r => r.objective)
         dispatched = requests.slice(0, cap)
-        trimmedNote = `\n\n[batch trimmed] Session is early (turn ${params.sessionTurnCount ?? '?'}). Dispatched ${cap}/${requests.length} tasks. Deferred: ${dropped.map(o => `"${o.slice(0, 60)}"`).join(', ')}. Re-dispatch later tasks in a subsequent turn if needed.`
+        trimmedNote = `\n\n[批次已裁剪] 会话尚早（第 ${params.sessionTurnCount ?? '?'} 轮）。已派发 ${cap}/${requests.length} 个任务。延期：${dropped.map(o => `"${o.slice(0, 60)}"`).join(', ')}。如需可在后续轮次再派发延期任务。`
       }
 
       // T4: per-worker terminal status for the subagent panel. Emitted TWICE by
@@ -296,15 +296,15 @@ export function createDelegateBatchTool(
         const msg = err instanceof Error ? err.message : String(err)
         return {
           content: [
-            `delegate_batch failed: ${msg}`,
+            `delegate_batch 失败：${msg}`,
             '',
-            '⚠️ Do NOT retry this batch with the same parameters — the failure is persistent.',
+            '⚠️ 不要用相同参数重试本批次——该失败是持续性的。',
             '',
-            'Recovery options (pick one):',
-            '1. Use inline tools instead: read_file, grep, glob, repo_graph for exploration',
-            '2. Use delegate_task (singular) for a single focused task with a 30s timeout',
-            '3. Reduce batch to 1-2 tasks with simpler, more specific objectives',
-            '4. If timeout: subagents exceeded their time budget — simplify the objective text',
+            '恢复选项（任选其一）：',
+            '1. 改用内联工具探索：read_file、grep、glob、repo_graph',
+            '2. 用 delegate_task（单个）做单一聚焦任务，超时约 30s',
+            '3. 把批次缩到 1–2 个任务，目标更简单、更具体',
+            '4. 若为超时：子代理超出时间预算——请简化 objective 文本',
           ].join('\n'),
           isError: true,
         }
@@ -337,7 +337,7 @@ export function createDelegateBatchTool(
       const passed = run.results.filter(r => r.status === 'passed').length
       return {
         content: run.packet + trimmedNote,
-        uiContent: `delegate_batch: ${passed}/${run.results.length} passed`,
+        uiContent: `delegate_batch：${passed}/${run.results.length} 通过`,
         isError: false,
       }
     },

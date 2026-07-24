@@ -94,7 +94,7 @@ describe('DELEGATE_BATCH_TOOL', () => {
     assert.deepEqual(reqs[1]?.dependencies, ['batch:0'])
   })
 
-  it('rejects out-of-range dependsOn indices', async () => {
+  it('rejects 越界索引 dependsOn indices', async () => {
     const tool = createDelegateBatchTool({ delegateBatch: async () => makeRun() })
     const result = await tool.execute({
       toolUseId: 'tu_bad',
@@ -107,7 +107,7 @@ describe('DELEGATE_BATCH_TOOL', () => {
       },
     })
     assert.equal(result.isError, true)
-    assert.match(String(result.content), /out-of-range/)
+    assert.match(String(result.content), /越界索引/)
   })
 
   it('rejects self-referential dependsOn', async () => {
@@ -119,12 +119,12 @@ describe('DELEGATE_BATCH_TOOL', () => {
       input: {
         tasks: [
           { objective: 'First task does standalone work here.' },
-          { objective: 'Second task incorrectly depends on itself here.', dependsOn: [1] },
+          { objective: 'Second task incorrectly 依赖了自身 here.', dependsOn: [1] },
         ],
       },
     })
     assert.equal(result.isError, true)
-    assert.match(String(result.content), /depends on itself/)
+    assert.match(String(result.content), /依赖了自身/)
   })
 
   it('passes resume param through to the coordinator for each task', async () => {

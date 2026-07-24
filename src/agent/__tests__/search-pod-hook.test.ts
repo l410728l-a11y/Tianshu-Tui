@@ -15,6 +15,10 @@ import {
   type SearchPodRow,
 } from '../hooks/search-pod-hook.js'
 import type { RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
+import { AST_GREP_EMPTY_PREFIX, formatAstGrepSummary } from '../../tools/ast-grep.js'
+import { GLOB_EMPTY_RESULT } from '../../tools/glob.js'
+import { GREP_EMPTY_RESULT } from '../../tools/grep.js'
+import { SEMANTIC_SEARCH_NO_MATCHES_MARKER } from '../../tools/semantic-search.js'
 
 function ev(partial: Partial<RuntimeToolEvent> & { name: string }): RuntimeToolEvent {
   return { success: true, ...partial }
@@ -23,7 +27,7 @@ function ev(partial: Partial<RuntimeToolEvent> & { name: string }): RuntimeToolE
 describe('classifySearchPod — grep', () => {
   it('字面量 pattern + 全库搜 + 空结果 → high-pod（可信排除）', () => {
     const row = classifySearchPod(ev({
-      name: 'grep', resultContent: 'No matches found.',
+      name: 'grep', resultContent: GREP_EMPTY_RESULT,
       input: { pattern: 'FrobnicateWidget' },
     }))
     assert.deepEqual(row, { event: 'search-pod', tool: 'grep', queryClass: 'high-pod', emptyResult: true })
@@ -31,12 +35,12 @@ describe('classifySearchPod — grep', () => {
 
   it('含正则元字符 → low-pod；限定 path/glob → low-pod', () => {
     const regex = classifySearchPod(ev({
-      name: 'grep', resultContent: 'No matches found.',
+      name: 'grep', resultContent: GREP_EMPTY_RESULT,
       input: { pattern: 'foo.*bar' },
     }))
     assert.equal(regex?.queryClass, 'low-pod')
     const scoped = classifySearchPod(ev({
-      name: 'grep', resultContent: 'No matches found.',
+      name: 'grep', resultContent: GREP_EMPTY_RESULT,
       input: { pattern: 'plainLiteral', path: 'src/agent' },
     }))
     assert.equal(scoped?.queryClass, 'low-pod')
@@ -44,7 +48,7 @@ describe('classifySearchPod — grep', () => {
 
   it('literal: true 显式声明时元字符不降级', () => {
     const row = classifySearchPod(ev({
-      name: 'grep', resultContent: 'No matches found.',
+      name: 'grep', resultContent: GREP_EMPTY_RESULT,
       input: { pattern: 'a.b(c)', literal: true },
     }))
     assert.equal(row?.queryClass, 'high-pod')
@@ -55,10 +59,10 @@ describe('classifySearchPod — grep', () => {
       name: 'grep', resultContent: 'src/a.ts:1: hit', input: { pattern: 'x' },
     })), null)
     assert.equal(classifySearchPod(ev({
-      name: 'grep', success: false, resultContent: 'No matches found.', input: { pattern: 'x' },
+      name: 'grep', success: false, resultContent: GREP_EMPTY_RESULT, input: { pattern: 'x' },
     })), null)
     assert.equal(classifySearchPod(ev({
-      name: 'grep', isError: true, resultContent: 'No matches found.', input: { pattern: 'x' },
+      name: 'grep', isError: true, resultContent: GREP_EMPTY_RESULT, input: { pattern: 'x' },
     })), null)
   })
 })
@@ -66,30 +70,32 @@ describe('classifySearchPod — grep', () => {
 describe('classifySearchPod — glob / ast_grep', () => {
   it('glob 简单文件名 + 全库 → high-pod；限定 path 或含目录段 → low-pod', () => {
     const simple = classifySearchPod(ev({
-      name: 'glob', resultContent: 'No files found matching pattern',
+      name: 'glob', resultContent: GLOB_EMPTY_RESULT,
       input: { pattern: '**/config.yaml' },
     }))
     assert.equal(simple?.queryClass, 'high-pod')
     const scoped = classifySearchPod(ev({
-      name: 'glob', resultContent: 'No files found matching pattern',
+      name: 'glob', resultContent: GLOB_EMPTY_RESULT,
       input: { pattern: '*.ts', path: 'src/tui' },
     }))
     assert.equal(scoped?.queryClass, 'low-pod')
     const nested = classifySearchPod(ev({
-      name: 'glob', resultContent: 'No files found matching pattern',
+      name: 'glob', resultContent: GLOB_EMPTY_RESULT,
       input: { pattern: 'src/**/hooks/*.ts' },
     }))
     assert.equal(nested?.queryClass, 'low-pod')
   })
 
   it('ast_grep 空结果一律 low-pod（形状敏感，不存在可信排除）', () => {
+    const empty = formatAstGrepSummary(0, 214, 0)
+    assert.ok(empty.startsWith(AST_GREP_EMPTY_PREFIX))
     const row = classifySearchPod(ev({
-      name: 'ast_grep', resultContent: '0 match(es) in 214 file(s)',
+      name: 'ast_grep', resultContent: empty,
       input: { pattern: 'function $NAME($$ARGS)' },
     }))
     assert.deepEqual(row, { event: 'search-pod', tool: 'ast_grep', queryClass: 'low-pod', emptyResult: true })
     assert.equal(classifySearchPod(ev({
-      name: 'ast_grep', resultContent: '3 match(es) in 214 file(s)\n\n…',
+      name: 'ast_grep', resultContent: `${formatAstGrepSummary(3, 214, 0)}\n\n…`,
     })), null)
   })
 })
@@ -97,7 +103,7 @@ describe('classifySearchPod — glob / ast_grep', () => {
 describe('classifySearchPod — semantic_search 三级判据', () => {
   it('绝对空 → low-pod 记录（embedding 召回有限，空 ≠ 全库无相关）', () => {
     const row = classifySearchPod(ev({
-      name: 'semantic_search', resultContent: 'Index refreshed. No matches for: auth token rotation',
+      name: 'semantic_search', resultContent: `索引已刷新。${SEMANTIC_SEARCH_NO_MATCHES_MARKER}auth token rotation`,
     }))
     assert.deepEqual(row, { event: 'search-pod', tool: 'semantic_search', queryClass: 'low-pod', emptyResult: true })
   })
@@ -119,12 +125,12 @@ describe('classifySearchPod — semantic_search 三级判据', () => {
 
 describe('classifySearchPod — 纪律', () => {
   it('非检索工具不记录', () => {
-    assert.equal(classifySearchPod(ev({ name: 'read_file', resultContent: 'No matches found.' })), null)
-    assert.equal(classifySearchPod(ev({ name: 'bash', resultContent: 'No files found matching pattern' })), null)
+    assert.equal(classifySearchPod(ev({ name: 'read_file', resultContent: GREP_EMPTY_RESULT })), null)
+    assert.equal(classifySearchPod(ev({ name: 'bash', resultContent: GLOB_EMPTY_RESULT })), null)
   })
 
   it('确定性：同输入两次分类 deepEqual', () => {
-    const input = ev({ name: 'grep', resultContent: 'No matches found.', input: { pattern: 'x.y', glob: '*.ts' } })
+    const input = ev({ name: 'grep', resultContent: GREP_EMPTY_RESULT, input: { pattern: 'x.y', glob: '*.ts' } })
     assert.deepEqual(classifySearchPod(input), classifySearchPod(input))
   })
 })
@@ -134,7 +140,7 @@ describe('createSearchPodHook', () => {
     const rows: SearchPodRow[] = []
     const hook = createSearchPodHook({ record: r => rows.push(r) })
     const ctx = { snapshot: { turn: 7 } } as unknown as RuntimeHookContext
-    hook.run(ctx, ev({ name: 'grep', resultContent: 'No matches found.', input: { pattern: 'PlainNeedle' } }))
+    hook.run(ctx, ev({ name: 'grep', resultContent: GREP_EMPTY_RESULT, input: { pattern: 'PlainNeedle' } }))
     hook.run(ctx, ev({ name: 'grep', resultContent: 'src/a.ts:1: hit', input: { pattern: 'PlainNeedle' } }))
     hook.run(ctx, ev({ name: 'edit_file', resultContent: 'ok' }))
     assert.equal(rows.length, 1)

@@ -141,6 +141,18 @@ function pathsMatch(cwd: string, a: string, b: string): boolean {
   return canonicalizePathForCompare(resolve(cwd, a)) === canonicalizePathForCompare(resolve(cwd, b))
 }
 
+/** A5（信号互扰治理 H5）：plan mode 放行 `.rivet/scratch/` 下的写入。
+ *  提示词与义务门把 scratch 探针写成验证声称的标准出路——硬拦会形成
+ *  "系统教你写探针、系统又拦你写探针"的自打架。resolve 后必须仍在
+ *  scratch 目录内（路径穿越拒绝）。 */
+const SCRATCH_DIR = '.rivet/scratch'
+
+function isUnderScratchDir(cwd: string, target: string): boolean {
+  const abs = canonicalizePathForCompare(resolve(cwd, target))
+  const scratch = canonicalizePathForCompare(resolve(cwd, SCRATCH_DIR))
+  return abs.startsWith(scratch + '/')
+}
+
 /**
  * Short tool-result receipt when write/edit hits the active plan draft —
  * CLI users often misread silence as "didn't land". Only tool result text
@@ -165,14 +177,14 @@ export function checkPlanMode(
 ): PlanModeResult {
   if (state === 'off') return { allowed: true }
 
-  if (
-    (toolName === 'write_file' || toolName === 'edit_file')
-    && ctx?.cwd
-    && ctx.activePlanFilePath
-    && ctx.targetFilePath
-    && pathsMatch(ctx.cwd, ctx.targetFilePath, ctx.activePlanFilePath)
-  ) {
-    return { allowed: true }
+  if ((toolName === 'write_file' || toolName === 'edit_file') && ctx?.cwd && ctx.targetFilePath) {
+    if (ctx.activePlanFilePath && pathsMatch(ctx.cwd, ctx.targetFilePath, ctx.activePlanFilePath)) {
+      return { allowed: true }
+    }
+    // A5：scratch 探针放行——计划期验证声称的标准出路
+    if (isUnderScratchDir(ctx.cwd, ctx.targetFilePath)) {
+      return { allowed: true }
+    }
   }
 
   // Hard-block write/execute-capable delegation — the prompt says "禁止 patcher"
@@ -198,6 +210,7 @@ export function checkPlanMode(
     allowed: false,
     reason:
       `Plan Mode is active — write operations are blocked.${planFileHint} ` +
+      'Scratch probes (writable): `.rivet/scratch/`. ' +
       'Allowed tools: read, grep, glob, repo_map, inspect_project, web_search, web_fetch, ' +
       'ask_user_question, run_tests (瑶光反证 reproduction), ' +
       'delegate_task/delegate_batch (code_scout/doc_scout/adversarial_verifier + authority), todo, plan. ' +

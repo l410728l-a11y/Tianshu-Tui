@@ -20,6 +20,7 @@ import { InputHandler, type KeyPress } from './input-handler.js'
 import { ResizeHandler } from './resize-handler.js'
 import { InputLine } from './input-line.js'
 import { loadImageAttachment, looksLikeImagePath, MAX_IMAGES } from './image-attach.js'
+import { readImageFromClipboard, readTextFromClipboard, FOCUS_DEBOUNCE_MS } from './clipboard-image.js'
 import { WriteBatcher } from './write-batcher.js'
 import { StreamRenderer } from './stream-renderer.js'
 import type { TuiPerfMonitor, TuiPerfSummary } from './perf-monitor.js'
@@ -30,6 +31,7 @@ import { MetricsGlanceController } from './metrics-glance-controller.js'
 import { StreamRenderController } from './stream-render-controller.js'
 import { InputController } from './input-controller.js'
 import { ANSI, color, fg, bg, QUERY_CURSOR_POS } from './ansi.js'
+import type { CacheStatus } from '../status-types.js'
 import { debugLog } from '../../utils/debug.js'
 import { BlockStreamWriter } from '../block-stream-writer.js'
 import { SteerBuffer } from '../steer-buffer.js'
@@ -45,6 +47,7 @@ import { formatApprovalPrompt } from '../format/approval-renderers.js'
 import { formatThinking } from '../format/thinking.js'
 import { formatGlanceBar, resolveStarDomainDisplay, formatGlanceLeft, formatGlanceRight, formatPermissionModeLine } from '../format/glance-bar.js'
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
+import { starDomainRegistry } from '../../agent/star-domain-registry.js'
 import { formatTaskList, shouldShowTaskPanel } from '../format/task-list.js'
 import { formatContextHints } from '../format/context-hints.js'
 import type { TodoItem } from '../../tools/todo-store.js'
@@ -189,6 +192,8 @@ const INPUT_BOX_CHARS = {
   thin:  { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', m: '┬' },
   thick: { tl: '┏', tr: '┓', bl: '┗', br: '┛', h: '━', v: '┃', m: '┳' },
   dots:  { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '┄', v: '┊', m: '┬' },
+  /** Kimi Code 风格：圆角 thin 字面 + 顶框内嵌模型名标签。字面量与 thin 一致。 */
+  kimi:  { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', m: '┬' },
   /**
    * legacy conhost 降级档：GBK 点阵字体把框线字符按 2 列渲染（或缺字形出
    * tofu），边框行实际宽度超过 cols → 折行 → LiveEngine 回顶欠擦 → 输入框
@@ -207,6 +212,7 @@ export function boxCharsFor(separator: string): BoxCharSet {
   switch (separator) {
     case 'thick': return INPUT_BOX_CHARS.thick
     case 'dots': return INPUT_BOX_CHARS.dots
+    case 'kimi': return INPUT_BOX_CHARS.kimi
     default: return INPUT_BOX_CHARS.thin
   }
 }
@@ -302,6 +308,8 @@ export interface TuiMetrics {
   maxTokens: number
   /** 缓存命中率 0-1（近 N 回合优先，回退会话累计）；无数据为 null */
   cacheHitRate: number | null
+  /** 缓存健康度状态（来自 projectCacheTelemetry 三态判定） */
+  cacheStatus?: CacheStatus
   /** 会话累计费用（美元，单次从 getTotalUsage 计算，不累加） */
   cost: number
   /** 会话累计 input / output token（仅用于展示，不参与 += 累加） */
@@ -504,6 +512,8 @@ export class TuiApp {
   // ── W4b: 输入辅助（W-B5: fields moved to InputController） ───
   /** W-B5: input state manager (slash/file-completion/history/ctrl+c/esc) */
   private inputController = new InputController()
+  /** 输入框最近一次获得焦点的时间戳，用于 Ctrl+V 剪贴板图片防抖 */
+  private lastInputFocusAt = 0
   /** 原始 stdout（用于直接写 DEC 私有模式如 bracketed paste 开关） */
   private stdout: WriteStream
   private readonly perfMonitor?: TuiPerfMonitor
@@ -1007,8 +1017,13 @@ export class TuiApp {
         }
         return
       }
+      // ── Ctrl+V: clipboard image paste (before normal input processing) ──
+      if (key.name === 'ctrl_v') {
+        void this.handleCtrlV()
+        return
+      }
       // ── Normal input processing ─────────────────────────────
-      const event = this.inputLine.handleKey(key.name, key.char, key.ctrl, key.meta)
+      const event = this.inputLine.handleKey(key.name, key.char, key.ctrl, key.meta, key.shift)
       if (event?.type === 'change') {
         // 输入变化使 @ 补全循环失效
         this.inputController.fileCompletion = null
@@ -1118,6 +1133,7 @@ export class TuiApp {
     // 标记已启动：构造后到 start() 之间的 setter 不再触发渲染，
     // 避免在 main.ts 清屏前画出一版输入框，清屏/flush 偏差时形成顶部重影。
     this.started = true
+    this.lastInputFocusAt = Date.now()
     // 启用 bracketed paste（DEC 2004）：粘贴被 200~/201~ 包裹，
     // 避免含 \r 的多行粘贴被逐行当作 Enter 提交、控制字符污染显示。
     this.stdout.write('\x1B[?2004h')
@@ -1212,6 +1228,11 @@ export class TuiApp {
   /** 读取当前输入框文本（测试/外部检视用） */
   getInputValue(): string {
     return this.inputLine.value
+  }
+
+  /** 读取当前输入框携带的图片附件数量（测试/外部检视用；plan 9e126c7c 漏的公共 getter） */
+  getInputImagesCount(): number {
+    return this.inputLine.images.length
   }
 
   /** 切换 vim 键位，返回切换后的状态（供 /vim 命令）。 */
@@ -1321,6 +1342,8 @@ export class TuiApp {
   deactivateOverlay(): void {
     this.input.setEscapeImmediate(false)
     this.overlay.deactivate()
+    // 记录焦点回归时间：Ctrl+V 剪贴板图片防抖窗口起点
+    this.lastInputFocusAt = Date.now()
     // Alt screen exit restores cursor to where it was before overlay activate.
     // activateOverlay called live.clear() which: (1) moved cursor to live region
     // top and erased it, (2) set lastDisplayRows=0. After alt screen exit,
@@ -2107,6 +2130,14 @@ export class TuiApp {
         this.deactivateOverlay()
         return true
       }
+      if (c === 's') {
+        const entry = count > 0 ? this.overlayController.getData()?.domainPickerData?.().entries[cur] : undefined
+        if (entry && this.overlayController.getDomainPickerSaveDefaultExec()) {
+          this.overlayController.getDomainPickerSaveDefaultExec()?.(entry.key)
+        }
+        this.deactivateOverlay()
+        return true
+      }
       return false
     }
 
@@ -2145,6 +2176,14 @@ export class TuiApp {
       if (key.name === 'return') {
         const entry = count > 0 ? this.overlayController.getData()?.modelPickerData?.().entries[cur] : undefined
         if (entry && this.overlayController.getModelPickerExec()) this.overlayController.getModelPickerExec()?.(entry.id)
+        this.deactivateOverlay()
+        return true
+      }
+      if (c === 's') {
+        const entry = count > 0 ? this.overlayController.getData()?.modelPickerData?.().entries[cur] : undefined
+        if (entry && this.overlayController.getModelPickerSaveDefaultExec()) {
+          this.overlayController.getModelPickerSaveDefaultExec()?.(entry.provider, entry.id)
+        }
         this.deactivateOverlay()
         return true
       }
@@ -2556,11 +2595,8 @@ export class TuiApp {
     return true
   }
 
-  /** Commit `▍ Rivet` 标签行（每段 assistant 流式输出一次） */
+  /** 标记 assistant 响应开始（每段流式输出一次，无需多余标题行） */
   private commitAssistantHeader(): void {
-    this.commit.write({
-      text: `${color('▍', this.theme.assistantColor, { bold: true })} ${color('Rivet', this.theme.assistantColor)}`,
-    })
     this.streamRenderController.assistantHeaderDone = true
   }
 
@@ -3400,6 +3436,48 @@ export class TuiApp {
     return this.agentBusy || this.state.isStreaming || this.state.isThinking || this.state.phase !== 'idle'
   }
 
+  /**
+   * Ctrl+V 处理：优先读剪贴板图片 → 失败则 fallback 到文本粘贴。
+   * 焦点防抖：如果输入框在最近 FOCUS_DEBOUNCE_MS 内刚获得焦点，跳过剪贴板读图。
+   */
+  private async handleCtrlV(): Promise<void> {
+    // 非 input 模式不处理（overlay / approval 等）
+    if (this.input.getMode() !== 'input') return
+
+    // 焦点防抖：overlay 关闭后短时间内 Ctrl+V 走文本路径
+    if (Date.now() - this.lastInputFocusAt < FOCUS_DEBOUNCE_MS) {
+      const text = await readTextFromClipboard()
+      if (text) {
+        this.inputLine.insertText(text)
+        this.writeBatcher.schedule()
+      }
+      return
+    }
+
+    try {
+      const result = await readImageFromClipboard()
+      if (result) {
+        if (this.inputLine.images.length >= MAX_IMAGES) {
+          this.commitStatic(color(`⚠ 最多附加 ${MAX_IMAGES} 张图片`, this.theme.warning))
+          this.renderLive()
+          return
+        }
+        this.inputLine.addImage(result.dataUrl)
+        this.writeBatcher.schedule()
+        return
+      }
+    } catch {
+      // 剪贴板读图失败，静默 fallback 到文本
+    }
+
+    // 无图或失败 → 走文本粘贴路径
+    const text = await readTextFromClipboard()
+    if (text) {
+      this.inputLine.insertText(text)
+      this.writeBatcher.schedule()
+    }
+  }
+
   private handleAbort(reason?: string): void {
     // 世代自增：被中断的旧 run 的迟到回调（bridge 捕获旧 gen）将被丢弃
     this._runGen++
@@ -3532,15 +3610,22 @@ export class TuiApp {
     return { leftBar, rightBar, botBorder }
   }
 
+  private getActiveDomainId(): string | undefined {
+    if (!this.state.domainName) return undefined
+    return starDomainRegistry.list().find(d => d.name === this.state.domainName || d.id === this.state.domainName)?.id
+  }
+
   private getThinkingLines(expanded: boolean): string[] {
     const text = this.state.thinkingText
-    const key = `${expanded ? '1' : '0'}\u0000${text}`
+    const domainId = this.getActiveDomainId()
+    const key = `${expanded ? '1' : '0'}\u0000${domainId ?? ''}\u0000${text}`
     if (this.thinkingLinesMemo?.key === key) return this.thinkingLinesMemo.lines
     const computed = formatThinking({
       text,
       elapsedMs: Date.now() - this.state.thinkStartMs,
       header: false,
       expanded,
+      domainId,
     }, this.theme)
     this.thinkingLinesMemo = { key, lines: computed }
     return computed
@@ -3574,8 +3659,13 @@ export class TuiApp {
    */
   private getDynamicBudget(chromeRows: number): number {
     if (this.state.phase === 'idle') return 0
-    const raw = (this.rows || 24) - chromeRows - 2
-    return Math.max(0, Math.min(16, raw))
+    const terminalRows = this.rows || 24
+    const raw = terminalRows - chromeRows - 2
+    // 预算上限 = liveMaxRows - chromeRows，与 LiveEngine 同口径。
+    // 大终端上 live region 能填更多空间，输入框更贴近底部；
+    // 小终端上由 raw 自然封顶（不超屏）。
+    const cap = liveMaxRowsFor(terminalRows) - chromeRows
+    return Math.max(0, Math.min(raw, cap))
   }
 
   /**
@@ -3689,6 +3779,7 @@ export class TuiApp {
     // Metrics 供 side panel 与 GlanceBar 共享，提前计算。
     const metrics = this.metricsGlanceController.metricsProvider?.() ?? null
     let glanceCacheHitRate: number | undefined
+    let glanceCacheStatus: CacheStatus | undefined
     let glanceContextRatio: number | undefined
     let glanceCost: number
     let glanceEstimatedTokens: number | undefined
@@ -3696,6 +3787,7 @@ export class TuiApp {
     let glanceMaxTokens: number | undefined
     if (metrics) {
       glanceCacheHitRate = metrics.cacheHitRate ?? undefined
+      glanceCacheStatus = metrics.cacheStatus
       glanceContextRatio = metrics.maxTokens > 0 ? Math.min(1, metrics.estimatedTokens / metrics.maxTokens) : undefined
       glanceCost = metrics.cost
       glanceEstimatedTokens = metrics.estimatedTokens
@@ -4007,6 +4099,7 @@ export class TuiApp {
         modelName: this.state.modelName,
         reasoningEffort: this.metricsGlanceController.reasoningEffortProvider?.(),
         cacheHitRate: glanceCacheHitRate,
+        cacheStatus: glanceCacheStatus,
         estimatedTokens: glanceEstimatedTokens,
         conversationTokens: glanceConversationTokens,
         maxTokens: glanceMaxTokens,
@@ -4039,18 +4132,39 @@ export class TuiApp {
       //    宽度恒 = innerWidth + 4，与输入行/底边框精确对齐（修复右角 1 列残缺）。
       const chars = boxCharsFor(uiSep)
       const labelFill = innerWidth - plainLeft - 1
-      const topBorder = labelFill < 2
-        ? color(`${chars.tl}${chars.h.repeat(innerWidth + 2)}${chars.tr}`, borderColor)
-        : color(`${chars.tl}${chars.h} `, borderColor)
+      const topBorder = (() => {
+        if (labelFill < 2) {
+          return color(`${chars.tl}${chars.h.repeat(innerWidth + 2)}${chars.tr}`, borderColor)
+        }
+        // Kimi 模式：leftStr 后内嵌模型名标签（╭─ leftStr ─ model ──╮）
+        if (uiSep === 'kimi') {
+          const modelLabel = ` ${this.state.modelName} `
+          const modelWidth = displayWidth(modelLabel, { ambiguousAsWide: true })
+          const fillAfter = innerWidth - plainLeft - 1 - modelWidth
+          if (fillAfter < 1) {
+            // 空间不够，回退到标准 thin 渲染
+            return color(`${chars.tl}${chars.h} `, borderColor)
+              + leftStr
+              + color(` ${chars.h.repeat(labelFill)}${chars.tr}`, borderColor)
+          }
+          return color(`${chars.tl}${chars.h} `, borderColor)
+            + leftStr
+            + color(` ${chars.h}${modelLabel}${chars.h.repeat(Math.max(0, fillAfter))}${chars.tr}`, borderColor)
+        }
+        return color(`${chars.tl}${chars.h} `, borderColor)
           + leftStr
           + color(` ${chars.h.repeat(labelFill)}${chars.tr}`, borderColor)
+      })()
 
       const MAX_INPUT_DISPLAY_LINES = 12
       // 暗绿 + bold：用户验收过的提示符质感，与 primary 色光标块 █ 形成前后层次——
       // graphite 单色纪律下保留的唯一例外（同色 ❯ 与光标块粘连、无辨识度）。
       const arrowColor = '#3ba55c'
+      // caret 坐标（行 = inputLines 下标，col = 行内 0-based cell，含 ❯ 前缀）：
+      // 渲染到 LiveRegionLine.caretCol，引擎帧末把硬件光标搬过去锚定 IME 候选窗。
+      const inputDisplay = this.inputLine.displayLinesWithCaret({ maxLines: MAX_INPUT_DISPLAY_LINES, maxWidth: innerWidth })
       const inputLines = this.inputLine.value
-        ? this.inputLine.displayLines({ maxLines: MAX_INPUT_DISPLAY_LINES, maxWidth: innerWidth })
+        ? inputDisplay.lines
         : [`${color('❯', arrowColor, { bold: true })} ${color('█', this.theme.primary)}${color(this.inputLine.placeholder, this.theme.dim)}`]
 
       /** 着色输入行：光标行前缀 ❯ 涂暗绿 bold，其余保持原样。
@@ -4060,15 +4174,33 @@ export class TuiApp {
         return raw
       }
 
+      const vimNormalMode = this.inputLine.vimEnabled && this.inputLine.vimMode === 'normal'
+      // 0-based cell（相对行首）= 左边框宽 + 行内 caret 列；
+      // '-- NORMAL -- ' 前缀只加在首行——caret 在首行时才计入其宽度。
+      const leftBarW = displayWidth(leftBar, { ambiguousAsWide: true })
+      const vimPrefixW = vimNormalMode ? displayWidth('-- NORMAL -- ', { ambiguousAsWide: true }) : 0
+      const caretColFor = (lineIdx: number): number =>
+        leftBarW + (lineIdx === 0 ? vimPrefixW : 0) + inputDisplay.caret.col
+      /** 输入行 → LiveRegionLine；光标行携带 caretCol（IME 硬件光标归位标记）。 */
+      const pushInputRow = (raw: string, lineIdx: number): void => {
+        lines.push({
+          text: this.renderInputRow(colorizeInputLine(raw), innerWidth, leftBar, rightBar),
+          ...(inputDisplay.caret.line === lineIdx ? { caretCol: caretColFor(lineIdx) } : {}),
+        })
+      }
+
       lines.push({ text: topBorder })
-      if (this.inputLine.vimEnabled && this.inputLine.vimMode === 'normal') {
-        lines.push({ text: this.renderInputRow(`-- NORMAL -- ${colorizeInputLine(inputLines[0] ?? '')}`, innerWidth, leftBar, rightBar) })
-        for (const extra of inputLines.slice(1)) {
-          lines.push({ text: this.renderInputRow(colorizeInputLine(extra), innerWidth, leftBar, rightBar) })
+      if (vimNormalMode) {
+        lines.push({
+          text: this.renderInputRow(`-- NORMAL -- ${colorizeInputLine(inputLines[0] ?? '')}`, innerWidth, leftBar, rightBar),
+          ...(inputDisplay.caret.line === 0 ? { caretCol: caretColFor(0) } : {}),
+        })
+        for (let i = 1; i < inputLines.length; i++) {
+          pushInputRow(inputLines[i]!, i)
         }
       } else {
-        for (const inputDisplayLine of inputLines) {
-          lines.push({ text: this.renderInputRow(colorizeInputLine(inputDisplayLine), innerWidth, leftBar, rightBar) })
+        for (let i = 0; i < inputLines.length; i++) {
+          pushInputRow(inputLines[i]!, i)
         }
       }
       lines.push({ text: botBorder })
@@ -4213,6 +4345,7 @@ export class TuiApp {
       elapsedMs: Date.now() - this.state.thinkStartMs,
       done: true,
       expanded: false,
+      domainId: this.getActiveDomainId(),
     }, this.theme)
     if (formatted.length === 0) return
     this.commit.write({ text: formatted.join('\n'), trailingNewline: true })
@@ -4347,13 +4480,15 @@ export class TuiApp {
     themePickerData?: () => ThemePickerData
     choicePanelData?: () => ChoicePanelData
     planPickerData?: () => PlanPickerData
-  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (key: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => void, planPickerExec?: (slug: string) => void): void {
+  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (key: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => void, planPickerExec?: (slug: string) => void): void {
     this.overlayController.setData(overlayData)
     this.overlayController.setPaletteExec(paletteExec)
     this.overlayController.setRewindExec(rewindExec)
     this.overlayController.setChronicleExec(chronicleExec)
     this.overlayController.setDomainPickerExec(domainPickerExec)
+    this.overlayController.setDomainPickerSaveDefaultExec(domainPickerSaveDefaultExec)
     this.overlayController.setModelPickerExec(modelPickerExec)
+    this.overlayController.setModelPickerSaveDefaultExec(modelPickerSaveDefaultExec)
     this.overlayController.setThemePickerExec(themePickerExec)
     this.overlayController.setThemePickerSaveDefaultExec(themePickerSaveDefaultExec)
     this.overlayController.setChoicePanelExec(choicePanelExec)

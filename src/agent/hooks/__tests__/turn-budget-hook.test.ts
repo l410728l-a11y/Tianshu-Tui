@@ -86,4 +86,33 @@ describe('turn-budget-hook 缺口 D', () => {
     h.hook.run(makeCtx())
     assert.equal(h.submitted.length, 0)
   })
+
+  // ── A4 收束 vs 续轮互斥合并 ──
+
+  it('A4: 活跃 continuation 时文案合并为"先核销再收束"', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createTurnBudgetHook({
+      advisoryBus: { submit: e => { submitted.push(e) } },
+      getMaxTurns: () => 10,
+      getRunTurn: () => 8,
+      hasActiveContinuation: () => true,
+    })
+    hook.run(makeCtx())
+    assert.equal(submitted.length, 1)
+    assert.match(submitted[0]!.content, /核销/, '合并文案必须包含核销指引')
+    assert.match(submitted[0]!.content, /还剩 2 轮/, '预算数字保留')
+  })
+
+  it('A4: 无活跃 continuation 时保持原文案', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createTurnBudgetHook({
+      advisoryBus: { submit: e => { submitted.push(e) } },
+      getMaxTurns: () => 10,
+      getRunTurn: () => 8,
+      hasActiveContinuation: () => false,
+    })
+    hook.run(makeCtx())
+    assert.equal(submitted.length, 1)
+    assert.match(submitted[0]!.content, /不要开新支线/)
+  })
 })

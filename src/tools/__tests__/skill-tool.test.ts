@@ -37,15 +37,15 @@ describe('skill tool', () => {
   it('unknown skill → friendly error with available list, no throw', async () => {
     const res = await call('does-not-exist')
     assert.equal(res.isError, true)
-    assert.match(res.content, /Skill not found/)
-    assert.match(res.content, /Available skills:/)
+    assert.match(res.content, /未找到 skill/)
+    assert.match(res.content, /可用 skill：/)
     assert.match(res.content, /small/)
   })
 
   it('missing name → error', async () => {
     const res = await call('')
     assert.equal(res.isError, true)
-    assert.match(res.content, /name is required/)
+    assert.match(res.content, /name 必填/)
   })
 
   it('is cache-safe: definition embeds no concrete skill name', () => {
@@ -103,7 +103,7 @@ describe('skill tool', () => {
     const params = { input: { name: 'small', complete: true }, toolUseId: 't', cwd: process.cwd(), onSkillCompleted: (n: string) => completed.push(n) } as unknown as ToolCallParams
     const res = await SKILL_TOOL.execute(params)
     assert.equal(res.isError, undefined)
-    assert.ok(res.content.includes('marked as completed'))
+    assert.ok(res.content.includes('已标记为完成'))
     assert.deepEqual(completed, ['small'])
   })
 })

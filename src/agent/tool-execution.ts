@@ -25,7 +25,7 @@ import type { CacheAdvisor } from '../cache/advisor.js'
 import type { P3Integration } from './p3-integration.js'
 import type { ImmuneHook } from './immune-hook.js'
 import type { LspManager } from '../lsp/manager.js'
-import { classifyFailure } from './failure-classifier.js'
+import { classifyFailure, isReadProbeInvocation, isTestRunInvocation, type FailureClass } from './failure-classifier.js'
 import { ToolAccumulator } from './tool-accumulator.js'
 import { guardLossyToolResult } from './negative-fact-detector.js'
 import { getToolStormLevel, type ToolStormLevel } from './trace-store.js'
@@ -317,6 +317,9 @@ export class ToolExecutionController {
     // (computer_use screenshots). Forwarded after addToolResults as a trailing
     // multimodal user message — only when the model supports vision.
     const pendingImages: string[] = []
+    // 结构化失败分类侧信道：wire 块（tool_result）不携带 errorKind，
+    // 按 tool_use_id 记录，postTool hook 的 vigor failureClass 优先消费。
+    const errorKindByToolUse = new Map<string, FailureClass>()
 
     // Partition tools into concurrency-safe (parallelizable) and sequential groups.
     // Run contiguous blocks of safe tools in parallel for latency savings.
@@ -349,6 +352,7 @@ export class ToolExecutionController {
           if (result.checkpointCreated) checkpointCreatedThisTurn = true
           if (result.endTurn) endTurn = true
           if (result.images) pendingImages.push(...result.images)
+          if (result.errorKind && result.toolResult.type === 'tool_result') errorKindByToolUse.set(result.toolResult.tool_use_id, result.errorKind)
           toolResults.push(result.toolResult)
         }
       } else {
@@ -370,6 +374,7 @@ export class ToolExecutionController {
         if (result.checkpointCreated) checkpointCreatedThisTurn = true
         if (result.endTurn) endTurn = true
         if (result.images) pendingImages.push(...result.images)
+        if (result.errorKind && result.toolResult.type === 'tool_result') errorKindByToolUse.set(result.toolResult.tool_use_id, result.errorKind)
         toolResults.push(result.toolResult)
       }
     }
@@ -642,8 +647,17 @@ export class ToolExecutionController {
             : undefined,
           // Classify failure for vigor: environment issues (timeout, api_error)
           // get reduced phasic penalty vs semantic failures (type_error, assertion).
+          // 测试运行（run_tests 或 bash 跑测试命令）的断言失败走 test_red →
+          // weight=0.0（TDD 红灯不扣分）。只读探测的 not-found 走 probe_miss →
+          // weight=0.3（A5：反幻影探针是信息收集，不是认知失败）。
           failureClass: result && 'is_error' in result && result.is_error === true
-            ? classifyFailure(typeof result.content === 'string' ? result.content : '').class
+            ? errorKindByToolUse.get(tu.id) ?? classifyFailure(
+                typeof result.content === 'string' ? result.content : '',
+                {
+                  isTestRun: isTestRunInvocation(tu.name, tu.input as Record<string, unknown> | undefined),
+                  isReadProbe: isReadProbeInvocation(tu.name),
+                },
+              ).class
             : undefined,
        },
       )

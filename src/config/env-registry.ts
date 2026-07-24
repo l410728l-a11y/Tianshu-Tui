@@ -3,8 +3,8 @@
  *
  * name/defaultHint/files 由 scripts/gen-env-registry.ts 生成，勿手改；
  * description 字段人工维护，重新生成时按 name 保留。
- * 最后生成：2026-07-20T16:28:06.231Z
- * 共 108 个变量。
+ * 最后生成：2026-07-22T12:05:46.521Z
+ * 共 109 个变量。
  *
  * 每个条目含：名称 / 默认值提示 / 引用文件 / 简要说明。
  * 当源码中新增 RIVET_* 引用但注册表未同步时，
@@ -316,6 +316,12 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     defaultHint: '',
     files: ['agent/create-runtime-hooks.ts'],
     description: '',
+  },
+  {
+    name: 'RIVET_HEADLESS_MAX_TURNS',
+    defaultHint: '15',
+    files: ['main.ts'],
+    description: '非 goal 模式下 -p 一次提示的最大轮数（默认 15）；benchmark/eval 多文档任务可调高',
   },
   {
     name: 'RIVET_HOME',

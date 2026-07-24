@@ -57,9 +57,6 @@ export function decodeHtmlEntities(text: string): string {
       case 'thinsp': return '\u2009'
       case 'rsaquo': return '\u203A'
       case 'lsaquo': return '\u2039'
-      case 'quot': return '"'
-      case 'apos':
-      case '#39': return "'"
     }
     // numeric: &#92; (decimal) or &#x27; (hex)
     const code = e[1] === 'x' || e[1] === 'X'

@@ -626,6 +626,57 @@ export function setDefaultDomainConfig(input: { defaultDomain?: unknown; domainK
   }
 }
 
+// --- Default model ---
+
+export interface DefaultModelConfigSnapshot {
+  /** "provider:modelId" 格式；未配置时为 null。 */
+  defaultModel: string | null
+}
+
+/** Snapshot of the default model config for the TUI model picker 's' key. */
+export function getDefaultModelConfig(): DefaultModelConfigSnapshot {
+  const cfg = loadConfig()
+  return {
+    defaultModel: cfg.agent.defaultModel ?? null,
+  }
+}
+
+/**
+ * Persist the default model for new sessions. Format: "provider:modelId".
+ * Takes effect at the NEXT session — the session model is resolved once at
+ * startup and stays stable (prefix-cache anchor).
+ *
+ * 格式和存在性校验：provider 必须存在于当前配置中，model 必须在 provider 的
+ * models 列表中。校验放在此层以避免调用方（TUI main.ts）访问 config internals。
+ */
+export function setDefaultModelConfig(input: { defaultModel?: unknown }): DefaultModelConfigSnapshot {
+  const cfg = loadConfig()
+  if (input.defaultModel !== undefined) {
+    if (typeof input.defaultModel !== 'string' || input.defaultModel.trim() === '') {
+      throw new Error('defaultModel must be a non-empty "provider:modelId" string')
+    }
+    const trimmed = input.defaultModel.trim()
+    const colonIdx = trimmed.indexOf(':')
+    if (colonIdx < 1 || colonIdx === trimmed.length - 1) {
+      throw new Error('defaultModel must be in "provider:modelId" format')
+    }
+    const providerName = trimmed.slice(0, colonIdx)
+    const modelId = trimmed.slice(colonIdx + 1)
+    const provider = cfg.provider.providers[providerName]
+    if (!provider) {
+      throw new Error(`Provider "${providerName}" not found in configuration`)
+    }
+    if (!provider.models.some(m => m.id === modelId || m.alias === modelId)) {
+      throw new Error(`Model "${modelId}" not found in provider "${providerName}"`)
+    }
+    cfg.agent.defaultModel = trimmed
+  }
+  saveConfig(cfg)
+  return {
+    defaultModel: cfg.agent.defaultModel ?? null,
+  }
+}
+
 // --- Vision model bridge (multimodal image recognition) ---
 
 const visionModelConfigSchema = z.object({
@@ -684,10 +735,13 @@ export function setMirrorConfig(input: {
   pypi?: unknown
   go?: unknown
   rust?: unknown
+  autoFallback?: unknown
+  fallbackMemoryMinutes?: unknown
+  fallbackTimeoutSec?: unknown
 }): MirrorsConfig {
   const cfg = loadConfig()
   const merged: Record<string, unknown> = { ...cfg.mirrors }
-  for (const key of ['enabled', 'preset', 'github', 'npm', 'pypi', 'go', 'rust'] as const) {
+  for (const key of ['enabled', 'preset', 'github', 'npm', 'pypi', 'go', 'rust', 'autoFallback', 'fallbackMemoryMinutes', 'fallbackTimeoutSec'] as const) {
     if (input[key] !== undefined) merged[key] = input[key]
   }
   cfg.mirrors = mirrorsSchema.parse(merged)
@@ -921,11 +975,24 @@ export function removeModel(providerName: string, modelId: string): void {
   const cfg = loadConfig()
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
-  provider.models = provider.models.filter(m => m.id !== modelId)
-  // Auto-remove empty provider — a provider with zero models has no use.
-  if (provider.models.length === 0) {
-    delete cfg.provider.providers[providerName]
+
+  // 先检查 modelId 是否存在——不存在时应尽早报错，不要被下游的"最后一个模型"
+  // 检查拦截，否则报错文案会误导用户。
+  if (!provider.models.some(m => m.id === modelId)) {
+    throw new Error(`Model "${modelId}" not found in provider "${providerName}"`)
   }
+
+  // 禁止移除最后一个模型——预设 provider 删除后会从 DEFAULT_CONFIG 恢复全部预设模型，
+  // 导致用户之前手动移除的模型全部回来；自定义 provider 删除后则彻底消失。
+  // 用户应通过「移除 Provider」按钮删除整个 provider。
+  if (provider.models.length <= 1) {
+    throw new Error(
+      `Cannot remove the last model from "${providerName}". ` +
+      `Remove the provider instead, or add another model first.`,
+    )
+  }
+
+  provider.models = provider.models.filter(m => m.id !== modelId)
   saveConfig(cfg)
 }
 

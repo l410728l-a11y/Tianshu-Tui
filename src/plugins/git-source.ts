@@ -16,6 +16,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileGit } from '../tools/spawn-git.js'
 import { isSafeGitRef } from '../tools/import-resource.js'
+import { cloneWithFallback, isGithubUrl } from '../tools/github-mirror-fallback.js'
+import { loadConfig } from '../config/manager.js'
 
 /** Schemes accepted for plugin git URLs. `file://` is allowed for local dev
  *  (e.g. cloning a sibling repo); plain paths should go through kind:'local'. */
@@ -73,23 +75,39 @@ export class GitCloneError extends Error {
  * attached so the caller can surface a useful message).
  */
 export function cloneGitSource(url: string, ref?: string): Promise<CloneResult> {
-  return new Promise((resolve, reject) => {
-    if (!isValidGitUrl(url)) {
-      return reject(new GitCloneError(`Invalid git URL: ${url}`))
+  if (!isValidGitUrl(url)) {
+    return Promise.reject(new GitCloneError(`Invalid git URL: ${url}`))
+  }
+  if (ref !== undefined && ref !== '') {
+    if (!isSafeGitRef(ref)) {
+      return Promise.reject(new GitCloneError(`Invalid git ref: ${ref}`))
     }
-    if (ref !== undefined && ref !== '') {
-      if (!isSafeGitRef(ref)) {
-        return reject(new GitCloneError(`Invalid git ref: ${ref}`))
-      }
-    }
+  }
 
+  const effectiveRef = ref && ref.trim().length > 0 ? ref.trim() : undefined
+
+  // GitHub URLs: use mirror auto-fallback
+  if (isGithubUrl(url)) {
+    return cloneWithMirrorFallback(url, effectiveRef)
+  }
+
+  // Non-GitHub: direct clone
+  return cloneAttempt(url, effectiveRef, 120_000)
+}
+
+/**
+ * Attempt a single git clone to a fresh temp directory.
+ * Returns the clone result on success; throws GitCloneError on failure.
+ * The returned `cleanup` must be called by the caller (on success or failure).
+ */
+function cloneAttempt(url: string, ref: string | undefined, timeoutMs: number): Promise<CloneResult> {
+  return new Promise((resolve, reject) => {
     const target = mkdtempSync(join(tmpdir(), 'rivet-plugin-'))
     const args = ['clone', '--depth', '1']
-    const effectiveRef = ref && ref.trim().length > 0 ? ref.trim() : undefined
-    if (effectiveRef) args.push('--branch', effectiveRef)
+    if (ref) args.push('--branch', ref)
     args.push('--', url.trim(), target)
 
-    execFileGit(args, { timeout: 120_000 }, async (err, _stdout, stderr) => {
+    execFileGit(args, { timeout: timeoutMs }, async (err, _stdout, stderr) => {
       if (err) {
         // Best-effort cleanup of the empty/partial temp dir before rejecting.
         try { rmSync(target, { recursive: true, force: true }) } catch { /* best-effort */ }
@@ -114,6 +132,37 @@ export function cloneGitSource(url: string, ref?: string): Promise<CloneResult> 
       })
     })
   })
+}
+
+/**
+ * Clone a GitHub URL through the mirror fallback pipeline.
+ * Tries mirrors in sequence (gitcode → kkgithub → fastgit) on failure,
+ * with session-level memory of the first working mirror.
+ */
+async function cloneWithMirrorFallback(url: string, ref: string | undefined): Promise<CloneResult> {
+  const mirrorConfig = loadConfig().mirrors
+  let result: CloneResult | undefined
+
+  try {
+    await cloneWithFallback({
+      originalUrl: url,
+      config: mirrorConfig,
+      cwd: process.cwd(),
+      cloneFn: async (tryUrl, timeoutMs) => {
+        const r = await cloneAttempt(tryUrl, ref, timeoutMs)
+        // Clean up any previous failed attempt's temp dir
+        if (result) result.cleanup()
+        result = r
+      },
+      fallbackTimeoutMs: mirrorConfig.fallbackTimeoutSec * 1000,
+      fallbackMemoryMinutes: mirrorConfig.fallbackMemoryMinutes,
+    })
+    return result!
+  } catch (err) {
+    // Clean up the last failed attempt's temp dir
+    if (result) result.cleanup()
+    throw err
+  }
 }
 
 /** Read HEAD commit SHA from a cloned working tree (git rev-parse HEAD). */

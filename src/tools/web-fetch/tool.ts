@@ -3,6 +3,7 @@ import { fetchCauseDetail } from '../../api/error-classifier.js'
 import { httpFetchGuarded, type HttpFetchDeps, type HttpFetchOptions } from '../net/http-fetch.js'
 import { SSRFError } from '../net/ssrf.js'
 import { decodeBody, extractMainContent, htmlToMarkdown } from './extract.js'
+import { fetchViaJina, isJinaQualityHeuristic } from './jina-fetch.js'
 
 export interface FetchDeps extends HttpFetchDeps {}
 export interface WebFetchOptions extends HttpFetchOptions {
@@ -23,6 +24,12 @@ const BINARY_CONTENT_TYPE_PREFIXES = [
   'audio/',
   'font/',
 ]
+
+/** HTTP 状态码会留在文案里并命中 classifyFailure 的 api_error 正则——结构字段先行。 */
+function httpApiErrorKind(status: number): 'api_error' | undefined {
+  if (status === 429 || status === 500 || status === 502 || status === 503) return 'api_error'
+  return undefined
+}
 
 // No explicit `fetch` here: leaving it undefined lets httpFetchGuarded use the
 // real (undici) global fetch AND engage connection pinning against DNS
@@ -63,24 +70,29 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
       try {
         url = new URL(rawUrl)
       } catch {
-        return { content: `Invalid URL: ${rawUrl}`, isError: true }
+        return { content: `无效 URL：${rawUrl}`, isError: true }
       }
 
       if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return { content: `Unsupported protocol: ${url.protocol}. Only http and https are allowed.`, isError: true }
+        return { content: `不支持的协议：${url.protocol}。仅允许 http 和 https。`, isError: true }
       }
 
       try {
         const { status, contentType, bytes } = await httpFetchGuarded(rawUrl, deps, options)
 
         if (status >= 400) {
-          return { content: `HTTP ${status} for ${rawUrl}`, isError: true }
+          const errorKind = httpApiErrorKind(status)
+          return {
+            content: `HTTP ${status}：${rawUrl}`,
+            isError: true,
+            ...(errorKind ? { errorKind } : {}),
+          }
         }
 
         const contentTypeLower = contentType.toLowerCase()
         if (BINARY_CONTENT_TYPE_PREFIXES.some(prefix => contentTypeLower.includes(prefix))) {
           return {
-            content: `Binary content (${contentType}) is not returned as text. Use import_resource to download this URL.`,
+            content: `二进制内容（${contentType}）不会以文本返回。请使用 import_resource 下载此 URL。`,
             isError: true,
           }
         }
@@ -88,14 +100,24 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
         const body = decodeBody(bytes, contentType)
 
         let content: string
+        let via: string = ''
         if (contentTypeLower.includes('text/html')) {
           const html = extractMainContentEnabled ? extractMainContent(body) : body
           content = await htmlToMarkdown(html)
+          // Quality heuristic: if local extraction looks bad (short, JS-only page),
+          // fall back to Jina Reader which server-renders + strips noise.
+          if (isJinaQualityHeuristic(content)) {
+            const jinaResult = await fetchViaJina(rawUrl, deps, options)
+            if (jinaResult) {
+              content = jinaResult.markdown
+              via = '（经 Jina Reader）'
+            }
+          }
         } else {
           content = body
         }
 
-        return { content: `URL: ${rawUrl}\nStatus: ${status}\nContent-Length: ${bytes.length}\n\n${content}` }
+        return { content: `URL：${rawUrl}\n状态：${status}\n内容长度：${bytes.length}${via}\n\n${content}` }
       } catch (err) {
         if (err instanceof SSRFError) {
           return { content: err.message, isError: true }
@@ -103,7 +125,8 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
         const message = err instanceof Error ? err.message : String(err)
         const detail = fetchCauseDetail(err)
         const full = detail ? `${message}: ${detail}` : message
-        return { content: `Failed to fetch ${rawUrl}: ${full}`, isError: true }
+        // 外部错误文本可能仍含 timeout/ECONNRESET 等英文模式——中文前缀+变量，可不打标。
+        return { content: `抓取失败 ${rawUrl}：${full}`, isError: true }
       }
     },
 

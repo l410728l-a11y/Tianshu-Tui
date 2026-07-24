@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatToolCardLive, formatToolCard } from '../tool-card.js'
+import { formatToolCardLive, formatToolCard, isToolCardTruncated } from '../tool-card.js'
 import { getTheme } from '../../theme.js'
 import { buildFileDiff } from '../../../tools/edit-diff.js'
 
@@ -85,5 +85,45 @@ describe('formatToolCard — inline edit diff (write family + isDiffContent)', a
     }, theme)
     const plain = lines.map(stripAnsi).join('\n')
     assert.match(plain, /diff: \+1 −1/)
+  })
+})
+
+describe('formatToolCard — diff 内联阈值 (adds+dels ≤ 10)', () => {
+  it('renders inline diff when adds+dels = 10', () => {
+    // 构造恰好 10 行修改 (5 adds + 5 dels)
+    const hunks = '@@ -1,5 +1,5 @@'
+    const dels = ['-a', '-b', '-c', '-d', '-e']
+    const adds = ['+A', '+B', '+C', '+D', '+E']
+    const diff = ['diff --git a/x b/x', '--- a/x', '+++ b/x', hunks, ...dels, ...adds].join('\n')
+    const lines = formatToolCard({ toolName: 'edit_file', content: diff }, theme)
+    const plain = lines.map(stripAnsi).join('\n')
+    assert.match(plain, /diff: \+5 −5/, 'diff stat should be present')
+    assert.ok(plain.includes('-a'), 'removal lines rendered inline')
+    assert.ok(plain.includes('+A'), 'addition lines rendered inline')
+  })
+
+  it('renders summary when adds+dels > 10', () => {
+    // 构造 12 行修改 (6 adds + 6 dels)
+    const hunks = '@@ -1,6 +1,6 @@'
+    const dels = ['-a', '-b', '-c', '-d', '-e', '-f']
+    const adds = ['+A', '+B', '+C', '+D', '+E', '+F']
+    const diff = ['diff --git a/x b/x', '--- a/x', '+++ b/x', hunks, ...dels, ...adds].join('\n')
+    const lines = formatToolCard({ toolName: 'edit_file', content: diff }, theme)
+    const plain = lines.map(stripAnsi).join('\n')
+    assert.match(plain, /1 处修改/, 'summary with hunk count')
+    assert.match(plain, /\+6 −6/, 'summary with line counts')
+    assert.ok(!plain.includes('-a'), 'removal lines NOT rendered inline')
+    assert.ok(!plain.includes('+A'), 'addition lines NOT rendered inline')
+    assert.match(plain, /Ctrl\+O/, 'expand hint present')
+  })
+
+  it('isToolCardTruncated returns false for ≤10 changes', () => {
+    const diff = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n-a\n-b\n-c\n+A\n+B\n+C\n'
+    assert.equal(isToolCardTruncated({ toolName: 'edit_file', content: diff }), false)
+  })
+
+  it('isToolCardTruncated returns true for >10 changes', () => {
+    const diff = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,6 +1,6 @@\n-a\n-b\n-c\n-d\n-e\n-f\n+A\n+B\n+C\n+D\n+E\n+F\n'
+    assert.equal(isToolCardTruncated({ toolName: 'edit_file', content: diff }), true)
   })
 })

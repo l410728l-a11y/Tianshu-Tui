@@ -3,6 +3,7 @@ import type { AggregationPolicy } from '../agent/work-order.js'
 import type { CoordinatorRun, DelegationRequest, WorkerActivityEvent } from '../agent/coordinator.js'
 import { runCouncil, runCouncilDebate, buildSeatObjective, type CouncilDeps } from '../agent/council/council-orchestrator.js'
 import { summarizeCouncilPlan } from '../agent/council/council-render.js'
+import { encodeCouncilPanel, type CouncilPanelModel } from '../tui/council-panel-model.js'
 import { DEFAULT_COUNCIL_SEATS, THREE_PILLAR_COUNCIL_SEATS, mergeSeatOverrides, type CouncilSeat, type CouncilRoutingShadowEvent } from '../agent/council/council-routing.js'
 import { isCouncilEnabled } from '../agent/council/council-gate.js'
 import { buildCouncilSessionEvent, type CouncilSessionEvent } from '../agent/council/council-telemetry.js'
@@ -128,10 +129,10 @@ export function createCouncilConveneTool(
     },
     async execute(params: ToolCallParams): Promise<ToolResult> {
       if (!isCouncilEnabled()) {
-        return { content: 'council_convene disabled (COUNCIL=0) — no seats dispatched', isError: false }
+        return { content: 'council_convene 已禁用（COUNCIL=0）——未派发任何席位', isError: false }
       }
       const parsed = inputSchema.safeParse(params.input)
-      if (!parsed.success) return { content: `Invalid input: ${parsed.error.message}`, isError: true }
+      if (!parsed.success) return { content: `无效输入：${parsed.error.message}`, isError: true, errorKind: 'format_error' }
       const { objective, draftItems, seats, rounds: requestedRounds, pillars, autoExecute } = parsed.data
 
       // ── Pro gate: 多轮议事会 ──
@@ -262,7 +263,29 @@ export function createCouncilConveneTool(
         // 流会/编排失败：席位 worker 已真实跑过 —— 终态事件照发，面板不留悬挂席位。
         emitSeatTerminals()
         const msg = err instanceof Error ? err.message : String(err)
-        return { content: `council_convene failed: ${msg}`, isError: true }
+        // 降级帧：席位终态 + verdict 全零（流会/编排失败态）
+        const degradedSeats: CouncilPanelModel['seats'] = []
+        for (const batch of batchResults) {
+          const modelMap = new Map<string, string>()
+          for (const wm of batch.workerModels ?? []) modelMap.set(wm.workOrderId, wm.model)
+          for (const r of batch.results) {
+            const seatId = r.workOrderId.startsWith('council:seat-')
+              ? r.workOrderId.slice('council:seat-'.length)
+              : undefined
+            if (!seatId) continue
+            const round = seatId.endsWith('-r2') ? 2 : 1
+            const authority = seatId.replace(/(-(r2|retry|reconvene))+$/, '')
+            degradedSeats.push({ authority, status: r.status, round, modelUsed: modelMap.get(r.workOrderId) })
+          }
+        }
+        const degradedPanel: CouncilPanelModel = {
+          schemaVersion: 1,
+          objective,
+          seats: degradedSeats,
+          verdict: { accepted: 0, rejected: 0, deferred: 0, conflicts: 0 },
+          pillarsMode: pillarsActive,
+        }
+        return { content: `council_convene 失败：${msg}`, uiContent: encodeCouncilPanel(degradedPanel), isError: true }
       }
 
       // append-only 遥测旁路 —— 绝不影响返回。
@@ -410,17 +433,63 @@ export function createCouncilConveneTool(
               }
               fromWave++
             } while (fromWave < totalWaves)
-            parts.push('', `## Auto-Executed (${workers} workers, ${totalWaves} waves)`)
+            parts.push('', `## 已自动执行（${workers} 个 worker，${totalWaves} 波）`)
             parts.push(...waveLines)
           }
         } catch (err) {
-          parts.push('', `## Auto-Execution Failed\n${err instanceof Error ? err.message : String(err)}`)
+          parts.push('', `## 自动执行失败\n${err instanceof Error ? err.message : String(err)}`)
           storePlan(planJson, params.sessionId)
-          parts.push('', '⚠ Council plan reviewed but auto-execution failed. 计划已存入会话 — 修复失败项后直接调用 `team_orchestrate({ objective })` 续跑（存储的计划会被自动消费）。')
+          parts.push('', '⚠ 议事会计划已审完，但自动执行失败。计划已存入会话 — 修复失败项后直接调用 `team_orchestrate({ objective })` 续跑（存储的计划会被自动消费）。')
         }
       }
 
-      return { content: parts.join('\n') + proGateNote, uiContent: summarizeCouncilPlan(plan), isError: false }
+      // ── council-panel 帧（P2 Wave 2）─────────────────────
+      // 从 plan + batchResults 构建 CouncilPanelModel，经 uiContent 通道
+      // 发射到桌面端。零前缀缓存影响（uiContent 不进 prompt）。
+      const councilPanelSeats: CouncilPanelModel['seats'] = []
+      for (const batch of batchResults) {
+        // 从 workerModels 建 workOrderId → model 映射（WorkerResult 自身不携带 model）
+        const modelMap = new Map<string, string>()
+        for (const wm of batch.workerModels ?? []) {
+          modelMap.set(wm.workOrderId, wm.model)
+        }
+        for (const r of batch.results) {
+          const seatId = r.workOrderId.startsWith('council:seat-')
+            ? r.workOrderId.slice('council:seat-'.length)
+            : undefined
+          if (!seatId) continue
+          const round = seatId.endsWith('-r2') ? 2 : 1
+          const authority = seatId.replace(/(-(r2|retry|reconvene))+$/, '')
+          // merge: later batch results for same authority overwrite earlier
+          const existing = councilPanelSeats.findIndex(s => s.authority === authority)
+          const seat = { authority, status: r.status, round, modelUsed: modelMap.get(r.workOrderId) }
+          if (existing >= 0) councilPanelSeats[existing] = seat
+          else councilPanelSeats.push(seat)
+        }
+      }
+      const verdictCounts = { accepted: 0, rejected: 0, deferred: 0 }
+      for (const d of plan.aggregate.decisions) {
+        if (d.verdict === 'accepted') verdictCounts.accepted++
+        else if (d.verdict === 'rejected') verdictCounts.rejected++
+        else if (d.verdict === 'deferred') verdictCounts.deferred++
+      }
+      const councilPanel: CouncilPanelModel = {
+        schemaVersion: 1,
+        objective: plan.objective,
+        seats: councilPanelSeats,
+        verdict: {
+          accepted: verdictCounts.accepted,
+          rejected: verdictCounts.rejected,
+          deferred: verdictCounts.deferred,
+          conflicts: plan.aggregate.conflicts.length,
+        },
+        sealVersion: unifiedPlan?.seal?.version,
+        pillarsMode: pillarsActive,
+        failedSeats: plan.meta.failedSeats,
+        qliphothCount: plan.meta.qliphoth?.length,
+      }
+
+      return { content: parts.join('\n') + proGateNote, uiContent: summarizeCouncilPlan(plan) + '\n' + encodeCouncilPanel(councilPanel), isError: false }
     },
     requiresApproval: () => false,
     isConcurrencySafe: () => false,

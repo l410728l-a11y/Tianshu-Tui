@@ -1,6 +1,6 @@
 # 天枢 (Tianshu) / Rivet
 
-Terminal coding agent optimized for DeepSeek V4 prefix cache. Node.js 24+ (`engines` pins 24.1.0) / TypeScript strict / 纯 ANSI 终端 UI（`src/tui/engine/`，零 React/Ink 渲染） / node:test。桌面端 `desktop/` 是独立的 Tauri + React 应用，经 `src/server/` sidecar 驱动同一内核。CLI 命令仍为 `rivet`。
+Terminal coding agent optimized for DeepSeek V4 prefix cache. Node.js 24+ (`engines` pins 24.1.0) / TypeScript strict / 纯 ANSI 终端 UI（`src/tui/engine/`，零 React/Ink 渲染） / node:test。桌面端 `desktop/`（Tauri + React，闭源）与 VS Code/Cursor 插件 `vscode-extension/`（开源，随 sync 进公开仓）均经 `src/server/` sidecar 驱动同一内核。CLI 命令仍为 `rivet`。插件打包/发布见 `docs/VSCODE-EXTENSION-RELEASE.md`。
 
 顶层索引与运行时排查：[`AGENTS.md`](./AGENTS.md)。架构总览：[`docs/architecture-overview.md`](./docs/architecture-overview.md)。
 
@@ -43,7 +43,7 @@ main.ts → AgentLoop (agent/loop.ts)
 
 > ⚠️ 旧文档写「9 个固定 hook」是误导性简化。真相是条件装配，开关在 `loop-factory.ts:createRuntimeHooksPipeline` 传入的 deps。改 hook 行为前先看 `create-runtime-hooks.ts` 的 gate 条件，不要假设某 hook 一定在跑。
 
-Key modules: `src/agent/` (loop, hooks/, session, coordinator, star-domain), `src/api/`, `src/tui/`, `src/tools/`, `src/prompt/`, `src/compact/`, `src/cache/`, `src/context/`, `src/server/` (desktop sidecar), `src/repo/`, `src/mcp/`, `src/auth/`, `desktop/`
+Key modules: `src/agent/` (loop, hooks/, session, coordinator, star-domain), `src/api/`, `src/tui/`, `src/tools/`, `src/prompt/`, `src/compact/`, `src/cache/`, `src/context/`, `src/server/` (desktop sidecar), `src/repo/`, `src/mcp/`, `src/auth/`, `desktop/`, `vscode-extension/`
 
 ## Conventions
 

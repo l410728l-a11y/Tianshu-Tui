@@ -28,26 +28,26 @@ export function createRecallGeneralTool(getCwd: () => string): Tool {
       const cwd = getCwd() || params.cwd
       const star = (input.star ?? '').trim()
       if (!star) {
-        return { content: 'recall_general: star is required.', isError: true }
+        return { content: 'recall_general: 需要提供 star。', isError: true }
       }
 
       if (starToGeneralSlug(star) === null) {
         return {
-          content: `recall_general: unknown star "${star}". Ledgers on disk: ${listGenerals(cwd).join(', ') || '(none)'}.`,
+          content: `recall_general: 未知星域「${star}」。磁盘上的账本：${listGenerals(cwd).join(', ') || '（无）'}。`,
           isError: true,
         }
       }
       const ledger = readGeneralLedger(cwd, star)
       if (!ledger) {
         return {
-          content: `recall_general: no ledger yet for "${star}" (.rivet/generals/). Ledgers on disk: ${listGenerals(cwd).join(', ') || '(none)'}. 用 record_general_finding 记下第一条战绩即可创建。`,
+          content: `recall_general: 「${star}」尚无账本（.rivet/generals/）。磁盘上的账本：${listGenerals(cwd).join(', ') || '（无）'}。用 record_general_finding 记下第一条战绩即可创建。`,
           isError: true,
         }
       }
 
       return {
         content: ledger.content,
-        uiContent: `recall general: ${star} (${ledger.slug}.md)`,
+        uiContent: `召回将星账本：${star}（${ledger.slug}.md）`,
         isError: false,
       }
     },

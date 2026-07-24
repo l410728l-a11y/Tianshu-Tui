@@ -85,6 +85,34 @@ describe('createContextPressureHook', () => {
     assert.match(second, /立即收束/)
   })
 
+  // ── A4 收束 vs 续轮互斥合并：活跃 goal/义务在场时改发"先核销再收束" ──
+
+  it('A4: 活跃 continuation 时 86% 文案合并为"先核销再收束"，不发裸收束指令', () => {
+    const bus = new AdvisoryBus()
+    const hook = createContextPressureHook({
+      advisoryBus: bus,
+      getEstimatedTokens: () => 90_000,
+      getContextWindow: () => 100_000,
+      hasActiveContinuation: () => true,
+    })
+    hook.run(makeCtx(1))
+    const out = bus.render()
+    assert.match(out, /核销/, '合并文案必须包含"先核销"指引')
+    assert.doesNotMatch(out, /立即收束当前子任务/, '不再发与 goal continuation 打架的裸收束指令')
+  })
+
+  it('A4: 无活跃 continuation 时保持原收束文案', () => {
+    const bus = new AdvisoryBus()
+    const hook = createContextPressureHook({
+      advisoryBus: bus,
+      getEstimatedTokens: () => 90_000,
+      getContextWindow: () => 100_000,
+      hasActiveContinuation: () => false,
+    })
+    hook.run(makeCtx(1))
+    assert.match(bus.render(), /立即收束当前子任务/)
+  })
+
   it('re-arms after the ratio drops below threshold - hysteresis (compact happened)', () => {
     const bus = new AdvisoryBus()
     const ratios = [0.75, 0.5, 0.75]

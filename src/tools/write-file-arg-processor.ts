@@ -35,3 +35,16 @@ export const writeFileArgProcessor = createFileContentArgProcessor({
   render: ({ path, lines, chars }) =>
     `${WRITE_FILE_POINTER_PREFIX} ${path} — ${lines} lines, ${chars} chars. ${POINTER_INTERNAL_TAG} Display placeholder — never emit this as content; use read_file to review.]`,
 })
+
+/**
+ * Parse a regurgitated write_file pointer line back into its parts — the inverse
+ * of `render` above (single source of truth for the format). Returns null when
+ * the line is not a well-formed write_file pointer. Used by write_file's
+ * idempotent resolution: a pointer echoed back as content for the SAME path
+ * means the intended content is already on disk.
+ */
+export function parseWriteFilePointer(line: string): { path: string; lines: number; chars: number } | null {
+  const m = /^\[file written to (.+?) — (\d+) lines, (\d+) chars\./.exec(line.trimStart())
+  if (!m) return null
+  return { path: m[1]!, lines: Number(m[2]), chars: Number(m[3]) }
+}

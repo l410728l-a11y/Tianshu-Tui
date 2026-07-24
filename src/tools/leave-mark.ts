@@ -48,10 +48,10 @@ export const LEAVE_MARK_TOOL: Tool = {
     const symbol = params.input.symbol
     const summary = params.input.summary
     if (typeof symbol !== 'string' || !symbol.trim()) {
-      return { content: 'Error: symbol is required (choose any glyph)', isError: true }
+      return { content: '错误：symbol 必填（任选一个字形）', isError: true }
     }
     if (typeof summary !== 'string' || !summary.trim()) {
-      return { content: 'Error: summary is required (one line on what you did)', isError: true }
+      return { content: '错误：summary 必填（一行概括你做了什么）', isError: true }
     }
 
     const rawType = params.input.type
@@ -66,11 +66,11 @@ export const LEAVE_MARK_TOOL: Tool = {
 
     if (!params.onLeaveMark) {
       // No runtime to record (e.g. worker context) — acknowledge without persisting.
-      return { content: `Mark noted (${mark.symbol}) but no starmap is attached to this context.` }
+      return { content: `印记已记下（${mark.symbol}），但当前上下文未挂接星图。` }
     }
     params.onLeaveMark(mark)
     return {
-      content: `✶ Your mark ${mark.symbol} is set. 主控 will seal it into the starmap as you depart.\nSummary: ${mark.summary}`,
+      content: `✶ 你的印记 ${mark.symbol} 已落下。主控将在你离别时把它封入星图。\n摘要：${mark.summary}`,
     }
   },
 

@@ -54,6 +54,8 @@ import {
   setFetchConfig,
   getSearchConfig,
   setSearchConfig,
+  getDefaultModelConfig,
+  setDefaultModelConfig,
 } from '../config/manager.js'
 import { applyConfiguredPathGrants } from '../tools/path-grants.js'
 import { expandHome } from '../platform.js'
@@ -201,7 +203,10 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
 
     'DELETE /config/providers/:name/models/:modelId': withAuth((_body, params) => {
       const name = params?.name
-      const modelId = params?.modelId
+      // decodeURIComponent 配合客户端的 encodeURIComponent——modelId 可能含空格、
+      // 斜杠等特殊字符，URL 路径中为 percent-encoded 形式，需解码后才能与配置中的
+      // 原始 ID 匹配。
+      const modelId = params?.modelId ? decodeURIComponent(params.modelId) : undefined
       if (!name || !modelId) return { status: 400, body: { error: 'provider name and modelId are required' } }
       try {
         removeModel(name, modelId)
@@ -360,6 +365,23 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
       try {
         return { status: 200, body: { ok: true, ...setDefaultDomainConfig({ defaultDomain, domainKeywordRouting }) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // 默认模型（provider:modelId）——下个会话生效。TUI model picker 按 s 键写入。
+    'GET /config/default-model': withAuth(() => {
+      return { status: 200, body: getDefaultModelConfig() }
+    }, apiToken),
+
+    'PUT /config/default-model': withAuth((body) => {
+      const { defaultModel } = (body ?? {}) as { defaultModel?: unknown }
+      if (defaultModel === undefined) {
+        return { status: 400, body: { error: 'defaultModel is required ("provider:modelId" format)' } }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setDefaultModelConfig({ defaultModel }) } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }

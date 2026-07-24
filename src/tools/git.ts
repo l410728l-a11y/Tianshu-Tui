@@ -76,7 +76,7 @@ async function runGit(args: string[], cwd: string, abortSignal?: AbortSignal): P
       stdout += stdoutDecoder.end()
       stderr += stderrDecoder.end()
       if (code !== 0) {
-        const err = new Error((stderr || '').trim() || `git exited with status ${code}`)
+        const err = new Error((stderr || '').trim() || `git 以状态码 ${code} 退出`)
         const gitErr = err as GitExitError
         gitErr.exitCode = code ?? 1
         // Preserve stdout even on non-zero exit — `git diff --no-index` exits 1
@@ -87,7 +87,7 @@ async function runGit(args: string[], cwd: string, abortSignal?: AbortSignal): P
       } else {
         let output = stdout
         if (output.length > MAX_OUTPUT) {
-          output = output.slice(0, MAX_OUTPUT) + `\n\n[... truncated at ${MAX_OUTPUT} chars, total ${output.length}]`
+          output = output.slice(0, MAX_OUTPUT) + `\n\n[... 已截断至 ${MAX_OUTPUT} 字符，共 ${output.length}]`
         }
         finish(output)
       }
@@ -104,7 +104,7 @@ async function runGit(args: string[], cwd: string, abortSignal?: AbortSignal): P
       killProcessTree(child, 'SIGTERM')
       forceKillTimer = setTimeout(() => {
         killProcessTree(child, 'SIGKILL')
-        finish('', new Error('git command timed out'))
+        finish('', new Error('git 命令超时'))
       }, FORCE_KILL_DELAY)
     }, GIT_TIMEOUT)
   })
@@ -159,7 +159,7 @@ async function hasStagedChanges(cwd: string, pathspecs?: string[], abortSignal?:
   const { code } = await runGitExitCode(args, cwd, abortSignal)
   if (code === 0) return false // no staged changes
   if (code === 1) return true  // has staged changes
-  throw new Error(`git diff --cached failed with exit code ${code}`)
+  throw new Error(`git diff --cached 失败，退出码 ${code}`)
 }
 
 /** Best-effort: create a safety ref before stash so changes are recoverable (P2). */
@@ -352,7 +352,7 @@ function safeBaseRef(ref: string): string {
 export async function getFileDiff(cwd: string, path: string, baseRef = 'HEAD'): Promise<string> {
   // Guard against path traversal / pathspec injection — pathspec must be relative
   const rel = normalizeProjectRelativePath(cwd, path)
-  if (!rel) throw new Error(`Invalid file path: ${path}`)
+  if (!rel) throw new Error(`无效文件路径：${path}`)
   const base = safeBaseRef(baseRef)
   // Tracked changes (modified/deleted/staged) diff cleanly against the base.
   const tracked = await runGitSafe(['diff', base, '--', rel], cwd)
@@ -379,7 +379,7 @@ export async function getFileAtBase(
   baseRef = 'HEAD',
 ): Promise<{ exists: boolean; content: string }> {
   const rel = normalizeProjectRelativePath(cwd, path)
-  if (!rel) throw new Error(`Invalid file path: ${path}`)
+  if (!rel) throw new Error(`无效文件路径：${path}`)
   const base = safeBaseRef(baseRef)
   const shown = await runGitSafe(['show', `${base}:${rel}`], cwd)
   if (!shown.ok) return { exists: false, content: '' }
@@ -442,7 +442,7 @@ export const GIT_TOOL: Tool = {
     const cwd = params.cwd
 
     if (!ACTIONS.includes(action)) {
-      return { content: `Unknown action: ${action}. Supported: ${ACTIONS.join(', ')}`, isError: true }
+      return { content: `未知 action：${action}。支持：${ACTIONS.join(', ')}`, isError: true }
     }
 
     try {
@@ -453,16 +453,16 @@ export const GIT_TOOL: Tool = {
             runGit(['status', '--porcelain'], cwd, params.abortSignal),
             runGit(['ls-files', '--others', '--exclude-standard'], cwd, params.abortSignal),
           ])
-          const lines = [`Branch: ${branch.trim()}`]
+          const lines = [`分支：${branch.trim()}`]
           const porcelainTrimmed = porcelain.trim()
           if (!porcelainTrimmed) {
-            lines.push('Status: clean')
+            lines.push('状态：干净')
           } else {
-            lines.push('Changes:', porcelainTrimmed)
+            lines.push('变更：', porcelainTrimmed)
           }
           const untrackedTrimmed = untracked.trim()
           if (untrackedTrimmed) {
-            lines.push('Untracked:', untrackedTrimmed)
+            lines.push('未跟踪：', untrackedTrimmed)
           }
           return { content: lines.join('\n') }
         }
@@ -475,16 +475,16 @@ export const GIT_TOOL: Tool = {
           const lines: string[] = []
           const stagedTrimmed = staged.trim()
           const unstagedTrimmed = unstaged.trim()
-          if (stagedTrimmed) lines.push('Staged:', stagedTrimmed)
-          if (unstagedTrimmed) lines.push('Unstaged:', unstagedTrimmed)
-          if (!stagedTrimmed && !unstagedTrimmed) lines.push('No changes.')
+          if (stagedTrimmed) lines.push('已暂存：', stagedTrimmed)
+          if (unstagedTrimmed) lines.push('未暂存：', unstagedTrimmed)
+          if (!stagedTrimmed && !unstagedTrimmed) lines.push('无变更。')
           return { content: lines.join('\n') }
         }
 
         case 'commit': {
           const message = params.input.message as string
           if (!message) {
-            return { content: 'Commit requires a "message" parameter.', isError: true }
+            return { content: 'commit 需要 "message" 参数。', isError: true }
           }
 
           const scopedFiles = getScopedCommitFiles(cwd, params.ownedFiles, params.sessionModifiedFiles)
@@ -494,14 +494,19 @@ export const GIT_TOOL: Tool = {
             commitArgs.push('--only', '--', ...scopedFiles)
           } else if (!(await hasStagedChanges(cwd, undefined, params.abortSignal))) {
             return {
-              content: 'No session-owned files were provided to git commit and no staged changes exist. Use deliver_task with commit=true for ownership-scoped delivery, or stage explicit files if you intentionally manage git manually.',
+              content: '未提供会话归属文件给 git commit，且不存在已暂存变更。请使用 deliver_task 并设 commit=true 做归属范围内交付，或在你有意手动管理 git 时显式暂存文件。',
               isError: true,
             }
           }
 
           const commitResult = await runGitSafe(commitArgs, cwd, params.abortSignal)
           if (!commitResult.ok) {
-            return { content: `git commit failed: ${commitResult.output}`, isError: true }
+            const timedOut = /超时|timed out/i.test(commitResult.output)
+            return {
+              content: `git commit 失败：${commitResult.output}`,
+              isError: true,
+              ...(timedOut ? { errorKind: 'timeout' as const } : {}),
+            }
           }
 
           // Post-commit truth readback: show actual landed changes + audit tag scope
@@ -512,14 +517,14 @@ export const GIT_TOOL: Tool = {
             .map(l => l.split('|')[0]!.trim())
             .filter(f => f.length > 0)
           const audit = auditCommitTagScope(message, changedFiles)
-          const body = `${commitResult.output.trim()}\n\n--- actual changes (git show --stat) ---\n${changed}`
+          const body = `${commitResult.output.trim()}\n\n--- 实际变更（git show --stat）---\n${changed}`
           return { content: audit.ok ? body : `${body}\n\n${audit.message}` }
         }
 
         case 'log': {
           const maxCount = Math.max(1, Math.min((params.input.maxCount as number) ?? 20, 100))
           const log = (await runGit(['log', `--max-count=${maxCount}`, '--oneline', '--decorate'], cwd, params.abortSignal)).trim()
-          return { content: log || 'No commits yet.' }
+          return { content: log || '尚无提交。' }
         }
 
         case 'log_graph': {
@@ -540,13 +545,13 @@ export const GIT_TOOL: Tool = {
               params.abortSignal,
             )
           ).trimEnd()
-          return { content: graph || 'No commits yet.' }
+          return { content: graph || '尚无提交。' }
         }
 
         case 'stash': {
           const stashStatus = (await runGit(['status', '--porcelain'], cwd, params.abortSignal)).trim()
           if (!stashStatus) {
-            return { content: 'No changes to stash.' }
+            return { content: '没有可 stash 的变更。' }
           }
 
           // B1: scope stash to owned files when available
@@ -554,18 +559,18 @@ export const GIT_TOOL: Tool = {
             const scoped = getScopedCommitFiles(cwd, params.ownedFiles, params.sessionModifiedFiles)
             if (scoped.length === 0) {
               return {
-                content: 'No owned files to stash. External dirty files are present but excluded from stash scope.',
+                content: '没有可 stash 的归属文件。外部脏文件存在，但已排除在 stash 范围外。',
                 isError: true,
               }
             }
             await createSafetyRef(cwd, params.abortSignal)
             await runGit(['stash', 'push', '--', ...scoped], cwd, params.abortSignal)
-            return { content: `Stashed ${scoped.length} owned file(s): ${scoped.join(', ')}` }
+            return { content: `已 stash ${scoped.length} 个归属文件：${scoped.join(', ')}` }
           }
 
           await createSafetyRef(cwd, params.abortSignal)
           await runGit(['stash'], cwd, params.abortSignal)
-          return { content: 'Saved working directory and index state.' }
+          return { content: '已保存工作区与索引状态。' }
         }
 
         case 'stash_pop': {
@@ -575,15 +580,20 @@ export const GIT_TOOL: Tool = {
             return { content: safety.reasons.join('\n'), isError: true }
           }
           await runGit(['stash', 'pop', stashRef], cwd, params.abortSignal)
-          return { content: `Popped ${stashRef} (safety-checked: no overwriting conflicts).` }
+          return { content: `已弹出 ${stashRef}（已做安全检查：无覆盖冲突）。` }
         }
 
         default:
-          return { content: `Unknown action: ${action}. Supported: ${ACTIONS.join(', ')}`, isError: true }
+          return { content: `未知 action：${action}。支持：${ACTIONS.join(', ')}`, isError: true }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      return { content: `git ${action} failed: ${message}`, isError: true }
+      const timedOut = /超时|timed out/i.test(message)
+      return {
+        content: `git ${action} 失败：${message}`,
+        isError: true,
+        ...(timedOut ? { errorKind: 'timeout' as const } : {}),
+      }
     }
   },
 

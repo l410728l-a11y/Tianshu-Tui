@@ -49,17 +49,17 @@ describe('INSPECT_PROJECT_TOOL', () => {
   it('detects TypeScript project correctly', async () => {
     const result = await INSPECT_PROJECT_TOOL.execute(makeParams(testDir))
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('Language: TypeScript'))
+    assert.ok(result.content.includes('语言：TypeScript'))
   })
 
   it('detects npm as package manager', async () => {
     const result = await INSPECT_PROJECT_TOOL.execute(makeParams(testDir))
-    assert.ok(result.content.includes('Package manager: npm'))
+    assert.ok(result.content.includes('包管理器：npm'))
   })
 
   it('detects React framework from dependencies', async () => {
     const result = await INSPECT_PROJECT_TOOL.execute(makeParams(testDir))
-    assert.ok(result.content.includes('Framework: React'))
+    assert.ok(result.content.includes('框架：React'))
   })
 
   it('lists scripts from package.json', async () => {
@@ -91,7 +91,7 @@ describe('INSPECT_PROJECT_TOOL', () => {
     try {
       const result = await INSPECT_PROJECT_TOOL.execute(makeParams(emptyDir))
       assert.equal(result.isError, true)
-      assert.ok(result.content.includes('No package.json'))
+      assert.ok(result.content.includes('未找到 package.json'))
     } finally {
       rmSync(emptyDir, { recursive: true, force: true })
     }

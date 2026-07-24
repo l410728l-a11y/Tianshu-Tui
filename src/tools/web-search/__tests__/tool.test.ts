@@ -22,7 +22,7 @@ describe('createWebSearchTool', () => {
     const tool = createWebSearchTool()
     const out = await tool.execute(params({ query: '  ' }))
     assert.equal(out.isError, true)
-    assert.match(out.content, /non-empty string/)
+    assert.match(out.content, /非空字符串/)
   })
 
   it('formats results and attributes the winning backend', async () => {
@@ -31,7 +31,7 @@ describe('createWebSearchTool', () => {
     })
     const out = await tool.execute(params({ query: 'q' }))
     assert.equal(out.isError, undefined)
-    assert.match(out.content, /via brave/)
+    assert.match(out.content, /经 brave/)
     assert.match(out.content, /\[T\]\(https:\/\/x\)/)
   })
 
@@ -39,7 +39,7 @@ describe('createWebSearchTool', () => {
     const tool = createWebSearchTool({ backends: [backend('ddg', async () => [])] })
     const out = await tool.execute(params({ query: 'nothing here' }))
     assert.equal(out.isError, undefined)
-    assert.match(out.content, /No search results found/)
+    assert.match(out.content, /未找到与「nothing here」相关的搜索结果/)
   })
 
   it('surfaces an error when all backends fail hard', async () => {
@@ -48,7 +48,7 @@ describe('createWebSearchTool', () => {
     })
     const out = await tool.execute(params({ query: 'q' }))
     assert.equal(out.isError, true)
-    assert.match(out.content, /Search failed/)
+    assert.match(out.content, /搜索失败/)
     assert.match(out.content, /ddg: HTTP 503/)
   })
 

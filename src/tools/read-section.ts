@@ -62,7 +62,7 @@ function extractSection(rawContent: string, sectionId: string): string {
     const startIdx = lineRange.start - 1
     const endIdx = Math.min(lineRange.end, lines.length)
     if (startIdx >= lines.length) {
-      return `[Section ${sectionId} out of range — file has ${lines.length} lines]`
+      return `[区段 ${sectionId} 超出范围 — 文件共 ${lines.length} 行]`
     }
     return lines.slice(startIdx, endIdx).join('\n')
   }
@@ -74,7 +74,7 @@ function extractSection(rawContent: string, sectionId: string): string {
     return rawContent.slice(start, end)
   }
 
-  return `[Invalid section format: ${sectionId}. Use "L100-L200" for line range or "c0-c5000" for char range]`
+  return `[无效的区段格式：${sectionId}。行范围用 "L100-L200"，字符范围用 "c0-c5000"]`
 }
 
 export const READ_SECTION_TOOL: Tool = {
@@ -121,7 +121,7 @@ export const READ_SECTION_TOOL: Tool = {
 
     if (!section) {
       return {
-        content: 'Error: section is required',
+        content: '错误：需要提供 section',
         isError: true,
       }
     }
@@ -130,7 +130,7 @@ export const READ_SECTION_TOOL: Tool = {
     const charRange = parseCharRange(section)
     if (!lineRange && !charRange) {
       return {
-        content: `Error: Invalid section format: ${section}. Use "L100-L200" for line range or "c0-c5000" for char range.`,
+        content: `错误：无效的区段格式：${section}。行范围用 "L100-L200"，字符范围用 "c0-c5000"。`,
         isError: true,
       }
     }
@@ -157,7 +157,7 @@ export const READ_SECTION_TOOL: Tool = {
         try { _rawSize = (await stat(canonical)).size } catch { /* handled below */ }
         if (_rawSize > MAX_RAW_BYTES) {
           return {
-            content: `Error: File ${canonical} is too large (${(_rawSize / 1024 / 1024).toFixed(1)}MB > ${MAX_RAW_BYTES / 1024 / 1024}MB limit). Use grep or bash with head/tail to inspect the file directly.`,
+            content: `错误：文件 ${canonical} 过大（${(_rawSize / 1024 / 1024).toFixed(1)}MB > ${MAX_RAW_BYTES / 1024 / 1024}MB 上限）。请用 grep 或 bash 配合 head/tail 直接查看。`,
             isError: true,
           }
         }
@@ -171,7 +171,7 @@ export const READ_SECTION_TOOL: Tool = {
         })
         const maxChars = Math.max(cap.maxChars, LEGACY_MAX_SECTION_CHARS)
         const truncated = sectionContent.length > maxChars
-          ? sectionContent.slice(0, maxChars) + `\n... [truncated at ${maxChars} chars]`
+          ? sectionContent.slice(0, maxChars) + `\n... [已截断至 ${maxChars} 字符]`
           : sectionContent
 
         return {
@@ -181,7 +181,7 @@ export const READ_SECTION_TOOL: Tool = {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return {
-          content: `Error reading file: ${message}`,
+          content: `错误：读取文件失败：${message}`,
           isError: true,
         }
       }
@@ -190,7 +190,7 @@ export const READ_SECTION_TOOL: Tool = {
     // ── artifactId branch: existing behavior ──
     if (!artifactId) {
       return {
-        content: 'Error: artifactId or file_path is required',
+        content: '错误：需要提供 artifactId 或 file_path',
         isError: true,
       }
     }
@@ -198,7 +198,7 @@ export const READ_SECTION_TOOL: Tool = {
     const artifactStore = params.artifactStore
     if (!artifactStore) {
       return {
-        content: 'Error: artifactStore is not configured for this session',
+        content: '错误：当前会话未配置 artifactStore',
         isError: true,
       }
     }
@@ -206,8 +206,9 @@ export const READ_SECTION_TOOL: Tool = {
     const artifact = artifactStore.get(artifactId)
     if (!artifact) {
       return {
-        content: `Error: Artifact ${artifactId} not found — it may have been pruned or never created. Use the original tool (bash/read_file/grep) to regenerate the output.`,
+        content: `错误：未找到 Artifact ${artifactId}——可能已被清理或从未创建。请用原始工具（bash/read_file/grep）重新生成输出。`,
         isError: true,
+        errorKind: 'probe_miss',
       }
     }
 
@@ -220,13 +221,14 @@ export const READ_SECTION_TOOL: Tool = {
         const ranged = await artifactStore.readLineRange(artifactId, lineRange.start, lineRange.end)
         if (ranged === null) {
           return {
-            content: `Error: Artifact ${artifactId} not found.`,
+            content: `错误：未找到 Artifact ${artifactId}。`,
             isError: true,
+            errorKind: 'probe_miss',
           }
         }
         if (ranged.content.length === 0 && lineRange.start > ranged.totalLines) {
           return {
-            content: `[Section ${section} out of range — artifact has ${ranged.totalLines} lines]`,
+            content: `[区段 ${section} 超出范围 — artifact 共 ${ranged.totalLines} 行]`,
             isError: false,
           }
         }
@@ -236,10 +238,10 @@ export const READ_SECTION_TOOL: Tool = {
         })
         const maxChars = Math.max(cap.maxChars, LEGACY_MAX_SECTION_CHARS)
         let body = ranged.content.length > maxChars
-          ? ranged.content.slice(0, maxChars) + `\n... [truncated at ${maxChars} chars]`
+          ? ranged.content.slice(0, maxChars) + `\n... [已截断至 ${maxChars} 字符]`
           : ranged.content
         if (ranged.capped) {
-          body += `\n... [range capped at ${MAX_RANGE_LINES} lines — request a narrower range to page]`
+          body += `\n... [范围已限制为 ${MAX_RANGE_LINES} 行 — 请缩小范围分页读取]`
         }
         return {
           content: `${buildRecallMarker(artifactId, section)}\n${body}`,
@@ -248,7 +250,7 @@ export const READ_SECTION_TOOL: Tool = {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return {
-          content: `Error reading artifact ${artifactId}: ${message}`,
+          content: `错误：读取 artifact ${artifactId} 失败：${message}`,
           isError: true,
         }
       }
@@ -260,7 +262,7 @@ export const READ_SECTION_TOOL: Tool = {
       try { _rawSize = (await stat(artifact.rawPath)).size } catch { /* file may not exist */ }
       if (_rawSize > MAX_RAW_BYTES) {
         return {
-          content: `Error: Artifact ${artifactId} raw file is too large (${(_rawSize / 1024 / 1024).toFixed(1)}MB > 2MB limit). Use grep on the original output, or bash with head/tail to inspect the file directly.`,
+          content: `错误：Artifact ${artifactId} 原始文件过大（${(_rawSize / 1024 / 1024).toFixed(1)}MB > 2MB 上限）。请对原始输出用 grep，或用 bash 配合 head/tail 直接查看。`,
           isError: true,
         }
       }
@@ -268,8 +270,9 @@ export const READ_SECTION_TOOL: Tool = {
       const rawContent = await artifactStore.readRaw(artifactId)
       if (rawContent === null) {
         return {
-          content: `Error: Artifact ${artifactId} raw file missing on disk (${artifact.rawPath}). It may have been cleaned up. Use the original tool to regenerate the output.`,
+          content: `错误：Artifact ${artifactId} 的原始文件在磁盘上缺失（${artifact.rawPath}）。可能已被清理。请用原始工具重新生成输出。`,
           isError: true,
+          errorKind: 'probe_miss',
         }
       }
       const sectionContent = extractSection(rawContent, section)
@@ -284,7 +287,7 @@ export const READ_SECTION_TOOL: Tool = {
       const maxChars = Math.max(cap.maxChars, LEGACY_MAX_SECTION_CHARS)
 
       const truncated = sectionContent.length > maxChars
-        ? sectionContent.slice(0, maxChars) + `\n... [truncated at ${maxChars} chars]`
+        ? sectionContent.slice(0, maxChars) + `\n... [已截断至 ${maxChars} 字符]`
         : sectionContent
 
       // Tag recalls of compacted-history blocks so the NEXT compaction can
@@ -301,13 +304,13 @@ export const READ_SECTION_TOOL: Tool = {
     } catch (err) {
       if (err instanceof ArtifactCorruptionError) {
         return {
-          content: `Error: Artifact ${artifactId} is corrupted on disk (SHA-256 mismatch). Re-read the source.`,
+          content: `错误：Artifact ${artifactId} 磁盘数据已损坏（SHA-256 不匹配）。请重新读取源内容。`,
           isError: true,
         }
       }
       const message = err instanceof Error ? err.message : String(err)
       return {
-        content: `Error reading artifact ${artifactId}: ${message}`,
+        content: `错误：读取 artifact ${artifactId} 失败：${message}`,
         isError: true,
       }
     }

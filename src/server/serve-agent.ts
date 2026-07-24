@@ -44,6 +44,7 @@ import { serializeUnifiedPlan, deserializeUnifiedPlan, type UnifiedPlan } from '
 import { buildCouncilSessionEvent, recordCouncilSession } from '../agent/council/council-telemetry.js'
 import { persistCouncilRoutingShadow } from '../agent/council/council-routing.js'
 import type { PlanItem } from '../agent/council/council-plan.js'
+import type { CouncilPanelModel } from '../tui/council-panel-model.js'
 import type { McpManager } from '../mcp/manager.js'
 import {
   type ServeContext,
@@ -695,7 +696,7 @@ async function conveneCouncilOnCoordinator(
     seats?: { authority: string; charter?: string }[]
     rounds?: number
   },
-): Promise<{ planMarkdown: string; artifactId: string }> {
+): Promise<{ planMarkdown: string; artifactId: string; councilPanel?: CouncilPanelModel }> {
   if (agent.isRunning()) {
     throw new CouncilError('Session is already running a turn', 409)
   }
@@ -762,8 +763,11 @@ async function conveneCouncilOnCoordinator(
   const planMarkdown = renderCouncilPlan(plan)
   // Da'at 编译门（与 council_convene 工具同款）：否决态不嵌可执行 planJson。
   const compiled = plan.aggregate.mergedItems.length > 0 ? compileCouncilPlan(plan) : undefined
-  const outputRaw = compiled?.ok && compiled.plan
-    ? [planMarkdown, '', '```council-plan-json', serializeUnifiedPlan(sealPlan(attachObligations(compiled.plan, extractObligations(plan)))), '```'].join('\n')
+  const sealed = compiled?.ok && compiled.plan
+    ? sealPlan(attachObligations(compiled.plan, extractObligations(plan)))
+    : undefined
+  const outputRaw = sealed
+    ? [planMarkdown, '', '```council-plan-json', serializeUnifiedPlan(sealed), '```'].join('\n')
     : compiled && !compiled.ok
       ? [planMarkdown, '', '## ⛔ 议事会否决（blocking challenge 未化解）', ...compiled.vetoes.map(v => `- ${v.description}: ${v.left}`)].join('\n')
       : planMarkdown
@@ -788,7 +792,27 @@ async function conveneCouncilOnCoordinator(
   if (!savedArtifactId) {
     throw new Error('Failed to save council plan artifact')
   }
-  return { planMarkdown, artifactId: savedArtifactId }
+  const councilPanel: CouncilPanelModel = {
+    schemaVersion: 1,
+    objective: plan.objective,
+    seats: plan.contributions.map(c => ({
+      authority: c.authority,
+      status: 'passed',
+      round: c.round ?? 1,
+      modelUsed: c.modelUsed,
+    })),
+    verdict: {
+      accepted: plan.aggregate.decisions.filter(d => d.verdict === 'accepted').length,
+      rejected: plan.aggregate.decisions.filter(d => d.verdict === 'rejected').length,
+      deferred: plan.aggregate.decisions.filter(d => d.verdict === 'deferred').length,
+      conflicts: plan.aggregate.conflicts.length,
+    },
+    sealVersion: sealed?.seal?.version,
+    pillarsMode: false,
+    failedSeats: plan.meta.failedSeats,
+    qliphothCount: plan.meta.qliphoth?.length,
+  }
+  return { planMarkdown, artifactId: savedArtifactId, councilPanel }
 }
 
 function extractCouncilPlanJson(raw: string): UnifiedPlan | null {

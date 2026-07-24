@@ -3,6 +3,7 @@ import type { ArtifactStore } from '../artifact/store.js'
 import type { PrewarmCache } from '../agent/prewarm.js'
 import type { ReadRefStats } from './read-file.js'
 import type { ProviderProfile } from '../api/provider-profile.js'
+import type { FailureClass } from '../agent/failure-classifier.js'
 
 /**
  * T4 — structured per-worker delegation update for the desktop subagent panel
@@ -320,6 +321,14 @@ export interface ToolResult {
    *  'timeout' = the command exceeded its budget — slow ≠ dead-end, so dead-end
    *  pheromone deposition must exclude these too. */
   errorClass?: ToolErrorClass
+  /** 结构化失败分类（中文化第二波解耦层）——工具自报的失败类别，
+   *  优先于 failure-classifier 的英文正则文本匹配。消息文案中文化后
+   *  正则会失灵，凡自家消息会被 classifyFailure 正则命中的工具
+   *  （timeout / not-found / assertion 等）必须在中文化前先打此字段。
+   *  与 errorClass（shell 三态，驱动 vigor 豁免）语义正交：errorKind
+   *  是全谱失败分类学（FailureClass），喂给 repair-hint / antibody /
+   *  doom-loop 指纹 / blocked 通知等下游。undefined = 回退文本正则。 */
+  errorKind?: FailureClass
   /** Executed command (bash) — used by ToolAccumulator for per-command collapse summaries. */
   command?: string
   /** Signal the turn loop to end after this tool result (e.g. ask_user_question

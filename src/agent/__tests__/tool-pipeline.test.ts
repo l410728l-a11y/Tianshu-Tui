@@ -671,7 +671,7 @@ describe('executeToolUse', () => {
         ...makeDeps().config,
         toolRegistry: {
           execute: async () => ({
-            content: 'Exit code: 1\n0 passed, 0 failed, 0 skipped',
+            content: '退出码：1\n0 通过，0 失败，0 跳过',
             isError: true,
             verification: {
               command: 'tsx --test src/foo.test.ts',

@@ -71,7 +71,7 @@ describe('plan tool submit', () => {
     const result = await execute({ action: 'submit', title: 'Placeholder Plan', plan })
     assert.equal(result.isError, true)
     assert.ok(result.content.includes('占位符'))
-    assert.ok(!result.content.includes('Plan submitted'))
+    assert.ok(!result.content.includes('计划已提交'))
   })
 
   it('rejects a plan with empty sections', async () => {
@@ -99,7 +99,7 @@ describe('plan tool submit', () => {
       plan: '## 根因分析\n具体原因说明。\n\n## 实现方案\n修改 src/foo.ts。',
     })
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('no Mermaid diagram'))
+    assert.ok(result.content.includes('缺 Mermaid 图'))
   })
 
   it('accepts a concrete plan with a mermaid diagram', async () => {
@@ -127,7 +127,7 @@ describe('plan tool submit', () => {
 
     const result = await execute({ action: 'submit', title: 'Concrete Plan', plan })
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('Plan submitted'))
+    assert.ok(result.content.includes('计划已提交'))
 
     const written = readFileSync(join(dir, '.rivet/plans/concrete-plan.md'), 'utf-8')
     assert.ok(written.includes('# Concrete Plan'))
@@ -159,7 +159,7 @@ describe('plan tool submit', () => {
       onPlanSubmitted: (info: PlanSubmittedInfo) => { submitted = info },
     } as any)
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('Plan submitted'))
+    assert.ok(result.content.includes('计划已提交'))
     assert.ok(submitted)
     assert.equal((submitted as PlanSubmittedInfo).slug, 'callback-plan')
     assert.equal((submitted as PlanSubmittedInfo).title, 'Callback Plan')
@@ -189,7 +189,7 @@ describe('plan tool submit', () => {
       { activePlanFilePath: draftPath },
     )
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('Plan submitted'))
+    assert.ok(result.content.includes('计划已提交'))
 
     const written = readFileSync(join(dir, '.rivet/plans/from-draft.md'), 'utf-8')
     assert.ok(written.includes('# Draft Title'))
@@ -344,7 +344,7 @@ describe('plan tool submit', () => {
 
     const second = await execute({ action: 'submit', title: 'Anchor Drift Plan', plan })
     assert.ok(!second.isError, second.content)
-    assert.ok(second.content.includes('Plan submitted'))
+    assert.ok(second.content.includes('计划已提交'))
     assert.ok(second.content.includes('锚点残留提示'), 'residual drift note kept on pass-through')
   })
 
@@ -469,7 +469,7 @@ describe('plan tool submit', () => {
 
     const second = await execute({ action: 'submit', title: 'No Falsification Plan', plan })
     assert.ok(!second.isError, second.content)
-    assert.ok(second.content.includes('Plan submitted'))
+    assert.ok(second.content.includes('计划已提交'))
   })
 
   it('accepts a plan carrying a 复现 heading without the soft block', async () => {
@@ -491,7 +491,7 @@ describe('plan tool submit', () => {
 
     const result = await execute({ action: 'submit', title: 'Reproduced Plan', plan })
     assert.ok(!result.isError, result.content)
-    assert.ok(result.content.includes('Plan submitted'))
+    assert.ok(result.content.includes('计划已提交'))
   })
 
   // ── 需求提炼门禁 — 审批先审意图 ──
@@ -517,7 +517,7 @@ describe('plan tool submit', () => {
 
     const second = await execute({ action: 'submit', title: 'No Requirement Plan', plan })
     assert.ok(!second.isError, second.content)
-    assert.ok(second.content.includes('Plan submitted'))
+    assert.ok(second.content.includes('计划已提交'))
   })
 
   it('accepts a plan carrying a 需求提炼 heading without the soft block', async () => {
@@ -539,7 +539,7 @@ describe('plan tool submit', () => {
 
     const result = await execute({ action: 'submit', title: 'Distilled Plan', plan })
     assert.ok(!result.isError, result.content)
-    assert.ok(result.content.includes('Plan submitted'))
+    assert.ok(result.content.includes('计划已提交'))
     assert.ok(!result.content.includes('缺「需求提炼」'), 'no requirement block when the heading is present')
   })
 
@@ -555,7 +555,7 @@ describe('plan tool submit', () => {
     assert.equal(first.isError, true)
     assert.ok(first.content.includes('共 4 项缺口'), first.content)
     assert.ok(first.content.includes('需求提炼'), first.content)
-    assert.ok(first.content.includes('no Mermaid diagram'), first.content)
+    assert.ok(first.content.includes('缺 Mermaid 图'), first.content)
     assert.ok(first.content.includes('瑶光反证'), first.content)
     assert.ok(first.content.includes('规模超阈值'), first.content)
     assert.ok(!existsSync(join(dir, '.rivet/plans/aggregated-gates-plan.md')), 'not persisted while gates unmet')
@@ -563,7 +563,7 @@ describe('plan tool submit', () => {
     // one-shot 语义不变：同 title 重提放行（各项已警告过）
     const second = await execute({ action: 'submit', title: 'Aggregated Gates Plan', plan })
     assert.ok(!second.isError, second.content)
-    assert.ok(second.content.includes('Plan submitted'))
+    assert.ok(second.content.includes('计划已提交'))
   })
 
   // ── 指针回传门禁（2026-07-18 事故：两份计划文件被写成显示指针）──
@@ -578,7 +578,7 @@ describe('plan tool submit', () => {
 
     const first = await execute({ action: 'submit', title: 'Pointer Incident Plan', plan: realPlan })
     assert.equal(first.isError, true)
-    assert.ok(first.content.includes('no Mermaid diagram'), first.content)
+    assert.ok(first.content.includes('缺 Mermaid 图'), first.content)
     assert.ok(first.content.includes('瑶光反证'), first.content)
 
     // 该提交的 plan 字段在历史里已被 arg processor 改写成显示指针；模型回传指针重提
@@ -667,7 +667,7 @@ describe('plan tool enter_mode', () => {
   it('fails closed when the enterPlanMode ref is absent (worker context)', async () => {
     const result = await execute({ action: 'enter_mode' })
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('not available'))
+    assert.ok(result.content.includes('不可用'))
   })
 
   it('enters plan mode via the pre-bound ref and reports the draft path', async () => {
@@ -693,7 +693,7 @@ describe('plan tool enter_mode', () => {
       enterPlanMode: () => ({ activePlanFilePath: '.rivet/plans/draft-2.md', alreadyPlanning: true }),
     })
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('Already in plan mode'))
+    assert.ok(result.content.includes('已在计划模式中'))
     assert.ok(result.content.includes('.rivet/plans/draft-2.md'))
   })
 

@@ -47,6 +47,7 @@ import { auditDeliveryClaims, claimAuditEnabled } from './claim-audit.js'
 import { scanFilesForProbes, formatProbeHits, type ProbeHit } from './probe-detector.js'
 import { findApprovedPlanInventory, verifyRegressionInventory, formatInventoryReport, type InventorySearcher } from './regression-inventory.js'
 import { verifyObligations, formatObligationReport, type GateRunner, type PlanWithObligations } from './council/council-obligations.js'
+import { declaredVerificationCommands, reconcileVerificationCommands, formatVerificationReconcileReport } from './verification-reconcile.js'
 import { getStoredPlan } from './plan-store.js'
 import { deserializeUnifiedPlan } from './unified-plan.js'
 import { enqueuePostCommitReviewOutcome } from './post-commit-review-queue.js'
@@ -636,6 +637,16 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
       try {
         const storedJson = getStoredPlan(params.sessionId)
         const storedPlan = storedJson ? (deserializeUnifiedPlan(storedJson) as PlanWithObligations | null) : null
+        // ── 验证命令对账（advisory）：计划声明的验证命令逐条核销 ──
+        // 覆盖"选择性报绿"：命令挂死/未跑时报告只列跑通的套件也能穿过
+        // 诚实门禁——对账把 passed/failed/blocked/not_run 四态机械披露。
+        if (storedPlan && ctx.taskLedger) {
+          const declared = declaredVerificationCommands(storedPlan)
+          if (declared.length > 0) {
+            const reconciled = reconcileVerificationCommands(declared, ctx.taskLedger.getVerifications())
+            lines.push(...formatVerificationReconcileReport(reconciled))
+          }
+        }
         if (storedPlan?.obligations && storedPlan.obligations.length > 0) {
           const runGate: GateRunner = ctx.obligationGateRunner ?? ((command) => {
             try {

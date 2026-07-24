@@ -1718,6 +1718,81 @@ Do not declare a streamed response duplicate in the middle of the stream.
     })
   })
 
+  // ── 验证命令对账：计划声明的 verification 命令逐条核销（advisory）──
+  describe('plan verification command reconciliation', () => {
+    function storedPlanWithVerification(verification: string[][]): string {
+      return JSON.stringify({
+        version: 1, objective: 'plan', source: 'manual', createdAt: 1,
+        tasks: verification.map((v, i) => ({
+          id: `T${i}`, title: 't', objective: 'o', profile: 'implementer',
+          kind: 'patch_proposal', files: [], dependsOn: [], riskTier: 'low',
+          verification: v,
+        })),
+      })
+    }
+
+    it('声明命令部分未跑/挂死 → 报告逐条披露四态（advisory 不阻断）', async () => {
+      const sessionId = `deliver-reconcile-${Date.now()}`
+      const { storePlan, clearPlan } = await import('../plan-store.js')
+      storePlan(storedPlanWithVerification([
+        ['npx tsc --noEmit', 'npx tsx --test src/__tests__/a.test.ts'],
+        ['npx tsx --test src/__tests__/b.test.ts'],
+      ]), sessionId)
+      try {
+        const { tool, params } = makeContext({
+          taskId: 't1',
+          ownedFiles: ['src/a.ts'],
+          verifications: [
+            { command: 'npx tsc --noEmit', status: 'passed', meta: { passed: 0, failed: 0 } },
+            { command: 'npx tsx --test src/__tests__/a.test.ts', status: 'blocked', meta: { blockedReason: 'timeout' } },
+          ],
+        })
+        const result = await tool.execute({ ...params, sessionId })
+        assert.match(result.content, /验证命令对账（计划声明 3 条，2 条未核销）/)
+        assert.match(result.content, /⏱ npx tsx --test src\/__tests__\/a\.test\.ts — blocked（timeout）——跑了但没跑完/)
+        assert.match(result.content, /∅ npx tsx --test src\/__tests__\/b\.test\.ts — 无运行记录/)
+        assert.match(result.content, /与虚报同罪/)
+        assert.equal(result.isError, undefined, '对账是 advisory，绝不让交付失败')
+      } finally {
+        clearPlan(sessionId)
+      }
+    })
+
+    it('全部有通过记录 → 单行带过', async () => {
+      const sessionId = `deliver-reconcile-green-${Date.now()}`
+      const { storePlan, clearPlan } = await import('../plan-store.js')
+      storePlan(storedPlanWithVerification([['npx tsc --noEmit']]), sessionId)
+      try {
+        const { tool, params } = makeContext({
+          taskId: 't1',
+          ownedFiles: ['src/a.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        })
+        const result = await tool.execute({ ...params, sessionId })
+        assert.match(result.content, /✓ 验证命令对账：计划声明 1 条，全部有通过记录/)
+      } finally {
+        clearPlan(sessionId)
+      }
+    })
+
+    it('计划无声明验证命令 → 零输出', async () => {
+      const sessionId = `deliver-reconcile-none-${Date.now()}`
+      const { storePlan, clearPlan } = await import('../plan-store.js')
+      storePlan(storedPlanWithVerification([[]]), sessionId)
+      try {
+        const { tool, params } = makeContext({
+          taskId: 't1',
+          ownedFiles: ['src/a.ts'],
+          verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        })
+        const result = await tool.execute({ ...params, sessionId })
+        assert.doesNotMatch(result.content, /验证命令对账/)
+      } finally {
+        clearPlan(sessionId)
+      }
+    })
+  })
+
   describe('unclassified dirty files → dynamic external reclassification', () => {
     it('reports GREEN when dirty unclassified files are lazily reclassified as dynamic externals', async () => {
       // P1 living baseline: files with no ledger trace that are NOT in the baseline

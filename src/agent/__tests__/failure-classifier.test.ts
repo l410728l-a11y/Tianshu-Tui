@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyFailure, classifyTestRun, isTransient } from '../failure-classifier.js'
+import { classifyFailure, classifyTestRun, classifyToolFailure, isTransient, isTestRunInvocation, isReadProbeInvocation, resolveErrorKind } from '../failure-classifier.js'
 
 describe('classifyFailure', () => {
   it('classifies TS type errors correctly', () => {
@@ -49,6 +49,33 @@ describe('classifyFailure', () => {
     const result = classifyFailure('something weird happened')
     assert.equal(result.class, 'unknown')
     assert.ok(result.confidence <= 0.5)
+  })
+
+  // === probe_miss（A5 信号互扰治理 M3）===
+  it('只读探测的 File not found → probe_miss（反幻影探针不是认知失败）', () => {
+    const result = classifyFailure('File not found: /repo/src/maybe-exists.ts', { isReadProbe: true })
+    assert.equal(result.class, 'probe_miss')
+    assert.equal(result.retryable, false)
+  })
+
+  it('只读探测的 ENOENT → probe_miss', () => {
+    const result = classifyFailure("ENOENT: no such file or directory, open '/repo/x.ts'", { isReadProbe: true })
+    assert.equal(result.class, 'probe_miss')
+  })
+
+  it('非探测来源的 File not found 保持原分类（unknown）——写路径缺文件是真失败', () => {
+    const result = classifyFailure('File not found: /repo/src/maybe-exists.ts')
+    assert.equal(result.class, 'unknown')
+  })
+
+  it('isReadProbeInvocation: 只读探测工具 true，写/执行工具 false', () => {
+    assert.equal(isReadProbeInvocation('read_file'), true)
+    assert.equal(isReadProbeInvocation('glob'), true)
+    assert.equal(isReadProbeInvocation('grep'), true)
+    assert.equal(isReadProbeInvocation('file_info'), true)
+    assert.equal(isReadProbeInvocation('bash'), false)
+    assert.equal(isReadProbeInvocation('edit_file'), false)
+    assert.equal(isReadProbeInvocation('write_file'), false)
   })
 
   // === permission_denied ===
@@ -217,5 +244,102 @@ describe('isTransient', () => {
     const result = classifyFailure('intermittent flaky test failure')
     assert.equal(result.class, 'flaky')
     assert.equal(result.retryable, true)
+  })
+
+  // ── test_red routing (TDD RED must not be penalized) ──
+
+  it('routes assertion failure to test_red when isTestRun', () => {
+    const result = classifyFailure('AssertionError: expected 2 but got 1', { isTestRun: true })
+    assert.equal(result.class, 'test_red')
+  })
+
+  it('keeps assertion class for non-test-run assertion failures', () => {
+    const result = classifyFailure('AssertionError: expected 2 but got 1')
+    assert.equal(result.class, 'assertion')
+  })
+
+  it('test_red does not swallow type errors in test runs', () => {
+    // A type error during a test run is a build failure, not a RED.
+    const result = classifyFailure('error TS2345: Argument of type ...', { isTestRun: true })
+    assert.equal(result.class, 'type_error')
+  })
+})
+
+describe('isTestRunInvocation', () => {
+  it('run_tests tool always counts', () => {
+    assert.equal(isTestRunInvocation('run_tests', undefined), true)
+  })
+
+  it('bash with test-runner commands counts', () => {
+    for (const command of [
+      'npm test',
+      'npm run test -- --grep foo',
+      'pnpm test',
+      'npx tsx --test src/agent/__tests__/foo.test.ts',
+      'node --test dist/test/',
+      'npx vitest run',
+      'pytest tests/',
+      'go test ./...',
+      'cargo test',
+    ]) {
+      assert.equal(isTestRunInvocation('bash', { command }), true, `should match: ${command}`)
+    }
+  })
+
+  it('bash with non-test commands does not count', () => {
+    for (const command of [
+      'npm run build',
+      'git status',
+      'node script.js --testfile foo', // --testfile ≠ --test
+      'ls contest/', // "test" substring inside a word
+      'echo latest',
+    ]) {
+      assert.equal(isTestRunInvocation('bash', { command }), false, `should NOT match: ${command}`)
+    }
+  })
+
+  it('non-bash tools never count', () => {
+    assert.equal(isTestRunInvocation('edit_file', { command: 'npm test' }), false)
+  })
+})
+
+describe('resolveErrorKind（结构化短路解析）', () => {
+  it('errorKind 直读优先', () => {
+    assert.equal(resolveErrorKind({ errorKind: 'probe_miss' }), 'probe_miss')
+    assert.equal(resolveErrorKind({ errorKind: 'timeout', errorClass: 'environment' }), 'timeout')
+  })
+
+  it('bash errorClass 三态桥接：timeout / environment 映射，exec-failure 不桥接', () => {
+    assert.equal(resolveErrorKind({ errorClass: 'timeout' }), 'timeout')
+    assert.equal(resolveErrorKind({ errorClass: 'environment' }), 'missing_dep')
+    assert.equal(resolveErrorKind({ errorClass: 'exec-failure' }), undefined)
+  })
+
+  it('无结构信号返回 undefined', () => {
+    assert.equal(resolveErrorKind(undefined), undefined)
+    assert.equal(resolveErrorKind({}), undefined)
+  })
+})
+
+describe('classifyToolFailure（结构优先的工具失败分类）', () => {
+  it('工具自报 errorKind 短路文本正则——中文消息不再依赖英文模式', () => {
+    const r = classifyToolFailure({ errorKind: 'timeout' }, '测试超时，已终止进程')
+    assert.equal(r.class, 'timeout')
+    assert.equal(r.confidence, 1)
+    assert.equal(r.retryable, true)
+  })
+
+  it('结构短路结果与文本分类的 retryable 语义一致', () => {
+    const structured = classifyToolFailure({ errorKind: 'type_error' }, '任意文案')
+    const textual = classifyFailure("error TS2322: Type 'a' is not assignable")
+    assert.equal(structured.class, textual.class)
+    assert.equal(structured.retryable, textual.retryable)
+  })
+
+  it('无结构信号回退 classifyFailure 文本匹配，行为不变', () => {
+    const r = classifyToolFailure(undefined, 'Error: Cannot find module "./foo.js"')
+    assert.equal(r.class, 'module_resolution')
+    const r2 = classifyToolFailure({}, 'ENOENT: no such file or directory', { isReadProbe: true })
+    assert.equal(r2.class, 'probe_miss')
   })
 })

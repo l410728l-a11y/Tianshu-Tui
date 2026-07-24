@@ -169,7 +169,7 @@ export const ASK_USER_QUESTION_TOOL: Tool = {
   async execute(params: ToolCallParams): Promise<ToolResult> {
     const questions = parseAskUserQuestions(params.input)
     if (questions.length === 0) {
-      return { content: 'Error: question (or questions[]) is required', isError: true }
+      return { content: '错误：question（或 questions[]）必填', isError: true }
     }
 
     // content: what the LLM sees. When options exist it MUST include the same
@@ -188,8 +188,8 @@ export const ASK_USER_QUESTION_TOOL: Tool = {
       params.onAskUserQuestion?.({ questions })
     }
     const content = hasOptions
-      ? `[Awaiting your response…]\n\nThe user was shown these numbered options:\n${rendered}\n\nA bare number in the reply refers to this numbering.`
-      : '[Awaiting your response…]'
+      ? `[等待你的回复…]\n\n已向用户展示以下编号选项：\n${rendered}\n\n回复中的裸数字对应这里的编号。`
+      : '[等待你的回复…]'
     return {
       content,
       uiContent: rendered,

@@ -124,6 +124,10 @@ async function walkDir(
   }
 }
 
+/** 空结果 sentinel——search-pod-hook 靠 includes(此串) 识别「可信排除」，
+ *  改文案必须与 hook 同步（用常量共享，禁止两边各自手抄）。 */
+export const GLOB_EMPTY_RESULT = '未找到匹配 pattern 的文件'
+
 export const GLOB_TOOL: Tool = {
   definition: {
     name: 'glob',
@@ -161,7 +165,7 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
     const requestedRoot = params.input.path ? String(params.input.path) : '.'
     const validated = validatePathSafe(params.cwd, requestedRoot)
     if (!validated.ok) {
-      return { content: `Error: ${validated.error}`, isError: true }
+      return { content: `错误：${validated.error}`, isError: true }
     }
     const searchRoot = validated.path
 
@@ -169,10 +173,12 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
     try {
       s = await stat(searchRoot)
     } catch {
-      return { content: `Error: Directory not found: ${searchRoot}`, isError: true }
+      // probe_miss：只读探测确认目录不存在是有效信息收集，不是认知失败。
+      // 结构字段先行——中文文案不再被 classifyFailure 的英文正则命中。
+      return { content: `错误：目录不存在：${searchRoot}`, isError: true, errorKind: 'probe_miss' as const }
     }
     if (!s.isDirectory()) {
-      return { content: `Error: Not a directory: ${searchRoot}`, isError: true }
+      return { content: `错误：不是目录：${searchRoot}`, isError: true }
     }
 
     const regex = globToRegex(pattern)
@@ -183,7 +189,7 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
       await walkDir(searchRoot, files, searchRoot, regex, includeSilentMatches)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${message}`, isError: true }
+      return { content: `错误：${message}`, isError: true }
     }
 
     const matches = files
@@ -192,7 +198,7 @@ Bad: glob(pattern="node_modules/**") (excluded by default)`,
       .map((f) => relativePosix(params.cwd, join(searchRoot, f)))
 
     return {
-      content: matches.length > 0 ? matches.join('\n') : 'No files found matching pattern',
+      content: matches.length > 0 ? matches.join('\n') : GLOB_EMPTY_RESULT,
     }
   },
 

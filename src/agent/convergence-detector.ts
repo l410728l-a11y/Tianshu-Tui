@@ -561,10 +561,16 @@ const REPORT_TEXT_MIN_LEN = 200
 /**
  * The set of tools that count as "productive" (write/test/commit class).
  * Used by distance-since-productive and read-only penalty logic.
+ *
+ * 单一事实源（2026-07-23 信号互扰治理 A2/M1）：CCR 的 computeReadOnlyStreak
+ * 与 classifyActivityMode 同吃这一个集合——此前 CCR 自持副本已漂移分叉
+ * （缺 apply_patch，多 delegate）。apply_patch(check_only)/ast_edit(dryRun)
+ * 的预检调用按纪律执行也计入产出——预检是有意义动作，不是空转（M5）。
  */
 export const PRODUCTIVE_TOOLS = new Set([
-  'edit_file', 'write_file', 'hash_edit', 'apply_patch',
-  'run_tests', 'bash', 'deliver_task', 'plan_submit', 'plan_close',
+  'edit_file', 'write_file', 'hash_edit', 'apply_patch', 'ast_edit',
+  'run_tests', 'bash', 'deliver_task', 'delegate_task', 'delegate_batch',
+  'plan_submit', 'plan_close',
 ])
 
 /**

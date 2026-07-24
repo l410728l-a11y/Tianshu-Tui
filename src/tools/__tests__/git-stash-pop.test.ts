@@ -48,6 +48,6 @@ describe('git stash_pop action', () => {
       toolUseId: 'test', onOutput: () => {},
     } as any)
     assert.notEqual(res.isError, true)
-    assert.match(res.content, /Popped|restored|safety/i)
+    assert.match(res.content, /已弹出|安全检查/)
   })
 })

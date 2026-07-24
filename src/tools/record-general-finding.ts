@@ -34,21 +34,21 @@ export function createRecordGeneralFindingTool(getCwd: () => string): Tool {
       const family = (input.family ?? '').trim()
       const note = (input.note ?? '').trim()
       if (!star || !family || !note) {
-        return { content: 'record_general_finding: star, family and note are all required.', isError: true }
+        return { content: 'record_general_finding: star、family、note 均为必填。', isError: true }
       }
       if (!/^[a-z0-9][a-z0-9-]*$/.test(family)) {
-        return { content: `record_general_finding: family must be a kebab-case slug (got "${family}").`, isError: true }
+        return { content: `record_general_finding: family 必须是 kebab-case slug（收到「${family}」）。`, isError: true }
       }
 
       const result = appendGeneralFinding(cwd, { star, family, note })
       if (!result) {
-        return { content: `record_general_finding: unknown star "${star}".`, isError: true }
+        return { content: `record_general_finding: 未知星域「${star}」。`, isError: true }
       }
       return {
         content: result.created
           ? `新族条目已建：${family}（${result.slug}.md，recurrenceCount: 1）。`
           : `同族复发已记：${family}（${result.slug}.md，recurrenceCount: ${result.recurrenceCount}）。`,
-        uiContent: `general finding: ${result.slug}/${family} ×${result.recurrenceCount}`,
+        uiContent: `将星战绩：${result.slug}/${family} ×${result.recurrenceCount}`,
         isError: false,
       }
     },

@@ -89,22 +89,22 @@ Bad: 用 bash explorer/open/start 命令加手写 shell 引号`,
   async execute(params) {
     const raw = params.input.path
     if (typeof raw !== 'string' || raw.trim().length === 0) {
-      return { content: 'Error: path is required', isError: true }
+      return { content: '错误：path 为必填项', isError: true }
     }
     const target = resolve(expandHome(raw.trim()))
     if (!existsSync(target)) {
-      return { content: `Error: path does not exist: ${target}`, isError: true }
+      return { content: `错误：路径不存在：${target}`, isError: true }
     }
     const command = buildOpenPathCommand(target)
 
     return new Promise((resolveResult) => {
       const child = spawn(command.cmd, command.args, { detached: true, stdio: 'ignore' })
       child.on('error', (err) => {
-        resolveResult({ content: `Error opening ${target}: ${err.message}`, isError: true })
+        resolveResult({ content: `打开 ${target} 时出错：${err.message}`, isError: true })
       })
       child.on('spawn', () => {
         child.unref()
-        resolveResult({ content: `Opened: ${target}` })
+        resolveResult({ content: `已打开：${target}` })
       })
     })
   },

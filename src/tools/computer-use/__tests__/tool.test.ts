@@ -186,7 +186,7 @@ test('list_apps returns the visible apps', async () => {
   const driver = new FakeDriver()
   const res = await darwinTool(driver).execute(params({ action: 'list_apps' }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /Safari \(frontmost\)/)
+  assert.match(res.content, /Safari（前台）/)
   assert.match(res.content, /Notes/)
   assert.equal(res.content.includes('—'), false, 'no title separator when titles absent')
 })
@@ -199,7 +199,7 @@ test('list_apps shows window titles when the driver provides them (Windows)', as
     { name: 'notepad', title: 'notepad', frontmost: false },
   ]
   const res = await darwinTool(driver).execute(params({ action: 'list_apps' }))
-  assert.match(res.content, /- chrome — "GitHub - Google Chrome" \(frontmost\)/)
+  assert.match(res.content, /- chrome — "GitHub - Google Chrome"（前台）/)
   assert.match(res.content, /- Calculator\n/, 'empty title → bare name')
   assert.match(res.content, /- notepad$/m, 'title identical to name → not repeated')
 })
@@ -226,7 +226,7 @@ test('snapshot without screenshot still returns the tree (tree-only degrade)', a
   const store = new FakeArtifactStore()
   const res = await darwinTool(driver).execute(params({ action: 'snapshot', app: 'Safari' }, store))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /screenshot unavailable/)
+  assert.match(res.content, /截图不可用/)
   assert.equal(store.saved.length, 0)
   assert.equal(res.images, undefined)
 })
@@ -239,7 +239,7 @@ test('identical consecutive snapshots dedupe to a short unchanged note (no image
   const first = await tool.execute(params({ action: 'snapshot', app: 'Safari' }))
   assert.match(first.content, /AXButton "OK"/)
   const second = await tool.execute(params({ action: 'snapshot', app: 'Safari' }))
-  assert.match(second.content, /UI unchanged since the last snapshot/)
+  assert.match(second.content, /自上次快照以来 UI 未变化/)
   assert.equal(second.content.includes('AXButton'), false, 'tree not repeated')
   assert.equal(second.images, undefined, 'no image re-attachment on dedup hit')
 })
@@ -269,7 +269,7 @@ test('click by ref resolves the cached AX path with identity check', async () =>
   const tool = darwinTool(driver)
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'click', app: 'Safari', ref: 1 }))
-  assert.match(res.content, /Clicked ref 1 "OK" in Safari/)
+  assert.match(res.content, /已点击 ref 1 "OK"（于 Safari）/)
   const click = driver.calls.find(c => c.method === 'click')!
   assert.deepEqual(click.args[1], { path: [0, 0], role: 'AXButton', title: 'OK' })
   assert.deepEqual(click.args[2], { button: 'left', count: 1 })
@@ -279,7 +279,7 @@ test('click by ref without a prior snapshot is rejected', async () => {
   const driver = new FakeDriver()
   const res = await darwinTool(driver).execute(params({ action: 'click', app: 'Safari', ref: 1 }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /take a snapshot first/)
+  assert.match(res.content, /请先 snapshot/)
   assert.equal(driver.calls.filter(c => c.method === 'click').length, 0)
 })
 
@@ -289,13 +289,13 @@ test('unknown ref (not in latest snapshot) is rejected as stale', async () => {
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'click', app: 'Safari', ref: 99 }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /ref 99 is not in the latest Safari snapshot/)
+  assert.match(res.content, /ref 99 不在 Safari 的最新快照中/)
 })
 
 test('click by coordinates dispatches raw coords', async () => {
   const driver = new FakeDriver()
   const res = await darwinTool(driver).execute(params({ action: 'click', app: 'Safari', x: 100, y: 200 }))
-  assert.match(res.content, /Clicked \(100, 200\) in Safari/)
+  assert.match(res.content, /已点击 \(100, 200\)（于 Safari）/)
   const click = driver.calls.find(c => c.method === 'click')!
   assert.deepEqual(click.args[1], { x: 100, y: 200 })
 })
@@ -303,7 +303,7 @@ test('click by coordinates dispatches raw coords', async () => {
 test('click without ref or coordinates is an error', async () => {
   const res = await darwinTool(new FakeDriver()).execute(params({ action: 'click', app: 'Safari' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /"ref".*or both "x" and "y"/)
+  assert.match(res.content, /"ref".*"x".*"y"/)
 })
 
 test('double_click and right_click carry button/count options', async () => {
@@ -311,9 +311,9 @@ test('double_click and right_click carry button/count options', async () => {
   const tool = darwinTool(driver)
   await snapshotFirst(tool)
   const dbl = await tool.execute(params({ action: 'double_click', app: 'Safari', ref: 1 }))
-  assert.match(dbl.content, /Double-clicked ref 1/)
+  assert.match(dbl.content, /已双击 ref 1/)
   const right = await tool.execute(params({ action: 'right_click', app: 'Safari', x: 5, y: 6 }))
-  assert.match(right.content, /Right-clicked \(5, 6\)/)
+  assert.match(right.content, /已右键点击 \(5, 6\)/)
   const clicks = driver.calls.filter(c => c.method === 'click')
   assert.deepEqual(clicks[0]!.args[2], { button: 'left', count: 2 })
   assert.deepEqual(clicks[1]!.args[2], { button: 'right', count: 1 })
@@ -330,7 +330,7 @@ test('scroll validates direction and passes amount + resolved ref position', asy
 
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'scroll', app: 'Safari', direction: 'down', amount: 10, ref: 1 }))
-  assert.match(res.content, /Scrolled down by 10 in Safari at \(15, 25\)/)
+  assert.match(res.content, /已在 Safari 中向 down 滚动 10，位置 \(15, 25\)/)
   const scroll = driver.calls.find(c => c.method === 'scroll')!
   assert.deepEqual(scroll.args[1], { direction: 'down', amount: 10, at: { x: 15, y: 25 } })
 })
@@ -338,7 +338,7 @@ test('scroll validates direction and passes amount + resolved ref position', asy
 test('scroll without target scrolls the window center (driver default)', async () => {
   const driver = new FakeDriver()
   const res = await darwinTool(driver).execute(params({ action: 'scroll', app: 'Safari', direction: 'up' }))
-  assert.match(res.content, /Scrolled up in Safari\./)
+  assert.match(res.content, /已在 Safari 中向 up 滚动。/)
   const scroll = driver.calls.find(c => c.method === 'scroll')!
   assert.deepEqual(scroll.args[1], { direction: 'up', amount: undefined, at: undefined })
 })
@@ -348,7 +348,7 @@ test('drag resolves ref endpoints via locate and coordinate endpoints directly',
   const tool = darwinTool(driver)
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'drag', app: 'Safari', from_ref: 1, to_x: 300, to_y: 400 }))
-  assert.match(res.content, /Dragged from \(15, 25\) to \(300, 400\) in Safari/)
+  assert.match(res.content, /已在 Safari 中从 \(15, 25\) 拖拽到 \(300, 400\)/)
   const drag = driver.calls.find(c => c.method === 'drag')!
   assert.deepEqual(drag.args[1], { x: 15, y: 25 })
   assert.deepEqual(drag.args[2], { x: 300, y: 400 })
@@ -358,7 +358,7 @@ test('drag with a stale from_ref is rejected before any driver drag', async () =
   const driver = new FakeDriver()
   const res = await darwinTool(driver).execute(params({ action: 'drag', app: 'Safari', from_ref: 7, to_x: 1, to_y: 2 }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /take a snapshot first/)
+  assert.match(res.content, /请先 snapshot/)
   assert.equal(driver.calls.filter(c => c.method === 'drag').length, 0)
 })
 
@@ -367,10 +367,10 @@ test('wait sleeps (capped at 5000ms) without touching the driver', async () => {
   const slept: number[] = []
   const tool = darwinTool(driver, [], async (ms) => { slept.push(ms) })
   const res = await tool.execute(params({ action: 'wait', duration_ms: 99_999 }))
-  assert.match(res.content, /Waited 5000ms/)
+  assert.match(res.content, /已等待 5000ms/)
   assert.deepEqual(slept, [5000])
   const dflt = await tool.execute(params({ action: 'wait' }))
-  assert.match(dflt.content, /Waited 1000ms/)
+  assert.match(dflt.content, /已等待 1000ms/)
   assert.equal(driver.calls.length, 0)
 })
 
@@ -380,11 +380,11 @@ test('type / key / focus_app dispatch and confirm', async () => {
   const driver = new FakeDriver()
   const tool = darwinTool(driver)
   const typed = await tool.execute(params({ action: 'type', app: 'Notes', text: 'hello' }))
-  assert.match(typed.content, /Typed 5 character\(s\) into Notes/)
+  assert.match(typed.content, /已向 Notes 输入 5 个字符/)
   const keyed = await tool.execute(params({ action: 'key', app: 'Notes', combo: 'cmd+s' }))
-  assert.match(keyed.content, /Sent cmd\+s to Notes/)
+  assert.match(keyed.content, /已向 Notes 发送 cmd\+s/)
   const focused = await tool.execute(params({ action: 'focus_app', app: 'Notes' }))
-  assert.match(focused.content, /Focused Notes/)
+  assert.match(focused.content, /已聚焦 Notes/)
   assert.deepEqual(driver.calls.map(c => c.method), ['type', 'key', 'focusApp'])
 })
 
@@ -392,8 +392,8 @@ test('check_permissions reports missing permissions', async () => {
   const driver = new FakeDriver()
   driver.permissions = { accessibility: false, screenRecording: true, detail: 'Grant Accessibility.' }
   const res = await darwinTool(driver).execute(params({ action: 'check_permissions' }))
-  assert.match(res.content, /Accessibility: MISSING/)
-  assert.match(res.content, /Screen Recording: granted/)
+  assert.match(res.content, /Accessibility：缺失/)
+  assert.match(res.content, /Screen Recording：已授予/)
 })
 
 test('missing required inputs produce errors, not driver calls', async () => {
@@ -419,7 +419,7 @@ test('driver failure is surfaced as a tool error', async () => {
   driver.snapshot = async () => { throw new Error('window not found') }
   const res = await darwinTool(driver).execute(params({ action: 'snapshot', app: 'Safari' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /computer_use failed: window not found/)
+  assert.match(res.content, /computer_use 失败：window not found/)
 })
 
 // ── Redaction ─────────────────────────────────────────────────────
@@ -447,7 +447,7 @@ test('unsupported platform: tool disabled and execute refuses', async () => {
   assert.equal(tool.isEnabled!(), false)
   const res = await tool.execute(params({ action: 'list_apps' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /only available on macOS and Windows/)
+  assert.match(res.content, /仅在 macOS 与 Windows 上可用/)
   assert.equal(driver.calls.length, 0)
 })
 
@@ -462,7 +462,7 @@ test('win32 platform: enabled when Pro gate is true and actions execute', async 
   assert.equal(tool.isEnabled!(), true)
   const list = await tool.execute(params({ action: 'list_apps' }))
   assert.equal(list.isError, undefined)
-  assert.match(list.content, /Visible apps/)
+  assert.match(list.content, /可见应用/)
   const snap = await tool.execute(params({ action: 'snapshot', app: 'notepad' }))
   assert.equal(snap.isError, undefined)
   const click = await tool.execute(params({ action: 'click', app: 'notepad', ref: 1 }))
@@ -491,7 +491,7 @@ test('launch_app dispatches to the driver', async () => {
   const driver = new FakeDriver()
   const res = await darwinTool(driver).execute(params({ action: 'launch_app', app: 'Notes' }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /Launched Notes/)
+  assert.match(res.content, /已启动 Notes/)
   assert.deepEqual(driver.calls[0], { method: 'launchApp', args: ['Notes'] })
 })
 
@@ -500,7 +500,7 @@ test('menu_select splits the "A > B > C" path and validates input', async () => 
   const tool = darwinTool(driver)
   const res = await tool.execute(params({ action: 'menu_select', app: 'Notes', menu_path: 'File >  Export> PNG ' }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /Selected menu File > Export > PNG in Notes/)
+  assert.match(res.content, /已在 Notes 中选择菜单 File > Export > PNG/)
   assert.deepEqual(driver.calls[0], { method: 'menuSelect', args: ['Notes', ['File', 'Export', 'PNG']] })
 
   const missing = await tool.execute(params({ action: 'menu_select', app: 'Notes' }))
@@ -514,8 +514,8 @@ test('paste_text dispatches to the driver and flags the clipboard overwrite', as
   const tool = darwinTool(driver)
   const res = await tool.execute(params({ action: 'paste_text', app: 'Notes', text: 'long text\nwith lines' }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /Pasted 20 character\(s\)/)
-  assert.match(res.content, /clipboard/)
+  assert.match(res.content, /粘贴 20 个字符/)
+  assert.match(res.content, /剪贴板/)
   assert.deepEqual(driver.calls[0], { method: 'pasteText', args: ['Notes', 'long text\nwith lines'] })
 
   const empty = await tool.execute(params({ action: 'paste_text', app: 'Notes', text: '' }))
@@ -537,10 +537,10 @@ test('feedback: UI change appends a diff with new refs and refreshes the cache',
   ]
   const res = await tool.execute(params({ action: 'click', app: 'Safari', ref: 1 }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /^Clicked ref 1/)
+  assert.match(res.content, /^已点击 ref 1/)
   assert.match(res.content, /UI changed after action \(\+1\/-0 elements\)/)
   assert.match(res.content, /\+ \[2\] AXSheet "Save\?"/)
-  assert.match(res.content, /refs refreshed/)
+  assert.match(res.content, /refs 已刷新/)
 
   // Feedback snapshot must be tree-only and must refresh the ref cache:
   // ref 2 (which only exists in the post-action tree) is now clickable.
@@ -555,7 +555,7 @@ test('feedback: unchanged UI appends the unchanged note', async () => {
   const tool = feedbackTool(driver)
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'key', app: 'Safari', combo: 'cmd+s' }))
-  assert.match(res.content, /^Sent cmd\+s to Safari\./)
+  assert.match(res.content, /^已向 Safari 发送 cmd\+s。/)
   assert.match(res.content, /UI unchanged after action\./)
 })
 
@@ -563,7 +563,7 @@ test('feedback: no prior snapshot → caches state without dumping the tree', as
   const driver = new FakeDriver()
   const tool = feedbackTool(driver)
   const res = await tool.execute(params({ action: 'click', app: 'Safari', x: 5, y: 6 }))
-  assert.match(res.content, /Post-action UI state cached \(1 elements\)/)
+  assert.match(res.content, /操作后 UI 状态已缓存（1 个元素）/)
   assert.equal(res.content.includes('AXButton'), false, 'tree not dumped')
   // Cache primed by feedback: ref 1 is clickable without an explicit snapshot.
   const byRef = await tool.execute(params({ action: 'click', app: 'Safari', ref: 1 }))
@@ -576,7 +576,7 @@ test('feedback: snapshot failure never taints the action result', async () => {
   const tool = feedbackTool(driver)
   const res = await tool.execute(params({ action: 'type', app: 'Safari', text: 'hi' }))
   assert.equal(res.isError, undefined)
-  assert.equal(res.content, 'Typed 2 character(s) into Safari.')
+  assert.equal(res.content, '已向 Safari 输入 2 个字符。')
 })
 
 test('feedback: disabled via option → no extra snapshot, bare result', async () => {
@@ -584,7 +584,7 @@ test('feedback: disabled via option → no extra snapshot, bare result', async (
   const tool = darwinTool(driver, ['Safari'])
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'key', app: 'Safari', combo: 'return' }))
-  assert.equal(res.content, 'Sent return to Safari.')
+  assert.equal(res.content, '已向 Safari 发送 return。')
   assert.equal(driver.calls.filter((c) => c.method === 'snapshot').length, 1, 'only the explicit snapshot ran')
 })
 
@@ -612,7 +612,7 @@ test('stale click: unique role+title match → auto-heal, retry with fresh path,
   }]
   const res = await tool.execute(params({ action: 'click', app: 'Safari', ref: 1 }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /auto-matched the same AXButton "OK" as ref 5/)
+  assert.match(res.content, /自动匹配到相同的 AXButton "OK" 为 ref 5/)
   const clicks = driver.calls.filter((c) => c.method === 'click')
   assert.equal(clicks.length, 2, 'failed click + healed retry')
   assert.deepEqual((clicks[1]?.args[1] as { path: number[] }).path, [0, 3], 'retry uses the fresh path')
@@ -632,8 +632,8 @@ test('stale click: ambiguous match → no retry, error says cache refreshed', as
   }]
   const res = await tool.execute(params({ action: 'click', app: 'Safari', ref: 1 }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /2 elements match/)
-  assert.match(res.content, /Ref cache refreshed/)
+  assert.match(res.content, /2 个元素匹配/)
+  assert.match(res.content, /已从新快照刷新 ref 缓存/)
   assert.equal(driver.calls.filter((c) => c.method === 'click').length, 1, 'no blind retry')
   // The refreshed cache is immediately usable.
   const followUp = await tool.execute(params({ action: 'click', app: 'Safari', ref: 2 }))
@@ -712,7 +712,7 @@ test('find: value text matches too; zero hits fall back to the outline', async (
 
   const miss = await tool.execute(params({ action: 'find', app: 'Safari', query: 'nonexistent' }))
   assert.equal(miss.isError, undefined)
-  assert.match(miss.content, /No elements matching "nonexistent"/)
+  assert.match(miss.content, /未找到匹配 "nonexistent"/)
   assert.match(miss.content, /Menu bar: File \| Edit \| View/)
   assert.match(miss.content, /\[1\] AXWindow "Doc"/)
   assert.equal(miss.content.includes('[3]'), false, 'outline stays top-level')
@@ -735,7 +735,7 @@ test('wait_for: appears on a later poll → success with matching lines and timi
   const tool = darwinTool(driver, ['Safari'], async (ms) => { sleeps.push(ms) })
   const res = await tool.execute(params({ action: 'wait_for', app: 'Safari', text: '存储', timeout_ms: 15_000 }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /"存储" appeared in Safari after \d+ms/)
+  assert.match(res.content, /"存储" 在 Safari 中于 \d+ms 后出现/)
   assert.match(res.content, /\[2\] AXSheet "存储"/)
   assert.equal(sleeps.length, 1, 'one poll gap before the hit')
   // Cache refreshed by the poll — new ref is clickable.
@@ -750,7 +750,7 @@ test('wait_for: timeout → isError with orientation outline; gone-mode waits fo
   const tool = darwinTool(driver, ['Safari'], async () => {})
   const miss = await tool.execute(params({ action: 'wait_for', app: 'Safari', text: 'Ghost', timeout_ms: 1 }))
   assert.equal(miss.isError, true)
-  assert.match(miss.content, /timed out after 1ms/)
+  assert.match(miss.content, /在 1ms 后超时/)
   assert.match(miss.content, /\[1\] AXWindow "Doc"/)
 
   // gone: the text vanishes on the second poll.
@@ -761,7 +761,7 @@ test('wait_for: timeout → isError with orientation outline; gone-mode waits fo
   ]
   const gone = await tool.execute(params({ action: 'wait_for', app: 'Safari', text: '载入中', gone: true, timeout_ms: 15_000 }))
   assert.equal(gone.isError, undefined)
-  assert.match(gone.content, /"载入中" is gone from Safari/)
+  assert.match(gone.content, /"载入中" 已从 Safari 消失/)
 
   const blank = await tool.execute(params({ action: 'wait_for', app: 'Safari' }))
   assert.equal(blank.isError, true)
@@ -775,7 +775,7 @@ test('set_value: routes ref + text to driver.setValue with the cached path', asy
   await snapshotFirst(tool)
   const res = await tool.execute(params({ action: 'set_value', app: 'Safari', ref: 1, text: 'hello 世界' }))
   assert.equal(res.isError, undefined)
-  assert.match(res.content, /Set value of ref 1 \(AXButton "OK"\) to 8 character\(s\)/)
+  assert.match(res.content, /已将 Safari 中 ref 1（AXButton "OK"）的值设为 8 个字符/)
   const call = driver.calls.find((c) => c.method === 'setValue')
   assert.deepEqual(call?.args, ['Safari', { path: [0, 0], role: 'AXButton', title: 'OK' }, 'hello 世界'])
 })
@@ -810,8 +810,8 @@ test('driver error + fuzzy app name → "did you mean" hint with visible apps', 
   const tool = darwinTool(driver, ['safar'])
   const res = await tool.execute(params({ action: 'focus_app', app: 'safar' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /Did you mean "Safari"\?/)
-  assert.match(res.content, /Visible apps: Safari, Notes/)
+  assert.match(res.content, /你是指 "Safari" 吗/)
+  assert.match(res.content, /可见应用：Safari, Notes/)
 })
 
 test('driver error + no fuzzy match → visible apps listed without a guess', async () => {
@@ -820,8 +820,8 @@ test('driver error + no fuzzy match → visible apps listed without a guess', as
   const tool = darwinTool(driver, ['chrome'])
   const res = await tool.execute(params({ action: 'focus_app', app: 'chrome' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /No visible app matches "chrome"/)
-  assert.equal(res.content.includes('Did you mean'), false)
+  assert.match(res.content, /没有与 "chrome" 匹配的可见应用/)
+  assert.equal(res.content.includes('你是指'), false)
 })
 
 test('driver error on an app that IS visible → no name hint appended', async () => {
@@ -831,6 +831,6 @@ test('driver error on an app that IS visible → no name hint appended', async (
   const res = await tool.execute(params({ action: 'focus_app', app: 'Safari' }))
   assert.equal(res.isError, true)
   assert.match(res.content, /window server connection lost/)
-  assert.equal(res.content.includes('Did you mean'), false)
-  assert.equal(res.content.includes('Visible apps'), false)
+  assert.equal(res.content.includes('你是指'), false)
+  assert.equal(res.content.includes('可见应用'), false)
 })

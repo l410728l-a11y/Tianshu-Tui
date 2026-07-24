@@ -29,7 +29,7 @@ describe('edit_file tool', () => {
       new_string: 'universe',
     }))
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('Applied edit'))
+    assert.ok(result.content.includes('已编辑'))
   })
 
   it('emits a colored-ready unified diff in uiContent, keeps content short', async () => {
@@ -42,7 +42,7 @@ describe('edit_file tool', () => {
     }))
     assert.ok(!result.isError)
     // model-facing content stays a short confirmation (prefix-cache friendly)
-    assert.ok(result.content.startsWith('Applied edit to'))
+    assert.ok(result.content.startsWith('已编辑 '))
     assert.ok(!result.content.includes('@@'), 'diff must not leak into model content')
     // display-only uiContent carries the unified diff
     assert.ok(result.uiContent, 'uiContent present')
@@ -77,7 +77,7 @@ describe('edit_file tool', () => {
       new_string: 'xyz',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('multiple locations'))
+    assert.ok(result.content.includes('匹配到多处'))
   })
 
   it('replaces all with replace_all flag', async () => {
@@ -90,7 +90,7 @@ describe('edit_file tool', () => {
       replace_all: true,
     }))
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('2 occurrences'))
+    assert.ok(result.content.includes('全部 2 处') || result.content.includes('2 处'))
   })
 
   it('rejects missing old_string', async () => {
@@ -102,7 +102,7 @@ describe('edit_file tool', () => {
       new_string: 'replacement',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('not found'))
+    assert.ok(result.content.includes('未找到'))
   })
 
   it('rejects non-existent file', async () => {
@@ -112,7 +112,7 @@ describe('edit_file tool', () => {
       new_string: 'y',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('not found'))
+    assert.ok(result.content.includes('未找到'))
   })
 
   it('rejects path traversal', async () => {
@@ -141,7 +141,7 @@ describe('edit_file tool', () => {
       new_string: 'function foo() {\n\treturn 2\n}',
     }))
     assert.ok(!result.isError, `Expected fuzzy success, got: ${result.content}`)
-    assert.match(result.content, /whitespace-tolerant/i)
+    assert.match(result.content, /空白容错/)
     const content = readFileSync(file, 'utf-8')
     assert.ok(content.includes('return 2'), `edit should have landed, got: ${content}`)
   })
@@ -187,7 +187,7 @@ describe('edit_file tool', () => {
       new_string: 'x',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('not found') || result.content.includes('Closest match'))
+    assert.ok(result.content.includes('未找到') || result.content.includes('最接近的匹配'))
   })
 
   it('edits a large file above the old 100KB cap', async () => {
@@ -214,9 +214,9 @@ describe('edit_file tool', () => {
       new_string: 'bar',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('multiple locations'))
-    assert.ok(result.content.includes('Match 1 at line 2'), `Expected line 2 match, got: ${result.content}`)
-    assert.ok(result.content.includes('Match 2 at line 4'), `Expected line 4 match, got: ${result.content}`)
+    assert.ok(result.content.includes('匹配到多处'))
+    assert.ok(result.content.includes('匹配 1（第 2 行）'), `Expected line 2 match, got: ${result.content}`)
+    assert.ok(result.content.includes('匹配 2（第 4 行）'), `Expected line 4 match, got: ${result.content}`)
   })
 
   it('reports clear error when old_string is completely absent', async () => {
@@ -229,7 +229,7 @@ describe('edit_file tool', () => {
     }))
     assert.equal(result.isError, true)
     // Should not pretend to find a "closest match" when nothing is close.
-    assert.ok(result.content.includes('not found'))
+    assert.ok(result.content.includes('未找到'))
   })
 
   it('warns when replace_all count mismatches expected_count', async () => {
@@ -244,9 +244,9 @@ describe('edit_file tool', () => {
       expected_count: 2,
     }))
     assert.ok(!result.isError, 'should not be an error — file was modified')
-    assert.ok(result.content.includes('Warning'), `expected Warning, got: ${result.content}`)
-    assert.ok(result.content.includes('expected 2'), `expected mention of expected count, got: ${result.content}`)
-    assert.ok(result.content.includes('replaced 1'), `expected mention of actual count, got: ${result.content}`)
+    assert.ok(result.content.includes('警告'), `expected 警告, got: ${result.content}`)
+    assert.ok(result.content.includes('预期替换 2'), `expected mention of expected count, got: ${result.content}`)
+    assert.ok(result.content.includes('只替换了 1'), `expected mention of actual count, got: ${result.content}`)
   })
 
   it('no warning when replace_all count matches expected_count', async () => {
@@ -260,8 +260,8 @@ describe('edit_file tool', () => {
       expected_count: 3,
     }))
     assert.ok(!result.isError)
-    assert.ok(!result.content.includes('Warning'), `unexpected Warning: ${result.content}`)
-    assert.ok(result.content.includes('Replaced all 3'), `expected success, got: ${result.content}`)
+    assert.ok(!result.content.includes('警告'), `unexpected 警告: ${result.content}`)
+    assert.ok(result.content.includes('已替换全部 3'), `expected success, got: ${result.content}`)
   })
 
   it('on stale file: auto-reapplies edit when old_string still matches', async () => {
@@ -281,7 +281,7 @@ describe('edit_file tool', () => {
     }))
 
     assert.ok(!result.isError, `Expected success on stale auto-apply, got: ${result.content}`)
-    assert.match(result.content, /modified externally.*still matched/i)
+    assert.match(result.content, /外部修改.*仍能匹配/)
 
     const content = readFileSync(filePath, 'utf-8')
     assert.ok(content.includes('const y = 3'))
@@ -308,7 +308,7 @@ describe('edit_file tool', () => {
     }))
 
     assert.ok(!result.isError, `Expected success on stale auto-apply, got: ${result.content}`)
-    assert.match(result.content, /Warning.*expected 3.*replaced 2/i,
+    assert.match(result.content, /警告.*预期替换 3.*只替换了 2/,
       `Expected expected_count warning, got: ${result.content}`)
   })
 
@@ -332,7 +332,7 @@ describe('edit_file tool', () => {
     }))
 
     assert.ok(!result.isError, `Expected success on stale auto-apply, got: ${result.content}`)
-    assert.ok(!result.content.includes('Warning'),
+    assert.ok(!result.content.includes('警告'),
       `Expected no warning, got: ${result.content}`)
   })
 
@@ -367,7 +367,7 @@ describe('edit_file tool', () => {
     }))
     assert.equal(result.isError, true)
     assert.ok(result.content.includes('Python syntax error'), `Expected syntax error, got: ${result.content}`)
-    assert.ok(result.content.includes('automatically rolled back'), `Expected rollback note, got: ${result.content}`)
+    assert.ok(result.content.includes('已自动回滚'), `Expected rollback note, got: ${result.content}`)
     assert.equal(readFileSync(filePath, 'utf-8'), original, 'File should be rolled back to original content')
   })
 
@@ -382,7 +382,7 @@ describe('edit_file tool', () => {
       dry_run: true,
     }))
     assert.ok(!result.isError, `Expected dry_run preview, got: ${result.content}`)
-    assert.ok(result.content.includes('Preview (dry_run)'), `Expected preview header, got: ${result.content}`)
+    assert.ok(result.content.includes('预览（dry_run）'), `Expected preview header, got: ${result.content}`)
     assert.ok(result.content.includes('@@'), `Expected diff hunk, got: ${result.content}`)
     assert.ok(result.content.includes('+BETA'), `Expected addition line, got: ${result.content}`)
     assert.ok(result.content.includes('-beta'), `Expected removal line, got: ${result.content}`)
@@ -402,7 +402,7 @@ describe('edit_file tool', () => {
       dry_run: true,
     }))
     assert.ok(!result.isError, `Expected dry_run preview, got: ${result.content}`)
-    assert.ok(result.content.includes('Preview (dry_run)'), `Expected preview header, got: ${result.content}`)
+    assert.ok(result.content.includes('预览（dry_run）'), `Expected preview header, got: ${result.content}`)
     assert.equal(readFileSync(filePath, 'utf-8'), original, 'dry_run must not modify the file')
   })
 
@@ -417,7 +417,7 @@ describe('edit_file tool', () => {
       dry_run: true,
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('not found'), `Expected not-found error, got: ${result.content}`)
+    assert.ok(result.content.includes('未找到'), `Expected not-found error, got: ${result.content}`)
     assert.equal(readFileSync(filePath, 'utf-8'), original, 'dry_run must not modify the file on error')
   })
 
@@ -432,7 +432,7 @@ describe('edit_file tool', () => {
       dry_run: true,
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('multiple locations'), `Expected multiple-match error, got: ${result.content}`)
+    assert.ok(result.content.includes('匹配到多处'), `Expected multiple-match error, got: ${result.content}`)
     assert.equal(readFileSync(filePath, 'utf-8'), original, 'dry_run must not modify the file on error')
   })
 })

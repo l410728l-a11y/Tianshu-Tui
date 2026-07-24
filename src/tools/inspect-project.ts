@@ -74,7 +74,7 @@ async function detectPackageManager(cwd: string): Promise<string> {
   if (await fileExists(join(cwd, 'pnpm-lock.yaml'))) return 'pnpm'
   if (await fileExists(join(cwd, 'yarn.lock'))) return 'yarn'
   if (await fileExists(join(cwd, 'package-lock.json'))) return 'npm'
-  return 'unknown'
+  return '未知'
 }
 
 function detectFramework(pkg: PackageJson): string | null {
@@ -213,7 +213,7 @@ export const INSPECT_PROJECT_TOOL: Tool = {
     const pkgPath = join(cwd, 'package.json')
     if (!(await fileExists(pkgPath))) {
       return {
-        content: 'No package.json found in current directory. Not a Node.js project.',
+        content: '当前目录未找到 package.json。不是 Node.js 项目。',
         isError: true,
       }
     }
@@ -223,7 +223,7 @@ export const INSPECT_PROJECT_TOOL: Tool = {
       pkg = JSON.parse(await readFile(pkgPath, 'utf-8')) as PackageJson
     } catch {
       return {
-        content: 'Failed to parse package.json.',
+        content: '解析 package.json 失败。',
         isError: true,
       }
     }
@@ -241,18 +241,18 @@ export const INSPECT_PROJECT_TOOL: Tool = {
 
     // Build output
     const lines: string[] = []
-    lines.push('## Project Summary')
+    lines.push('## 项目摘要')
     lines.push('')
-    lines.push(`Language: ${language}`)
-    lines.push(`Package manager: ${packageManager}`)
+    lines.push(`语言：${language}`)
+    lines.push(`包管理器：${packageManager}`)
     if (framework) {
-      lines.push(`Framework: ${framework} (detected from dependencies)`)
+      lines.push(`框架：${framework}（从依赖检测）`)
     }
     if (testFramework) {
-      lines.push(`Test framework: ${testFramework}`)
+      lines.push(`测试框架：${testFramework}`)
     }
     if (linters.length > 0) {
-      lines.push(`Linters: ${linters.join(', ')}`)
+      lines.push(`Linter：${linters.join(', ')}`)
     }
 
     // Scripts
@@ -261,7 +261,7 @@ export const INSPECT_PROJECT_TOOL: Tool = {
     const relevantScripts = keyScripts.filter((s) => s in scripts)
     if (relevantScripts.length > 0) {
       lines.push('')
-      lines.push('### Scripts')
+      lines.push('### 脚本')
       for (const s of relevantScripts) {
         lines.push(`- ${s}: ${scripts[s]}`)
       }
@@ -270,7 +270,7 @@ export const INSPECT_PROJECT_TOOL: Tool = {
     // Entry files
     if (entryFiles.length > 0) {
       lines.push('')
-      lines.push('### Entry Files')
+      lines.push('### 入口文件')
       for (const f of entryFiles) {
         lines.push(`- ${f}`)
       }
@@ -279,7 +279,7 @@ export const INSPECT_PROJECT_TOOL: Tool = {
     // Test structure
     if (testFiles.length > 0) {
       lines.push('')
-      lines.push('### Test Structure')
+      lines.push('### 测试结构')
       for (const f of testFiles) {
         lines.push(`- ${f}`)
       }
@@ -288,7 +288,7 @@ export const INSPECT_PROJECT_TOOL: Tool = {
     // Config files
     if (configFiles.length > 0) {
       lines.push('')
-      lines.push('### Config Files')
+      lines.push('### 配置文件')
       for (const f of configFiles) {
         lines.push(`- ${f}`)
       }

@@ -679,7 +679,7 @@ export function renderDomainPicker(data: DomainPickerData, width: number, height
     lines.push(padLine(previewLines[i] ?? '', width, theme))
   }
 
-  lines.push(formatFooter(compactHints([['←/→', '切换'], ['↑↓', '选择'], ['Enter', '应用'], ['Esc', '取消']]), width, theme, 'subtle'))
+  lines.push(formatFooter(compactHints([['←/→', '切换'], ['↑↓', '选择'], ['Enter', '应用'], ['S', '设为默认'], ['Esc', '取消']]), width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
   return lines
 }
@@ -865,7 +865,7 @@ export function renderModelPicker(data: ModelPickerData, width: number, height: 
     lines.push(padLine(previewLines[i] ?? '', width, theme))
   }
 
-  lines.push(formatFooter(compactHints([['←/→', '切换'], ['↑↓', '选择'], ['Enter', '应用'], ['Esc', '取消']]), width, theme, 'subtle'))
+  lines.push(formatFooter(compactHints([['←/→', '切换'], ['↑↓', '选择'], ['Enter', '应用'], ['S', '设为默认'], ['Esc', '取消']]), width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
   return lines
 }

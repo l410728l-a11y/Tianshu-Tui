@@ -10,6 +10,7 @@ import { applyEol, chooseEol, detectFileEol, toLf } from './line-endings.js'
 import { getTargetEol } from '../platform.js'
 import { buildFileDiff, computeChangedLineRanges, type LineRange } from './edit-diff.js'
 import { detectPointerPlaceholder, pointerPlaceholderError } from './pointer-guard.js'
+import { WRITE_FILE_POINTER_PREFIX, parseWriteFilePointer } from './write-file-arg-processor.js'
 import { toPosixPath } from '../path-format.js'
 import { writeMarkdownAsDocx } from './office-writer.js'
 import { formatActivePlanDraftReceipt, canonicalizePathForCompare } from '../agent/plan-mode.js'
@@ -48,7 +49,7 @@ export const WRITE_FILE_TOOL: Tool = {
     try {
       filePath = validatePath(params.cwd, params.input.file_path as string, 'write')
     } catch (e) {
-      return { content: `Error: ${e instanceof Error ? e.message : 'Path escapes project directory'}`, isError: true }
+      return { content: `错误：${e instanceof Error ? e.message : '路径逃逸出项目目录'}`, isError: true }
     }
     const content = params.input.content as string
 
@@ -57,12 +58,12 @@ export const WRITE_FILE_TOOL: Tool = {
       try {
         const result = await writeMarkdownAsDocx(filePath, content)
         return {
-          content: `Wrote Markdown→docx to ${toPosixPath(relative(params.cwd, filePath))} (via ${result.engine})`,
+          content: `已将 Markdown→docx 写入 ${toPosixPath(relative(params.cwd, filePath))}（引擎：${result.engine}）`,
           rawPath: filePath,
         }
       } catch (e) {
         return {
-          content: `Error: Markdown→docx conversion failed: ${e instanceof Error ? e.message : 'unknown'}. Install pandoc (brew install pandoc) or LibreOffice.`,
+          content: `错误：Markdown→docx 转换失败：${e instanceof Error ? e.message : '未知'}。请安装 pandoc（brew install pandoc）或 LibreOffice。`,
           isError: true,
         }
       }
@@ -77,6 +78,14 @@ export const WRITE_FILE_TOOL: Tool = {
     // ALL pointer prefixes — the model may echo any tool's placeholder here.
     const matchedPointer = detectPointerPlaceholder(content)
     if (matchedPointer) {
+      // 幂等化解：回传的是 write_file 显示指针且路径与本文件一致时，磁盘上已经
+      // 是它想写的内容（arg processor 只对成功落盘的写入做指针化）——按幂等
+      // 成功处理，正向断循环，而不是只给一记错误（v4-pro 冒烟实证：硬错误后
+      // 模型未能在轮次预算内恢复，会话以 success:false 收场）。
+      if (matchedPointer === WRITE_FILE_POINTER_PREFIX) {
+        const resolved = await resolveRegurgitatedWritePointer(filePath, content)
+        if (resolved) return resolved
+      }
       return {
         content: pointerPlaceholderError({ toolName: 'write_file', field: 'content', matchedPrefix: matchedPointer, filePath }),
         isError: true,
@@ -86,7 +95,7 @@ export const WRITE_FILE_TOOL: Tool = {
     if (content.length > MAX_WRITE_FILE_BYTES) {
       const sizeMB = (content.length / (1024 * 1024)).toFixed(1)
       return {
-        content: `Error: Content too large for write_file (${sizeMB}MB). Split the content into smaller files, or use edit_file for incremental changes.`,
+        content: `错误：内容过大，超出 write_file 能力（${sizeMB}MB）。请拆成更小的文件，或用 edit_file 做增量修改。`,
         isError: true,
       }
     }
@@ -142,10 +151,10 @@ export const WRITE_FILE_TOOL: Tool = {
       && !(haveOldContentForDiff && oldContentForDiff === toLf(content))
     ) {
       return {
-        content: `Error: ${filePath} already exists (${existingSize} bytes) but was never read in this session. `
-          + `Overwriting it blind would destroy content you have not seen. `
-          + `read_file it first to confirm what you are replacing, then use edit_file for targeted changes `
-          + `or call write_file again for a deliberate full rewrite.`,
+        content: `错误：${filePath} 已存在（${existingSize} 字节），但本会话从未读取过。`
+          + `盲目覆盖会销毁你尚未见过的内容。`
+          + `请先 read_file 确认要替换的内容，再用 edit_file 做定向修改，`
+          + `或再次调用 write_file 进行有意的整文件重写。`,
         isError: true,
       }
     }
@@ -188,11 +197,12 @@ export const WRITE_FILE_TOOL: Tool = {
       const relPath = relative(params.cwd, filePath)
       const restored = restoreLatestBackup(params.cwd, relPath)
       const fails = incrementEditFailCount(filePath)
-      const gatePrefix = fails >= 3 ? `After ${fails} consecutive write failures on this file, you MUST re-read it before editing again.\n\n` : ''
-      const rollbackMsg = restored ? 'The change has been automatically rolled back.' : 'Automatic rollback failed.'
+      const gatePrefix = fails >= 3 ? `此文件已连续写入失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
+      const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'
       return {
-        content: gatePrefix + `Error: ${syntax.fatal}\n\n${rollbackMsg}\n\nFix the content and retry.`,
+        content: gatePrefix + `错误：${syntax.fatal}\n\n${rollbackMsg}\n\n请修复内容后重试。`,
         isError: true,
+        errorKind: 'syntax_error',
       }
     }
 
@@ -215,7 +225,7 @@ export const WRITE_FILE_TOOL: Tool = {
         changedRanges = await computeChangedLineRanges(oldContentForDiff, afterForDiff)
       }
     } catch (e) {
-      warn = warn ? `${warn}\n(diff skipped: ${(e as Error).message})` : `(diff skipped: ${(e as Error).message})`
+      warn = warn ? `${warn}\n(diff 已跳过：${(e as Error).message})` : `(diff 已跳过：${(e as Error).message})`
     }
     const uiContent = diff ? (warn ? `${diff}\n\n${warn}` : diff) : (warn ? warn : undefined)
     const draftReceipt = formatActivePlanDraftReceipt(
@@ -225,7 +235,7 @@ export const WRITE_FILE_TOOL: Tool = {
       finalContent.length,
     )
     const receipt = draftReceipt
-      ?? `Wrote ${finalContent.length} bytes (${lines} lines) to ${toPosixPath(filePath)}`
+      ?? `已写入 ${finalContent.length} 字节（${lines} 行）到 ${toPosixPath(filePath)}`
     return {
       content: receipt + (warn ? '\n\n' + warn : ''),
       uiContent,
@@ -236,4 +246,32 @@ export const WRITE_FILE_TOOL: Tool = {
   requiresApproval: () => true,
   isConcurrencySafe: () => false,
   isEnabled: () => true,
+}
+
+/**
+ * 幂等化解显示指针回传：模型把消息历史里的 "[file written to X …]" 显示指针
+ * 当作 content 回传，且指针路径与本文件一致——arg processor 只对成功落盘的
+ * 写入做指针化，磁盘上已经是它想写的内容。按幂等成功处理（不落盘、不动 edit
+ * 计数），正向断模仿循环。路径不一致 / 文件缺失 / 统计不符时返回 null，
+ * 调用方走原 pointer-guard 拦截错误。
+ */
+async function resolveRegurgitatedWritePointer(filePath: string, content: string) {
+  const firstLine = content.trimStart().split(/\r?\n/, 1)[0] ?? ''
+  const parsed = parseWriteFilePointer(firstLine)
+  if (!parsed) return null
+  if (canonicalizePathForCompare(parsed.path) !== canonicalizePathForCompare(toPosixPath(filePath))) return null
+  let onDisk: string
+  try {
+    onDisk = toLf(await readFile(filePath, 'utf-8'))
+  } catch {
+    return null
+  }
+  const lines = onDisk.split('\n').length
+  // 行数精确相等；chars 允许每行 1 个 \r 的偏差（CRLF 文件在 toLf 归一后
+  // 与指针里的原始 content.length 差至多为行尾 CR 数）。
+  if (lines !== parsed.lines || Math.abs(onDisk.length - parsed.chars) > parsed.lines) return null
+  return {
+    content: `该文件已是 "[file written to …]" 指针所指向的内容（磁盘为凭：${lines} lines，路径一致），本次按幂等成功处理、未做写入。`
+      + `那是消息历史里的显示指针被当作 content 回传的自动化解——以后如需修改请先 read_file 再用 edit_file/hash_edit；如需整文件重写，请写出完整真实内容。`,
+  }
 }

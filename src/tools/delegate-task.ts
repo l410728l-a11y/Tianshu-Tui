@@ -40,10 +40,10 @@ const delegateTaskInputSchema = z.object({
 })
 
 function formatUiContent(run: CoordinatorRun): string {
-  if (run.status === 'skipped') return 'delegate_task skipped: objective did not pass budget gate'
+  if (run.status === 'skipped') return 'delegate_task 已跳过：objective 未通过预算门禁'
   const passed = run.results.filter(r => r.status === 'passed').length
   const blocked = run.results.filter(r => r.status === 'blocked').length
-  const base = `delegate_task completed: ${passed} passed, ${blocked} blocked, model=${run.selectedModel ?? 'unknown'}`
+  const base = `delegate_task 已完成：${passed} 通过，${blocked} 阻塞，model=${run.selectedModel ?? 'unknown'}`
   if (run.escalated) return `⚠️ ${base}\n[escalated] 子代理连续失败，建议改为内联执行`
   return base
 }
@@ -76,8 +76,9 @@ export function createDelegateTaskTool(
       const parsed = delegateTaskInputSchema.safeParse(params.input)
       if (!parsed.success) {
         return {
-          content: `Invalid delegate_task input: ${parsed.error.message}`,
+          content: `无效的 delegate_task 输入：${parsed.error.message}`,
           isError: true,
+          errorKind: 'format_error',
         }
       }
 
@@ -91,10 +92,10 @@ export function createDelegateTaskTool(
         if (outOfProject.length > 0) {
           return {
             content: [
-              `delegate_task blocked: ${outOfProject.length} file(s) are outside the project directory.`,
-              `Offending paths: ${outOfProject.join(', ')}`,
-              `Workers cannot access files outside the project root (${params.cwd}).`,
-              `If you need to analyze external code, copy it into the project first or use bash to cat the file content inline.`,
+              `delegate_task 已拦截：${outOfProject.length} 个文件在项目目录之外。`,
+              `违规路径：${outOfProject.join(', ')}`,
+              `Worker 无法访问项目根目录（${params.cwd}）之外的文件。`,
+              `若需分析外部代码，请先复制进项目，或用 bash 把文件内容 cat 进来内联分析。`,
             ].join('\n'),
             isError: true,
           }

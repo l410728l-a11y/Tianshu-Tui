@@ -144,7 +144,7 @@ export function createPlanTaskTool(deps: {
     async execute(params: ToolCallParams) {
       const objective = String(params.input.objective ?? '').trim()
       if (!objective) {
-        return { content: 'Error: objective is required', isError: true }
+        return { content: '错误：objective 必填', isError: true }
       }
 
       const files = Array.isArray(params.input.files)
@@ -195,7 +195,7 @@ export function createPlanTaskTool(deps: {
       if (!validation.valid) {
         const errors = [...validation.errors, ...validation.nodeErrors.map(ne => `[${ne.nodeId}] ${ne.error}`)]
         return {
-          content: `Plan validation failed:\n${errors.map(e => `  - ${e}`).join('\n')}\n\n${renderTaskGraphSummary(graph)}`,
+          content: `计划校验失败：\n${errors.map(e => `  - ${e}`).join('\n')}\n\n${renderTaskGraphSummary(graph)}`,
           isError: true,
         }
       }
@@ -212,7 +212,7 @@ export function createPlanTaskTool(deps: {
           ? `\n\n✅ Todo list 已同步 (${leafNodes.length} 项)。用 \`todo read\` 查看,完成后用 \`todo write\` 标记进度。`
           : ''
         return {
-          content: `${renderUnifiedPlanSummary(plan)}\n\n${guidance}${todoNote}\n\n---\n## UnifiedPlan JSON (pass to team_orchestrate as planJson)\n\`\`\`json\n${json}\n\`\`\``,
+          content: `${renderUnifiedPlanSummary(plan)}\n\n${guidance}${todoNote}\n\n---\n## UnifiedPlan JSON（作为 planJson 传给 team_orchestrate）\n\`\`\`json\n${json}\n\`\`\``,
         }
       }
 
@@ -225,7 +225,7 @@ export function createPlanTaskTool(deps: {
       const coordinator = deps.getCoordinator()
       if (!coordinator) {
         return {
-          content: `${renderUnifiedPlanSummary(plan)}\n\nError: coordinator not available for execution`,
+          content: `${renderUnifiedPlanSummary(plan)}\n\n错误：当前上下文无可用 coordinator，无法执行`,
           isError: true,
         }
       }
@@ -258,7 +258,7 @@ export function createPlanTaskTool(deps: {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        return { content: `${renderUnifiedPlanSummary(plan)}\n\nExecution failed: ${msg}`, isError: true }
+        return { content: `${renderUnifiedPlanSummary(plan)}\n\n执行失败：${msg}`, isError: true }
       }
     },
 

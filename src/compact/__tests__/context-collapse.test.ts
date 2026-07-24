@@ -109,8 +109,8 @@ describe('collapseToolResult', () => {
 
   it('collapses run_tests with passed/failed counts and exit code', () => {
     const content = [
-      'Exit code: 1',
-      '18 passed, 2 failed, 0 skipped',
+      '退出码：1',
+      '18 通过，2 失败，0 跳过',
       '',
       '✗ test at src/foo.test.ts:42 — should handle edge case',
       '✗ test at src/bar.test.ts:88 — timeout exceeded',
@@ -126,8 +126,8 @@ describe('collapseToolResult', () => {
 
   it('run_tests collapse: all-pass result does NOT report failures', () => {
     const content = [
-      'Exit code: 0',
-      '20 passed, 0 failed, 0 skipped',
+      '退出码：0',
+      '20 通过，0 失败，0 跳过',
       ...Array.from({ length: 20 }, (_, i) => `detail line ${i}`),
     ].join('\n')
     const result = collapseToolResult('run_tests', content, 5, 200_000)

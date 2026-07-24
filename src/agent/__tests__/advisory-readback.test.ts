@@ -98,6 +98,57 @@ describe('AdvisoryReadback — 谓词矩阵（P1a 核销闭环）', () => {
     assert.equal(rb.drainOutcomes()[0]!.outcome, 'adopted')
   })
 
+  // ── course_changed（B1/M4 改道核销） ──────────────────────────
+
+  it('course_changed: 换文件面（前置窗反复读 a.ts,观察窗读 b.ts）→ adopted', () => {
+    const rb = new AdvisoryReadback()
+    rb.observeTool(tool(8, 'read_file', 'src/a.ts'))
+    rb.observeTool(tool(9, 'read_file', 'src/a.ts'))
+    deliver(rb, 'convergence', { kind: 'course_changed', withinTurns: 2 }, 10)
+    rb.observeTool(tool(10, 'read_file', 'src/b.ts'))
+    assert.equal(rb.evaluate(10), 1)
+    const o = rb.drainOutcomes()[0]!
+    assert.equal(o.outcome, 'adopted')
+    assert.equal(o.expectKind, 'course_changed')
+  })
+
+  it('course_changed: 换工具族（前置窗只读 a.ts,观察窗改写 a.ts）→ adopted', () => {
+    const rb = new AdvisoryReadback()
+    rb.observeTool(tool(9, 'read_file', 'src/a.ts'))
+    deliver(rb, 'convergence', { kind: 'course_changed', withinTurns: 2 }, 10)
+    rb.observeTool(tool(10, 'edit_file', 'src/a.ts'))
+    rb.evaluate(10)
+    assert.equal(rb.drainOutcomes()[0]!.outcome, 'adopted')
+  })
+
+  it('course_changed: 观察窗仍是同一签名（同族同文件）→ 到期 ignored', () => {
+    const rb = new AdvisoryReadback()
+    rb.observeTool(tool(9, 'read_file', 'src/a.ts'))
+    deliver(rb, 'convergence', { kind: 'course_changed', withinTurns: 2 }, 10)
+    rb.observeTool(tool(10, 'read_file', 'src/a.ts'))
+    assert.equal(rb.evaluate(10), 0, '窗口未到期不判定')
+    rb.observeTool(tool(11, 'grep', 'src/a.ts')) // grep 与 read_file 同 read 族+同文件 = 同签名
+    assert.equal(rb.evaluate(11), 1)
+    assert.equal(rb.drainOutcomes()[0]!.outcome, 'ignored')
+  })
+
+  it('course_changed: 前置窗无事件（no-tool 僵局）→ 观察窗任意工具即 adopted', () => {
+    const rb = new AdvisoryReadback()
+    deliver(rb, 'convergence', { kind: 'course_changed', withinTurns: 2 }, 3)
+    rb.observeTool(tool(3, 'glob', '**/*.ts'))
+    rb.evaluate(3)
+    assert.equal(rb.drainOutcomes()[0]!.outcome, 'adopted')
+  })
+
+  it('course_changed: 观察窗到期无任何事件 → ignored', () => {
+    const rb = new AdvisoryReadback()
+    rb.observeTool(tool(9, 'read_file', 'src/a.ts'))
+    deliver(rb, 'convergence', { kind: 'course_changed', withinTurns: 2 }, 10)
+    assert.equal(rb.evaluate(10), 0)
+    assert.equal(rb.evaluate(11), 1)
+    assert.equal(rb.drainOutcomes()[0]!.outcome, 'ignored')
+  })
+
   // ── pattern_absent（负向谓词） ─────────────────────────────────
 
   it('pattern_absent: 到期时 needle 已不在文件 → adopted;还在 → ignored', () => {

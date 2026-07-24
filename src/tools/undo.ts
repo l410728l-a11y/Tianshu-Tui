@@ -21,12 +21,12 @@ export function createUndoTool(getFileHistory: () => FileHistory | undefined): T
     async execute(params: ToolCallParams) {
       const history = getFileHistory()
       if (!history) {
-        return { content: 'File history not available.', isError: true }
+        return { content: '文件历史不可用。', isError: true }
       }
 
       const latestId = history.getLatestSnapshotId()
       if (!latestId) {
-        return { content: 'No file history snapshots available to undo.' }
+        return { content: '没有可撤销的文件历史快照。' }
       }
 
       const confirm = params.input.confirm === true
@@ -34,7 +34,7 @@ export function createUndoTool(getFileHistory: () => FileHistory | undefined): T
       if (!confirm) {
         const stats = await history.getDiffStats(latestId)
         if (!stats || stats.filesChanged.length === 0) {
-          return { content: 'No changes to undo in the most recent snapshot.' }
+          return { content: '最近快照中没有可撤销的变更。' }
         }
         const fileList = stats.filesChanged.map(f => `  - ${f}`).join('\n')
         // B1: note if any files are not owned by the current task
@@ -42,17 +42,17 @@ export function createUndoTool(getFileHistory: () => FileHistory | undefined): T
           ? stats.filesChanged.filter(f => !params.ownedFiles!.includes(f))
           : []
         const unownedNote = unownedFiles.length > 0
-          ? `\n\n⚠️  Warning: ${unownedFiles.length} file(s) are not owned by the current task and may belong to a parallel session:\n${unownedFiles.map(f => `  - ${f}`).join('\n')}\nVerify ownership before confirming.`
+          ? `\n\n⚠️  警告：${unownedFiles.length} 个文件不属于当前任务，可能属于并行会话：\n${unownedFiles.map(f => `  - ${f}`).join('\n')}\n确认前请核实归属。`
           : ''
         return {
-          content: `Preview: ${stats.filesChanged.length} file(s) would be restored:\n${fileList}\n+${stats.insertions}/-${stats.deletions} lines${unownedNote}\n\nCall with confirm: true to execute.`,
+          content: `预览：将恢复 ${stats.filesChanged.length} 个文件：\n${fileList}\n+${stats.insertions}/-${stats.deletions} 行${unownedNote}\n\n传入 confirm: true 以执行。`,
         }
       }
 
       try {
         const restored = await history.rewind(latestId)
         if (restored.length === 0) {
-          return { content: 'No files needed restoration.' }
+          return { content: '没有需要恢复的文件。' }
         }
         // Recovery-journal tracking is a best-effort audit side-effect; a write
         // failure (e.g. an unwritable cwd) must not mask an already-successful
@@ -67,11 +67,11 @@ export function createUndoTool(getFileHistory: () => FileHistory | undefined): T
           ? restored.filter(f => !params.ownedFiles!.includes(f))
           : []
         const unownedNote = unownedRestored.length > 0
-          ? `\n⚠️  ${unownedRestored.length} file(s) were not owned by this task: ${unownedRestored.join(', ')}`
+          ? `\n⚠️  ${unownedRestored.length} 个文件不属于本任务：${unownedRestored.join(', ')}`
           : ''
-        return { content: `Restored ${restored.length} file(s):\n${restored.map(f => `  - ${f}`).join('\n')}${unownedNote}` }
+        return { content: `已恢复 ${restored.length} 个文件：\n${restored.map(f => `  - ${f}`).join('\n')}${unownedNote}` }
       } catch (err) {
-        return { content: `Undo failed: ${err instanceof Error ? err.message : String(err)}`, isError: true }
+        return { content: `撤销失败：${err instanceof Error ? err.message : String(err)}`, isError: true }
       }
     },
 

@@ -28,7 +28,7 @@ export const FILE_INFO_TOOL: Tool = {
   async execute(params: ToolCallParams) {
     const inputPath = (params.input.path as string)?.trim()
     if (!inputPath) {
-      return { content: 'Error: path is required', isError: true }
+      return { content: '错误：path 参数必填', isError: true }
     }
 
     const validated = validatePathSafe(params.cwd, inputPath)
@@ -38,11 +38,11 @@ export const FILE_INFO_TOOL: Tool = {
         await stat(resolved)
         const rel = relativePosix(params.cwd, resolved)
         return {
-          content: `Path: ${rel}\nNote: outside project directory — use import_resource to bring it in.`,
-          uiContent: `${rel} (outside project)`,
+          content: `Path: ${rel}\n注意：位于项目目录外——需要读取时先用 import_resource 引入。`,
+          uiContent: `${rel}（项目外）`,
         }
       } catch {
-        return { content: `Error: ${validated.error}`, isError: true }
+        return { content: `错误：${validated.error}`, isError: true }
       }
     }
 
@@ -53,8 +53,8 @@ export const FILE_INFO_TOOL: Tool = {
       ls = await lstat(absPath)
     } catch {
       return {
-        content: `Path: ${relativePosix(params.cwd, absPath)}\nExists: false`,
-        uiContent: `${relativePosix(params.cwd, absPath)} — does not exist`,
+        content: `Path: ${relativePosix(params.cwd, absPath)}\nExists: false（路径不存在）`,
+        uiContent: `${relativePosix(params.cwd, absPath)} — 不存在`,
       }
     }
 

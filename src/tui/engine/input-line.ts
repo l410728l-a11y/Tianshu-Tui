@@ -114,6 +114,8 @@ function pushWrappedSegment(
   maxContentWidth: number,
   cursorOffset: number | null,
   ambiguousAsWide: boolean,
+  /** 输出参数：记录 █ 插入点左侧的 cell 数（不含前缀）。仅在插入时写入。 */
+  caretCol?: { value: number },
 ): void {
   const chars = Array.from(segment)
   let current = ''
@@ -132,6 +134,7 @@ function pushWrappedSegment(
     if (cursorOffset !== null && offset === cursorOffset) {
       const markerWidth = inputDisplayWidth('█', ambiguousAsWide)
       if (currentWidth > 0 && currentWidth + markerWidth > maxContentWidth) flush()
+      if (caretCol) caretCol.value = currentWidth
       current += '█'
       currentWidth += markerWidth
       currentHasCursor = true
@@ -147,6 +150,7 @@ function pushWrappedSegment(
   if (cursorOffset !== null && cursorOffset === segment.length) {
     const markerWidth = inputDisplayWidth('█', ambiguousAsWide)
     if (currentWidth > 0 && currentWidth + markerWidth > maxContentWidth) flush()
+    if (caretCol) caretCol.value = currentWidth
     current += '█'
     currentWidth += markerWidth
     currentHasCursor = true
@@ -155,13 +159,14 @@ function pushWrappedSegment(
   if (current.length > 0 || currentHasCursor || segment.length === 0) flush()
 }
 
-function wrapInputLines(value: string, cursor: number, maxWidth: number): { lines: string[]; cursorLine: number } {
+function wrapInputLines(value: string, cursor: number, maxWidth: number): { lines: string[]; cursorLine: number; cursorCol: number } {
   const ambiguousAsWide = ambiguousWideEnabled()
   const visual: VisualLine[] = []
   const logicalLines = value.split('\n')
   const prefixWidth = inputDisplayWidth('❯ ', ambiguousAsWide)
   const maxContentWidth = Math.max(1, maxWidth - prefixWidth)
   let cursorLine = 0
+  let cursorCol = prefixWidth
   let absoluteOffset = 0
 
   for (let lineIndex = 0; lineIndex < logicalLines.length; lineIndex++) {
@@ -171,15 +176,17 @@ function wrapInputLines(value: string, cursor: number, maxWidth: number): { line
     const cursorInLine = cursor >= lineStart && cursor <= lineEnd
     const prefix = cursorInLine ? '❯ ' : '  '
     const beforeCount = visual.length
-    pushWrappedSegment(visual, logicalLine, prefix, maxContentWidth, cursorInLine ? cursor - lineStart : null, ambiguousAsWide)
+    const caretCol: { value: number } = { value: 0 }
+    pushWrappedSegment(visual, logicalLine, prefix, maxContentWidth, cursorInLine ? cursor - lineStart : null, ambiguousAsWide, caretCol)
     if (cursorInLine) {
       const found = visual.findIndex((line, idx) => idx >= beforeCount && line.cursor)
       cursorLine = found >= 0 ? found : beforeCount
+      cursorCol = prefixWidth + caretCol.value
     }
     absoluteOffset = lineEnd + 1
   }
 
-  return { lines: visual.map(line => line.text), cursorLine }
+  return { lines: visual.map(line => line.text), cursorLine, cursorCol }
 }
 
 /** 在升序边界数组中找严格小于 cursor 的最大下标（光标左侧最近边界）。二分 O(log n)。 */
@@ -204,15 +211,18 @@ function boundaryAfter(bounds: number[], cursor: number): number {
   return bounds[lo]! > cursor ? bounds[lo]! : -1
 }
 
-function viewportAroundCursor(lines: string[], cursorLine: number, maxLines?: number): string[] {
-  if (maxLines === undefined || lines.length <= maxLines) return lines
+/** 视窗裁剪：返回可见行 + 光标行在【返回数组内】的下标（硬件光标归位需要）。 */
+function viewportWithCaret(lines: string[], cursorLine: number, maxLines?: number): { lines: string[]; caretLine: number } {
+  if (maxLines === undefined || lines.length <= maxLines) {
+    return { lines, caretLine: Math.min(Math.max(cursorLine, 0), lines.length - 1) }
+  }
   const max = Math.max(1, Math.floor(maxLines))
   const cursor = Math.min(Math.max(cursorLine, 0), lines.length - 1)
-  if (max === 1) return [lines[cursor]!]
+  if (max === 1) return { lines: [lines[cursor]!], caretLine: 0 }
   if (max === 2) {
     return cursor < lines.length - 1
-      ? [lines[cursor]!, `… ${lines.length - cursor - 1} lines below`]
-      : [`… ${cursor} lines above`, lines[cursor]!]
+      ? { lines: [lines[cursor]!, `… ${lines.length - cursor - 1} lines below`], caretLine: 0 }
+      : { lines: [`… ${cursor} lines above`, lines[cursor]!], caretLine: 1 }
   }
 
   const hasAbove = cursor > 0
@@ -226,11 +236,14 @@ function viewportAroundCursor(lines: string[], cursorLine: number, maxLines?: nu
   const start = Math.min(Math.max(centeredStart, minStart), maxStart)
   const visible = lines.slice(start, start + contentSlots)
 
-  return [
-    ...(hasAbove ? [`… ${start} lines above`] : []),
-    ...visible,
-    ...(hasBelow ? [`… ${lines.length - (start + contentSlots)} lines below`] : []),
-  ]
+  return {
+    lines: [
+      ...(hasAbove ? [`… ${start} lines above`] : []),
+      ...visible,
+      ...(hasBelow ? [`… ${lines.length - (start + contentSlots)} lines below`] : []),
+    ],
+    caretLine: (hasAbove ? 1 : 0) + (cursor - start),
+  }
 }
 
 export class InputLine {
@@ -293,8 +306,22 @@ export class InputLine {
    *   maxLines 仍按光标所在视觉行裁剪，保证正在编辑的位置始终可见。
    */
   displayLines(options: InputLineDisplayOptions = {}): string[] {
+    return this.displayLinesWithCaret(options).lines
+  }
+
+  /**
+   * displayLines + 光标 cell 坐标（2026-07-23 IME 硬件光标归位）。
+   *
+   * 返回的 caret 是「█ 左侧」在显示行内的位置：line 为返回数组下标，
+   * col 为 0-based cell 数（含 `❯ ` 前缀，按 ambiguousAsWide 口径度量，
+   * 与 renderInputRow/rowsForLine 同尺）。调用方把硬件光标搬到该行该列，
+   * 终端 IME 候选窗即锚定在输入框内（自绘 █ 终端不可见）。
+   */
+  displayLinesWithCaret(options: InputLineDisplayOptions = {}): { lines: string[]; caret: { line: number; col: number } } {
+    const ambiguousAsWide = ambiguousWideEnabled()
+    const prefixWidth = inputDisplayWidth('❯ ', ambiguousAsWide)
     if (!this._value) {
-      return [`❯ █${this._placeholder}`]
+      return { lines: [`❯ █${this._placeholder}`], caret: { line: 0, col: prefixWidth } }
     }
     const before = this._value.slice(0, this._cursor)
     const cursorLine = before.split('\n').length - 1
@@ -302,7 +329,8 @@ export class InputLine {
 
     if (options.maxWidth !== undefined) {
       const wrapped = wrapInputLines(this._value, this._cursor, options.maxWidth)
-      return viewportAroundCursor(wrapped.lines, wrapped.cursorLine, options.maxLines)
+      const view = viewportWithCaret(wrapped.lines, wrapped.cursorLine, options.maxLines)
+      return { lines: view.lines, caret: { line: view.caretLine, col: wrapped.cursorCol } }
     }
 
     const lines = this._value.split('\n').map((line, i) => {
@@ -313,7 +341,10 @@ export class InputLine {
       const afterCursor = `█${line.slice(cursorCol)}`
       return `${prefix}${beforeCursor}${afterCursor}`
     })
-    return viewportAroundCursor(lines, cursorLine, options.maxLines)
+    const view = viewportWithCaret(lines, cursorLine, options.maxLines)
+    const beforeCursorText = before.slice(before.lastIndexOf('\n') + 1)
+    const col = prefixWidth + inputDisplayWidth(beforeCursorText, ambiguousAsWide)
+    return { lines: view.lines, caret: { line: view.caretLine, col } }
   }
 
   /** 设置值（外部更新用） */
@@ -378,7 +409,7 @@ export class InputLine {
    */
   handleKey(name: string, char: string, ctrl: boolean, meta: boolean, shift = false): InputLineEvent | null {
     // ── 全局键 ─────────────────────────────────────────────────
-    if (name === 'return' && shift) {
+    if (name === 'return' && (shift || meta)) {
       return this.insertChar('\n')
     }
 

@@ -11,6 +11,10 @@
  */
 
 import type { PostSessionRuntimeHook, PostToolRuntimeHook, RuntimeToolEvent } from '../runtime-hooks.js'
+import {
+  BROWSER_NAVIGATED_PREFIX,
+  BROWSER_SCREENSHOT_OF_PREFIX,
+} from '../../tools/browser.js'
 
 export interface WalkthroughStep {
   /** 1-based step number in capture order. */
@@ -52,8 +56,12 @@ export interface WalkthroughDocument {
   markdown: string
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 // computer_use 用 `(screenshot → artifact <id>)`；browser_debug 用
-// `Captured screenshot of <url> → artifact <id>`（无括号）——统一按 id 字符集截取。
+// `截图于 <url> → artifact <id>`（无括号）——统一按 id 字符集截取。结构标记不译。
 const SCREENSHOT_ARTIFACT_RE = /(?:screenshot[^\n]*)?→ artifact ([\w.:-]+)/
 const UI_DIFF_RE = /^UI (changed|unchanged)[^\n]*(?:\n[+-] [^\n]*)*/m
 const APPROVAL_DENY_RE = /requires (?:explicit user )?(?:an )?approval/i
@@ -75,8 +83,11 @@ function stepDetail(input: Record<string, unknown> | undefined): string | undefi
 
 const RECORDED_TOOLS = new Set(['computer_use', 'browser_debug'])
 
-/** browser_debug 结果里的当前页 URL（`Navigated to <url>` / `screenshot of <url>`）。 */
-const BROWSER_URL_RE = /(?:Navigated to|screenshot of) (\S+)/i
+/** browser_debug 结果里的当前页 URL（前缀与工具常量同源）。 */
+const BROWSER_URL_RE = new RegExp(
+  `(?:${escapeRegExp(BROWSER_NAVIGATED_PREFIX)}|${escapeRegExp(BROWSER_SCREENSHOT_OF_PREFIX)}) (\\S+)`,
+  'i',
+)
 
 /**
  * Convert one postTool event into a walkthrough step. Returns null for

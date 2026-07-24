@@ -235,9 +235,15 @@ export const agentSchema = z.object({
    *  'auto' 表示不钉定，由会话首条消息按关键词路由（见 domainKeywordRouting）。 */
   defaultDomain: z.string().default('auto'),
   /**
+   * 默认模型（provider:modelId 格式，如 "deepseek:deepseek-v4-pro"）。
+   * 新会话的首模型——无项目覆盖时生效。未配置时使用默认 provider 的首模型。
+   * 格式校验在 setDefaultModelConfig 层完成（需要校验 provider + model 存在性）。 */
+  defaultModel: z.string().optional(),
+  /**
    * 会话 Auto 星域是否按消息关键词匹配换域。
-   * 默认 true：Auto 按首条消息 matchDomain，未命中回退 DEFAULT_DOMAIN（天枢）。
-   * 显式 false 时 Auto 固定落到 DEFAULT_DOMAIN，其它域仅手动切换。
+   * 默认 true：Auto 按首条消息在 auto 池（天权/开阳/瑶光/天梁/华盖 + 自定义域）
+   * 内 matchDomain，未命中回退 DEFAULT_DOMAIN（天权）。池外特化域经 defaultDomain
+   * 钉定或 /domain 手工切换进入。显式 false 时 Auto 固定落到 DEFAULT_DOMAIN。
    */
   domainKeywordRouting: z.boolean().default(true),
   /**
@@ -497,6 +503,18 @@ export const mirrorsSchema = z.object({
   go: z.enum(['default', 'goproxy_cn', 'aliyun']).default('default'),
   /** Rust rustup/crates.io override. */
   rust: z.enum(['default', 'tsinghua', 'tuna', 'ustc']).default('default'),
+  /** When true (default), automatically retry GitHub clones through the mirror
+   *  list if the direct clone fails or times out. Only active when the user has
+   *  NOT explicitly chosen a mirror (mirrors.enabled=false OR
+   *  mirrors.github='default'). No effect when user picked a specific mirror. */
+  autoFallback: z.boolean().default(true),
+  /** Per-mirror cooldown: after a mirror succeeds, remember it for this many
+   *  minutes and try it first on subsequent clones. 0 = no memory. */
+  fallbackMemoryMinutes: z.number().default(10),
+  /** Max seconds for a single clone attempt before declaring it failed and
+   *  moving to the next mirror. Default 60s (shorter than git's own 120s
+   *  timeout so we get a chance to try mirrors). */
+  fallbackTimeoutSec: z.number().default(60),
 }).default({})
 
 export const envSchema = z.object({

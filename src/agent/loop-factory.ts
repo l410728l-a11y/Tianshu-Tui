@@ -476,6 +476,8 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     stigmergyQuery: () => self.stigmergyStore.query(),
     getEvidenceState: () => self.evidence.getState(),
     obligations: self.obligations,
+    // A4（信号互扰治理）：收束类 hook 的续轮活跃判定半边（另一半是 high 义务）。
+    getGoalActive: () => self.isGoalActive(),
     submitControlSignal: signal => { self.controlPlane.submit(signal) },
     setLoadedPheromones: pheromones => { self.loadedPheromones = mapQueriedPheromones(pheromones) },
     recordStance: signal => self.stanceTally.record(signal),

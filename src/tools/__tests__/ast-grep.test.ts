@@ -95,7 +95,7 @@ describe('ast-grep pattern matching', () => {
       paths: ['sample.ts'],
       lang: 'TypeScript',
     })
-    assert.ok(out.includes('0 match'), out)
+    assert.ok(out.includes('0 处匹配'), out)
   })
 
   it('supports rule-based matching', async () => {
@@ -135,7 +135,7 @@ describe('ast-grep language handling', () => {
       abortSignal: new AbortController().signal,
       onOutput: undefined,
     } as unknown as ToolCallParams)
-    assert.ok(result.content.includes('unsupported') || result.content.includes('error'),
+    assert.ok(result.content.includes('不支持的语言') || result.content.includes('错误'),
       `expected unsupported language error, got: ${result.content}`)
   })
 })
@@ -149,7 +149,7 @@ describe('ast-grep error handling', () => {
       paths: ['broken.ts'],
       lang: 'TypeScript',
     })
-    assert.ok(out.includes('parse error') || out.includes('error'), `expected parse warning, got: ${out}`)
+    assert.ok(out.includes('解析错误') || out.includes('错误'), `expected parse warning, got: ${out}`)
   })
 
   it('rejects empty pattern', async () => {
@@ -174,7 +174,7 @@ describe('ast-grep error handling', () => {
       onOutput: undefined,
     } as unknown as ToolCallParams)
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('regex tokens'), `expected regex misuse error, got: ${result.content}`)
+    assert.ok(result.content.includes('正则 token'), `expected regex misuse error, got: ${result.content}`)
   })
 
   it('allows regex-like strings inside JSON rule objects', async () => {

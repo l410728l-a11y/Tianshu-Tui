@@ -62,7 +62,7 @@ describe('create_pdf', () => {
       })
 
       assert.equal(result.isError, undefined)
-      assert.ok(result.content.includes('Created print-ready html document'))
+      assert.ok(result.content.includes('已创建可打印的 html 文档'))
       assert.ok(result.content.includes('Cmd+P'))
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -77,6 +77,6 @@ describe('create_pdf', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /content is required/)
+    assert.match(result.content, /content 为必填项/)
   })
 })

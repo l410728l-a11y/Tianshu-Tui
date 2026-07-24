@@ -245,6 +245,9 @@ export const DEFAULT_CONFIG: Config = {
     pypi: 'default',
     go: 'default',
     rust: 'default',
+    autoFallback: true,
+    fallbackMemoryMinutes: 10,
+    fallbackTimeoutSec: 60,
   },
   env: {
     resolve: true,

@@ -62,6 +62,35 @@ describe('D2 · multi-line Up/Down', () => {
   })
 })
 
+describe('D4 · Shift+Enter inserts newline without submitting', () => {
+  it('Shift+Enter inserts \\n and returns change event', () => {
+    const input = new InputLine({ value: 'hello' })
+    // 5th arg shift=true: app.ts 补传 key.shift 后此路径可达
+    const ev = input.handleKey('return', '', false, false, true)
+    assert.equal(ev?.type, 'change', 'Shift+Enter 应插入换行，不是提交')
+    assert.equal(input.value, 'hello\n')
+    assert.equal(input.cursor, 6)
+  })
+
+  it('Shift+Enter mid-line splits the line', () => {
+    const input = new InputLine({ value: 'abc' })
+    input.handleKey('left', '', false, false) // cursor at 2
+    const ev = input.handleKey('return', '', false, false, true)
+    assert.equal(ev?.type, 'change')
+    assert.equal(input.value, 'ab\nc')
+    assert.equal(input.cursor, 3)
+  })
+
+  it('Alt+Enter (meta) inserts \\n without submitting', () => {
+    const input = new InputLine({ value: 'hello' })
+    // Alt/Meta+Enter: Kitty \x1B[13;3u 或 ESC+CR 统一为此路径
+    const ev = input.handleKey('return', '', false, true)
+    assert.equal(ev?.type, 'change', 'Alt+Enter 应插入换行，不是提交')
+    assert.equal(input.value, 'hello\n')
+    assert.equal(input.cursor, 6)
+  })
+})
+
 describe('D3 · backslash + Enter continuation cursor', () => {
   it('cursor lands after the inserted newline (mid-line)', () => {
     // 'ab\' 光标在末尾，续行后应为 'ab\n'，光标在 \n 之后（pos 3）

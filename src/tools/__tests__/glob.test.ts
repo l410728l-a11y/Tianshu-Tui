@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { GLOB_TOOL } from '../glob.js'
+import { GLOB_TOOL, GLOB_EMPTY_RESULT } from '../glob.js'
 
 describe('GLOB_TOOL', () => {
   let testDir: string
@@ -93,7 +93,7 @@ describe('GLOB_TOOL', () => {
   it('returns no files message for no matches', async () => {
     const result = await GLOB_TOOL.execute(makeParams({ pattern: '*.xyz' }))
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('No files found'))
+    assert.ok(result.content.includes(GLOB_EMPTY_RESULT))
   })
 
   it('rejects parent directory traversal in search path', async () => {

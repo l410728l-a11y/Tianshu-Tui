@@ -52,13 +52,13 @@ Good: diff(path="src/api/client.ts") — 显示单个文件的 diff`,
         .map(f => relative(params.cwd, resolve(params.cwd, f)))
         .filter(f => !f.startsWith('..'))
       if (ownedPaths.length === 0) {
-        return { content: 'No owned files to diff.' }
+        return { content: '没有可 diff 的归属文件。' }
       }
       args.push('--', ...ownedPaths)
     } else if (path) {
       const validated = validatePathSafe(params.cwd, path)
       if (!validated.ok) {
-        return { content: `Error: ${validated.error}`, isError: true }
+        return { content: `错误：${validated.error}`, isError: true }
       }
       args.push('--', relative(params.cwd, validated.path))
     }
@@ -83,7 +83,7 @@ Good: diff(path="src/api/client.ts") — 显示单个文件的 diff`,
       const timer = setTimeout(async () => {
         gracefulKill(child)
         const rawPath = await persistRawOutput(params.toolUseId, 'git diff timed out')
-        resolve({ content: 'Error: git diff timed out', rawPath, isError: true })
+        resolve({ content: '错误：git diff 超时', rawPath, isError: true, errorKind: 'timeout' })
       }, 30_000)
 
       // 用户中止：协作式取消，kill git diff 子进程。
@@ -91,7 +91,7 @@ Good: diff(path="src/api/client.ts") — 显示单个文件的 diff`,
       const onAbort = () => {
         clearTimeout(timer)
         gracefulKill(child)
-        resolve({ content: 'Diff aborted by user.', isError: false })
+        resolve({ content: '用户已中止 diff。', isError: false })
       }
       if (signal) {
         if (signal.aborted) onAbort()
@@ -103,11 +103,11 @@ Good: diff(path="src/api/client.ts") — 显示单个文件的 diff`,
         if (signal) signal.removeEventListener('abort', onAbort)
         if (stderr.trim()) {
           const rawPath = await persistRawOutput(params.toolUseId, stderr.trim())
-          resolve({ content: `Error: ${stderr.trim()}`, rawPath, isError: true })
+          resolve({ content: `错误：${stderr.trim()}`, rawPath, isError: true })
           return
         }
         if (!stdout.trim()) {
-          resolve({ content: 'No changes.' })
+          resolve({ content: '无改动。' })
           return
         }
         const durationMs = Date.now() - startTime
@@ -124,7 +124,7 @@ Good: diff(path="src/api/client.ts") — 显示单个文件的 diff`,
         clearTimeout(timer)
         if (signal) signal.removeEventListener('abort', onAbort)
         const rawPath = await persistRawOutput(params.toolUseId, err.message)
-        resolve({ content: `Error: ${err.message}`, rawPath, isError: true })
+        resolve({ content: `错误：${err.message}`, rawPath, isError: true })
       })
     })
   },
@@ -140,11 +140,11 @@ function truncateDiff(output: string): string {
     const lines = file.split('\n')
     if (lines.length <= MAX_LINES_PER_FILE) return file
     const head = lines.slice(0, MAX_LINES_PER_FILE).join('\n')
-    return `${head}\n... (truncated, ${lines.length - MAX_LINES_PER_FILE} more lines)`
+    return `${head}\n...（已截断，另有 ${lines.length - MAX_LINES_PER_FILE} 行）`
   })
   const result = truncated.join('\n')
   if (result.length <= MAX_TOTAL_CHARS) return result
-  return result.slice(0, MAX_TOTAL_CHARS) + '\n... (truncated)'
+  return result.slice(0, MAX_TOTAL_CHARS) + '\n...（已截断）'
 }
 
 function splitByFile(output: string): string[] {

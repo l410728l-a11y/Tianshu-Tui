@@ -18,7 +18,7 @@ installEpermFilter()
 import { bootstrapInteractiveSession, createShutdownHandler, switchAgentRuntime, restorePlanModeFromMeta } from './bootstrap.js'
 import type { BootstrapContext } from './bootstrap.js'
 import { maybePrintStaticPromptCacheWarning } from './cli/prompt-version-warning.js'
-import { loadConfig as loadRivetConfig, setupProvider, setupCustomProvider, setUiConfig, setApprovalMode as persistApprovalDefault } from './config/manager.js'
+import { loadConfig as loadRivetConfig, setupProvider, setupCustomProvider, setUiConfig, setApprovalMode as persistApprovalDefault, setDefaultDomainConfig, setDefaultModelConfig } from './config/manager.js'
 import { isProFeatureEnabled } from './config/pro-license.js'
 import type { GoalTracker as GoalTrackerInstance } from './agent/goal-tracker.js'
 import { createUpdateGoalTool } from './tools/update-goal.js'
@@ -68,6 +68,8 @@ import { applyProjectTemplates, recordTemplatesDecision } from './bootstrap/proj
 import { checkForUpdate, formatUpdateBanner, detectInstallRoot, getCurrentVersion } from './tui/updater.js'
 import { detectEnv, formatGitMissingBanner } from './tools/env-check.js'
 import { computeUsageCost, findModelPricing } from './utils/pricing.js'
+import { projectCacheTelemetry } from './tui/cache-telemetry.js'
+import type { CacheStatus } from './tui/status-types.js'
 import { TuiPerfMonitor, isTuiPerfEnabled } from './tui/engine/perf-monitor.js'
 import { runTuiShutdownSequence } from './tui/engine/shutdown-sequence.js'
 
@@ -278,9 +280,13 @@ async function main() {
 
     // --budget N (default 100) is the hard turn cap for goal mode; it doubles as
     // the GoalTracker iteration budget so the two limits coincide. Non-goal -p
-    // runs keep the original tight 15-turn cap.
+    // runs keep the original tight 15-turn cap — benchmark/eval harnesses can
+    // raise it via RIVET_HEADLESS_MAX_TURNS (JobBench 多文档任务实证 15 轮不够：
+    // agent 分析到一半被掐断，交付物残缺但进程仍以 success:false 退出)。
     const goalBudget = parsed.budget ?? 100
-    const headlessMaxTurns = parsed.goal ? goalBudget : 15
+    const headlessMaxTurns = parsed.goal
+      ? goalBudget
+      : Math.max(1, Number(process.env.RIVET_HEADLESS_MAX_TURNS) || 15)
     // Tracker is created inside createAgent (attached to the agent) but referenced
     // here so we can read achievement state after the run completes. A ref object
     // (not a bare let) is used so the opaque runHeadless() call invalidates CFA
@@ -580,11 +586,12 @@ async function main() {
   // TUI / 桌面共用 agent.defaultDomain（默认 auto）。非 auto 时在首个请求前钉住，
   // 仅构建初始 frozenBase，无缓存代价；钉住后 bindSessionDomain 跳过 Auto 绑定。
   // defaultDomain === 'auto'（默认）时保持未钉定，由 bindSessionDomain 按首条消息
-  // 关键词路由（domainKeywordRouting 默认开），未命中回退天枢。尊重 STAR_SOUL 总开关。
+  // 在 auto 池内关键词路由（domainKeywordRouting 默认开），未命中回退天权。
+  // 尊重 STAR_SOUL 总开关。
   if (ctx!.agent.getSessionDomain() === undefined && isStarSoulEnabled()) {
     const key = ctx!.config.agent?.defaultDomain ?? 'auto'
     if (key !== 'auto') {
-      const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('tianshu')
+      const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('tianquan')
       if (pinned) {
         ctx!.agent.setSessionDomain({
           id: pinned.id as import('./agent/star-domain.js').StarDomainId,
@@ -1021,18 +1028,57 @@ async function main() {
     } else {
       tuiApp.commitStatic(`⚠️ Model switch failed: ${res.error ?? 'unknown error'}`)
     }
+  }, /* domainPickerSaveDefaultExec: */ (key: string) => {
+    // Domain Picker S 键回调：应用星域 + 设为默认并持久化。
+    const midSession = ctx!.agent.getSessionTurnCount() > 0
+    if (key === 'auto') {
+      ctx!.agent.resetSessionDomain()
+      tuiApp.setSessionStarDomain(undefined)
+      tuiApp.commitStatic('Domain → Auto（按任务匹配）')
+    } else {
+      const d = starDomainRegistry.get(key)
+      if (d) {
+        ctx!.agent.setSessionDomain({ id: d.id, name: d.name, volatileBlock: d.volatileBlock, motto: d.motto, courageThreshold: d.courageThreshold })
+        tuiApp.setSessionStarDomain(d.name)
+        tuiApp.commitStatic(`Domain → ${d.name} (${d.decisionStyle})`)
+      } else {
+        tuiApp.commitStatic(`⚠️ 未知星域: ${key}`)
+        return
+      }
+    }
+    try { setDefaultDomainConfig({ defaultDomain: key }) } catch (err) {
+      tuiApp.commitStatic(`⚠️ 设置默认失败: ${(err as Error).message}`)
+    }
+    if (midSession) tuiApp.commitStatic(DOMAIN_SWITCH_CACHE_WARNING)
+  }, /* modelPickerSaveDefaultExec: */ (provider: string, modelId: string) => {
+    // Model Picker S 键回调：切换模型 + 设为默认并持久化。
+    try { ctx!.agent.abort() } catch {}
+    const res = switchAgentRuntime(ctx!, modelId)
+    if (res.ok && res.modelName) {
+      tuiApp.setModelInfo(res.modelName, res.contextWindow)
+      tuiApp.commitStatic(`Model switched to: ${res.modelName}`)
+    } else {
+      tuiApp.commitStatic(`⚠️ Model switch failed: ${res.error ?? 'unknown error'}`)
+    }
+    try {
+      setDefaultModelConfig({ defaultModel: `${provider}:${modelId}` })
+    } catch (err) {
+      tuiApp.commitStatic(`⚠️ 设置默认失败: ${(err as Error).message}`)
+    }
   }, /* themePickerExec: */ (themeName: string) => {
     // Theme Picker Enter 回调：切换主题。
     setTheme(themeName as ThemeName)
     tuiApp.forceRedraw()
     tuiApp.commitStatic(`Theme switched to: ${themeName}`)
   }, /* themePickerSaveDefaultExec: */ (themeName: string) => {
-    // Theme Picker S 键回调：设为默认主题并持久化。
+    // Theme Picker S 键回调：切换主题 + 设为默认并持久化。
+    setTheme(themeName as ThemeName)
+    tuiApp.forceRedraw()
+    tuiApp.commitStatic(`Theme switched to: ${themeName}`)
     try {
       setUiConfig({ theme: themeName })
-      tuiApp.commitStatic(`已设置默认主题为: ${themeName}（下次启动生效）`)
     } catch (err) {
-      tuiApp.commitStatic(`⚠️ 设置默认主题失败: ${(err as Error).message}`)
+      tuiApp.commitStatic(`⚠️ 设置默认失败: ${(err as Error).message}`)
     }
   }, /* choicePanelExec: */ (id: string) => {
     // 应用并持久化权限模式：会话内即时生效（agent）+ 底栏 badge 同步（tuiApp）+
@@ -1216,6 +1262,7 @@ async function main() {
   // ── 真实指标 provider（GlanceBar cache/ctx/cost）─────────────
   // 闭包动态读 module-level ctx：/model 切换时 switchAgentRuntime 原地改 ctx.agent，
   // ctx.session 不变，因此读取始终命中当前 runtime（天然 /model 切换安全）。
+  let prevCacheStatus: CacheStatus = 'healthy'
   app.setMetricsProvider(() => {
     if (!ctx) return null
     const session = ctx.session
@@ -1228,17 +1275,15 @@ async function main() {
     const pricing = findModelPricing(providers, providerName, modelId)
     const cost = pricing ? computeUsageCost(total, pricing).total : 0
     const maxTokens = ctx.agent.config.contextWindow ?? currentModel?.contextWindow ?? 0
+    const turnNumber = session.getTurnCount()
+    const cacheProjection = projectCacheTelemetry(session, turnNumber, prevCacheStatus)
+    prevCacheStatus = cacheProjection.status
     return {
-      // Real occupancy: anchor on last API prompt_tokens + estimate the tail
-      // appended since (provider-agnostic — works for DeepSeek/MiMo/GLM). Falls
-      // back to the calibrated estimate before the first response / post-compact.
       estimatedTokens: session.getRealOccupancy(),
-      // Visible conversation only (excluding system prompt / tool schemas / prefix
-      // overhead) for the GlanceBar context display, so users see the chat-sized
-      // context rather than the API-facing prompt bulk.
       conversationTokens: session.getConversationTokens(),
       maxTokens,
       cacheHitRate: session.getRecentTurnHitRate(3) ?? session.getCacheHitRate(),
+      cacheStatus: cacheProjection.status,
       cost,
       inputTokens: total.input_tokens,
       outputTokens: total.output_tokens,
@@ -1391,49 +1436,125 @@ async function main() {
       }
     })()
 
-    const { createInterface } = await import('node:readline/promises')
-    const rl = createInterface({ input: stdin, output: stdout })
-    try {
-      stdout.write('\n')
-      stdout.write('╭─ First-run setup ────────────────────────────────╮\n')
-      stdout.write('│ This project has no AGENTS.md or .rivet.md.     │\n')
-      stdout.write('│ Create them from templates?                      │\n')
-      stdout.write('╰──────────────────────────────────────────────────╯\n')
-      if (!gitAvailable) {
-        stdout.write('\n')
-        stdout.write('  ⚠ 未检测到 git。git 是可选依赖——不装也能正常用，\n')
-        stdout.write('    但安装后可解锁：委派隔离 / 检查点回滚 / commit / diff 审查。\n')
-        stdout.write('    安装：https://git-scm.com/downloads\n')
-        stdout.write('\n')
+    // Interactive picker with ↑↓ navigation — replaces the old readline prompt
+    // that leaked keystrokes into the TUI input ("press 1 becomes chat message").
+    const options = ['Create both (AGENTS.md + .rivet.md)', 'Skip'] as const
+    let selectedIdx = 0
+
+    const renderPicker = (idx: number) => {
+      stdout.write('\x1B[2K\r') // clear current line
+      stdout.write('\x1B[1A\x1B[2K\r') // clear previous line
+      for (let i = 0; i < options.length; i++) {
+        const prefix = i === idx ? '\x1B[7m ❯' : '   '
+        const suffix = i === idx ? ' \x1B[0m' : ''
+        stdout.write(`${prefix} ${options[i]}${suffix}\n`)
       }
-      stdout.write('  [1] Create both (AGENTS.md + .rivet.md)\n')
-      stdout.write('  [2] Skip                         \n')
+      stdout.write(`\n  ↑↓ navigate · Enter confirm · Esc skip\n`)
+      // Move cursor back up so re-render overwrites the same lines
+      stdout.write(`\x1B[${options.length + 2}A`)
+    }
+
+    stdout.write('\n')
+    stdout.write('╭─ First-run setup ────────────────────────────────╮\n')
+    stdout.write('│ This project has no AGENTS.md or .rivet.md.     │\n')
+    stdout.write('│ Create them from templates?                      │\n')
+    stdout.write('╰──────────────────────────────────────────────────╯\n')
+    if (!gitAvailable) {
       stdout.write('\n')
-      const answer = (await rl.question('Choice [1-2] (default: 1): ')).trim()
-      if (answer === '' || answer === '1') {
-        const result = applyProjectTemplates(process.cwd(), { agentsMode: 'overwrite' })
-        recordTemplatesDecision(process.cwd(), 'created', {
-          created: result.created,
-          appended: result.appended,
-          skipped: result.skipped,
+      stdout.write('  ⚠ 未检测到 git。git 是可选依赖——不装也能正常用，\n')
+      stdout.write('    但安装后可解锁：委派隔离 / 检查点回滚 / commit / diff 审查。\n')
+      stdout.write('    安装：https://git-scm.com/downloads\n')
+      stdout.write('\n')
+    }
+    stdout.write('\n')
+    renderPicker(selectedIdx)
+
+    // Read keys in raw mode — no readline buffering that leaks into TUI.
+    let created = false
+    let aborted = false
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true)
+      process.stdin.resume()
+      let onData: ((chunk: Buffer) => void) | undefined
+      try {
+        await new Promise<void>((resolve) => {
+          let buf = ''
+          onData = (chunk: Buffer) => {
+            const str = chunk.toString()
+            buf += str
+
+            // Arrow keys arrive as ESC sequences: ↑ = \x1B[A, ↓ = \x1B[B
+            if (buf === '\x1B[A' || buf === '\x1B[1;2A') {
+              // Up
+              selectedIdx = (selectedIdx - 1 + options.length) % options.length
+              renderPicker(selectedIdx)
+              buf = ''
+              return
+            }
+            if (buf === '\x1B[B' || buf === '\x1B[1;2B') {
+              // Down
+              selectedIdx = (selectedIdx + 1) % options.length
+              renderPicker(selectedIdx)
+              buf = ''
+              return
+            }
+            // k / j — vim-style up/down
+            if (buf === 'k' && selectedIdx > 0) {
+              selectedIdx--
+              renderPicker(selectedIdx)
+              buf = ''
+              return
+            }
+            if (buf === 'j' && selectedIdx < options.length - 1) {
+              selectedIdx++
+              renderPicker(selectedIdx)
+              buf = ''
+              return
+            }
+            // Enter
+            if (str === '\r' || str === '\n') {
+              created = selectedIdx === 0
+              buf = ''
+              resolve()
+              return
+            }
+            // Direct number selection (1-2) — still works for muscle memory
+            if (str === '1') { selectedIdx = 0; created = true; resolve(); return }
+            if (str === '2') { selectedIdx = 1; created = false; resolve(); return }
+            // Escape — skip
+            if (str === '\x1B' && buf.length === 1) {
+              aborted = true
+              resolve()
+              return
+            }
+            // Any other key: if it starts a known sequence, wait; otherwise ignore
+            if (buf.length >= 6) buf = '' // flush garbled escape sequences
+          }
+          process.stdin.on('data', onData)
         })
-        stdout.write(`✓ Created: ${result.created.join(', ') || 'none'}\n`)
-      } else {
-        applyProjectTemplates(process.cwd(), { agentsMode: 'skip' })
-        recordTemplatesDecision(process.cwd(), 'declined')
-        stdout.write('Skipped template creation.\n')
+      } finally {
+        if (onData) process.stdin.removeListener('data', onData)
       }
-    } finally {
-      rl.close()
-      // Linux: readline.close() leaves stdin in flowing mode with residual
-      // 'keypress' listeners. Without pause + removeAllListeners, keystrokes
-      // typed between rl.close() and app.start() leak into the TUI input handler
-      // as raw characters — the "press 1/2 becomes a chat message" bug.
-      if (process.stdin.isTTY) {
-        process.stdin.pause()
-        process.stdin.removeAllListeners('data')
-        process.stdin.removeAllListeners('keypress')
-      }
+    }
+
+    // Move past the picker rendering
+    stdout.write(`\x1B[${options.length + 2}B`)
+    if (aborted) {
+      applyProjectTemplates(process.cwd(), { agentsMode: 'skip' })
+      recordTemplatesDecision(process.cwd(), 'declined')
+      stdout.write('Skipped template creation.\n')
+    } else if (created) {
+      const result = applyProjectTemplates(process.cwd(), { agentsMode: 'overwrite' })
+      recordTemplatesDecision(process.cwd(), 'created', {
+        created: result.created,
+        appended: result.appended,
+        skipped: result.skipped,
+      })
+      stdout.write(`✓ Created: ${result.created.join(', ') || 'none'}\n`)
+    } else {
+      applyProjectTemplates(process.cwd(), { agentsMode: 'skip' })
+      recordTemplatesDecision(process.cwd(), 'declined')
+      stdout.write('Skipped template creation.\n')
     }
   } else if (ctx.templatesPendingAgents) {
     // headless / --dangerously-skip-permissions: silent .rivet.md, decline AGENTS.md

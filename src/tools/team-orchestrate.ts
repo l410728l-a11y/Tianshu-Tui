@@ -148,7 +148,7 @@ export function createTeamOrchestrateTool(
     },
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const parsed = inputSchema.safeParse(params.input)
-      if (!parsed.success) return { content: `Invalid input: ${parsed.error.message}`, isError: true }
+      if (!parsed.success) return { content: `无效输入：${parsed.error.message}`, isError: true, errorKind: 'format_error' }
       const { mode, objective, planPath, planMarkdown, planJson: explicitPlanJson, maxParallel, fromWave } = parsed.data
       // Bridge: auto-consume the plan stored by plan_task when planJson is omitted.
       const planJson = explicitPlanJson ?? consumePlan(params.sessionId)
@@ -161,7 +161,7 @@ export function createTeamOrchestrateTool(
       const scale = classifyOrchestrationScale(objective)
       if (scale.blocked) {
         return {
-          content: `team_orchestrate blocked: ${scale.reason}\n\nDo this task inline instead — it doesn't need parallel orchestration.\n(To bypass: prefix the objective with "force:")`,
+          content: `team_orchestrate 已拦截：${scale.reason}\n\n请改为内联完成此任务——不需要并行编排。\n（若要绕过：在 objective 前加前缀 "force:"）`,
           isError: true,
         }
       }
@@ -171,11 +171,11 @@ export function createTeamOrchestrateTool(
       let planAdvisoryNote = ''
       if (planJson) {
         const plan = deserializeUnifiedPlan(planJson)
-        if (!plan) return { content: 'team_orchestrate blocked: planJson is not a valid UnifiedPlan', isError: true }
+        if (!plan) return { content: 'team_orchestrate 已拦截：planJson 不是合法的 UnifiedPlan', isError: true }
         const validation = validateUnifiedPlan(plan)
         if (!validation.valid) {
           const errors = [...validation.errors, ...validation.nodeErrors.map(ne => `[${ne.nodeId}] ${ne.error}`)]
-          return { content: `team_orchestrate blocked: plan validation failed:\n${errors.map(e => `  - ${e}`).join('\n')}`, isError: true }
+          return { content: `team_orchestrate 已拦截：计划校验失败：\n${errors.map(e => `  - ${e}`).join('\n')}`, isError: true }
         }
         if (validation.warnings.length > 0) {
           planAdvisoryNote = `\n\n分片建议(不阻断):\n${validation.warnings.map(w => `  - ${w}`).join('\n')}`
@@ -186,7 +186,7 @@ export function createTeamOrchestrateTool(
         const sealCheck = verifyPlanSeal(plan as SealedUnifiedPlan)
         if (sealCheck.status === 'broken') {
           return {
-            content: `team_orchestrate blocked: ${formatSealStatus(plan as SealedUnifiedPlan)}`,
+            content: `team_orchestrate 已拦截：${formatSealStatus(plan as SealedUnifiedPlan)}`,
             isError: true,
           }
         }
@@ -203,12 +203,12 @@ export function createTeamOrchestrateTool(
       let markdown = planMarkdown
       if (!markdown && !tasks && planPath) {
         const safe = validatePathSafe(params.cwd, planPath)
-        if (!safe.ok) return { content: `team_orchestrate blocked: ${safe.error}`, isError: true }
+        if (!safe.ok) return { content: `team_orchestrate 已拦截：${safe.error}`, isError: true }
         try {
           markdown = readFileSync(safe.path, 'utf8')
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
-          return { content: `team_orchestrate blocked: cannot read planPath "${planPath}": ${msg}`, isError: true }
+          return { content: `team_orchestrate 已拦截：无法读取 planPath「${planPath}」：${msg}`, isError: true }
         }
       }
 
@@ -234,7 +234,7 @@ export function createTeamOrchestrateTool(
       // "no dispatchable waves" weak result when nothing was provided/stored.
       if (effectiveMode === 'standard' && !tasks && !markdown) {
         return {
-          content: 'team_orchestrate blocked: No plan provided and no stored plan found. Run plan_task first or pass planJson/planPath.',
+          content: 'team_orchestrate 已拦截：未提供计划，也未找到已存储的计划。请先运行 plan_task，或传入 planJson/planPath。',
           isError: true,
         }
       }
@@ -319,7 +319,7 @@ export function createTeamOrchestrateTool(
         )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        return { content: `team_orchestrate failed: ${msg}`, isError: true }
+        return { content: `team_orchestrate 失败：${msg}`, isError: true }
       }
 
       const { summary, reviewVerdict, notes } = run

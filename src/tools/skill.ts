@@ -37,23 +37,23 @@ skill 是可复用的工作流 playbook。available-skills 区块列出了每个
   async execute(params) {
     const raw = params.input.name
     if (typeof raw !== 'string' || raw.trim().length === 0) {
-      return { content: 'Error: name is required', isError: true }
+      return { content: '错误：name 必填', isError: true }
     }
     const name = raw.trim()
 
     const skill = skillRegistry.get(name) ?? skillRegistry.list().find(s => s.name.toLowerCase() === name.toLowerCase())
     if (!skill) {
       const available = skillRegistry.list().map(s => s.name).sort()
-      const list = available.length > 0 ? available.join(', ') : '(none loaded)'
+      const list = available.length > 0 ? available.join(', ') : '（未加载任何 skill）'
       return {
-        content: `Skill not found: "${name}".\nAvailable skills: ${list}`,
+        content: `未找到 skill：「${name}」。\n可用 skill：${list}`,
         isError: true,
       }
     }
 
     if (params.input.complete === true) {
       params.onSkillCompleted?.(skill.name)
-      return { content: `Skill "${skill.name}" marked as completed.`, uiContent: `Completed skill: ${skill.name}` }
+      return { content: `Skill「${skill.name}」已标记为完成。`, uiContent: `已完成 skill：${skill.name}` }
     }
 
     params.onSkillInvoked?.(skill.name)
@@ -61,23 +61,23 @@ skill 是可复用的工作流 playbook。available-skills 区块列出了每个
     const body = `<skill name="${skill.name}">\n${skill.body}\n</skill>`
     // Flat (no skillDir) skills have no sub-files — return body as-is.
     if (!skill.skillDir) {
-      return { content: body, uiContent: `Loaded skill: ${skill.name}` }
+      return { content: body, uiContent: `已加载 skill：${skill.name}` }
     }
     const files = listSkillFiles(skill.skillDir)
     if (files.length === 0) {
-      return { content: body, uiContent: `Loaded skill: ${skill.name}` }
+      return { content: body, uiContent: `已加载 skill：${skill.name}` }
     }
     // Directory skill: append the sub-file tree so the model knows what it can
     // read on demand (Tier-3). The body itself is never truncated.
     const tree = files.map(f => `  ${f.path}`).join('\n')
     const filesBlock = [
-      `<skill-files dir="${skill.skillDir}" note="Read these on demand with read_file/grep/glob as the instructions above reference them. Do not load all of them preemptively. For a large sub-file, page through it COMPLETELY with read_file offset/limit — never act on a partial read.">`,
+      `<skill-files dir="${skill.skillDir}" note="按上方指令需要时再用 read_file/grep/glob 按需读取。不要预先全部加载。大文件须用 read_file 的 offset/limit 完整翻完——切勿基于半截内容行动。">`,
       tree,
       '</skill-files>',
     ].join('\n')
     return {
       content: `${body}\n${filesBlock}`,
-      uiContent: `Loaded skill: ${skill.name} (+${files.length} files)`,
+      uiContent: `已加载 skill：${skill.name}（+${files.length} 个文件）`,
     }
   },
 

@@ -57,7 +57,7 @@ describe('create_document', () => {
       })
 
       assert.equal(result.isError, undefined)
-      assert.ok(result.content.includes('Created html document'))
+      assert.ok(result.content.includes('已创建 html 文档'))
       assert.ok(result.content.includes(destination))
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -72,6 +72,6 @@ describe('create_document', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /content is required/)
+    assert.match(result.content, /content 为必填项/)
   })
 })

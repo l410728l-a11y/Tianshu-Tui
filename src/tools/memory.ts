@@ -74,7 +74,7 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
 
       if (action === 'recall') {
         const query = typeof params.input.query === 'string' ? params.input.query.trim() : ''
-        if (!query) return { content: 'Error: query is required for recall', isError: true }
+        if (!query) return { content: '错误：recall 需要提供 query', isError: true }
 
         const kind = typeof params.input.kind === 'string' ? params.input.kind as MemoryKind : undefined
         const topic = typeof params.input.topic === 'string' ? params.input.topic.trim() : undefined
@@ -112,7 +112,7 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
         // Wave 5（反馈闭环）：supersede 链结构告警（模型可见，不影响检索结果）
         const chainIssues = getKnowledgeIndex(cwd).chainIssues
         if (chainIssues.length > 0) {
-          lines.push(`⚠ Knowledge chain integrity issues (${chainIssues.length}):`)
+          lines.push(`⚠ 知识链完整性问题（${chainIssues.length}）：`)
           for (const issue of chainIssues.slice(0, 3)) {
             lines.push(`  [${issue.kind}] ${issue.detail}`)
           }
@@ -129,7 +129,7 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
         const entryHits = hits.filter(h => h.entry)
         const mdHits = hits.filter(h => h.file)
         if (entryHits.length > 0) {
-          lines.push(`Knowledge entries (${entryHits.length}):`)
+          lines.push(`知识条目（${entryHits.length}）：`)
           for (const h of entryHits) {
             const e = h.entry!
             const meta: string[] = []
@@ -141,21 +141,21 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
           }
         }
         if (mdHits.length > 0) {
-          lines.push(`Knowledge files (${mdHits.length}):`)
+          lines.push(`知识文件（${mdHits.length}）：`)
           for (const h of mdHits) lines.push(`- ${h.file}: ${h.text.slice(0, 160).replace(/\n/g, ' ')}`)
         }
         const playbookHits = hits.filter(h => h.playbook)
         if (playbookHits.length > 0) {
-          lines.push(`Playbook lessons (${playbookHits.length}):`)
+          lines.push(`Playbook 教训（${playbookHits.length}）：`)
           for (const h of playbookHits) lines.push(`- ${h.text.replace(/\n/g, ' ')}`)
         }
         if (commitFacts.length > 0) {
-          lines.push(`Commit facts (${commitFacts.length}):`)
+          lines.push(`Commit 事实（${commitFacts.length}）：`)
           for (const e of commitFacts) lines.push(`- ${e.text}`)
         }
         // 告警行（链校验/闸门健康）可能存在于零命中的响应里——仍要明确"没找到"
         if (hits.length === 0 && commitFacts.length === 0) {
-          lines.push(`No memory found for "${query}".`)
+          lines.push(`未找到与「${query}」相关的记忆。`)
         }
         return { content: lines.join('\n') }
       }
@@ -165,10 +165,10 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
         ? (REMEMBER_KINDS.includes(params.input.kind as ContextClaimKind) ? params.input.kind as ContextClaimKind : null)
         : null
       if (!kind) {
-        return { content: `Error: kind is required for remember. Must be one of: ${REMEMBER_KINDS.join(', ')}`, isError: true }
+        return { content: `错误：remember 需要提供 kind。必须是：${REMEMBER_KINDS.join(', ')}`, isError: true }
       }
       const text = typeof params.input.text === 'string' ? params.input.text.trim() : ''
-      if (!text) return { content: 'Error: text is required for remember', isError: true }
+      if (!text) return { content: '错误：remember 需要提供 text', isError: true }
 
       const scope: ContextClaimScope = params.input.scope === 'project' ? 'project' : 'session'
       const confidence = typeof params.input.confidence === 'number' ? Math.max(0, Math.min(1, params.input.confidence)) : 0.9
@@ -195,10 +195,10 @@ export function createMemoryTool(store: ContextClaimStore, ctx?: MemoryContext):
       // 中 scope=project 的本会话条目由闸门收口裁决（loop-factory essenceGate 接线）。
       // 会话内该条目经 active-claims 通道立即可见，不受影响。
       if (scope === 'project') {
-        return { content: `✅ Remembered: [${kind}] ${text}\n(project-scope persistence pending session-end quality gate)` }
+        return { content: `✅ 已记住：[${kind}] ${text}\n（项目作用域持久化待会话结束时的质量门禁）` }
       }
 
-      return { content: `✅ Remembered: [${kind}] ${text}` }
+      return { content: `✅ 已记住：[${kind}] ${text}` }
     },
 
     requiresApproval: () => false,

@@ -34,13 +34,22 @@ function formatMatch(m: AstGrepMatch, includeMeta: boolean): string {
   // visible on the same logical line the model scans.
   const raw = m.matchText
   const lines = raw.split('\n')
-  const head = lines.length > 1 ? `${lines[0]!.slice(0, 70)} (+${lines.length - 1} lines)` : lines[0]!.slice(0, 80)
+  const head = lines.length > 1 ? `${lines[0]!.slice(0, 70)} (+${lines.length - 1} 行)` : lines[0]!.slice(0, 80)
   const base = `${m.file}:${m.line}:${m.column}: ${head}`
   if (includeMeta && m.metaVariables && Object.keys(m.metaVariables).length > 0) {
     const mv = Object.entries(m.metaVariables).map(([k, v]) => `${k}=${v.slice(0, 40)}`).join(', ')
     return `${base}  [${mv}]`
   }
   return base
+}
+
+/** 空结果首行前缀——search-pod-hook 靠 startsWith 识别；改文案必须与 hook 同步。 */
+export const AST_GREP_EMPTY_PREFIX = '0 处匹配'
+
+/** 格式化匹配计数摘要行（空结果时以 AST_GREP_EMPTY_PREFIX 开头）。 */
+export function formatAstGrepSummary(matchCount: number, filesScanned: number, errorCount: number): string {
+  const errPart = errorCount > 0 ? `，${errorCount} 个错误` : ''
+  return `${matchCount} 处匹配，扫描了 ${filesScanned} 个文件${errPart}`
 }
 
 export const AST_GREP_TOOL: Tool = {
@@ -64,7 +73,7 @@ export const AST_GREP_TOOL: Tool = {
   async execute(params: ToolCallParams): Promise<ToolResult> {
     const input = params.input as Record<string, unknown>
     const pattern = String(input.pattern ?? '').trim()
-    if (!pattern) return { content: 'Error: pattern is required', isError: true }
+    if (!pattern) return { content: '错误：需要提供 pattern', isError: true }
 
     // Parse the pattern once: a bare pattern string and a `{ rule: ... }` JSON
     // object are both valid ast-grep inputs. Detect rule objects early so we
@@ -83,7 +92,7 @@ export const AST_GREP_TOOL: Tool = {
     // not regular expressions. \d \w \1 etc. will not work as intended.
     if (!isRuleObject && /\\[dDwWsSbB1-9]/.test(pattern)) {
       return {
-        content: `Error: pattern contains regex tokens (\\d, \\w, \\s, \\1, etc.).\n\nast_grep uses ast-grep syntax, not regular expressions. Use $NAME for single-node captures and $$NAME for ellipsis (multi-node) captures.\n\nOffending pattern: ${pattern.slice(0, 80)}`,
+        content: `错误：pattern 含有正则 token（\\d、\\w、\\s、\\1 等）。\n\nast_grep 使用 ast-grep 语法，不是正则表达式。用 $NAME 捕获单节点，用 $$NAME 做省略（多节点）捕获。\n\n有问题的 pattern：${pattern.slice(0, 80)}`,
         isError: true,
       }
     }
@@ -98,7 +107,7 @@ export const AST_GREP_TOOL: Tool = {
     try {
       napi = await import('@ast-grep/napi')
     } catch {
-      return { content: 'Error: @ast-grep/napi is not installed. Run: npm install @ast-grep/napi', isError: true }
+      return { content: '错误：未安装 @ast-grep/napi。请运行：npm install @ast-grep/napi', isError: true }
     }
 
     const allFiles: string[] = []
@@ -108,7 +117,7 @@ export const AST_GREP_TOOL: Tool = {
         allFiles.push(...collectFiles(resolved))
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        return { content: `Error: ${message}`, isError: true }
+        return { content: `错误：${message}`, isError: true }
       }
     }
 
@@ -125,7 +134,7 @@ export const AST_GREP_TOOL: Tool = {
     for (const filePath of allFiles) {
       const langStr = resolveLang(explicitLang, filePath)
       if (!langStr) {
-        errors.push(`${filePath}: unsupported language (no grammar for extension)`)
+        errors.push(`${filePath}: 不支持的语言（该扩展名无语法）`)
         continue
       }
 
@@ -134,7 +143,7 @@ export const AST_GREP_TOOL: Tool = {
       const langValue = isDynamicLang(langStr) ? langStr : LANG_MAP[langStr]
       // runtime assertion: napi.Lang uses non-enumerable getters — verify we got a real string
       if (typeof langValue !== 'string') {
-        errors.push(`${filePath}: LANG_MAP returned non-string for "${langStr}" — possible @ast-grep/napi API change`)
+        errors.push(`${filePath}: LANG_MAP 对 "${langStr}" 返回了非字符串——可能是 @ast-grep/napi API 变更`)
         continue
       }
 
@@ -142,7 +151,7 @@ export const AST_GREP_TOOL: Tool = {
       try {
         source = readFileSync(filePath, 'utf-8')
       } catch {
-        errors.push(`${filePath}: cannot read file`)
+        errors.push(`${filePath}: 无法读取文件`)
         continue
       }
 
@@ -152,14 +161,14 @@ export const AST_GREP_TOOL: Tool = {
       try {
         root = napi.parse(langValue, source).root()
       } catch {
-        errors.push(`${filePath}: parse error`)
+        errors.push(`${filePath}: 解析错误`)
         continue
       }
 
       // tree-sitter error recovery produces ERROR nodes — detect broken syntax
       const errorNodes = root.findAll({ rule: { kind: 'ERROR' } } as unknown as string)
       if (errorNodes.length > 0) {
-        errors.push(`${filePath}: parse error (${errorNodes.length} syntax error(s))`)
+        errors.push(`${filePath}: 解析错误（${errorNodes.length} 处语法错误）`)
         continue
       }
 
@@ -167,7 +176,7 @@ export const AST_GREP_TOOL: Tool = {
       try {
         found = root.findAll(ruleOrPattern as string)
       } catch {
-        errors.push(`${filePath}: pattern compile error`)
+        errors.push(`${filePath}: pattern 编译错误`)
         continue
       }
 
@@ -207,9 +216,9 @@ export const AST_GREP_TOOL: Tool = {
       if (matches.length >= limit) break
     }
 
-    const summary = `${matches.length} match(es) in ${filesScanned} file(s)${errors.length > 0 ? `, ${errors.length} error(s)` : ''}`
+    const summary = formatAstGrepSummary(matches.length, filesScanned, errors.length)
     const body = matches.map(m => formatMatch(m, includeMeta)).join('\n')
-    const errorSection = errors.length > 0 ? `\n\nErrors:\n${errors.map(e => `  - ${e}`).join('\n')}` : ''
+    const errorSection = errors.length > 0 ? `\n\n错误：\n${errors.map(e => `  - ${e}`).join('\n')}` : ''
 
     return { content: `${summary}\n\n${body}${errorSection}` }
   },

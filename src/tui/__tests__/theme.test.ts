@@ -29,7 +29,7 @@ describe('getTheme', () => {
     setTheme('cobalt')
     const theme = getTheme(3)
     assert.equal(theme.primary, '#6ab8ff') // 钴蓝 — 唯一 accent（提亮）
-    assert.equal(theme.userColor, '#e6ecf2')      // 冷调亮白 ▌ mark
+    assert.equal(theme.userColor, '#fbbf24')      // 亮琥珀金 ▌ mark
     assert.equal(theme.assistantColor, '#c9cfd6') // 冷中性灰正文（提亮）
   })
 
@@ -38,7 +38,7 @@ describe('getTheme', () => {
     const theme = getTheme(3)
     assert.equal(theme.primary, '#5aa9ff') // cool azure
     assert.equal(theme.error, '#f76b6b')   // coral red
-    assert.equal(theme.userColor, '#e2e6ec')
+    assert.equal(theme.userColor, '#38bdf8')
   })
 
   it('slate still available via explicit switch (cool teal accent)', () => {

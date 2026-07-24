@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { Tool } from './types.js'
-import { TodoStore } from './todo-store.js'
+import { TodoStore, TODO_EMPTY_RESULT } from './todo-store.js'
 import type { TodoItem } from './todo-store.js'
 import { detectDependencies, assessScopeRisk, buildScopeNotice } from './todo-deps.js'
 import { writeFileAtomicSync } from '../fs-atomic.js'
@@ -139,7 +139,7 @@ TDD 纪律：
     async execute(params) {
       const parsed = todoActionSchema.safeParse(params.input)
       if (!parsed.success) {
-        return { content: `Invalid input: ${parsed.error.message}`, isError: true }
+        return { content: `无效输入：${parsed.error.message}`, isError: true, errorKind: 'format_error' }
       }
 
       const data = parsed.data
@@ -147,7 +147,7 @@ TDD 纪律：
       if (data.action === 'read') {
         const todos = store.read()
         if (todos.length === 0) {
-          return { content: 'No todos. Use write action to create a list.' }
+          return { content: TODO_EMPTY_RESULT }
         }
         return { content: TodoStore.formatList(todos) }
       }
@@ -183,9 +183,8 @@ TDD 纪律：
 
       if (regressions.length > 0) {
         const warn = regressions.map(r => `  - ${r}`).join('\n')
-        content = `⚠️ ${regressions.length} previously-completed item(s) were reset or dropped:\n${warn}\n\n`
-            + `If this was unintentional (e.g. rebuilding the list from memory after a long task), `
-            + `re-mark them as completed. Do NOT redo finished work.\n\n${content}`
+        content = `⚠️ ${regressions.length} 项此前已完成的任务被重置或移除：\n${warn}\n\n`
+            + `若非有意为之（例如长任务后凭记忆重建清单），请重新标为 completed。不要重做已完成的工作。\n\n${content}`
       }
 
       // P1-1: 续用回执——提醒模型继续用 todo 跟踪进度

@@ -324,6 +324,20 @@ describe('InputHandler · Shift+Tab and Alt+letter (领航星 2026-06-28)', () =
     assert.equal(keys[0]!.meta, true)
     handler.dispose()
   })
+
+  it('Alt+Enter ESC+CR (\\x1B\\x0D) parses as return with meta=true', () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin })
+    const keys: KeyPress[] = []
+    handler.onAnyKey((k) => { keys.push(k) })
+
+    stdin.emitData('\x1B\r')
+    assert.equal(keys.length, 1, 'one key dispatched')
+    assert.equal(keys[0]!.name, 'return', 'ESC+CR → return')
+    assert.equal(keys[0]!.meta, true, 'Alt modifier → meta=true')
+    assert.equal(keys[0]!.char, '', 'no printable char for return')
+    handler.dispose()
+  })
 })
 
 describe('InputHandler · CPR（cursor position report）通道', () => {

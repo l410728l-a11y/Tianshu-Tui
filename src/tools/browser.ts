@@ -32,6 +32,17 @@ export interface BrowserToolOptions {
   enabled?: boolean
 }
 
+/**
+ * 导航结果 URL 前缀——desktop browser-mirror / walkthrough-recorder 靠此前缀
+ * 提取当前页。改文案必须与消费方同步（用常量共享，禁止两边各自手抄）。
+ */
+export const BROWSER_NAVIGATED_PREFIX = '已导航至'
+
+/**
+ * 截图结果 URL 前缀——同上。尾随 ` → artifact <id>` 为结构标记，不译。
+ */
+export const BROWSER_SCREENSHOT_OF_PREFIX = '截图于'
+
 /** Default allowlist: comma-separated hosts in RIVET_BROWSER_ALLOWLIST. */
 function envAllowlist(): string[] {
   return (process.env.RIVET_BROWSER_ALLOWLIST ?? '')
@@ -54,7 +65,7 @@ async function playwrightDriver(): Promise<BrowserDriver> {
   try {
     mod = (await import(specifier)) as never
   } catch {
-    throw new Error('Playwright is not installed. Run `npm i -D playwright && npx playwright install chromium`.')
+    throw new Error('未安装 Playwright。请运行 `npm i -D playwright && npx playwright install chromium`。')
   }
   const browser = (await mod.chromium.launch({ headless: true })) as {
     newPage: () => Promise<never>
@@ -111,20 +122,20 @@ export function createBrowserTool(options: BrowserToolOptions = {}): Tool {
       try {
         url = new URL(rawUrl)
       } catch {
-        return { content: `Invalid URL: ${rawUrl}`, isError: true }
+        return { content: `无效 URL：${rawUrl}`, isError: true }
       }
       if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return { content: `Unsupported protocol: ${url.protocol}. Only http/https allowed.`, isError: true }
+        return { content: `不支持的协议：${url.protocol}。仅允许 http/https。`, isError: true }
       }
 
       const list = allowlist()
       if (!isHostAllowed(url.hostname, list)) {
         return {
           content:
-            `browser blocked: host "${url.hostname}" is not on the allowlist (fail-closed). ` +
+            `browser 已拦截：主机 "${url.hostname}" 不在许可名单中（fail-closed）。` +
             (list.length === 0
-              ? 'No hosts are allowlisted — set RIVET_BROWSER_ALLOWLIST.'
-              : `Allowed: ${list.join(', ')}.`),
+              ? '当前未配置任何许可主机——请设置 RIVET_BROWSER_ALLOWLIST。'
+              : `已允许：${list.join(', ')}。`),
           isError: true,
         }
       }
@@ -135,15 +146,15 @@ export function createBrowserTool(options: BrowserToolOptions = {}): Tool {
         await driver.goto(rawUrl)
 
         if (action === 'click') {
-          if (!selector) return { content: 'click requires a "selector".', isError: true }
+          if (!selector) return { content: 'click 需要 "selector"。', isError: true }
           await driver.click(selector)
-          return { content: `Clicked ${selector} on ${rawUrl}` }
+          return { content: `已在 ${rawUrl} 点击 ${selector}` }
         }
 
         if (action === 'text') {
           const text = await driver.textContent(selector)
           const trimmed = text.slice(0, 20_000)
-          return { content: `Text from ${rawUrl}${selector ? ` (${selector})` : ''}:\n\n${trimmed}` }
+          return { content: `来自 ${rawUrl}${selector ? `（${selector}）` : ''} 的文本：\n\n${trimmed}` }
         }
 
         // screenshot
@@ -160,11 +171,11 @@ export function createBrowserTool(options: BrowserToolOptions = {}): Tool {
           })
         }
         return {
-          content: `Captured screenshot of ${rawUrl}` + (artifactId ? ` → artifact ${artifactId}` : ''),
+          content: `${BROWSER_SCREENSHOT_OF_PREFIX} ${rawUrl}` + (artifactId ? ` → artifact ${artifactId}` : ''),
           rawPath: undefined,
         }
       } catch (err) {
-        return { content: `browser failed: ${(err as Error).message}`, isError: true }
+        return { content: `browser 失败：${(err as Error).message}`, isError: true }
       } finally {
         try { await driver?.close() } catch { /* ignore */ }
       }

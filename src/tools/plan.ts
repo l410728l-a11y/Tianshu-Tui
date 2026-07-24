@@ -247,14 +247,21 @@ export const PLAN_TOOL: Tool = {
 仅支持 docs/superpowers/plans/ 或 .rivet/plans/ 下的 Markdown 文件。
 
 ### Action: enter_mode
-自主进入计划模式，先规划再动手（写工具将被禁用；会创建计划草稿文件）。命中以下任一情况时主动使用：新功能实现、多文件（>2-3 个）改动、存在多个有效方案、架构决策、需求不清需要先探索。不要用于：单点小修、用户已给出详细逐步指令的任务、纯研究/问答。进入**无需用户确认**——用户的审批门在计划提交时，不在进入时。已在规划中时重复调用幂等。用户通过会话内审批卡（桌面端）或 /plan-approve（TUI）批准提交的计划；全部任务完成后 \`plan close\` apply=true 会把计划标记为 EXECUTED 并自动退出计划模式。`,
+自主进入计划模式，先规划再动手（写工具将被禁用；会创建计划草稿文件）。命中以下任一情况时主动使用：新功能实现、多文件（>2-3 个）改动、存在多个有效方案、架构决策、需求不清需要先探索。不要用于：单点小修、用户已给出详细逐步指令的任务、纯研究/问答。进入**无需用户确认**——用户的审批门在计划提交时，不在进入时。已在规划中时重复调用幂等。用户通过会话内审批卡（桌面端）或 /plan-approve（TUI）批准提交的计划；全部任务完成后 \`plan close\` apply=true 会把计划标记为 EXECUTED。
+
+### Action: exit_mode
+退出计划模式，解除写操作限制。不修改计划文件——不会标记 EXECUTED、不会勾选 checkbox。
+用于以下场景：
+- 审批后系统未自动退出 plan mode 时，手动调用退出
+- 用户明确要求「退出计划模式、直接开始写代码」时
+审批即自动退出正常流程无需调用；仅后备。`,
     input_schema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['submit', 'close', 'enter_mode'],
-          description: 'submit: 提交计划供用户审批。close: 关闭已完成任务。enter_mode: 自主进入计划模式（进入无需用户确认）。',
+          enum: ['submit', 'close', 'enter_mode', 'exit_mode'],
+          description: 'submit: 提交计划供用户审批。close: 关闭已完成任务。enter_mode: 自主进入计划模式（进入无需用户确认）。exit_mode: 退出计划模式、解除写操作限制。不修改计划文件内容——不会标记 EXECUTED、不会勾选 checkbox。审批即自动退出；仅当审批后系统未自动退出时手动调用。',
         },
         // ── submit fields ──
         title: { type: 'string', description: '[submit] 简短描述性计划标题（用于生成文件 slug）' },
@@ -299,7 +306,10 @@ export const PLAN_TOOL: Tool = {
     if (action === 'enter_mode') {
       return planEnterModeExecute(params)
     }
-    return { content: `Error: unknown action "${action}". Use "submit", "close" or "enter_mode".`, isError: true }
+    if (action === 'exit_mode') {
+      return planExitModeExecute(params)
+    }
+    return { content: `错误：未知 action「${action}」。请使用 "submit"、"close"、"enter_mode" 或 "exit_mode"。`, isError: true }
   },
 
   requiresApproval(): boolean {
@@ -323,13 +333,13 @@ export const PLAN_TOOL: Tool = {
  */
 function planEnterModeExecute(params: ToolCallParams): ToolResult {
   if (!params.enterPlanMode) {
-    return { content: 'Error: enter_mode is not available in this context (sub-agents cannot switch the primary agent into plan mode).', isError: true }
+    return { content: '错误：当前上下文不可用 enter_mode（子代理不能把主代理切入计划模式）。', isError: true }
   }
   try {
     const { activePlanFilePath, alreadyPlanning } = params.enterPlanMode()
     if (alreadyPlanning) {
       return {
-        content: `Already in plan mode.${activePlanFilePath ? ` Active plan draft: ${activePlanFilePath}` : ''}`,
+        content: `已在计划模式中。${activePlanFilePath ? ` 活动计划草稿：${activePlanFilePath}` : ''}`,
       }
     }
     return {
@@ -346,7 +356,24 @@ function planEnterModeExecute(params: ToolCallParams): ToolResult {
       ].filter(Boolean).join('\n'),
     }
   } catch (err) {
-    return { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true }
+    return { content: `错误：${err instanceof Error ? err.message : String(err)}`, isError: true }
+  }
+}
+
+/**
+ * 退出 plan mode，解除写操作限制。不修改计划文件。
+ * 正常流程审批即自动退出；本工具是后备——审批后系统未自动退出时手动调用。
+ * worker/非 agent 上下文没有 exitPlanMode ref → fail-closed 报错。
+ */
+function planExitModeExecute(params: ToolCallParams): ToolResult {
+  if (!params.exitPlanMode) {
+    return { content: '错误：当前上下文不可用 exit_mode（子代理不能退出主代理的计划模式）。', isError: true }
+  }
+  try {
+    params.exitPlanMode()
+    return { content: '已退出计划模式——写操作限制已解除。' }
+  } catch (err) {
+    return { content: `错误：${err instanceof Error ? err.message : String(err)}`, isError: true }
   }
 }
 
@@ -360,13 +387,13 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
     submitOptions = parseSubmitOptions(params.input.options)
   } catch (err) {
     return {
-      content: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      content: `错误：${err instanceof Error ? err.message : String(err)}`,
       isError: true,
     }
   }
 
   if (typeof title !== 'string' || !title.trim()) {
-    return { content: 'Error: title is required', isError: true }
+    return { content: '错误：title 必填', isError: true }
   }
 
   let submittedFromDraft: string | null = null
@@ -374,7 +401,7 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
     const draftPath = params.activePlanFilePath
     if (!draftPath) {
       return {
-        content: 'Error: plan is required when no active plan file is set. Write to the plan file first or pass plan content.',
+        content: '错误：未设置活动计划文件时 plan 必填。请先写入计划文件，或直接传入 plan 内容。',
         isError: true,
       }
     }
@@ -383,13 +410,13 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
       draftText = await readFile(join(params.cwd, draftPath), 'utf-8')
     } catch (err) {
       return {
-        content: `Error reading active plan file (${draftPath}): ${err instanceof Error ? err.message : String(err)}`,
+        content: `读取活动计划文件失败（${draftPath}）：${err instanceof Error ? err.message : String(err)}`,
         isError: true,
       }
     }
     if (!draftText.trim()) {
       return {
-        content: `Error: active plan file is empty (${draftPath}). Write your plan there first, then submit.`,
+        content: `错误：活动计划文件为空（${draftPath}）。请先写入计划，再提交。`,
         isError: true,
       }
     }
@@ -428,7 +455,7 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   if (!placeholderCheck.ok) {
     return {
       content: [
-        `⚠️ Plan not yet saved — ${placeholderCheck.reason}`,
+        `⚠️ 计划尚未保存 — ${placeholderCheck.reason}`,
         '',
         '用 edit_file 完善活动计划文件：根因、每文件 diff/伪代码、取舍表、验证清单等。不要在聊天里重打全文；补完后同 title 重提（省略 plan 字段可从活动计划文件读取）。',
       ].join('\n'),
@@ -456,11 +483,11 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   if (!MERMAID_FENCE.test(planBody) && !warnedSlugs.has(slug)) {
     warnedSlugs.add(slug)
     blocks.push([
-      `缺 Mermaid 图（it has no Mermaid diagram）——用 edit_file 在活动计划文件里补一张架构/数据流图（哪怕核心 3–5 个节点）。骨架：`,
+      `缺 Mermaid 图——用 edit_file 在活动计划文件里补一张架构/数据流图（哪怕核心 3–5 个节点）。骨架：`,
       '',
       MISSING_DIAGRAM_SKELETON,
       '',
-      `Shapes: (rounded)=input/user · [[subroutine]]=agent · {{hexagon}}=LLM · [(cylinder)]=store · {rhombus}=decision.`,
+      `图形说明：(圆角)=输入/用户 · [[子程序]]=agent · {{六边形}}=LLM · [(圆柱)]=存储 · {菱形}=决策。`,
     ].join('\n'))
   }
 
@@ -524,7 +551,7 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   if (blocks.length > 0) {
     return {
       content: [
-        `⚠️ Plan not yet saved — 共 ${blocks.length} 项缺口（一次列全，免去逐条往返）：`,
+        `⚠️ 计划尚未保存 — 共 ${blocks.length} 项缺口（一次列全，免去逐条往返）：`,
         '',
         ...blocks.map((block, i) => `${i + 1}. ${block}`),
         '',
@@ -556,30 +583,30 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
       await rm(join(params.cwd, submittedFromDraft), { force: true }).catch(() => {})
     }
     const optionsHint = submitOptions && submitOptions.length >= 2
-      ? `\nOptions recorded (${submitOptions.length}). User can choose at approval: ${submitOptions.map(o => `\`${o.label}\``).join(', ')}`
+      ? `\n已记录选项（${submitOptions.length}）。用户可在审批时选择：${submitOptions.map(o => `\`${o.label}\``).join(', ')}`
       : ''
     // Notify the TUI so it can prompt the user with an arrow-key approval panel.
     params.onPlanSubmitted?.({ slug, title: title.trim(), options: submitOptions })
     return {
       content: [
-        `✅ Plan submitted: **${title.trim()}**`,
-        `File: \`${relativePath}\``,
-        `Slug: \`${slug}\``,
+        `✅ 计划已提交：**${title.trim()}**`,
+        `文件：\`${relativePath}\``,
+        `Slug：\`${slug}\``,
         optionsHint,
         anchorDriftNote,
         scaleNote,
         cheapModelNote,
         '',
         '',
-        `An approval card has been presented to the user in the conversation (desktop) / approval panel (TUI) — they can approve to start execution immediately, or reject with revision feedback. Approval never requires the user to type any command.`,
-        `TUI fallback if asked: /plan-approve ${slug}, /plan-reject ${slug}, or /plan-list.`,
+        `已向用户展示审批卡（桌面端会话内 / TUI 审批面板）——可立即批准开始执行，或附修订意见驳回。批准从不要求用户手输任何命令。`,
+        `若用户问起 TUI 备用命令：/plan-approve ${slug}、/plan-reject ${slug}，或 /plan-list。`,
         '',
-        `**Wait here — do not proceed until the user approves.**`,
+        `**请在此等待——在用户批准前不要继续推进。**`,
       ].filter(Boolean).join('\n'),
     }
   } catch (err) {
     return {
-      content: `Error writing plan: ${err instanceof Error ? err.message : String(err)}`,
+      content: `写入计划失败：${err instanceof Error ? err.message : String(err)}`,
       isError: true,
     }
   }
@@ -591,32 +618,32 @@ async function planCloseExecute(params: ToolCallParams): Promise<ToolResult> {
   const rawPath = params.input.file_path
   const tasks = params.input.tasks
   if (typeof rawPath !== 'string' || !rawPath.trim()) {
-    return { content: 'Error: file_path is required', isError: true }
+    return { content: '错误：file_path 必填', isError: true }
   }
   if (typeof tasks !== 'string' || !tasks.trim()) {
-    return { content: 'Error: tasks is required', isError: true }
+    return { content: '错误：tasks 必填', isError: true }
   }
 
   let filePath: string
   try {
     filePath = validatePath(params.cwd, rawPath)
   } catch {
-    return { content: 'Error: Path escapes project directory', isError: true }
+    return { content: '错误：路径逃逸出项目目录', isError: true }
   }
 
   const relativePath = relative(params.cwd, filePath).replaceAll('\\', '/')
   const inSuperpowersPlans = relativePath.startsWith('docs/superpowers/plans/') && relativePath.endsWith('.md')
   const inRivetPlans = relativePath.startsWith('.rivet/plans/') && relativePath.endsWith('.md')
   if (!inSuperpowersPlans && !inRivetPlans) {
-    return { content: `Error: plan close only supports docs/superpowers/plans/ or .rivet/plans/: ${relativePath}`, isError: true }
+    return { content: `错误：plan close 仅支持 docs/superpowers/plans/ 或 .rivet/plans/：${relativePath}`, isError: true }
   }
   try { await stat(filePath) } catch {
-    return { content: `Error: Plan file not found: ${filePath}`, isError: true }
+    return { content: `错误：未找到计划文件：${filePath}`, isError: true }
   }
 
   const deliveryState = params.input.deliveryState
   if (deliveryState !== undefined && !isDeliveryState(deliveryState)) {
-    return { content: 'Error: deliveryState must be GREEN, YELLOW, or RED', isError: true }
+    return { content: '错误：deliveryState 必须是 GREEN、YELLOW 或 RED', isError: true }
   }
 
   const claimedCommands = asStringArray(params.input.verifiedCommands)
@@ -660,11 +687,11 @@ async function planCloseExecute(params: ToolCallParams): Promise<ToolResult> {
   if (gateBlock && params.input.apply === true) {
     return {
       content: [
-        `Plan close blocked: claimed GREEN but the delivery gate is RED.`,
+        `计划关闭被拦截：声称 GREEN，但交付门禁为 RED。`,
         gateBlock.reason,
-        gateBlock.nextStep ? `Next: ${gateBlock.nextStep}` : '',
+        gateBlock.nextStep ? `下一步：${gateBlock.nextStep}` : '',
         '',
-        `Run the real verification (typecheck/tests) then re-close, or close honestly with deliveryState=RED/YELLOW as a progress checkpoint.`,
+        `请先跑真实验证（typecheck/测试）再关闭，或诚实以 deliveryState=RED/YELLOW 作为进度检查点关闭。`,
       ].filter(Boolean).join('\n'),
       isError: true,
     }
@@ -689,10 +716,8 @@ async function planCloseExecute(params: ToolCallParams): Promise<ToolResult> {
       // EXECUTED status marker is written only on gate-backed GREEN.
       const contentToWrite = realGreen ? insertPlanStatusMarker(result.content, 'EXECUTED') : result.content
       await writeFileAtomicAsync(filePath, contentToWrite)
-      // 闭环即解锁（桌面端 Cursor 式流程）：EXECUTED 由交付门 GREEN 背书，
-      // 计划锁定的目的已达成——自动退出 plan mode（ref 内仅 planning 时生效）。
-      // 「未执行时退出归用户」原则不变；worker 上下文无 ref，自然不退出。
-      if (realGreen) params.exitPlanMode?.()
+      // plan close 只做闭环标记，不再承担「解锁写权限」职责。
+      // 退出 plan mode 改用 plan action=exit_mode（或审批自动退出）。
       if (params.onPlanClosed) {
         params.onPlanClosed({
           planFile: relativePath,
@@ -704,35 +729,34 @@ async function planCloseExecute(params: ToolCallParams): Promise<ToolResult> {
 
       return {
         content: [
-          `Plan closed: ${relativePath}`,
-          `Tasks: ${tasks}`,
-          `Checkboxes updated: ${result.totalChangedCheckboxes}`,
-          `Closure: ${action}`,
-          effectiveState ? `Delivery: ${effectiveState}${realGreen ? ' (marked EXECUTED)' : ''}` : '',
-          realGreen && params.exitPlanMode ? '已自动退出计划模式（闭环即解锁）。' : '',
-          mismatchNote ? `Evidence: ${mismatchNote}` : '',
+          `计划已关闭：${relativePath}`,
+          `任务：${tasks}`,
+          `已更新复选框：${result.totalChangedCheckboxes}`,
+          `闭环：${action}`,
+          effectiveState ? `交付：${effectiveState}${realGreen ? '（已标记 EXECUTED）' : ''}` : '',
+          mismatchNote ? `证据：${mismatchNote}` : '',
         ].filter(Boolean).join('\n'),
       }
     }
 
     return {
       content: [
-        `Plan close preview: ${relativePath}`,
-        `Tasks: ${tasks}`,
-        `Checkboxes to update: ${result.totalChangedCheckboxes}`,
-        `Closure: ${action}`,
-        effectiveState ? `Delivery: ${effectiveState}` : '',
-        gateBlock ? `⚠ Gate: claimed GREEN but real gate is RED — apply=true will be blocked.` : '',
-        mismatchNote ? `Evidence: ${mismatchNote}` : '',
+        `计划关闭预览：${relativePath}`,
+        `任务：${tasks}`,
+        `将更新复选框：${result.totalChangedCheckboxes}`,
+        `闭环：${action}`,
+        effectiveState ? `交付：${effectiveState}` : '',
+        gateBlock ? `⚠ 门禁：声称 GREEN 但真实门禁为 RED —— apply=true 将被拦截。` : '',
+        mismatchNote ? `证据：${mismatchNote}` : '',
         '',
-        'Changes:',
+        '变更：',
         ...formatChanges(result),
         '',
-        'No files changed. Re-run with apply=true to write the plan closure.',
+        '未写入任何文件。以 apply=true 重跑以写入计划闭环。',
       ].filter(Boolean).join('\n'),
     }
   } catch (err) {
-    return { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true }
+    return { content: `错误：${err instanceof Error ? err.message : String(err)}`, isError: true }
   }
 }
 

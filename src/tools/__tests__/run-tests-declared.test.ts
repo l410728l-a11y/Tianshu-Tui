@@ -68,8 +68,8 @@ describe('run_tests declared verify.test (A2)', () => {
     }
     const result = await RUN_TESTS_TOOL.execute(params as never)
     assert.equal(result.isError, false, 'snapshot-pass should override live-fail')
-    assert.match(String(result.content), /C3 attribution retry/)
-    assert.match(String(result.content), /workspace pollution/)
+    assert.match(String(result.content), /C3 归因重试/)
+    assert.match(String(result.content), /工作区污染/)
   })
 
   it('C3: both-fail keeps the failure and confirms code attribution', async () => {
@@ -84,7 +84,7 @@ describe('run_tests declared verify.test (A2)', () => {
     }
     const result = await RUN_TESTS_TOOL.execute(params as never)
     assert.equal(result.isError, true)
-    assert.match(String(result.content), /Also FAILED in an isolated snapshot/)
+    assert.match(String(result.content), /在隔离快照中也 FAILED/)
   })
 })
 

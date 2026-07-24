@@ -112,6 +112,6 @@ describe('open_path', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /path does not exist/)
+    assert.match(result.content, /路径不存在/)
   })
 })

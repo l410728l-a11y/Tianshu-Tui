@@ -56,7 +56,7 @@ describe('export_file', () => {
   it('rejects ambiguous content plus source_path calls', async () => {
     await assert.rejects(
       () => exportFile({ destination_path: join(tempDir(), 'x.txt'), content: 'x', source_path: '/tmp/source' }),
-      /exactly one/,
+      /必须且只能提供/,
     )
   })
 
@@ -71,7 +71,7 @@ describe('export_file', () => {
       })
 
       assert.equal(result.isError, undefined)
-      assert.ok(result.content.includes('Exported'))
+      assert.ok(result.content.includes('已导出'))
       assert.ok(result.content.includes(destination))
       assert.ok(existsSync(destination))
     } finally {

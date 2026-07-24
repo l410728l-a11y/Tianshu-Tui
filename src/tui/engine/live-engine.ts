@@ -18,7 +18,7 @@
  */
 
 import type { WriteStream } from 'node:tty'
-import { ANSI, cursorUp, cursorDown } from './ansi.js'
+import { ANSI, cursorUp, cursorDown, cursorToCol } from './ansi.js'
 import { displayWidth, ambiguousWideEnabled } from '../width.js'
 
 export interface LiveRegionLine {
@@ -26,6 +26,14 @@ export interface LiveRegionLine {
   text: string
   /** 可选：截断指示符 */
   truncated?: boolean
+  /**
+   * 可选：输入框软件光标（█）左侧的 0-based cell 列（2026-07-23 IME 锚定）。
+   * 终端 IME 候选窗锚定【硬件光标】而非自绘 █——帧末把硬件光标搬到该行该列，
+   * 组词串才会出现在输入框内（kimi-code pi-tui 同款机制，结构字段替代其零宽
+   * APC marker：不污染文本、不干扰 displayWidth 行数计量）。normalize/rowBudget
+   * 均 {...l} 透传该字段。
+   */
+  caretCol?: number
 }
 
 export interface LiveEngineOptions {
@@ -131,6 +139,26 @@ export class LiveEngine {
   /** 最近一次探针响应的光标行（恢复路径的爬升上限——绝不爬出视口顶）。 */
   private cprReportRow = 1
 
+  // ── 硬件光标驻停（2026-07-23 IME 锚定）─────────────────────────────
+  // 帧末把（默认隐藏的）硬件光标搬到输入框软件光标 █ 的坐标——终端 IME 候选窗
+  // 锚定硬件光标，自绘 █ 它不可见。kimi-code pi-tui 同款机制（tui.ts
+  // positionHardwareCursor），适配本引擎 cursor-resident 协议：
+  // - parkedRowsUp：驻停点距区域末行的 display rows（无 caret 帧 = 0）。帧首
+  //   爬升量必须减去它（光标不在末行尾而在 caret 行）。
+  // - parkedCol：驻停放列（0-based cell）；null = 驻停末行尾（历史协议）。
+  // - RIVET_TUI_HARDWARE_CURSOR=1：驻停后 SHOW_CURSOR（个别终端光标可见才
+  //   跟踪 IME；默认隐藏保持单指针视觉，与 pi-tui 默认一致）。
+  private parkedRowsUp = 0
+  private parkedCol: number | null = null
+  /** 发 CPR 探针那一刻的驻停记账——响应按它折算区域末行，防 caret 移动误判污染。 */
+  private probeParked: { rowsUp: number; col: number | null } | null = null
+  private readonly hardwareCursorVisible = process.env.RIVET_TUI_HARDWARE_CURSOR === '1'
+
+  /** 有效的驻停行数：硬件光标不可见时不驻停，恢复 pre-IME 的帧末光标位置（末行尾）。 */
+  private effectiveParkedRowsUp(): number {
+    return this.hardwareCursorVisible ? this.parkedRowsUp : 0
+  }
+
   /** 探针最小间隔：渲染每帧都可能触发，防探针风暴。 */
   private static readonly CPR_PROBE_MIN_INTERVAL_MS = 1000
   /** 探针响应超时：超过即允许重发（兼容不应答 DSR 的环境）。 */
@@ -188,6 +216,8 @@ export class LiveEngine {
     if (!this.cprProbePending && now - this.lastCprProbeMs < LiveEngine.CPR_PROBE_MIN_INTERVAL_MS) return
     this.cprProbePending = true
     this.lastCprProbeMs = now
+    // 记录发探针瞬间的驻停位置——noteCpr 按它把响应折算回区域末行再判污染。
+    this.probeParked = { rowsUp: this.parkedRowsUp, col: this.parkedCol }
     this.onProbeRequest()
   }
 
@@ -202,21 +232,29 @@ export class LiveEngine {
     // 不判污染也不更新基线，避免退出后用跨 alt screen 的基线误判。
     if (this.probeSuppressed) return
     this.cprReportRow = row
+    // caret 驻停期间响应的是 caret 坐标：折算回区域末行再与基线比对
+    //（发探针时的 parkedRowsUp 记账）；列比对只在驻停末行尾时进行——
+    // caret 驻停下列随打字合法变化，比列会误报。
+    const probe = this.probeParked
+    const regionEndRow = row + (probe?.rowsUp ?? 0)
+    const compareCol = probe?.col == null
     // 区域未在屏上（clear/commit 途中）时只更新基线，不判污染。
     if (!this.hasRendered || this.lastDisplayRows === 0) {
-      this.cprBaseline = { row, col }
+      this.cprBaseline = { row: regionEndRow, col }
       return
     }
     if (!this.cprBaseline) {
-      this.cprBaseline = { row, col }
+      this.cprBaseline = { row: regionEndRow, col }
       return
     }
-    if (this.cprBaseline.row !== row || this.cprBaseline.col !== col) {
+    if (this.cprBaseline.row !== regionEndRow || (compareCol && this.cprBaseline.col !== col)) {
       this.polluted = true
       // 立即采纳新位置为基线：迟到的响应（渲染/commit 交错）不会造成持续误判。
-      this.cprBaseline = { row, col }
+      this.cprBaseline = { row: regionEndRow, col }
       this.onPolluted?.()
+      return
     }
+    this.cprBaseline = { row: regionEndRow, col }
   }
 
   /**
@@ -322,6 +360,7 @@ export class LiveEngine {
    */
   render(lines: readonly LiveRegionLine[], opts?: { reservedTail?: number }): void {
     const bounded = this.applyRowBudget(this.normalizeLines(lines), opts?.reservedTail)
+    const parking = this.computeParking(bounded)
 
     // 恢复重铺：CPR 检出外来写入污染后，不再信任 lastDisplayRows 的屏上假设
     // （H2 短路会被 lineCache 与屏上不符的内容欺骗，diff 会加剧错位）。
@@ -335,18 +374,20 @@ export class LiveEngine {
       // 把区域撑高后爬升不足，旧帧顶部残留进 scrollback（resize 输入框叠屏）。
       this.reconcileWidth()
       const newDisplayRows = this.countDisplayRows(bounded)
+      let body: string
       if (this.hasRendered && this.lastDisplayRows > 0) {
-        const climb = Math.min(this.lastDisplayRows - 1, Math.max(0, this.cprReportRow - 1))
-        const body = (climb > 0 ? cursorUp(climb) : '') + '\r' + ANSI.ERASE_SCREEN_END + this.buildAppend(bounded)
-        this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + body + ANSI.END_SYNC)
+        const climb = Math.min(Math.max(0, this.lastDisplayRows - 1 - this.effectiveParkedRowsUp()), Math.max(0, this.cprReportRow - 1))
+        body = (climb > 0 ? cursorUp(climb) : '') + '\r' + ANSI.ERASE_SCREEN_END + this.buildAppend(bounded)
       } else {
-        this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + this.buildAppend(bounded) + ANSI.END_SYNC)
+        body = this.buildAppend(bounded)
       }
+      this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + body + this.buildParkSeq(parking) + ANSI.END_SYNC)
       this.lastDisplayRows = newDisplayRows
       this.lineCache = bounded.map(l => l.text)
       this.hasRendered = true
       this.lastColumns = this.stdout.columns || 80
       this.cprBaseline = null // 重锚完成，帧后探针重建基线
+      this.setParked(parking)
       this.requestProbe()
       return
     }
@@ -363,6 +404,10 @@ export class LiveEngine {
       bounded.length === this.lineCache.length &&
       bounded.every((l, i) => l.text === this.lineCache[i])
     ) {
+      // 行未变但 caret 移动（纯光标键）：不重绘文字，只把硬件光标搬到新坐标
+      // （kimi-code pi-tui 同款——无变化帧也归位光标，几字节零闪烁）。
+      // caret 消失（parking=null）的转移走常规路径收敛，不在此处理。
+      if (this.hardwareCursorVisible && parking) this.reparkIfChanged(parking)
       return
     }
 
@@ -378,10 +423,11 @@ export class LiveEngine {
       // 首帧 / clear/overlay 退出后的全量重铺同样用 CSI 2026 包裹，原子刷新
       // 防撕裂（与增量帧一致）。尾行不带 `\n`，光标仍常驻最后一行末尾。
       // 同步隐藏硬件光标，避免 overlay 退出后主屏出现额外闪烁指针。
-      this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + this.buildAppend(bounded) + ANSI.END_SYNC)
+      this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + this.buildAppend(bounded) + this.buildParkSeq(parking) + ANSI.END_SYNC)
       this.lastDisplayRows = newDisplayRows
       this.lineCache = bounded.map(l => l.text)
       this.hasRendered = true
+      this.setParked(parking)
       this.requestProbe()
       return
     }
@@ -402,17 +448,61 @@ export class LiveEngine {
       bounded.length === this.lineCache.length &&
       bounded.every((l, i) => this.rowsForLine(l.text) === this.rowsForLine(this.lineCache[i]!))
 
+    // 帧首爬升以驻停点为起点：硬件光标模式 caret 驻停时光标不在末行尾
+    // （差 parkedRowsUp 行）；软件光标模式下光标始终在末行尾，parkedRowsUp=0。
+    const climbRows = prevDisplayRows - this.effectiveParkedRowsUp()
     const body = canDiff
-      ? this.buildDiff(bounded, prevDisplayRows)
-      : this.buildFullRewrite(bounded, prevDisplayRows)
+      ? this.buildDiff(bounded, climbRows)
+      : this.buildFullRewrite(bounded, climbRows)
 
-    // 隐藏终端硬件光标：输入框使用软件光标 `█` 指示编辑位置，硬件光标若保持可见
-    // 会停留在 live region 尾行（如权限模式行 `yolo (shift+tab 切换)` 开头）闪烁，
-    // 造成「多了一个输入指针」的视觉干扰。每帧 render 都发送 HIDE_CURSOR，可覆盖
-    // overlay 退出后 SHOW_CURSOR 恢复默认状态的间隙。
-    this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + body + ANSI.END_SYNC)
+    // 帧首隐藏硬件光标（覆盖 overlay 退出后 SHOW_CURSOR 的间隙、帧内防闪）；
+    // 帧末 buildParkSeq 把它搬到输入框软件光标坐标（IME 候选窗锚定硬件光标）。
+    this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + body + this.buildParkSeq(parking) + ANSI.END_SYNC)
     this.lastDisplayRows = newDisplayRows
     this.lineCache = bounded.map(l => l.text)
+    this.setParked(parking)
+    this.requestProbe()
+  }
+
+  /** 从 bounded 行里找 caret 标记行，算驻停点（距末行 display rows + 0-based 列）。 */
+  private computeParking(bounded: readonly LiveRegionLine[]): { rowsUp: number; col: number } | null {
+    const idx = bounded.findIndex(l => l.caretCol != null)
+    if (idx < 0) return null
+    let rowsUp = 0
+    for (let i = idx + 1; i < bounded.length; i++) rowsUp += this.rowsForLine(bounded[i]!.text)
+    return { rowsUp, col: bounded[idx]!.caretCol! }
+  }
+
+  /** 帧末驻停序列：末行尾 → caret 坐标；硬件光标不可见时不移动光标（恢复 pre-IME 稳态）。 */
+  private buildParkSeq(parking: { rowsUp: number; col: number } | null): string {
+    // 软件光标（█ 字面渲染）不需要移动硬件光标；帧末保持 HIDE_CURSOR 即可。
+    if (!this.hardwareCursorVisible) return ANSI.HIDE_CURSOR
+    let seq = ''
+    if (parking) {
+      if (parking.rowsUp > 0) seq += cursorUp(parking.rowsUp)
+      seq += cursorToCol(parking.col + 1)
+    }
+    seq += parking ? ANSI.SHOW_CURSOR : ANSI.HIDE_CURSOR
+    return seq
+  }
+
+  /** 更新驻停记账（须在 requestProbe 前调用——探针按它折算响应坐标）。 */
+  private setParked(parking: { rowsUp: number; col: number } | null): void {
+    this.parkedRowsUp = parking?.rowsUp ?? 0
+    this.parkedCol = parking?.col ?? null
+  }
+
+  /** H2 路径专用：行未变、caret 变了 → 只发重定位序列（不重绘任何文字）。 */
+  private reparkIfChanged(parking: { rowsUp: number; col: number }): void {
+    if (this.parkedRowsUp === parking.rowsUp && this.parkedCol === parking.col) return
+    let seq = ''
+    // rowsUp 是「距末行的行数」：新驻停点更高（rowsUp 变大）→ 上移，反之 → 下移。
+    const delta = parking.rowsUp - this.parkedRowsUp
+    if (delta > 0) seq += cursorUp(delta)
+    else if (delta < 0) seq += cursorDown(-delta)
+    seq += cursorToCol(parking.col + 1)
+    this.stdout.write(ANSI.BEGIN_SYNC + ANSI.HIDE_CURSOR + seq + (this.hardwareCursorVisible ? ANSI.SHOW_CURSOR : '') + ANSI.END_SYNC)
+    this.setParked(parking)
     this.requestProbe()
   }
 
@@ -533,9 +623,10 @@ export class LiveEngine {
   clear(): void {
     this.reconcileWidth()
     if (this.lastDisplayRows === 0) return
-    this.stdout.write(ANSI.HIDE_CURSOR + this.moveToTop(this.lastDisplayRows) + '\r' + ANSI.ERASE_SCREEN_END)
+    this.stdout.write(ANSI.HIDE_CURSOR + this.moveToTop(this.lastDisplayRows - this.effectiveParkedRowsUp()) + '\r' + ANSI.ERASE_SCREEN_END)
     this.lastDisplayRows = 0
     this.lineCache = []
+    this.setParked(null)
     // 区域已离屏：污染标记随帧状态一起作废（noteCpr 此时只更新基线不判污染）。
     this.polluted = false
   }
@@ -565,5 +656,6 @@ export class LiveEngine {
     this.lastDisplayRows = 0
     this.lineCache = []
     this.hasRendered = false
+    this.setParked(null)
   }
 }

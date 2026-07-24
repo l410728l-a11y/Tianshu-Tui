@@ -69,13 +69,13 @@ describe('FILE_INFO_TOOL', () => {
 
   it('rejects paths outside project directory', async () => {
     const result = await FILE_INFO_TOOL.execute(makeParams({ path: '/tmp' }, tmpCwd))
-    assert.match(result.content, /outside project|Note: outside/)
+    assert.match(result.content, /项目目录外|outside project/)
   })
 
   it('returns error for empty path', async () => {
     const result = await FILE_INFO_TOOL.execute(makeParams({ path: '' }, tmpCwd))
     assert.equal(result.isError, true)
-    assert.match(result.content, /path is required/)
+    assert.match(result.content, /path 参数必填/)
   })
 
   it('requiresApproval is false', () => {

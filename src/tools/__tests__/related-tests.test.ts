@@ -58,7 +58,7 @@ describe('RELATED_TESTS_TOOL', () => {
   it('returns empty message when no tests exist', async () => {
     const result = await RELATED_TESTS_TOOL.execute(makeParams({ file: 'src/api/client.ts' }))
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('No related tests found'))
+    assert.ok(result.content.includes('未找到相关测试'))
   })
 
   it('supports non-src paths', async () => {
@@ -146,7 +146,7 @@ describe('RELATED_TESTS_TOOL — Python heuristics (W1)', () => {
   it('returns empty message when no python tests exist', async () => {
     const result = await RELATED_TESTS_TOOL.execute(makeParams({ file: 'pkg/lonely.py' }))
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('No related tests found'))
+    assert.ok(result.content.includes('未找到相关测试'))
   })
 
   it('reverse lookup: test_utils.py -> utils.py', async () => {

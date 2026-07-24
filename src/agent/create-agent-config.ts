@@ -49,7 +49,7 @@ export interface AgentConfigInput {
   autoDelegateEnabled?: boolean
   autoReasoning?: boolean
   crossSessionEnabled?: boolean
-  /** Session Auto keyword routing; default true（未命中回退天枢）. */
+  /** Session Auto keyword routing; default true（auto 池内匹配，未命中回退天权）. */
   domainKeywordRouting?: boolean
   goalJudge?: { enabled?: boolean; maxRuns?: number; browser?: boolean }
   auth?: AuthProvider

@@ -21,6 +21,7 @@ export type ChatItem =
   | { kind: 'tool'; id: string; name: string; input: unknown; result: string; isError: boolean }
   | { kind: 'approval'; requestId: string; toolName: string; input: unknown; decision?: string }
   | { kind: 'question'; toolUseId: string; questions: QuestionSpec[]; answered?: boolean }
+  | { kind: 'plan'; slug: string; title: string; status: string }
   | { kind: 'info'; text: string }
 
 export interface TodoItem {
@@ -38,6 +39,8 @@ export interface ChatState {
   todos: TodoItem[]
   /** plan mode: 'off' | 'planning' */
   planMode: string
+  /** plan mode 起草中（plan_draft 帧驱动的轻量指示，不渲染正文）。 */
+  planDrafting: boolean
   /** 当前模型/星域（事件驱动，选择器懒加载列表）。 */
   model?: string
   domain?: string
@@ -49,6 +52,7 @@ export const initialChatState: ChatState = {
   pendingApprovals: 0,
   todos: [],
   planMode: 'off',
+  planDrafting: false,
 }
 
 function asText(v: unknown): string {
@@ -147,8 +151,14 @@ export function reduceEvent(state: ChatState, ev: SessionEvent): ChatState {
       return { ...state, todos }
     }
 
-    case 'plan_mode':
-      return { ...state, planMode: asText(d.state) || state.planMode }
+    case 'plan_mode': {
+      const mode = asText(d.state) || state.planMode
+      // 退出 plan mode 时清起草指示（草稿要么已 submit 要么已废弃）
+      return { ...state, planMode: mode, planDrafting: mode === 'planning' && state.planDrafting }
+    }
+
+    case 'plan_draft':
+      return { ...state, planDrafting: true }
 
     case 'model_switched':
       return { ...state, model: asText(d.modelId) || state.model }
@@ -165,8 +175,21 @@ export function reduceEvent(state: ChatState, ev: SessionEvent): ChatState {
     case 'steer_queued':
       return push(state, { kind: 'info', text: '↪ 已排队插话，将在下一个工具边界注入' })
 
-    case 'plan_submitted':
-      return push(state, { kind: 'info', text: '📋 计划已提交审批' })
+    case 'plan_submitted': {
+      const slug = asText(d.slug)
+      const title = asText(d.title)
+      const status = asText(d.status) || 'submitted'
+      if (!slug) return push(state, { kind: 'info', text: '📋 计划已提交审批' })
+      // 同一计划的状态更新（reject → 再 submit）原位刷新，不重复出卡
+      const idx = items.findIndex((it) => it.kind === 'plan' && it.slug === slug)
+      const drafted = { ...state, planDrafting: false }
+      if (idx >= 0) {
+        const next = [...items]
+        next[idx] = { kind: 'plan', slug, title: title || (items[idx] as { title: string }).title, status }
+        return { ...drafted, items: next }
+      }
+      return push(drafted, { kind: 'plan', slug, title, status })
+    }
 
     default:
       return state

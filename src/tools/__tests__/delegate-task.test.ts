@@ -53,7 +53,7 @@ describe('DELEGATE_TASK_TOOL', () => {
     assert.equal(calls[0]!.reviewDepth, 2)
     assert.equal(result.isError, false)
     assert.ok(result.content.includes('<worker_results>'))
-    assert.ok(result.uiContent!.includes('delegate_task completed'))
+    assert.ok(result.uiContent!.includes('delegate_task 已完成'))
   })
 
   it('passes authority through to the coordinator', async () => {
@@ -88,7 +88,7 @@ describe('DELEGATE_TASK_TOOL', () => {
       input: { objective: 'do a thing', authority: 'not_a_domain' },
     })
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Invalid delegate_task input'))
+    assert.ok(result.content.includes('无效的 delegate_task 输入'))
   })
 
   it('accepts authority values from the star-domain registry (schema slimmed to plain string)', () => {
@@ -128,7 +128,7 @@ describe('DELEGATE_TASK_TOOL', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Invalid delegate_task input'))
+    assert.ok(result.content.includes('无效的 delegate_task 输入'))
   })
 
   it('does not require approval and is concurrency safe', () => {

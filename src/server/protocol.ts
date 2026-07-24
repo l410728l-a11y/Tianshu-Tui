@@ -113,6 +113,12 @@ export interface SessionRecord {
   currentPhase?: string
   lastSeq: number
   error?: string
+  /**
+   * Wave 4 — 无人值守 fail-closed 中止的结构化标记。区别于一般 error：
+   * 会话在等一个人类决定（授权/接管），侧栏与 Inbox 据此渲染 halted
+   * 徽标/决策卡。新 run 启动时清除。
+   */
+  unattendedHalt?: { reason: string; app?: string }
   pendingApprovals: number
   /**
    * S — per-session autonomy level. Overrides the global config approval mode
@@ -167,6 +173,10 @@ export interface SessionRecord {
    *  leave the branch commits unreachable from main, so rev-list can't tell
    *  "landed" — this marker lets archive safely delete a landed branch. */
   landedHead?: string
+  /** P1 任务身份化 — 关联的 Mission id。创建 session 时按 title 自动
+   *  getOrCreate（显式路径）或 maybeAutoTitle 起标题成功时隐式创建。
+   *  absent → 旧 session / 未接线，桌面端回退 session.title || shortId。 */
+  missionId?: string
 }
 
 /** Live plan-mode draft surfaced to the desktop — a growing working document,

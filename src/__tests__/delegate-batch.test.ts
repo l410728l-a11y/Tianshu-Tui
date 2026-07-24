@@ -130,10 +130,10 @@ describe('delegate_batch tool', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('delegate_batch failed'))
-    assert.ok(result.content.includes('Do NOT retry'))
-    assert.ok(result.content.includes('Recovery options'))
-    assert.ok(result.content.includes('inline tools'))
+    assert.ok(result.content.includes('delegate_batch 失败'))
+    assert.ok(result.content.includes('不要用相同参数重试'))
+    assert.ok(result.content.includes('恢复选项'))
+    assert.ok(result.content.includes('内联工具'))
   })
 
   describe('progressive timeout', () => {
@@ -200,8 +200,8 @@ describe('delegate_batch tool', () => {
       })
 
       assert.equal(dispatchedCount, 1)
-      assert.ok(result.content.includes('[batch trimmed]'))
-      assert.ok(result.content.includes('Dispatched 1/5'))
+      assert.ok(result.content.includes('[批次已裁剪]'))
+      assert.ok(result.content.includes('已派发 1/5'))
     })
 
     it('limits to 3 tasks on turn 2-4 (warming)', async () => {
@@ -256,7 +256,7 @@ describe('delegate_batch tool', () => {
       })
 
       assert.equal(dispatchedCount, 5)
-      assert.ok(!result.content.includes('[batch trimmed]'))
+      assert.ok(!result.content.includes('[批次已裁剪]'))
     })
 
     it('progressiveTaskCap unit: 1→3→5 by turn tier', () => {

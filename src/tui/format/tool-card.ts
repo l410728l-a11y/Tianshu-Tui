@@ -19,7 +19,7 @@ import { getToolFamily } from '../tool-family.js'
 import { toolArgSummary } from '../tool-label.js'
 import { isDelegationTool } from './tool-domain.js'
 import { formatElapsed } from '../tool-elapsed.js'
-import { formatDiff, isDiffContent } from './diff.js'
+import { formatDiff, isDiffContent, computeDiffStats } from './diff.js'
 import { brailleSpinnerFrame } from '../braille-spinner.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
 import { useAsciiGlyphs } from '../term-caps.js'
@@ -154,14 +154,21 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
   }
 
   // ── Diff 分支：write/edit 族 + diff 内容 → 红绿渲染 ─────────
+  // 阈值：adds+dels ≤ 10 内联完整 diff，>10 折叠为单行摘要
   if (family.family === 'write' && isDiffContent(trimmed)) {
-    const diffLines = formatDiff({
-      content: trimmed,
-      maxLines: expanded ? Number.MAX_SAFE_INTEGER : DIFF_MAX_LINES,
-    }, theme)
-    lines.push(...indentBody(diffLines, indent, theme))
-    if (!expanded && trimmed.split('\n').length > DIFF_MAX_LINES) {
-      lines.push(`${indent}${BODY_CONT_PREFIX}${color('… [Ctrl+O]', theme.secondary)}`)
+    const stats = computeDiffStats(trimmed)
+    const changeCount = stats.adds + stats.dels
+    if (changeCount <= 10 || expanded) {
+      const diffLines = formatDiff({
+        content: trimmed,
+        maxLines: Number.MAX_SAFE_INTEGER,
+      }, theme)
+      lines.push(...indentBody(diffLines, indent, theme))
+    } else {
+      const hunkLabel = stats.hunks > 0 ? `${stats.hunks} 处修改` : `${changeCount} 行修改`
+      const summary = `⎿ ${hunkLabel} (+${stats.adds} −${stats.dels})`
+      lines.push(`${indent}${color(BODY_FIRST_PREFIX, theme.dim)}${color(summary, theme.muted)}`)
+      lines.push(`${indent}${BODY_CONT_PREFIX}${color('[Ctrl+O] 展开完整 diff', theme.secondary)}`)
     }
     return lines
   }
@@ -233,7 +240,8 @@ export function isToolCardTruncated(input: Pick<FormatToolCardInput, 'toolName' 
   const totalLines = trimmed.split('\n').length
   const family = getToolFamily(input.toolName)
   if (family.family === 'write' && isDiffContent(trimmed)) {
-    return totalLines > DIFF_MAX_LINES
+    const stats = computeDiffStats(trimmed)
+    return (stats.adds + stats.dels) > 10
   }
   return totalLines > (input.maxLines ?? getDefaultMaxLines(input.toolName))
 }

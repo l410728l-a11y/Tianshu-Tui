@@ -76,9 +76,9 @@ export function renderDocument(input: CreateDocumentInput): { content: string; f
 
 export async function createDocument(input: CreateDocumentInput): Promise<{ path: string; bytes: number; format: DocumentFormat }> {
   if (typeof input.destination_path !== 'string' || input.destination_path.trim().length === 0) {
-    throw new Error('destination_path is required')
+    throw new Error('destination_path 为必填项')
   }
-  if (typeof input.content !== 'string') throw new Error('content is required')
+  if (typeof input.content !== 'string') throw new Error('content 为必填项')
   const rendered = renderDocument(input)
   const exported = await exportFile({ destination_path: input.destination_path, content: rendered.content })
   return { path: exported.path, bytes: exported.bytes, format: rendered.format }
@@ -109,10 +109,10 @@ Good: create_document(destination_path="H:\\zhuomian\\白嫖gpt\\notes.md", cont
   async execute(params) {
     try {
       const result = await createDocument(params.input as CreateDocumentInput)
-      return { content: `Created ${result.format} document (${result.bytes} bytes): ${result.path}` }
+      return { content: `已创建 ${result.format} 文档（${result.bytes} 字节）：${result.path}` }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${msg}`, isError: true }
+      return { content: `错误：${msg}`, isError: true }
     }
   },
 

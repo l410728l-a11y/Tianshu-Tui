@@ -56,6 +56,10 @@ const FAILURE_CLASS_PHASIC_WEIGHT: ReadonlyMap<FailureClass, number> = new Map<F
   ['assertion', 1.0],
   ['syntax_error', 1.0],
   ['module_resolution', 1.0],
+  // TDD RED is expected — test-first discipline should not be penalized
+  ['test_red', 0.0],
+  // 反幻影探针脱靶（A5/M3）：证实"不存在"是有效信息收集，轻罚保留信号
+  ['probe_miss', 0.3],
   // Other — default full penalty
   ['snapshot', 1.0],
   ['format_error', 1.0],

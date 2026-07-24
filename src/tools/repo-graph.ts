@@ -41,7 +41,7 @@ export function createRepoGraphTool(getIndexer: () => MeridianIndexer | null): T
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const indexer = getIndexer()
       if (!indexer) {
-        return { content: 'Meridian graph not initialized. Read some files first to build the index.', isError: true }
+        return { content: 'Meridian 图尚未初始化。请先读取一些文件以构建索引。', isError: true }
       }
 
       const input = params.input as unknown as RepoGraphInput
@@ -54,17 +54,17 @@ export function createRepoGraphTool(getIndexer: () => MeridianIndexer | null): T
       const result = await indexer.query(input.from_file, { maxTokens: input.max_tokens ?? 2000 })
 
       if (result.entries.length === 0) {
-        return { content: `No graph data for \`${input.from_file}\`. Read the file first to index it.` }
+        return { content: `\`${input.from_file}\` 尚无图数据。请先读取该文件以建立索引。` }
       }
 
       const lines: string[] = [
-        `## Code Graph from \`${input.from_file}\``,
-        `Index: ${result.graphSize} files, ${result.totalSymbols} symbols`,
+        `## 代码图（起点 \`${input.from_file}\`）`,
+        `索引：${result.graphSize} 个文件，${result.totalSymbols} 个符号`,
         '',
       ]
 
       for (const entry of result.entries) {
-        lines.push(`### ${entry.filePath} (score: ${entry.score.toFixed(2)})`)
+        lines.push(`### ${entry.filePath}（分数：${entry.score.toFixed(2)}）`)
         for (const sym of entry.symbols) {
           const prefix = sym.kind === 'function' ? 'ƒ' : sym.kind === 'class' ? '◆' : sym.kind === 'interface' || sym.kind === 'type' ? '◇' : '•'
           lines.push(`  ${prefix} ${sym.name} L${sym.line}`)
@@ -73,7 +73,7 @@ export function createRepoGraphTool(getIndexer: () => MeridianIndexer | null): T
       }
 
       const content = lines.join('\n')
-      return { content: content.length > 15000 ? content.slice(0, 15000) + '\n...(truncated)' : content }
+      return { content: content.length > 15000 ? content.slice(0, 15000) + '\n...（已截断）' : content }
     },
     requiresApproval() { return false },
     isConcurrencySafe() { return true },
@@ -85,30 +85,30 @@ function executeImpact(indexer: MeridianIndexer, filePath: string): ToolResult {
   const result = indexer.impact([filePath])
 
   if (result.totalImpact === 0 && result.tests.length === 0) {
-    return { content: `No known dependents for \`${filePath}\`. The graph may need more files indexed.` }
+    return { content: `\`${filePath}\` 尚无已知依赖方。图可能还需要索引更多文件。` }
   }
 
   const lines: string[] = [
-    `## Impact Analysis: \`${filePath}\``,
-    `Total impacted: ${result.totalImpact} files`,
+    `## 影响分析：\`${filePath}\``,
+    `受影响合计：${result.totalImpact} 个文件`,
     '',
   ]
 
   if (result.direct.length > 0) {
-    lines.push(`### Direct dependents (${result.direct.length})`)
+    lines.push(`### 直接依赖方（${result.direct.length}）`)
     for (const f of result.direct) lines.push(`- ${f}`)
     lines.push('')
   }
 
   if (result.transitive.length > 0) {
-    lines.push(`### Transitive dependents (${result.transitive.length})`)
+    lines.push(`### 传递依赖方（${result.transitive.length}）`)
     for (const f of result.transitive.slice(0, 20)) lines.push(`- ${f}`)
-    if (result.transitive.length > 20) lines.push(`- ...(${result.transitive.length - 20} more)`)
+    if (result.transitive.length > 20) lines.push(`- ...（另有 ${result.transitive.length - 20} 个）`)
     lines.push('')
   }
 
   if (result.tests.length > 0) {
-    lines.push(`### Tests to run (${result.tests.length})`)
+    lines.push(`### 应运行的测试（${result.tests.length}）`)
     for (const f of result.tests) lines.push(`- ${f}`)
     lines.push('')
   }

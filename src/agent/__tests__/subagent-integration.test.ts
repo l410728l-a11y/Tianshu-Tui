@@ -452,7 +452,7 @@ describe('Delegation Flow', () => {
 
     assert.equal(result.isError, false)
     assert.ok(result.content.includes('Found authentication bug'))
-    assert.ok(result.uiContent?.includes('delegate_task completed'))
+    assert.ok(result.uiContent?.includes('delegate_task 已完成'))
 
     // Verify claim injection
     const claims = claimStore.listClaims()

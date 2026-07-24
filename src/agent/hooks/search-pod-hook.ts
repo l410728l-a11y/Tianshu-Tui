@@ -1,4 +1,8 @@
 import type { PostToolRuntimeHook, RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
+import { AST_GREP_EMPTY_PREFIX } from '../../tools/ast-grep.js'
+import { GLOB_EMPTY_RESULT } from '../../tools/glob.js'
+import { GREP_EMPTY_RESULT } from '../../tools/grep.js'
+import { SEMANTIC_SEARCH_NO_MATCHES_MARKER } from '../../tools/semantic-search.js'
 
 /**
  * search-pod-hook — 检索 POD 语义 shadow 观察（风暴遗产回收 W-B）。
@@ -53,7 +57,7 @@ export function classifySearchPod(tool: RuntimeToolEvent): Omit<SearchPodRow, 't
   const input = tool.input ?? {}
 
   if (tool.name === 'grep') {
-    if (!content.includes('No matches found')) return null
+    if (!content.includes(GREP_EMPTY_RESULT)) return null
     const pattern = typeof input['pattern'] === 'string' ? input['pattern'] : ''
     const literal = input['literal'] === true || !REGEX_META.test(pattern)
     const scoped = typeof input['path'] === 'string' || typeof input['glob'] === 'string'
@@ -62,7 +66,7 @@ export function classifySearchPod(tool: RuntimeToolEvent): Omit<SearchPodRow, 't
   }
 
   if (tool.name === 'glob') {
-    if (!content.includes('No files found matching pattern')) return null
+    if (!content.includes(GLOB_EMPTY_RESULT)) return null
     const pattern = typeof input['pattern'] === 'string' ? input['pattern'] : ''
     const scoped = typeof input['path'] === 'string'
     // 简单文件名模式（无目录段或仅 **/ 前缀）+ 全库搜 = 高检出力。
@@ -73,7 +77,7 @@ export function classifySearchPod(tool: RuntimeToolEvent): Omit<SearchPodRow, 't
   if (tool.name === 'ast_grep') {
     // AST 模式对代码形状敏感（缩进/换行即可从匹配变不匹配）——空结果一律
     // 视为低检出力，不存在"可信排除"的 ast_grep 空结果。
-    if (!/^0 match\(es\)/.test(content)) return null
+    if (!content.startsWith(AST_GREP_EMPTY_PREFIX)) return null
     return { event: 'search-pod', tool: 'ast_grep', queryClass: 'low-pod', emptyResult: true }
   }
 
@@ -81,7 +85,7 @@ export function classifySearchPod(tool: RuntimeToolEvent): Omit<SearchPodRow, 't
   //   绝对空 → embedding 召回有限，空结果 ≠ 全库无相关 → low-pod 记录；
   //   top score < 阈值 → 低质量结果，中等误排除风险 → low-pod 记录（带分数）；
   //   非空且高分 → 搜到了只是非目标，不记录。
-  if (content.includes('No matches for:')) {
+  if (content.includes(SEMANTIC_SEARCH_NO_MATCHES_MARKER)) {
     return { event: 'search-pod', tool: 'semantic_search', queryClass: 'low-pod', emptyResult: true }
   }
   const scoreMatch = /\(score (\d+\.\d+)\)/.exec(content)

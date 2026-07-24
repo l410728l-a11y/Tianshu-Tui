@@ -32,7 +32,7 @@ describe('write_file tool — uiContent diff', () => {
       content: 'one\ntwo\nthree\n',
     }))
     assert.ok(!result.isError)
-    assert.ok(result.content.startsWith('Wrote '))
+    assert.ok(result.content.startsWith('已写入 '))
     assert.ok(!result.content.includes('@@'), 'diff must not leak into model content')
     assert.ok(result.uiContent && /^@@/m.test(result.uiContent), 'uiContent has hunk header')
     assert.ok(/^\+one$/m.test(result.uiContent!))
@@ -132,7 +132,7 @@ describe('write_file tool — uiContent diff', () => {
       content: 'small replacement',
     }))
     assert.ok(!result.isError)
-    assert.ok(result.content.startsWith('Wrote '))
+    assert.ok(result.content.startsWith('已写入 '))
     assert.equal(result.uiContent, undefined, 'uiContent should be undefined when old content is not loaded')
     assert.deepEqual(result.changedRanges, [], 'changedRanges should be empty when old content is unknown')
   })
@@ -152,7 +152,7 @@ describe('write_file tool — blind-overwrite guard', () => {
       content: 'blind replacement\n',
     }))
     assert.ok(result.isError, 'blind overwrite must be refused')
-    assert.ok(result.content.includes('never read in this session'), 'error explains the guard')
+    assert.ok(result.content.includes('本会话从未读取过'), 'error explains the guard')
     assert.equal(readFileSync(file, 'utf-8'), 'original 221-line test suite\n', 'file untouched')
   })
 
@@ -231,7 +231,7 @@ describe('write_file tool — blind-overwrite guard', () => {
     }))
     assert.equal(result.isError, true)
     assert.ok(result.content.includes('Python syntax error'), `Expected syntax error, got: ${result.content}`)
-    assert.ok(result.content.includes('automatically rolled back'), `Expected rollback note, got: ${result.content}`)
+    assert.ok(result.content.includes('已自动回滚'), `Expected rollback note, got: ${result.content}`)
     assert.equal(readFileSync(file, 'utf-8'), original, 'File should be rolled back to original content')
   })
 })

@@ -17,6 +17,7 @@
  *    across sessions (B4).
  */
 import type { AgentCallbacks, ApprovalMode } from '../agent/loop-types.js'
+import { debugLog } from '../utils/debug.js'
 import { collectPostBoundaryEditIds } from '../agent/file-history.js'
 import { loadConfig } from '../config/manager.js'
 import type { DelegationActivity, Tool } from '../tools/types.js'
@@ -27,7 +28,8 @@ import { describeIntentNote } from '../agent/intent-preview.js'
 import type { Artifact } from '../artifact/types.js'
 import { ArtifactStore } from '../artifact/store.js'
 import type { OaiMessage } from '../api/oai-types.js'
-import { isAssistantWithTools, oaiMessageText } from '../api/oai-types.js'
+import { isAssistantWithTools, oaiMessageText, type OaiToolCall } from '../api/oai-types.js'
+import { toolArgSummary } from '../tui/tool-label.js'
 import { loadPersistedResult } from '../agent/coordinator.js'
 import { loadWorkerSession } from '../agent/worker-session-persist.js'
 import type { SessionRegistry } from '../agent/session-registry.js'
@@ -46,12 +48,15 @@ import {
 import { approvePlanWithGuards, type PlanApprovalResult } from '../plan/plan-approval.js'
 import { SteerBuffer } from '../tui/steer-buffer.js'
 import { TEAM_PANEL_UI_PREFIX } from '../tui/team-panel-model.js'
+import { COUNCIL_PANEL_UI_PREFIX } from '../tui/council-panel-model.js'
+import { containsRegisteredFrame } from '../tui/frame-codec.js'
 import { WatchdogRecoveryPolicy } from '../agent/watchdog-recovery-policy.js'
 import { buildDomainPickerEntries, type DomainPickerEntry } from '../agent/domain-picker-entries.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import type { ActiveStarDomain } from '../agent/star-domain.js'
 import type { StarDomainId } from '../agent/star-domain.js'
 import { skillRegistry, loadProjectSkills, listInstallableSkills, importSkillsIntoRivet, countInstalledSkills, type InstallableSkill } from '../skills/skill-loader.js'
+import type { MissionStore } from './mission-store.js'
 import { join, resolve } from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { createWorktree, removeWorktree, listWorktrees, hasUnlandedWork, commitAll, revParseHead, squashMergeBranch, pushBranch, type WorktreeEntry } from '../agent/worktree.js'
@@ -111,6 +116,21 @@ export type PlanUpdateOutcome =
       code: 'session-missing' | 'plan-not-found' | 'not-editable' | 'empty-content'
       reason: string
     }
+
+/** 工具调用参数摘要(worker 转录):优先 toolArgSummary 的领域摘要,
+ *  未覆盖的工具回退原始 JSON 截断。展示用途,解析失败不抛。 */
+function summarizeToolCallArgs(call: OaiToolCall | undefined): string | undefined {
+  if (!call) return undefined
+  const raw = call.function.arguments ?? ''
+  try {
+    const parsed = JSON.parse(raw || '{}') as Record<string, unknown>
+    const summary = toolArgSummary(call.function.name, parsed)
+    if (summary) return summary
+  } catch {
+    // 非法 JSON——直接落原文截断
+  }
+  return raw && raw !== '{}' ? raw.slice(0, 200) : undefined
+}
 
 /** PlusMenu — a selectable model across all configured providers. */
 export interface ModelOption {
@@ -419,6 +439,8 @@ export interface CreateSessionInput {
   cwd?: string
   title?: string
   prompt?: string
+  /** P1 — 显式指定关联的 Mission id。不传则按 title 自动 getOrCreate。 */
+  missionId?: string
   approvalMode?: ApprovalMode
   /** Override the model for this session (takes priority over project/global defaults). */
   model?: string
@@ -580,6 +602,12 @@ export interface RuntimeSessionManagerOptions {
    * Default 30 minutes.
    */
   idleAgentTtlMs?: number
+  /**
+   * P1 任务身份化 — Mission 存储。注入（而非默认实例化）是有意的：
+   * 未接线时 Mission 关联整体跳过，现有测试带 title 建会话不会写真实
+   * `~/.rivet/missions/`。serve.ts 构造真实实例并同时接给 mission routes。
+   */
+  missionStore?: MissionStore
   /** Injectable timer surface for deterministic tool-result coalescing tests. */
   toolResultScheduler?: {
     setTimeout(callback: () => void, ms: number): unknown
@@ -935,6 +963,8 @@ export class RuntimeSessionManager {
     clearTimeout(handle: unknown): void
   }
   private readonly loadPlans: typeof storeListPlans
+  /** P1 任务身份化 — 可选 Mission 存储（未注入时 Mission 关联整体跳过）。 */
+  private readonly missionStore?: MissionStore
   private idleSweepTimer?: ReturnType<typeof setInterval>
 
   constructor(opts: RuntimeSessionManagerOptions) {
@@ -964,6 +994,7 @@ export class RuntimeSessionManager {
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     }
     this.loadPlans = opts.listPlans ?? storeListPlans
+    this.missionStore = opts.missionStore
     if (this.idleAgentTtlMs > 0) {
       // Sweep once a minute; unref so the timer never keeps the process alive.
       this.idleSweepTimer = setInterval(() => this.sweepIdleAgents(), 60_000)
@@ -1285,15 +1316,20 @@ export class RuntimeSessionManager {
    * + 终态结果(loadPersistedResult)+ 转录尾部(loadWorkerSession,
    * 与 CLI worker-detail 同源 ~/.rivet/subagents/<orderId>.session.jsonl)。
    * 返回 undefined = 会话不存在;三段数据均可独立为空(worker 无存档时)。
+   * `full` 模式(桌面「查看完整转录」):不截尾部 50 条,单条正文上限放宽,
+   * 工具调用帧带参数摘要(toolInput)。默认模式保持轻载荷。
    */
-  async getWorkerLog(id: string, workerId: string): Promise<{
+  async getWorkerLog(id: string, workerId: string, opts?: { full?: boolean }): Promise<{
     activity: string[]
     result: ReturnType<typeof loadPersistedResult>
-    transcript: { role: string; text: string; toolName?: string }[]
+    transcript: { role: string; text: string; toolName?: string; toolInput?: string }[]
     savedAt: number | null
+    /** true = 默认模式下转录尾部有被截断的更早消息(可用 full=1 拉全量)。 */
+    truncated: boolean
   } | undefined> {
     const s = this.sessions.get(id)
     if (!s) return undefined
+    const full = opts?.full === true
     // 活动日志:会话事件流中该 worker 的 progressLine / 文本增量 / 状态迁移
     const { events } = (await this.getEventsAsync(id, 0)) ?? { events: [] as SessionEvent[] }
     const activity: string[] = []
@@ -1307,13 +1343,23 @@ export class RuntimeSessionManager {
     }
     const result = loadPersistedResult(workerId)
     const record = loadWorkerSession(workerId)
-    const transcript = (record?.messages ?? []).slice(-50).map((m: OaiMessage) => ({
+    const messages = record?.messages ?? []
+    const keep = full ? messages : messages.slice(-50)
+    const textCap = full ? 4000 : 800
+    const transcript = keep.map((m: OaiMessage) => ({
       role: m.role,
       // 纯工具调用轮的 assistant.content 为 null——oaiMessageText 此时运行期为 null,必须兜底
-      text: (oaiMessageText(m) ?? '').slice(0, 800),
+      text: (oaiMessageText(m) ?? '').slice(0, textCap),
       toolName: isAssistantWithTools(m) ? m.tool_calls[0]?.function.name : undefined,
+      toolInput: isAssistantWithTools(m) ? summarizeToolCallArgs(m.tool_calls[0]) : undefined,
     }))
-    return { activity: activity.slice(-50), result, transcript, savedAt: record?.savedAt ?? null }
+    return {
+      activity: full ? activity : activity.slice(-50),
+      result,
+      transcript,
+      savedAt: record?.savedAt ?? null,
+      truncated: !full && messages.length > 50,
+    }
   }
 
   /** Mark a session's log as most-recently-used in the LRU. */
@@ -1594,6 +1640,22 @@ export class RuntimeSessionManager {
       skillLoadErrors: [],
       unattended: input.unattended === true,
     }
+    // P1 — Mission 关联（显式路径）。projectId 用原项目根（input.cwd），
+    // 不用 worktree 变异后的 cwd——worktree 路径是临时的，projectId 会漂移。
+    // Best-effort：Mission 存储故障不阻断会话创建。
+    if (this.missionStore) {
+      try {
+        const projectCwd = input.cwd ?? this.defaultCwd
+        if (input.missionId) {
+          session.record.missionId = input.missionId
+          this.missionStore.addSession(input.missionId, id)
+        } else if (input.title && input.title.trim()) {
+          const mission = this.missionStore.getOrCreate(projectCwd, input.title)
+          session.record.missionId = mission.id
+          this.missionStore.addSession(mission.id, id)
+        }
+      } catch { /* non-fatal — 会话照常创建，桌面端回退 title/shortId */ }
+    }
     this.sessions.set(id, session)
     this.touchLoaded(session)
     this.persistRecord(session)
@@ -1629,6 +1691,8 @@ export class RuntimeSessionManager {
     session.abortWhileApprovalPending = false
     session.unattendedHaltReason = undefined
     session.unattendedHaltApp = undefined
+    // 结构化 halt 标记随新 run 清除（record 会随后续 persist 落盘）。
+    if (session.record.unattendedHalt) session.record.unattendedHalt = undefined
     session.watchdogPolicy ??= new WatchdogRecoveryPolicy()
     // 用户主动提交恢复续跑预算；自动续跑注入的 'continue' 不算（与 TUI 的
     // onSubmitCallback 直呼路径一致，否则 consecutive cap 形同虚设）。
@@ -1694,6 +1758,13 @@ export class RuntimeSessionManager {
           : {}),
       })
       this.append(session, 'status', { status: 'running' })
+      // P2-B: emit a goal_state baseline snapshot on the first user message so
+      // MissionProjector + GoalBar can cold-start from the event stream instead
+      // of relying on HTTP polling. No goalId/tracker yet — just an active empty
+      // goal that moves the projector phase from 'draft' to 'executing'.
+      if (wasFirstUser) {
+        this.append(session, 'goal_state', this.baselineGoalSnapshot() as unknown as Record<string, unknown>)
+      }
       this.persistRecord(session)
       // Auto-generate a session title from the first user message when none is
       // set. Fire-and-forget — extraction never blocks the main run, and the
@@ -2421,6 +2492,24 @@ export class RuntimeSessionManager {
     }
   }
 
+  /**
+   * P2-B: Baseline goal_state snapshot emitted on the first user message.
+   * No GoalTracker exists yet — this is a synthetic active-empty goal that
+   * lets MissionProjector transition from 'draft' to 'executing' phase.
+   * Subsequent setGoal/extractCriteria calls will emit richer goal_state events.
+   */
+  private baselineGoalSnapshot(): GoalSnapshot {
+    return {
+      goalId: '',
+      goal: '',
+      status: 'active',
+      iteration: 0,
+      maxIterations: 0,
+      wallClockElapsedMs: 0,
+      successCriteria: [],
+    }
+  }
+
   private async extractCriteria(id: string, goal: string, tracker: import('../agent/goal-tracker.js').GoalTracker): Promise<void> {
     const handles = this.resolveGoalHandles?.(id)
     if (!handles) return
@@ -2470,10 +2559,28 @@ export class RuntimeSessionManager {
       const s = this.sessions.get(id)
       if (s && title && !s.record.title) {
         this.setTitle(id, title)
+        this.attachImplicitMission(s, title)
       }
     } catch {
       // non-fatal — title stays unset, UI keeps sessionId-slice fallback
     }
+  }
+
+  /**
+   * rev2 — 隐式 Mission：主流路径（sendPrompt 无标题）在 maybeAutoTitle
+   * 起标题成功时获得 Mission。恒新建不去重（自动标题撞名 ≠ 同一任务）。
+   * 双检 !record.missionId：显式路径已关联的不重复创建。
+   * 注：worktree 会话的 record.cwd 是 worktree 路径，projectId 会偏离项目
+   * 根——该组合（无标题 + isolatedWorktree）极少见，P1 接受。
+   */
+  private attachImplicitMission(s: InternalSession, title: string): void {
+    if (!this.missionStore || s.record.missionId) return
+    try {
+      const mission = this.missionStore.create(s.record.cwd, title)
+      this.missionStore.addSession(mission.id, s.record.id)
+      s.record.missionId = mission.id
+      this.persistRecord(s)
+    } catch { /* non-fatal — 标题已写入，仅 Mission 关联缺席 */ }
   }
 
   /**
@@ -2665,7 +2772,9 @@ export class RuntimeSessionManager {
         selectedApproach: resolvedApproach,
       })
     } catch { /* non-fatal */ }
-    try { agent.exitPlanMode?.() } catch { /* non-fatal */ }
+    try { agent.exitPlanMode?.() } catch (err) {
+      debugLog('approvePlan: agent.exitPlanMode() failed — plan mode may not have exited', err instanceof Error ? err.message : String(err))
+    }
     // agent.onPlanModeChange 可能已镜像 record 并发过 plan_mode —— 条件补发防重复，
     // 同时兜底不支持回调的轻量 double。
     if (session.record.planMode !== 'off') {
@@ -3800,7 +3909,7 @@ export class RuntimeSessionManager {
           // Team panel frames encode rich structured data — raise the cap to 8K
           // so multi-task wave DAGs aren't truncated before the desktop decodes them.
           ...(uiContent
-            ? { uiContent: truncateUtf16Safe(redactText(uiContent), uiContent.includes(TEAM_PANEL_UI_PREFIX) ? 8000 : 2000) }
+            ? { uiContent: truncateUtf16Safe(redactText(uiContent), containsRegisteredFrame(uiContent) ? 8000 : 2000) }
             : {}),
         }
         if (isError === undefined) {
@@ -3934,6 +4043,9 @@ export class RuntimeSessionManager {
       if (session.unattendedHaltApp === undefined && appName) session.unattendedHaltApp = appName
       // record.error 让会话列表/桌面通知不用扒事件流就能拿到中止原因。
       session.record.error ??= reason
+      // 结构化标记：让侧栏/Inbox 不解析 error 文本就能识别"无人值守停机"
+      // 并区别于一般失败（Wave 4 halt 可见化的数据源）。
+      session.record.unattendedHalt ??= { reason, ...(appName ? { app: appName } : {}) }
       this.append(session, 'approval_required', { requestId, toolName: name, input: redactValue(input) })
       this.append(session, 'approval_resolved', { requestId, decision: 'unattended_blocked' })
       this.append(session, 'unattended_halt', { requestId, toolName: name, reason })

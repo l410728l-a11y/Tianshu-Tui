@@ -486,7 +486,8 @@ describe('priority tier (constitutional/operational/informational)', () => {
       const delivered = bus.drainDelivered()
       const srDelivered = delivered.filter(d => d.key === 'readonly-spiral' || d.key === 'turn-call-limit')
       assert.equal(srDelivered.length, 1, 'GREEN: only 1 SR counts as delivered')
-      assert.equal(srDelivered[0]!.key, 'readonly-spiral', 'first SR delivered')
+      // A3：drain 按 priority 降序——turn-call-limit(0.68) 先于 readonly-spiral(0.65)
+      assert.equal(srDelivered[0]!.key, 'turn-call-limit', 'highest-priority SR delivered first')
 
       // srDropped 不出现在 delivered 桶中
       const ledger = bus.drainLedger()
@@ -551,6 +552,98 @@ describe('priority tier (constitutional/operational/informational)', () => {
       const ledger = bus.drainLedger()
       assert.equal(ledger.srCarried, 2, '2 carries counted (3rd = dropped, not carried)')
       assert.equal(ledger.srDropped, 1, '1 dropped after carry limit exceeded')
+    })
+
+    // ── A4 互斥对：lossy-observation 胜 readonly-spiral ──
+
+    it('A4: lossy 与 readonly-spiral 同周期在场 → spiral 让位（lossy 是事实，spiral 是启发式）', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'lossy-observation', priority: 0.48, category: 'discipline',
+        content: '有损观测：禁止负向结论，先交叉验证', ttl: 1,
+      })
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读，信息可能已足够，开始行动', channel: 'system-reminder', immediate: true,
+      })
+      const rendered = bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 0, 'readonly-spiral 应被互斥丢弃，不进 SR 通道')
+      assert.match(rendered, /有损观测/, 'lossy 照常送达')
+    })
+
+    it('A4: spiral 单独在场时照常送达（互斥只在双方同场时生效）', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读，开始行动', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1)
+      assert.equal(srs[0]!.key, 'readonly-spiral')
+    })
+
+    // ── A3 信号互扰治理：SR drain 按 priority + 停放文案刷新 ──
+
+    it('A3: drain 按 priority 降序——高优先级 SR 先出队，不受提交顺序影响', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'readonly-spiral', priority: 0.65, category: 'discipline',
+        content: '连续只读', channel: 'system-reminder', immediate: true,
+      })
+      bus.submit({
+        key: 'regression-bisect', priority: 0.85, category: 'constitutional',
+        tier: 'constitutional', content: '回归对照', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 5)
+      const srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 2)
+      assert.equal(srs[0]!.key, 'regression-bisect', '高优先级先出队（旧实现按插入序会输给 spiral）')
+      assert.equal(srs[1]!.key, 'readonly-spiral')
+    })
+
+    it('A3: 停放期间同 key 新内容到达 → 刷新文案而非保留陈旧文案', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'turn-budget', priority: 0.7, category: 'discipline',
+        content: '轮数预算：还剩 3 轮', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 5)
+      let srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1)
+      // discipline 额度耗尽 → skipCarry 停放
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass, true)
+      // 下一轮 hook 重新提交同 key，预算数字已更新
+      bus.submit({
+        key: 'turn-budget', priority: 0.7, category: 'discipline',
+        content: '轮数预算：还剩 1 轮', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 6)
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 1, '同 key 不重复注入')
+      assert.ok(srs[0]!.content.includes('还剩 1 轮'),
+        `停放文案应刷新为新内容，got: ${srs[0]!.content}`)
+    })
+
+    it('A3: requeue 停放条目与新条目共同参与 priority 排序', () => {
+      const bus = new AdvisoryBus()
+      bus.submit({
+        key: 'action-intent', priority: 0.62, category: 'discipline',
+        content: '行动意图', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 5)
+      let srs = bus.drainSystemReminders()
+      bus.requeueSr(srs[0]!.key, srs[0]!.content, srs[0]!.srClass, true)
+      bus.submit({
+        key: 'turn-budget', priority: 0.7, category: 'discipline',
+        content: '预算收敛', channel: 'system-reminder', immediate: true,
+      })
+      bus.render(undefined, 6)
+      srs = bus.drainSystemReminders()
+      assert.equal(srs.length, 2)
+      assert.equal(srs[0]!.key, 'turn-budget', '新条目优先级更高，先出队')
+      assert.equal(srs[1]!.key, 'action-intent', '停放条目按其原 priority 参与排序')
     })
 
     it('W2: srClass flow through systemReminderOut with functional class', () => {

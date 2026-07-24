@@ -10,6 +10,7 @@ import { starDomainRegistry } from '../../agent/star-domain-registry.js'
 import { ANSI, color } from '../engine/ansi.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
 import { getActiveThemeName, type RivetTheme } from '../theme.js'
+import type { CacheStatus } from '../status-types.js'
 
 /** 星域名称 → 主题语义色键（用于 input border / prompt accent 着色）。 */
 export function resolveStarDomainAccent(domainName: string | undefined, theme: RivetTheme): string {
@@ -91,6 +92,8 @@ export interface GlanceBarInput {
   reasoningEffort?: string
   /** 缓存命中率 0-1 */
   cacheHitRate?: number
+  /** 缓存健康度状态（projectCacheTelemetry 三态判定） */
+  cacheStatus?: CacheStatus
   /** 上下文占比 0-1 */
   contextRatio?: number
   /** API 实际 prompt token（用于颜色阈值，反映真实窗口压力） */
@@ -195,8 +198,11 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
     }
     if (input.cacheHitRate !== undefined) {
       const cachePct = (input.cacheHitRate * 100).toFixed(0)
-      const cacheColor = input.cacheHitRate < 0.5 ? theme.warning : theme.muted
-      parts.push(color(`⚡${cachePct}%`, cacheColor))
+      const cacheColor = input.cacheStatus === 'degraded' ? theme.warning
+        : input.cacheStatus === 'stale' ? theme.dim
+        : input.cacheHitRate < 0.5 ? theme.warning : theme.muted
+      const label = input.cacheStatus === 'degraded' ? `⚡${cachePct}%冷` : `⚡${cachePct}%`
+      parts.push(color(label, cacheColor))
     } else {
       // 无缓存数据时显示占位，避免右侧空洞或误导
       parts.push(color('⚡-', theme.dim))
@@ -240,8 +246,11 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
   }
   if (input.cacheHitRate !== undefined) {
     const cachePct = (input.cacheHitRate * 100).toFixed(0)
-    const cacheColor = input.cacheHitRate < 0.5 ? theme.warning : theme.muted
-    parts.push(color(`⚡${cachePct}%`, cacheColor))
+    const cacheColor = input.cacheStatus === 'degraded' ? theme.warning
+      : input.cacheStatus === 'stale' ? theme.dim
+      : input.cacheHitRate < 0.5 ? theme.warning : theme.muted
+    const label = input.cacheStatus === 'degraded' ? `⚡${cachePct}%冷` : `⚡${cachePct}%`
+    parts.push(color(label, cacheColor))
   } else {
     // 无缓存数据时显示占位，避免右侧空洞或误导
     parts.push(color('⚡-', theme.dim))

@@ -16,6 +16,7 @@ export interface SessionRecord {
   title?: string
   lastSeq: number
   pendingApprovals: number
+  approvalMode?: string
 }
 
 export interface ModelEntry {
@@ -32,6 +33,28 @@ export interface DomainEntry {
   current: boolean
 }
 
+/** GET /config/providers 镜像（宿主桥转发）。 */
+export interface ProviderListItem {
+  name: string
+  label: string
+  isDefault: boolean
+  keyStatus: { source: 'inline' | 'env' | 'none'; ref: string }
+  isPreset: boolean
+}
+
+export interface ProviderConfigList {
+  providers: ProviderListItem[]
+  unconfigured: { key: string; label: string; defaultModelId: string }[]
+}
+
+/** Plan 审批卡数据（GET /sessions/:id/plans/:slug 镜像子集）。 */
+export interface PlanDocument {
+  slug: string
+  title: string
+  content: string
+  status: string
+}
+
 export type HostMsg =
   | { type: 'sessions'; sessions: SessionRecord[]; activeSessionId?: string }
   | { type: 'sessionCreated'; session: SessionRecord }
@@ -43,6 +66,10 @@ export type HostMsg =
   | { type: 'files'; reqId: number; files: string[] }
   | { type: 'insertText'; text: string }
   | { type: 'error'; message: string }
+  | { type: 'providers'; config: ProviderConfigList | null }
+  | { type: 'providerSetupResult'; ok: boolean; message?: string }
+  | { type: 'plan'; sessionId: string; plan: PlanDocument }
+  | { type: 'planDecisionResult'; sessionId: string; slug: string; decision: 'approve' | 'reject'; ok: boolean; message?: string }
 
 interface VsCodeApi {
   postMessage(msg: unknown): void

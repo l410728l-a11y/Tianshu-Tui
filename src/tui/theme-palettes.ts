@@ -295,7 +295,7 @@ const DAWN: ThemePaletteDef = {
     toolDelegate: '#d8a15c',
   },
   overrides: {
-    userColor: '#edf3f8',
+    userColor: '#f59e0b',
     assistantColor: '#dce3ea',
     muted: '#8f9aaa',
     systemColor: '#8f9aaa',
@@ -312,7 +312,7 @@ const DAWN: ThemePaletteDef = {
     pulseAlert: 'red',
   },
   fallbackOverrides: {
-    userColor: 'white',
+    userColor: 'yellowBright',
     assistantColor: 'white',
     muted: 'gray',
   },
@@ -337,12 +337,12 @@ const ANTIGRAVITY: ThemePaletteDef = {
     toolTest: '#43c463',
     toolDelegate: '#e0a93a',
   },
-  overrides: { userColor: '#e2e6ec', assistantColor: '#c4c9d2', muted: '#989aa6' },
+  overrides: { userColor: '#38bdf8', assistantColor: '#c4c9d2', muted: '#989aa6' },
   fallback: {
     primary: 'blue', secondary: 'cyan', success: 'green', warning: 'yellow',
     error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'blue', pulseAlert: 'red',
   },
-  fallbackOverrides: { userColor: 'white', assistantColor: 'white', muted: 'gray' },
+  fallbackOverrides: { userColor: 'cyanBright', assistantColor: 'white', muted: 'gray' },
 }
 
 // ── Cobalt — 钴蓝·冷调中性（默认）──────────────────────────────────
@@ -366,12 +366,12 @@ const COBALT: ThemePaletteDef = {
     toolTest: '#58cbb4',
     toolDelegate: '#d4b44c',
   },
-  overrides: { userColor: '#e6ecf2', assistantColor: '#c9cfd6', muted: '#9ca5b3' },
+  overrides: { userColor: '#fbbf24', assistantColor: '#c9cfd6', muted: '#9ca5b3' },
   fallback: {
     primary: 'blue', secondary: 'cyan', success: 'green', warning: 'yellow',
     error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'blue', pulseAlert: 'red',
   },
-  fallbackOverrides: { userColor: 'white', assistantColor: 'white', muted: 'gray' },
+  fallbackOverrides: { userColor: 'yellowBright', assistantColor: 'white', muted: 'gray' },
 }
 
 // ── Graphite — 石墨·冰青（专业默认）─────────────────────────────────
@@ -396,13 +396,13 @@ const GRAPHITE: ThemePaletteDef = {
     toolTest: '#7fbf8e',
     toolDelegate: '#d9b36c',
   },
-  // userColor 亮白 / assistantColor 中性灰：靠 ▌+bold 与灰度区分说话人，不引入第二彩色。
-  overrides: { userColor: '#eef1f5', assistantColor: '#c8cdd6', muted: '#9aa4b0', systemColor: '#8b95a1' },
+  // userColor 暖金琥珀 / assistantColor 中性灰：靠 ▌贯穿导轨 + 专属亮彩与灰度区分说话人
+  overrides: { userColor: '#f59e0b', assistantColor: '#c8cdd6', muted: '#9aa4b0', systemColor: '#8b95a1' },
   fallback: {
     primary: 'cyan', secondary: 'blue', success: 'green', warning: 'yellow',
     error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'cyan', pulseAlert: 'red',
   },
-  fallbackOverrides: { userColor: 'white', assistantColor: 'white', muted: 'gray' },
+  fallbackOverrides: { userColor: 'yellowBright', assistantColor: 'white', muted: 'gray' },
 }
 
 // ── Gemini — Indigo, Purple & Mint Teal ───────────────────────────

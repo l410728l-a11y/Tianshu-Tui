@@ -12,6 +12,9 @@ describe('mirror-env', () => {
     pypi: 'default',
     go: 'default',
     rust: 'default',
+    autoFallback: true,
+    fallbackMemoryMinutes: 10,
+    fallbackTimeoutSec: 60,
   }
 
   describe('buildMirrorEnv', () => {

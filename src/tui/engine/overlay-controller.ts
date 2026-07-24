@@ -61,6 +61,8 @@ export class OverlayController {
   private chronicleExec?: (id: string) => void
   private domainPickerExec?: (key: string) => void
   private modelPickerExec?: (key: string) => void
+  private domainPickerSaveDefaultExec?: (key: string) => void
+  private modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void
   private themePickerExec?: (key: string) => void
   private themePickerSaveDefaultExec?: (key: string) => void
   private choicePanelExec?: (id: string) => void
@@ -136,6 +138,10 @@ export class OverlayController {
   setDomainPickerExec(fn: ((key: string) => void) | undefined): void { this.domainPickerExec = fn }
   getModelPickerExec(): ((key: string) => void) | undefined { return this.modelPickerExec }
   setModelPickerExec(fn: ((key: string) => void) | undefined): void { this.modelPickerExec = fn }
+  getDomainPickerSaveDefaultExec(): ((key: string) => void) | undefined { return this.domainPickerSaveDefaultExec }
+  setDomainPickerSaveDefaultExec(fn: ((key: string) => void) | undefined): void { this.domainPickerSaveDefaultExec = fn }
+  getModelPickerSaveDefaultExec(): ((provider: string, modelId: string) => void) | undefined { return this.modelPickerSaveDefaultExec }
+  setModelPickerSaveDefaultExec(fn: ((provider: string, modelId: string) => void) | undefined): void { this.modelPickerSaveDefaultExec = fn }
   getThemePickerExec(): ((key: string) => void) | undefined { return this.themePickerExec }
   setThemePickerExec(fn: ((key: string) => void) | undefined): void { this.themePickerExec = fn }
   getThemePickerSaveDefaultExec(): ((key: string) => void) | undefined { return this.themePickerSaveDefaultExec }

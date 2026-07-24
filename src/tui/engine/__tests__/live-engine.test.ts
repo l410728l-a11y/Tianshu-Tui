@@ -558,3 +558,139 @@ test('嵌入 \\n 的行参与 reservedTail 预算时 chrome 仍完整保留', ()
   for (const c of chrome) assert.ok(out.includes(c), `${c} 必须保留`)
   assert.equal(term.cursorRow, 5, '帧恒 ≤ maxRows=6 display rows（光标停在第 6 行内）')
 })
+
+// ── IME 硬件光标锚定（caretCol parking，2026-07-23）────────────────
+// 终端 IME 候选窗锚定【硬件光标】而非自绘 █：帧末把硬件光标搬到 caretCol
+// 标记的坐标，组词串才会出现在输入框内。默认保持隐藏（单指针视觉）。
+// 需 RIVET_TUI_HARDWARE_CURSOR=1 才激活 parking 序列（cursorUp + G 驻停），
+// 否则走 pre-IME 路径（帧末光标留在末行尾，零额外序列）。
+
+function withHardwareCursor(fn: () => void): void {
+  const prev = process.env.RIVET_TUI_HARDWARE_CURSOR
+  process.env.RIVET_TUI_HARDWARE_CURSOR = '1'
+  try { fn() } finally {
+    if (prev === undefined) delete process.env.RIVET_TUI_HARDWARE_CURSOR
+    else process.env.RIVET_TUI_HARDWARE_CURSOR = prev
+  }
+}
+
+test('IME: caret 帧末硬件光标驻停到 caret 行/列（cursorUp + G 序列）', () => withHardwareCursor(() => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  const frame = term.flush()
+
+  assert.ok(frame.includes('\x1B[2A'), '帧末应上移 2 行（caret 行之下 2 行）')
+  assert.ok(frame.includes('\x1B[6G'), '帧末应定位第 6 列（caretCol 5 + 1）')
+  assert.equal(term.cursorRow, 1, '光标驻停 caret 行（区域第 2 行）')
+  assert.equal(term.cursorCol, 5, '光标驻停 caret 列')
+  assert.ok(frame.includes('\x1B[?25h'), '硬件光标模式下帧末 SHOW_CURSOR')
+}))
+
+test('IME: caret 驻停后下一帧 diff 爬升扣 parkedRowsUp（回顶不错位、无滚屏）', () => withHardwareCursor(() => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  term.flush()
+  engine.render([{ text: 'L0x' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  const frame = term.flush()
+
+  assert.ok(frame.includes('\x1B[1A'), '从 caret 行（而非末行）爬升 1 行回区域顶')
+  assert.ok(frame.includes('L0x'), '变化行被重写')
+  assert.equal(term.cursorRow, 1, '帧末仍驻停 caret 行')
+  assert.equal(term.cursorCol, 5)
+  assert.equal(term.scrollCount, 0, '全程无滚屏')
+}))
+
+test('IME: 行未变仅 caret 移动 → 只发重定位序列（零文字重绘）', () => withHardwareCursor(() => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  term.flush()
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 9 }, { text: 'L2' }, { text: 'L3' }])
+  const frame = term.flush()
+
+  assert.ok(!frame.includes('L0') && !frame.includes('L2'), '不得重绘任何文字行')
+  assert.ok(frame.includes('\x1B[10G'), '重定位到新列（9+1）')
+  assert.equal(term.cursorRow, 1, 'caret 行不变（rowsUp 相同无垂直移动）')
+  assert.equal(term.cursorCol, 9)
+}))
+
+test('IME: 行与 caret 均未变 → H2 短路零写入', () => withHardwareCursor(() => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  const frame = [{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }]
+  engine.render(frame)
+  term.flush()
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }])
+  assert.equal(term.flush(), '', '完全无变化应零写入')
+}))
+
+test('IME: CPR 响应按驻停记账折算区域末行——caret 移动/列变化不误判污染', () => {
+  let polluted = 0
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({
+    stdout: asStdout(term), reservedRows: 0, maxRows: 20,
+    onProbeRequest: () => {}, onPolluted: () => { polluted++ },
+  })
+
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  engine.noteCpr(10, 6) // 首响应建基线：regionEndRow = 10 + rowsUp(2) = 12
+  assert.equal(polluted, 0)
+
+  // 打字移动 caret（行内容相同走 H2 重定位），随后响应：行=10（caret 行）、列=10
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 9 }, { text: 'L2' }, { text: 'L3' }])
+  engine.noteCpr(10, 10)
+  assert.equal(polluted, 0, 'caret 驻停期间列随打字合法变化，不得误判污染')
+
+  // 外来写入把光标推到别的行：折算后 regionEndRow 偏离基线 → 应判污染
+  engine.noteCpr(14, 1)
+  assert.equal(polluted, 1, '区域末行被外来写入移动仍应判污染')
+})
+
+test('IME: 无 caret 驻停时 CPR 行列比对维持原语义（列变判污染）', () => {
+  let polluted = 0
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({
+    stdout: asStdout(term), reservedRows: 0, maxRows: 20,
+    onProbeRequest: () => {}, onPolluted: () => { polluted++ },
+  })
+
+  engine.render(lines('L0', 'L1'))
+  engine.noteCpr(10, 3) // 建基线
+  engine.noteCpr(10, 8) // 列变化（无 caret → 保持旧语义判污染）
+  assert.equal(polluted, 1)
+})
+
+test('IME: RIVET_TUI_HARDWARE_CURSOR=1 时帧末 SHOW_CURSOR（可见性后门）', () => {
+  process.env.RIVET_TUI_HARDWARE_CURSOR = '1'
+  try {
+    const term = new MockTerminal(80, 24)
+    const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+    engine.render([{ text: 'IN', caretCol: 2 }])
+    const frame = term.flush()
+    assert.ok(frame.includes('\x1B[?25h'), '应显示硬件光标')
+    assert.ok(frame.indexOf('\x1B[?25h') > frame.indexOf('IN'), 'SHOW_CURSOR 在帧末（内容之后）')
+  } finally {
+    delete process.env.RIVET_TUI_HARDWARE_CURSOR
+  }
+})
+
+test('IME: clear() 从 caret 驻停点爬升（不错位）并复位驻停记账', () => {
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
+
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  term.flush()
+  engine.clear()
+  // 从 caret 行（row 1）爬升 1 行回区域起始（row 0），而非从末行尾爬 3 行
+  assert.equal(term.cursorRow, 0, 'clear 后光标应在区域起始行')
+
+  // 驻停复位后首帧 append 不再携带爬升偏差
+  engine.render(lines('X'))
+  assert.equal(term.scrollCount, 0, 'clear/render 全程无滚屏')
+})

@@ -32,10 +32,10 @@ describe('diff tool', () => {
     rmSync(testDir, { recursive: true, force: true })
   })
 
-  it('returns "No changes" in a clean repo', async () => {
+  it('returns 无改动 in a clean repo', async () => {
     const result = await DIFF_TOOL.execute(makeParams({}))
     assert.equal(result.isError, undefined)
-    assert.equal(result.content, 'No changes.')
+    assert.equal(result.content, '无改动。')
   })
 
   it('shows diff for modified file', async () => {

@@ -106,14 +106,14 @@ export const AST_EDIT_TOOL: Tool = {
   async execute(params: ToolCallParams): Promise<ToolResult> {
     const input = params.input as Record<string, unknown>
     const ops = Array.isArray(input.ops) ? (input.ops as AstEditOp[]) : []
-    if (ops.length === 0) return { content: 'Error: at least one find/replace op is required', isError: true }
+    if (ops.length === 0) return { content: '错误：至少需要一个 find/replace 操作', isError: true }
 
     for (const op of ops) {
       if (typeof op.find !== 'string' || !op.find.trim()) {
-        return { content: 'Error: each op must have a non-empty "find" pattern', isError: true }
+        return { content: '错误：每个操作必须有非空的 "find" 模式', isError: true }
       }
       if (typeof op.replace !== 'string') {
-        return { content: 'Error: each op must have a "replace" template', isError: true }
+        return { content: '错误：每个操作必须有 "replace" 模板', isError: true }
       }
     }
 
@@ -123,14 +123,14 @@ export const AST_EDIT_TOOL: Tool = {
       const find = op.find as string
       if (/\\[dDwWsSbB1-9]/.test(find)) {
         return {
-          content: `Error: "find" pattern contains regex tokens (\\d, \\w, \\s, \\1, etc.).\n\nast_edit uses ast-grep syntax, not regular expressions. Patterns like "var $NAME = $VAL" match AST nodes — use $ metavariables for placeholders and $$ for ellipsis.\n\nOffending pattern: ${find.slice(0, 80)}`,
+          content: `错误："find" 模式含有正则标记（\\d、\\w、\\s、\\1 等）。\n\nast_edit 使用 ast-grep 语法，不是正则表达式。诸如 "var $NAME = $VAL" 的模式匹配 AST 节点——用 $ 元变量作占位，用 $$ 表示省略。\n\n问题模式：${find.slice(0, 80)}`,
           isError: true,
         }
       }
       const replace = op.replace as string
       if (/\\[dDwWsSbB1-9]/.test(replace)) {
         return {
-          content: `Error: "replace" template contains regex tokens (\\d, \\w, \\s, \\1, etc.).\n\nast_edit replacement templates use ast-grep metavariables ($NAME, $$NAME), not regular expressions. The tokens will be written literally into the file.\n\nOffending template: ${replace.slice(0, 80)}`,
+          content: `错误："replace" 模板含有正则标记（\\d、\\w、\\s、\\1 等）。\n\nast_edit 的替换模板使用 ast-grep 元变量（$NAME、$$NAME），不是正则表达式。这些标记会被原样写入文件。\n\n问题模板：${replace.slice(0, 80)}`,
           isError: true,
         }
       }
@@ -145,7 +145,7 @@ export const AST_EDIT_TOOL: Tool = {
     try {
       napi = await import('@ast-grep/napi')
     } catch {
-      return { content: 'Error: @ast-grep/napi is not installed. Run: npm install @ast-grep/napi', isError: true }
+      return { content: '错误：未安装 @ast-grep/napi。请运行：npm install @ast-grep/napi', isError: true }
     }
 
     const LANG_MAP = buildLangMap(napi)
@@ -158,7 +158,7 @@ export const AST_EDIT_TOOL: Tool = {
         allFiles.push(...collectFiles(resolved))
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        return { content: `Error: ${message}`, isError: true }
+        return { content: `错误：${message}`, isError: true }
       }
     }
 
@@ -168,7 +168,7 @@ export const AST_EDIT_TOOL: Tool = {
     for (const filePath of allFiles) {
       const langStr = resolveLang(explicitLang, filePath)
       if (!langStr) {
-        errors.push(`${filePath}: unsupported language`)
+        errors.push(`${filePath}: 不支持的语言`)
         continue
       }
 
@@ -177,7 +177,7 @@ export const AST_EDIT_TOOL: Tool = {
       const langValue = isDynamicLang(langStr) ? langStr : LANG_MAP[langStr]
       // runtime assertion: napi.Lang uses non-enumerable getters — verify we got a real string
       if (typeof langValue !== 'string') {
-        errors.push(`${filePath}: LANG_MAP returned non-string for "${langStr}" — possible @ast-grep/napi API change`)
+        errors.push(`${filePath}: LANG_MAP 对 "${langStr}" 返回了非字符串——可能是 @ast-grep/napi API 变更`)
         continue
       }
 
@@ -185,7 +185,7 @@ export const AST_EDIT_TOOL: Tool = {
       try {
         source = readFileSync(filePath, 'utf-8')
       } catch {
-        errors.push(`${filePath}: cannot read file`)
+        errors.push(`${filePath}: 无法读取文件`)
         continue
       }
 
@@ -197,14 +197,14 @@ export const AST_EDIT_TOOL: Tool = {
         try {
           root = napi.parse(langValue, currentSource).root()
         } catch {
-          errors.push(`${filePath}: parse error on op "${op.find.slice(0, 40)}"`)
+          errors.push(`${filePath}: 操作 "${op.find.slice(0, 40)}" 解析错误`)
           break
         }
 
         // detect syntax errors in current source
         const errorNodes = root.findAll({ rule: { kind: 'ERROR' } } as unknown as string)
         if (errorNodes.length > 0) {
-          errors.push(`${filePath}: parse error (${errorNodes.length} syntax error(s))`)
+          errors.push(`${filePath}: 解析错误（${errorNodes.length} 个语法错误）`)
           break
         }
 
@@ -221,7 +221,7 @@ export const AST_EDIT_TOOL: Tool = {
         try {
           found = root.findAll(pattern as string)
         } catch {
-          errors.push(`${filePath}: pattern compile error for "${op.find.slice(0, 40)}"`)
+          errors.push(`${filePath}: 模式 "${op.find.slice(0, 40)}" 编译错误`)
           continue
         }
 
@@ -264,14 +264,14 @@ export const AST_EDIT_TOOL: Tool = {
           deduped.push(e)
         }
         if (skippedOverlap > 0) {
-          errors.push(`${filePath}: skipped ${skippedOverlap} overlapping match(es) for "${op.find.slice(0, 40)}" — nested ranges would corrupt the edit`)
+          errors.push(`${filePath}: 已跳过 ${skippedOverlap} 个重叠匹配（"${op.find.slice(0, 40)}"）——嵌套范围会破坏编辑`)
         }
 
         // apply edits and re-parse for next op
         try {
           currentSource = root.commitEdits(deduped)
         } catch {
-          errors.push(`${filePath}: commitEdits failed for "${op.find.slice(0, 40)}"`)
+          errors.push(`${filePath}: 操作 "${op.find.slice(0, 40)}" 的 commitEdits 失败`)
           break
         }
       }
@@ -288,11 +288,11 @@ export const AST_EDIT_TOOL: Tool = {
             const finalRoot = napi.parse(langValue, currentSource).root()
             const finalErrors = finalRoot.findAll({ rule: { kind: 'ERROR' } } as unknown as string)
             if (finalErrors.length > 0) {
-              errors.push(`${filePath}: post-edit syntax error (${finalErrors.length} ERROR node(s)) — file NOT written, change discarded`)
+              errors.push(`${filePath}: 编辑后语法错误（${finalErrors.length} 个 ERROR 节点）——文件未写入，更改已丢弃`)
               finalSyntaxOk = false
             }
           } catch {
-            errors.push(`${filePath}: post-edit parse failed — file NOT written, change discarded`)
+            errors.push(`${filePath}: 编辑后解析失败——文件未写入，更改已丢弃`)
             finalSyntaxOk = false
           }
         }
@@ -322,7 +322,7 @@ export const AST_EDIT_TOOL: Tool = {
                   if (check.fatal) {
                     restoreLatestBackup(cwd, relPath)
                     incrementEditFailCount(filePath)
-                    errors.push(`${filePath}: post-write syntax error — rolled back: ${check.fatal.split('\n')[0]}`)
+                    errors.push(`${filePath}: 写入后语法错误——已回滚：${check.fatal.split('\n')[0]}`)
                     rolledBack = true
                   }
                 } catch {
@@ -335,7 +335,7 @@ export const AST_EDIT_TOOL: Tool = {
                 resetEditFailCount(filePath)
               }
             } catch {
-              errors.push(`${filePath}: failed to write changes`)
+              errors.push(`${filePath}: 写入更改失败`)
             }
           } else {
             fileResults.push({ file: filePath, changes })
@@ -347,7 +347,7 @@ export const AST_EDIT_TOOL: Tool = {
     // ── format output ─────────────────────────────────────────────
 
     const totalChanges = fileResults.reduce((sum, f) => sum + f.changes.length, 0)
-    const action = dryRun ? 'preview' : 'applied'
+    const action = dryRun ? '已预览' : '已应用'
 
     let body = ''
     for (const fr of fileResults) {
@@ -359,17 +359,17 @@ export const AST_EDIT_TOOL: Tool = {
         const beforeLines = ch.before.split('\n')
         const afterLines = ch.after.split('\n')
         const beforeShow = beforeLines.length > 1
-          ? beforeLines.slice(0, 3).join('\n    ') + (beforeLines.length > 3 ? `\n    … (+${beforeLines.length - 3} lines)` : '')
+          ? beforeLines.slice(0, 3).join('\n    ') + (beforeLines.length > 3 ? `\n    …（另 +${beforeLines.length - 3} 行）` : '')
           : beforeLines[0]!.slice(0, 80)
         const afterShow = afterLines.length > 1
-          ? afterLines.slice(0, 3).join('\n    ') + (afterLines.length > 3 ? `\n    … (+${afterLines.length - 3} lines)` : '')
+          ? afterLines.slice(0, 3).join('\n    ') + (afterLines.length > 3 ? `\n    …（另 +${afterLines.length - 3} 行）` : '')
           : afterLines[0]!.slice(0, 80)
         body += `\n  L${ch.line}:\n    - ${beforeShow}\n    + ${afterShow}`
       }
     }
 
-    const summary = `${totalChanges} change(s) ${action} in ${fileResults.length} file(s)${errors.length > 0 ? `, ${errors.length} error(s)` : ''}`
-    const errorSection = errors.length > 0 ? `\n\nErrors:\n${errors.map(e => `  - ${e}`).join('\n')}` : ''
+    const summary = `${totalChanges} 处更改${action}于 ${fileResults.length} 个文件${errors.length > 0 ? `，${errors.length} 个错误` : ''}`
+    const errorSection = errors.length > 0 ? `\n\n错误：\n${errors.map(e => `  - ${e}`).join('\n')}` : ''
 
     // Fail counter: if all ops produced errors and no changes, increment for
     // the first file with errors (the primary target). Reset on success above.

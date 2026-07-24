@@ -46,7 +46,7 @@ describe('REPO_MAP_TOOL', () => {
     assert.ok(result.content.includes('tools'))
     assert.ok(result.content.includes('tui'))
     // Summary line
-    assert.match(result.content, /\d+ files in tree, \d+ directories/)
+    assert.match(result.content, /树中 \d+ 个文件，\d+ 个目录/)
   })
 
   it('excludes build/runtime/foreign attention noise from default root map', async () => {
@@ -67,12 +67,12 @@ describe('REPO_MAP_TOOL', () => {
 
   it('annotates entry/test/config/doc files', async () => {
     const result = await REPO_MAP_TOOL.execute(makeParams())
-    assert.ok(result.content.includes('main.tsx [entry]'), 'main.tsx should be [entry]')
-    assert.ok(result.content.includes('app.tsx [entry]'), 'app.tsx should be [entry]')
-    assert.ok(result.content.includes('bash.test.ts [test]'), 'test file should be [test]')
-    assert.ok(result.content.includes('package.json [config]'), 'package.json should be [config]')
-    assert.ok(result.content.includes('tsconfig.json [config]'), 'tsconfig.json should be [config]')
-    assert.ok(result.content.includes('README.md [doc]'), 'README.md should be [doc]')
+    assert.ok(result.content.includes('main.tsx [入口]'), 'main.tsx should be [入口]')
+    assert.ok(result.content.includes('app.tsx [入口]'), 'app.tsx should be [入口]')
+    assert.ok(result.content.includes('bash.test.ts [测试]'), 'test file should be [测试]')
+    assert.ok(result.content.includes('package.json [配置]'), 'package.json should be [配置]')
+    assert.ok(result.content.includes('tsconfig.json [配置]'), 'tsconfig.json should be [配置]')
+    assert.ok(result.content.includes('README.md [文档]'), 'README.md should be [文档]')
   })
 
   it('respects max_files limit', async () => {
@@ -86,8 +86,8 @@ describe('REPO_MAP_TOOL', () => {
         toolUseId: 'test',
         cwd: limitDir,
       })
-      assert.ok(result.content.includes('truncated'), 'should show truncated message')
-      assert.ok(result.content.includes('15 files omitted'), 'should report omitted count')
+      assert.ok(result.content.includes('已截断'), 'should show truncated message')
+      assert.ok(result.content.includes('省略 15 个文件'), 'should report omitted count')
       assert.ok(result.content.includes('repo_map({path:'), 'should suggest targeted follow-up')
       // Should have at most 5 file lines in the tree
       const lines = result.content.split('\n')
@@ -141,7 +141,7 @@ describe('REPO_MAP_TOOL', () => {
       cwd: testDir,
     })
     assert.ok(result.isError, 'should be an error')
-    assert.ok(result.content.includes('not found') || result.content.includes('Error'), 'should mention error')
+    assert.ok(result.content.includes('目录不存在') || result.content.includes('错误'), 'should mention error')
   })
 
   it('returns error when path is a file', async () => {
@@ -151,7 +151,7 @@ describe('REPO_MAP_TOOL', () => {
       cwd: testDir,
     })
     assert.ok(result.isError, 'should be an error')
-    assert.ok(result.content.includes('Not a directory'), 'should mention not a directory')
+    assert.ok(result.content.includes('不是目录'), 'should mention not a directory')
   })
 
   it('rejects path traversal outside project', async () => {
@@ -161,7 +161,7 @@ describe('REPO_MAP_TOOL', () => {
       cwd: testDir,
     })
     assert.ok(result.isError, 'should be an error')
-    assert.ok(result.content.includes('within the project'), 'should mention project boundary')
+    assert.ok(result.content.includes('项目目录内'), 'should mention project boundary')
   })
 
   it('rejects prefix injection via sibling directory', async () => {

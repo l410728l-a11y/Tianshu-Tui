@@ -12,6 +12,11 @@ import { loadDeclaredVerify } from '../config/verify-config.js'
 import { detectProjectFingerprint } from '../repo/project-fingerprint.js'
 import { OutputStreamBudget } from './output-stream-budget.js'
 
+/** context-collapse 靠此正则解析 formatOutput 摘要行；改文案必须与消费方同步（常量共享，禁止两边各自手抄）。 */
+export const RUN_TESTS_PASSED_RE = /(\d+)\s+通过/
+export const RUN_TESTS_FAILED_RE = /(\d+)\s+失败(?!项)/
+export const RUN_TESTS_EXIT_CODE_RE = /退出码[：:]\s*(\d+)/i
+
 export interface RunnableTestCommand {
   type: 'run'
   command: string
@@ -234,9 +239,9 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
       runner,
       scope,
       message: [
-        'Unable to infer test command automatically.',
-        'No package.json or supported test runner markers were found.',
-        'Use bash to run the project-specific verification command (for example a Python script, pytest invocation, or output check).',
+        '无法自动推断测试命令。',
+        '未找到 package.json 或受支持的测试运行器标记。',
+        '请用 bash 运行项目专用的验证命令（例如 Python 脚本、pytest 调用或输出检查）。',
       ].join('\n'),
       recommendedCommand: undefined,
       blockedReason: 'no_test_framework',
@@ -252,9 +257,9 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
         runner,
         scope: 'full',
         message: [
-          'Unable to infer test command automatically for this Python project because no tests were found under tests/.',
-          'Pytest is the recommended runner when Python tests exist.',
-          'If this is a non-test output/plot task, use bash to run the concrete Python script or inspect generated output instead.',
+          '无法为该 Python 项目自动推断测试命令，因为 tests/ 下未找到测试。',
+          '存在 Python 测试时，推荐使用 pytest。',
+          '若这是非测试的输出/绘图任务，请用 bash 运行具体的 Python 脚本或检查生成输出。',
         ].join('\n'),
         recommendedCommand: recommendedCommand ?? 'pytest',
         blockedReason: 'no_tests_found',
@@ -310,8 +315,8 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
       runner,
       scope: 'targeted',
       message: [
-        'Unable to resolve the run_tests filter to a Node test file.',
-        'Use a concrete .test/.spec file path, or use bash to run the exact project-specific test command.',
+        '无法将 run_tests 的 filter 解析为 Node 测试文件。',
+        '请使用具体的 .test/.spec 文件路径，或用 bash 运行精确的项目测试命令。',
       ].join('\n'),
       recommendedCommand: 'npm test',
       blockedReason: 'filter_unresolved',
@@ -333,9 +338,9 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
     runner,
     scope: 'targeted',
     message: [
-      'Unable to infer a safe targeted test command for this project.',
-      'The configured npm test runner is not recognized as node:test, vitest, or jest, so run_tests(filter=...) will not synthesize npm test arguments.',
-      'Use bash to run the exact targeted verification command, or run run_tests() without a filter for the full npm test script.',
+      '无法为该项目推断安全的定向测试命令。',
+      '已配置的 npm test 运行器未被识别为 node:test、vitest 或 jest，因此 run_tests(filter=...) 不会合成 npm test 参数。',
+      '请用 bash 运行精确的定向验证命令，或不带 filter 运行 run_tests() 以执行完整 npm test 脚本。',
     ].join('\n'),
     recommendedCommand: 'npm test',
     blockedReason: 'unknown_runner',
@@ -469,11 +474,11 @@ export function parseOutput(raw: string, runner: string): ParsedResult {
 
 function formatOutput(result: ParsedResult): string {
   const lines: string[] = []
-  lines.push(`Exit code: ${result.exitCode}`)
-  lines.push(`${result.passed} passed, ${result.failed} failed, ${result.skipped} skipped`)
+  lines.push(`退出码：${result.exitCode}`)
+  lines.push(`${result.passed} 通过，${result.failed} 失败，${result.skipped} 跳过`)
 
   if (result.failures.length > 0) {
-    lines.push('FAILURES:')
+    lines.push('失败项：')
     for (const f of result.failures) {
       lines.push(`  ✖ ${f.name}`)
       if (f.error) {
@@ -486,7 +491,7 @@ function formatOutput(result: ParsedResult): string {
   }
 
   if (result.duration) {
-    lines.push(`Duration: ${result.duration}`)
+    lines.push(`耗时：${result.duration}`)
   }
 
   return lines.join('\n')
@@ -534,7 +539,7 @@ function truncateOutput(output: string): string {
   const head = output.slice(0, HEAD_CHARS)
   const tail = output.slice(-TAIL_CHARS)
   const omitted = output.length - HEAD_CHARS - TAIL_CHARS
-  return `${head}\n... (${omitted} chars omitted) ...\n${tail}`
+  return `${head}\n...（已省略 ${omitted} 字符）...\n${tail}`
 }
 
 function buildExecutionEnv(cwd: string): NodeJS.ProcessEnv {
@@ -612,10 +617,10 @@ export const RUN_TESTS_TOOL: Tool = {
           const isolated = await runTestCommandIn(retryPlan.path, testCommand, params, filter, timeout)
           tagVerification(isolated, 'isolated', retryPlan.snapshotRef)
           if (!isolated.isError) {
-            const note = `\n\n[C3 attribution retry] Tests FAILED in the live tree but PASSED in an isolated snapshot of your owned changes. The failure is workspace pollution (peer session stash/reset or external edits), NOT your code. Do not "fix" the code for this failure — coordinate with the peer session or wait for the workspace to settle, then re-verify.`
+            const note = `\n\n[C3 归因重试] 测试在实时工作区 FAILED，但在归属变更的隔离快照中 PASSED。失败来自工作区污染（并行会话的 stash/reset 或外部编辑），不是你的代码。不要为这次失败去“修”代码——与并行会话协调，或等待工作区稳定后再重新验证。`
             const result: ToolResult = {
               ...isolated,
-              content: `[live tree] FAILED\n${typeof inPlace.content === 'string' ? inPlace.content.slice(0, 1500) : ''}\n\n[isolated snapshot] PASSED\n${isolated.content}${note}`,
+              content: `[实时工作区] FAILED\n${typeof inPlace.content === 'string' ? inPlace.content.slice(0, 1500) : ''}\n\n[隔离快照] PASSED\n${isolated.content}${note}`,
               isError: false,
             }
             if (inPlace.verification) result.extraVerifications = [inPlace.verification]
@@ -623,7 +628,7 @@ export const RUN_TESTS_TOOL: Tool = {
           }
           // Failed in isolation too → genuinely broken code; report the
           // in-place result with the attribution confirmed.
-          inPlace.content += `\n\n[C3 attribution retry] Also FAILED in an isolated snapshot — the failure is in your owned changes, not workspace pollution.`
+          inPlace.content += `\n\n[C3 归因重试] 在隔离快照中也 FAILED——失败在你的归属变更中，不是工作区污染。`
           if (isolated.verification) inPlace.extraVerifications = [isolated.verification]
         }
       }
@@ -641,11 +646,11 @@ export const RUN_TESTS_TOOL: Tool = {
     tagVerification(phaseB, 'integration', plan.snapshotRef)
 
     const phaseBNote = phaseB.isError
-      ? `\n\n[Phase B · integration on current HEAD] FAILED — owned changes passed in isolation; this is a concurrent-change conflict. Rebase/coordinate before merging. Delivery is NOT blocked by this.`
-      : `\n\n[Phase B · integration on current HEAD] passed.`
+      ? `\n\n[阶段 B · 当前 HEAD 集成] FAILED — 归属变更在隔离环境已通过；这是并发变更冲突。合并前请 rebase/协调。交付不会因此被阻断。`
+      : `\n\n[阶段 B · 当前 HEAD 集成] 已通过。`
     const result: ToolResult = {
       ...phaseA,
-      content: `[Phase A · isolated snapshot] ${phaseA.content}${phaseBNote}`,
+      content: `[阶段 A · 隔离快照] ${phaseA.content}${phaseBNote}`,
       // Phase A governs isError (the blocking gate); Phase B is advisory only.
       isError: phaseA.isError,
     }
@@ -795,14 +800,15 @@ export function runTestCommandIn(
         const meta = { command: testCommand.display, exitCode: -1, durationMs: Date.now() - startTime }
         const rawPath = await deps.persist(params.toolUseId, raw)
         resolve({
-          content: `Tests timed out after ${timeout}ms`,
+          content: `测试在 ${timeout}ms 后超时`,
           uiContent: buildUiOutput(raw, meta),
           rawPath,
           isError: true,
+          errorKind: 'timeout',
           verification: buildBlockedVerification(
             testCommand, startTime,
             'timeout',
-            '测试超时。可尝试增大 timeout 参数（如 timeout=300000），或分批运行（按目录拆分），或只运行相关测试文件。',
+            '测试超时。先分诊再重试：若超时套件覆盖你本轮新建/修改的代码（尤其是纯函数/单文件小套件），优先怀疑代码死循环/挂起而非机器慢——这是产物缺陷（RED），定位修复后重跑。仅当套件与本轮改动无关时才按环境处理：增大 timeout 参数（如 timeout=300000）、分批运行（按目录拆分）或只运行相关测试文件。',
           ),
         })
       }, timeout)
@@ -818,7 +824,7 @@ export function runTestCommandIn(
         deps.setTimeout(() => deps.kill(child, 'SIGKILL'), 3000)
         uiOutput.flush()
         uiOutput.dispose()
-        resolve({ content: 'Tests aborted by user.', uiContent: '⏹ aborted', isError: false })
+        resolve({ content: '测试已被用户中止。', uiContent: '⏹ 已中止', isError: false })
       }
       if (signal) {
         if (signal.aborted) onAbort()
@@ -907,20 +913,20 @@ export function runTestCommandIn(
         if (invocationFailed) {
           const rawTail = stripAnsi(raw).trim().slice(-1200)
           failureContent = rawTail.length > 0
-            ? `${truncated}\n\n[runner output tail]\n${rawTail}\n\n${invocationGuidance}`
+            ? `${truncated}\n\n[运行器输出尾部]\n${rawTail}\n\n${invocationGuidance}`
             : `${truncated}\n\n${invocationGuidance}`
         } else if (exitCode !== 0 && zeroCounts && testCommand.runner === 'declared') {
           // Declared-command failure with unparseable counts — the diagnostic
           // lives only in the raw output, so surface its tail.
           const rawTail = stripAnsi(raw).trim().slice(-1200)
-          if (rawTail.length > 0) failureContent = `${truncated}\n\n[runner output tail]\n${rawTail}`
+          if (rawTail.length > 0) failureContent = `${truncated}\n\n[运行器输出尾部]\n${rawTail}`
         }
 
         resolve({
           content: exitCode === 0
             ? (parsed.passed === 0 && !parsed.duration
               ? truncated  // parse likely failed — fall back to full formatted output
-              : `✓ ${parsed.passed} passed${parsed.skipped ? `, ${parsed.skipped} skipped` : ''}${parsed.duration ? ` (${parsed.duration})` : ''}`)
+              : `✓ ${parsed.passed} 通过${parsed.skipped ? `，${parsed.skipped} 跳过` : ''}${parsed.duration ? `（${parsed.duration}）` : ''}`)
             : failureContent,
           uiContent: buildUiOutput(raw, meta),
           rawPath,

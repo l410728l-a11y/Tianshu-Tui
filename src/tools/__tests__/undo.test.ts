@@ -39,7 +39,7 @@ describe('createUndoTool', () => {
     const tool = createUndoTool(() => history)
     const result = await tool.execute({ input: {}, toolUseId: 't', cwd: '/' })
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('Preview'))
+    assert.ok(result.content.includes('预览'))
     assert.ok(result.content.includes('a.txt'))
   })
 
@@ -51,7 +51,7 @@ describe('createUndoTool', () => {
 
     const tool = createUndoTool(() => history)
     const result = await tool.execute({ input: { confirm: true }, toolUseId: 't', cwd: '/' })
-    assert.ok(result.content.includes('Restored'))
+    assert.ok(result.content.includes('已恢复'))
     assert.equal(readFileSync(file, 'utf-8'), 'v1')
   })
 

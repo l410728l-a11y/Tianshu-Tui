@@ -47,7 +47,7 @@ export function buildFreshAnchors(newFileLines: string[], editStart0: number, ne
   if (editStart0 + newLineCount < newFileLines.length) {
     parts.push(`L${editStart0 + newLineCount + 1}:${hashLine(newFileLines[editStart0 + newLineCount]!)}`)
   }
-  return parts.length > 0 ? `\nFresh anchors (chain-safe):\n${parts.join('\n')}` : ''
+  return parts.length > 0 ? `\n新鲜锚点（链式安全）：\n${parts.join('\n')}` : ''
 }
 
 /** Post-write syntax check that never throws — file is already on disk. */
@@ -56,7 +56,7 @@ async function safeSyntaxCheck(filePath: string, content: string): Promise<strin
     const result = await syntaxCheck(filePath, content)
     return result ?? ''
   } catch (e) {
-    return `(syntax-check skipped: ${(e as Error).message})`
+    return `(语法检查已跳过： ${(e as Error).message})`
   }
 }
 
@@ -71,17 +71,18 @@ async function finalizeHashEdit(
   sessionId: string | undefined,
   successContent: string,
   extraWarning: string,
-): Promise<{ content: string; isError?: boolean }> {
+): Promise<{ content: string; isError?: boolean; errorKind?: 'syntax_error' }> {
   const check = await checkSyntax(filePath, newContent)
   if (check.fatal) {
     const relPath = relative(cwd, filePath)
     const restored = restoreLatestBackup(cwd, relPath)
     const fails = incrementEditFailCount(filePath)
-    const gatePrefix = fails >= 3 ? `After ${fails} consecutive hash_edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
-    const rollbackMsg = restored ? 'The change has been automatically rolled back.' : 'Automatic rollback failed.'
+    const gatePrefix = fails >= 3 ? `此文件已连续 hash_edit 失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
+    const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'
     return {
-      content: gatePrefix + `Error: ${check.fatal}\n\n${rollbackMsg}\n\nFix the edit and retry. For complex changes prefer apply_patch with a unified diff.`,
+      content: gatePrefix + `错误：${check.fatal}\n\n${rollbackMsg}\n\n请修复编辑后重试。复杂改动建议优先用 apply_patch 加 unified diff。`,
       isError: true,
+      errorKind: 'syntax_error',
     }
   }
   await recordSuccessfulEdit(filePath, sessionId)
@@ -114,13 +115,13 @@ async function buildHashDryRunPreview(
   let warn = ''
   try {
     const check = await checkSyntax(filePath, after)
-    if (check.fatal) warn = `SYNTAX ERROR if applied: ${check.fatal}`
+    if (check.fatal) warn = `若应用将出现语法错误：${check.fatal}`
     else if (check.warning) warn = check.warning
   } catch (e) {
-    warn = `(syntax-check skipped: ${(e as Error).message})`
+    warn = `(语法检查已跳过： ${(e as Error).message})`
   }
 
-  const content = `Preview (dry_run) for ${filePath} — no changes written:\n\n${diff || '(no textual change)'}` + (warn ? `\n\n${warn}` : '')
+  const content = `预览（dry_run）${filePath} — 未写入任何更改：\n\n${diff || '（无文本变更）'}` + (warn ? `\n\n${warn}` : '')
   return { content, uiContent: diff || undefined, changedRanges }
 }
 
@@ -150,35 +151,6 @@ function parseAnchor(raw: string): Anchor | null {
 }
 
 const RECOVERY_NEAR_WINDOW = 200
-
-/** Detect new_string that looks like a complete declaration block, which is
- *  usually a sign the model intends to REPLACE a range rather than INSERT after
- *  a single anchor. Single-anchor mode inserts after the anchor line; using it
- *  with a full method/class leaves the old declaration in place and creates a
- *  duplicate. */
-function looksLikeCompleteDeclarationBlock(text: string): boolean {
-  const trimmed = text.trimStart()
-  if (!trimmed.includes('\n')) return false
-  const firstLine = trimmed.split('\n')[0] ?? ''
-  return /\b(async\s+)?function\s+\w+|class\s+\w+|interface\s+\w+|type\s+\w+|enum\s+\w+\b/.test(firstLine)
-}
-
-/** Count how many times each "function-like" header appears in the file.
- *  Used as a post-edit sanity check to catch accidental duplication caused by
- *  single-anchor insertion when replacement was intended. */
-function detectDuplicateDeclarations(content: string): string[] {
-  const headerPattern = /^(\s*)(?:export\s+|default\s+|async\s+)*\s*(function\s+(\w+)|class\s+(\w+)|interface\s+(\w+)|type\s+(\w+)|enum\s+(\w+))\b/gm
-  const counts = new Map<string, number>()
-  let m: RegExpExecArray | null
-  while ((m = headerPattern.exec(content)) !== null) {
-    const name = m[3] ?? m[4] ?? m[5] ?? m[6] ?? m[7] ?? ''
-    if (!name) continue
-    counts.set(name, (counts.get(name) ?? 0) + 1)
-  }
-  return Array.from(counts.entries())
-    .filter(([, count]) => count > 1)
-    .map(([name]) => name)
-}
 
 /**
  * Recover stale full-hash anchors by searching the current file.
@@ -259,7 +231,7 @@ function formatStaleDiagnostic(
   mismatches: Array<{ anchor: Anchor; actualHash: string; actualLine: string }>,
 ): string {
   const lines_of_evidence = mismatches.map(m => {
-    const ctx = lines[m.anchor.line - 1] ?? '<line not found>'
+    const ctx = lines[m.anchor.line - 1] ?? '<未找到该行>'
     return `  L${m.anchor.line}: expected ${m.anchor.hash} | actual ${m.actualHash} | content: ${ctx.slice(0, 60)}`
   }).join('\n')
 
@@ -282,24 +254,24 @@ function formatStaleDiagnostic(
     : null
 
   return [
-    `hash_edit failed on ${filePath}: ${mismatches.length} anchor(s) stale.`,
-    'The file has changed since your last read_file (possibly by your own earlier edit).',
+    `hash_edit 在 ${filePath} 上失败：${mismatches.length} 个锚点已过期。`,
+    '自你上次 read_file 以来文件已变化（可能是你自己更早的编辑导致）。',
     '',
-    'Expected anchors:',
+    '期望的锚点：',
     all_anchors,
     '',
-    'Stale anchors (with CURRENT hash at that line):',
+    '过期锚点（该行当前哈希）：',
     lines_of_evidence,
     '',
     ...(retryAnchors
       ? [
-          `If the "content" shown above is the line you intend to replace, retry NOW with: anchors: [${retryAnchors}]`,
-          'If it is not the right line, re-locate the target with grep (grep output includes fresh L<line>:<hash> anchor hints; read_file does NOT emit hashes).',
+          `若上方所示 "content" 正是你要替换的行，请立即用以下锚点重试：anchors: [${retryAnchors}]`,
+          '若不是正确的行，请用 grep 重新定位目标（grep 输出含新鲜的 L<line>:<hash> 锚点提示；read_file 不会输出哈希）。',
         ]
       : [
-          'Anchor line numbers exceed the current file length. Re-locate the target with grep (grep output includes fresh L<line>:<hash> anchor hints; read_file does NOT emit hashes).',
+          '锚点行号超出当前文件长度。请用 grep 重新定位目标（grep 输出含新鲜的 L<line>:<hash> 锚点提示；read_file 不会输出哈希）。',
         ]),
-    'Do NOT retry with the anchors you already used — they are one-shot coordinates and this exact call will fail again.',
+    '不要再用已经用过的锚点重试——它们是一次性坐标，完全相同的调用还会再次失败。',
   ].join('\n')
 }
 
@@ -311,7 +283,7 @@ export const HASH_EDIT_TOOL: Tool = {
 锚点格式为 L<line>:<8-char-hex>（完整哈希校验）或 L<line>
 （仅位置快速路径——仅在你刚读过该文件时使用）。提供 1-3 个
 锚点：首尾锚点定义含两端在内的替换区间；中间锚点校验区间内部。
-单锚点模式在该行之后插入内容。
+单锚点模式替换该行。
 
 哈希：SHA256(line_content_without_trailing_cr)[0:8]。
 grep 结果对单文件匹配附带锚点提示。
@@ -319,9 +291,7 @@ grep 结果对单文件匹配附带锚点提示。
 编辑成功后回传新区间的新鲜锚点（Fresh anchors）——链式编辑
 同一文件时直接使用回传锚点，不需要重新 read_file。
 
-⚠ 仅位置模式（L<line> 无哈希）：绝不链式连续调用——每次
-hash_edit 都会改动文件，使后续的 L<line> 锚点失效。链式编辑
-必须用回传的完整哈希锚点。
+仅位置模式（L<line> 无哈希）适合首次编辑；链式编辑优先用回传的完整哈希锚点（L<line>:<hash>）。
 
 多处改动、超过约 20 行的编辑或结构性重构，优先用
 apply_patch 加 unified diff。
@@ -349,7 +319,7 @@ apply_patch 加 unified diff。
     try {
       filePath = validatePath(params.cwd, params.input.file_path as string, 'write')
     } catch (e) {
-      return { content: `Error: ${e instanceof Error ? e.message : 'Path escapes project directory'}`, isError: true }
+      return { content: `错误：${e instanceof Error ? e.message : '路径逃逸出项目目录'}`, isError: true }
     }
 
     // Pointer-regurgitation guard: reject placeholder text echoed from message
@@ -371,19 +341,19 @@ apply_patch 加 unified diff。
     try {
       fileStat = await stat(filePath)
     } catch {
-      return { content: `Error: File not found: ${filePath}`, isError: true }
+      return { content: `错误：文件未找到：${filePath}`, isError: true }
     }
 
     const rawAnchors = params.input.anchors as string[] | undefined
     if (!rawAnchors || rawAnchors.length === 0 || rawAnchors.length > 3) {
-      return { content: 'Error: anchors must be an array of 1-3 "L<line>:<hash>" or "L<line>" strings', isError: true }
+      return { content: '错误：anchors 必须是 1-3 个 "L<line>:<hash>" 或 "L<line>" 字符串组成的数组', isError: true }
     }
 
     const anchors: Anchor[] = []
     for (const raw of rawAnchors) {
       const parsed = parseAnchor(raw)
       if (!parsed) {
-        return { content: `Error: invalid anchor format "${raw}". Expected "L<num>:<8-char-hex>" (e.g. "L5:a1b2c3d4") or "L<num>" (e.g. "L5")`, isError: true }
+        return { content: `错误：无效锚点格式 "${raw}"。期望 "L<num>:<8-char-hex>"（如 "L5:a1b2c3d4"）或 "L<num>"（如 "L5"）`, isError: true }
       }
       anchors.push(parsed)
     }
@@ -394,27 +364,14 @@ apply_patch 加 unified diff。
     for (let i = 1; i < anchors.length; i++) {
       if (anchors[i]!.line <= anchors[i - 1]!.line) {
         return {
-          content: `Error: anchors must be in strictly ascending line order. ` +
-            `Anchor ${i + 1} (L${anchors[i]!.line}) is not after anchor ${i} (L${anchors[i - 1]!.line}).`,
+          content: `错误：anchors 必须严格按行号升序排列。` +
+            `锚点 ${i + 1}（L${anchors[i]!.line}）没有排在锚点 ${i}（L${anchors[i - 1]!.line}）之后。`,
           isError: true,
         }
       }
     }
 
     const newString = params.input.new_string as string
-
-    // Semantic guard: single-anchor mode inserts AFTER the anchor line. If the
-    // model hands us what looks like a complete declaration block, it probably
-    // meant to REPLACE a range and should use two anchors (first and last of
-    // the block to remove). Flag it as a warning rather than an error because
-    // insertion of a standalone block is still legitimate.
-    let semanticWarning = ''
-    if (anchors.length === 1 && looksLikeCompleteDeclarationBlock(newString)) {
-      semanticWarning =
-        `⚠ Single-anchor mode inserts new_string AFTER L${anchors[0]!.line}, not replacing it. ` +
-        `new_string looks like a complete declaration block; if you meant to replace an existing block, ` +
-        `use two anchors marking the inclusive start and end of the range to remove.`
-    }
 
     // Normalize to LF for line splitting/rebuild; restore the file's EOL on
     // write-back. Without this, splicing LF new_string lines into a CRLF file's
@@ -447,27 +404,21 @@ apply_patch 加 unified diff。
       }
     }
 
-    // Hard reject: position-only anchors are unsafe after any session file edit.
-    // The first edit shifts line numbers; subsequent L<num> anchors point to
-    // wrong content. Force the model to re-read and use full-hash anchors.
+    // Position-only anchors after a session file edit: the first edit shifts
+    // line numbers. Don't hard-reject — still attempt the edit (line-existence
+    // check catches out-of-bounds), but surface a clear warning. The fresh
+    // anchor passback from the previous edit gives the model L<num>:<hash>
+    // anchors that sidestep this issue entirely.
     if (posOnly && wasFileEditedBySession(filePath, params.sessionId)) {
-      const fails = incrementEditFailCount(filePath)
-      const gatePrefix = fails >= 3 ? `After ${fails} consecutive hash_edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
-      return {
-        content: gatePrefix + [
-          `Error: position-only anchors blocked on ${filePath}`,
-          `This file has been edited in the current session, so line numbers have shifted.`,
-          `Re-read the file and use L<num>:<hash> anchors, or use edit_file instead.`,
-        ].join('\n'),
-        isError: true,
-      }
+      positionDriftWarning = true
+      noteFileObserved(filePath, currentMtime, fileStat.size, params.sessionId)
     }
 
     // Verify all anchors — compute line hashes and match
     const mismatches: Array<{ anchor: Anchor; actualHash: string; actualLine: string }> = []
     for (const anchor of anchors) {
       if (anchor.line > lines.length) {
-        mismatches.push({ anchor, actualHash: '<eof>', actualLine: '<line number exceeds file length>' })
+        mismatches.push({ anchor, actualHash: '<eof>', actualLine: '<行号超出文件长度>' })
         continue
       }
       if (anchor.hash !== null) {
@@ -514,23 +465,16 @@ apply_patch 加 unified diff。
             }
           }
           const recoveredInfo = recoveredCount > 0
-            ? ` (auto-recovered ${recoveredCount} stale anchor${recoveredCount > 1 ? 's' : ''})`
-            : ''
-          const staleAdvice = recoveredCount > 0 && anchors.length >= 2
-            ? '⚠ Multiple anchors went stale — anchors are interdependent. Consider switching to edit_file for further edits to this file.'
-            : ''
-          const duplicateNames = detectDuplicateDeclarations(newContent)
-          const duplicateWarning = duplicateNames.length > 0
-            ? `⚠ Duplicate declarations detected after edit: ${duplicateNames.join(', ')}. If you intended to replace the original, use two anchors.`
+            ? `（已自动恢复 ${recoveredCount} 个过期锚点）`
             : ''
           const posDrift = positionDriftWarning
-            ? '⚠ Position-only anchors used on a file modified since last read — line numbers may have drifted. Verify the result or use edit_file instead.'
+            ? '⚠ 在上次读取后已修改的文件上使用了仅位置锚点——行号可能已漂移。请核实结果或改用 edit_file。'
             : ''
-          const extraWarn = [staleAdvice, posDrift, semanticWarning, duplicateWarning].filter(Boolean).join('\n\n')
+          const extraWarn = [posDrift].filter(Boolean).join('\n\n')
           const freshAnchors = buildFreshAnchors(newContent.split('\n'), before.length, newLines.length)
           return await finalizeHashEdit(
             filePath, params.cwd, newContent, params.sessionId,
-            `hash_edit${recoveredInfo} applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines${freshAnchors}`,
+            `hash_edit${recoveredInfo} 已应用到 ${filePath}：将 L${firstLine}-L${lastLine}（${lastLine - firstLine + 1} 行）替换为 ${newLines.length} 行${freshAnchors}`,
             extraWarn,
           )
         }
@@ -538,7 +482,7 @@ apply_patch 加 unified diff。
 
       // Recovery not possible — return the original stale diagnostic
       const fails = incrementEditFailCount(filePath)
-      const gatePrefix = fails >= 3 ? `After ${fails} consecutive hash_edit failures on this file, you MUST re-read it before editing again.\n\n` : ''
+      const gatePrefix = fails >= 3 ? `此文件已连续 hash_edit 失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
       return {
         content: gatePrefix + formatStaleDiagnostic(filePath, anchors, lines, mismatches),
         isError: true,
@@ -564,10 +508,6 @@ apply_patch 加 unified diff。
     const relPath = relative(params.cwd, filePath)
     trackFileChange(params.cwd, { filePath: relPath, action: 'edit', toolCallId: params.toolUseId ?? 'hash_edit' })
 
-    const duplicateNames = detectDuplicateDeclarations(newContent)
-    const duplicateWarning = duplicateNames.length > 0
-      ? `⚠ Duplicate declarations detected after edit: ${duplicateNames.join(', ')}. If you intended to replace the original, use two anchors.`
-      : ''
     {
       const land = await landingWriteFile(params, filePath, content, applyEol(newContent, eol))
       if (land.kind === 'delegated' && (isDelegateRejected(land.delegated) || land.delegated.isError)) {
@@ -575,13 +515,13 @@ apply_patch 加 unified diff。
       }
     }
     const posDrift = positionDriftWarning
-      ? '⚠ Position-only anchors used on a file modified since last read — line numbers may have drifted. Verify the result or use edit_file instead.'
+      ? '⚠ 在上次读取后已修改的文件上使用了仅位置锚点——行号可能已漂移。请核实结果或改用 edit_file。'
       : ''
-    const extraWarn = [posDrift, semanticWarning, duplicateWarning].filter(Boolean).join('\n\n')
+    const extraWarn = [posDrift].filter(Boolean).join('\n\n')
     const freshAnchors = buildFreshAnchors(newContent.split('\n'), before.length, newLines.length)
     return await finalizeHashEdit(
       filePath, params.cwd, newContent, params.sessionId,
-      `hash_edit applied to ${filePath}: replaced L${firstLine}-L${lastLine} (${lastLine - firstLine + 1} lines) with ${newLines.length} lines${freshAnchors}`,
+      `hash_edit 已应用到 ${filePath}：将 L${firstLine}-L${lastLine}（${lastLine - firstLine + 1} 行）替换为 ${newLines.length} 行${freshAnchors}`,
       extraWarn,
     )
   },

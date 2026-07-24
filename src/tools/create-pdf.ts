@@ -88,17 +88,17 @@ ${content}
 
 export function renderPdf(input: CreatePdfInput): { content: string; format: PdfFormat } {
   if (typeof input.content !== 'string' || input.content.trim().length === 0) {
-    throw new Error('content is required')
+    throw new Error('content 为必填项')
   }
   return { format: 'html', content: renderPdfHtml(input) }
 }
 
 export async function createPdf(input: CreatePdfInput): Promise<{ path: string; bytes: number; format: PdfFormat }> {
   if (typeof input.destination_path !== 'string' || input.destination_path.trim().length === 0) {
-    throw new Error('destination_path is required')
+    throw new Error('destination_path 为必填项')
   }
   if (typeof input.content !== 'string' || input.content.trim().length === 0) {
-    throw new Error('content is required')
+    throw new Error('content 为必填项')
   }
   const rendered = renderPdf(input)
   const exported = await exportFile({ destination_path: input.destination_path, content: rendered.content })
@@ -133,10 +133,10 @@ Good: create_pdf(destination_path="~/Desktop/invoice.html", title="发票 #42", 
   async execute(params) {
     try {
       const result = await createPdf(params.input as CreatePdfInput)
-      return { content: `Created print-ready ${result.format} document (${result.bytes} bytes): ${result.path}\n\nOpen in browser and print to PDF (Cmd+P → Save as PDF).` }
+      return { content: `已创建可打印的 ${result.format} 文档（${result.bytes} 字节）：${result.path}\n\n在浏览器中打开并打印为 PDF（Cmd+P → 存储为 PDF）。` }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${msg}`, isError: true }
+      return { content: `错误：${msg}`, isError: true }
     }
   },
 

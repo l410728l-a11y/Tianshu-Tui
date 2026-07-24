@@ -24,7 +24,7 @@ describe('request_path_access tool', () => {
     try {
       const res = await REQUEST_PATH_ACCESS_TOOL.execute(params({ path: ext, mode: 'write' }, cwd) as never)
       assert.ok(!res.isError)
-      assert.match(res.content, /Granted write access/)
+      assert.match(res.content, /已授予 write 访问/)
       assert.equal(isWriteGranted(join(ext, 'out.zip')), true)
     } finally {
       rmSync(cwd, { recursive: true, force: true })

@@ -94,8 +94,8 @@ describe('mixed', () => {
     assert.equal(result.isError, false)
     // Success output is either a one-liner summary (when parse succeeds)
     // or a multi-line fallback (when parse can't match the test runner output)
-    assert.ok(result.content.includes('passed'), 'should include passed count')
-    assert.ok(!result.content.includes('FAILURES'), 'success should not include FAILURES')
+    assert.ok(result.content.includes('通过'), 'should include passed count')
+    assert.ok(!result.content.includes('失败项'), 'success should not include FAILURES')
     assert.ok(result.verification)
     assert.equal(result.verification!.status, 'passed')
     assert.equal(result.verification!.scope, 'full')
@@ -106,8 +106,8 @@ describe('mixed', () => {
     assert.equal(result.isError, false)
     // Phase 1 deterministic trimming: success output is either a one-liner ✓
     // or a multi-line fallback when parse fails (pre-existing limitation)
-    assert.ok(result.content.includes('passed'), 'should include passed count')
-    assert.ok(!result.content.includes('FAILURES'))
+    assert.ok(result.content.includes('通过'), 'should include passed count')
+    assert.ok(!result.content.includes('失败项'))
   })
 
   it('reports failure output for failing tests', async () => {
@@ -124,7 +124,7 @@ describe('mixed', () => {
       makeParams({ filter: 'src/example.test.ts' }, passingDir),
     )
     assert.equal(result.isError, false)
-    assert.ok(result.content.includes('passed'), 'should include passed count')
+    assert.ok(result.content.includes('通过'), 'should include passed count')
     assert.ok(result.verification)
     assert.equal(result.verification!.scope, 'targeted')
     assert.equal(result.verification!.command, 'tsx --test src/example.test.ts')
@@ -164,8 +164,8 @@ it('works', () => assert.equal(2 + 2, 4))`)
       assert.equal(result.verification!.status, 'blocked')
       assert.equal(result.verification!.failureKind, 'tool_invocation_failure')
       assert.equal(result.verification!.command, '(auto-detect tests)')
-      assert.match(result.content, /Unable to infer test command/i)
-      assert.match(result.content, /Use bash/i)
+      assert.match(result.content, /无法自动推断测试命令|无法为该 Python 项目自动推断/)
+      assert.match(result.content, /bash/)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -180,7 +180,7 @@ it('works', () => assert.equal(2 + 2, 4))`)
       assert.equal(result.verification!.status, 'blocked')
       assert.equal(result.verification!.recommendedCommand, 'pytest')
       assert.equal(result.verification!.command, '(auto-detect tests)')
-      assert.match(result.content, /Unable to infer test command/i)
+      assert.match(result.content, /无法自动推断测试命令|无法为该 Python 项目自动推断/)
       assert.match(result.content, /pytest/i)
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -276,7 +276,7 @@ it('works', () => assert.equal(2 + 2, 4))`)
       assert.equal(result.verification!.status, 'blocked')
       assert.equal(result.verification!.failureKind, 'tool_invocation_failure')
       assert.equal(result.verification!.command, 'npm test')
-      assert.match(result.content, /timed out/i)
+      assert.match(result.content, /超时/)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

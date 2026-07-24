@@ -54,7 +54,7 @@ describe('TODO_TOOL', () => {
       toolUseId: 'tu_1',
       cwd: '/repo',
     })
-    assert.ok(result.content.includes('No todos'))
+    assert.ok(result.content.includes('暂无待办'))
   })
 
   it('rejects unknown action', async () => {
@@ -89,7 +89,7 @@ describe('TODO_TOOL', () => {
     assert.equal(result.isError ?? false, false)
     assert.ok(result.content.includes('⚠️'), 'should warn on regression')
     assert.ok(result.content.includes('Ship feature'))
-    assert.ok(result.content.toLowerCase().includes('do not redo'))
+    assert.ok(result.content.includes('不要重做'))
   })
 })
 
@@ -134,7 +134,7 @@ describe('TodoStore', () => {
     ])
     assert.equal(regressions.length, 2)
     assert.ok(regressions.some(r => r.includes('Build parser') && r.includes('pending')))
-    assert.ok(regressions.some(r => r.includes('Wire CLI') && r.includes('dropped')))
+    assert.ok(regressions.some(r => r.includes('Wire CLI') && r.includes('已从清单移除')))
   })
 
   it('detectRegressions returns empty when completed items stay completed', () => {
@@ -203,7 +203,7 @@ describe('TODO_TOOL scope gate', () => {
       })),
     ]
     const r = await write(todos)
-    const regressionIdx = r.content.indexOf('previously-completed')
+    const regressionIdx = r.content.indexOf('此前已完成')
     const noticeIdx = r.content.indexOf('⚠️ 范围风险')
     assert.ok(regressionIdx >= 0, 'regression warning present')
     assert.ok(noticeIdx >= 0, 'scope notice present')

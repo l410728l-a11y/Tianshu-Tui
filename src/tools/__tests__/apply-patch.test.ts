@@ -65,7 +65,7 @@ index 2e65efe..a2005b8 100644
     })
     assert.ok(!result.isError, result.content)
     // model-facing content stays a short summary
-    assert.equal(result.content, 'Patch applied successfully.')
+    assert.equal(result.content, '补丁应用成功。')
     // display-only uiContent carries the diff for colored rendering
     assert.ok(result.uiContent && /^@@/m.test(result.uiContent), 'uiContent has hunk header')
     assert.ok(/^-original$/m.test(result.uiContent!))
@@ -80,7 +80,7 @@ index 2e65efe..a2005b8 100644
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /requires a non-empty/)
+    assert.match(result.content, /需要非空/)
   })
 
   it('normalizes Windows-style backslash paths in diff headers', async () => {
@@ -103,7 +103,7 @@ index 2e65efe..a2005b8 100644
       cwd: repoDir,
     })
     assert.equal(result.isError, true)
-    assert.match(result.content, /collapsed history pointer/i)
+    assert.match(result.content, /折叠后的历史指针/)
   })
 
   it('rolls back a patch that introduces a fatal Python syntax error', async () => {
@@ -127,7 +127,7 @@ index 2e65efe..a2005b8 100644
     // If python3 is unavailable, syntax check degrades to OK and the patch
     // stays applied — only assert rollback when the corruption was detected.
     if (result.isError) {
-      assert.match(result.content, /rolled back/i)
+      assert.match(result.content, /已自动回滚/)
       assert.equal(readFileSync(join(repoDir, 'mod.py'), 'utf-8'), 'def foo():\n    return 1\n')
     }
   })
@@ -165,6 +165,6 @@ diff --git a/gone.txt b/gone.txt
     assert.ok(!result.isError, result.content)
     const lines = result.uiContent!.split('\n')
     assert.ok(lines.length <= 602, `expected truncation, got ${lines.length} lines`)
-    assert.ok(result.uiContent!.includes('more diff lines, Ctrl+O'))
+    assert.ok(result.uiContent!.includes('行 diff，Ctrl+O'))
   })
 })

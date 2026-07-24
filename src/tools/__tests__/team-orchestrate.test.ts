@@ -154,7 +154,7 @@ test('team_orchestrate blocks a planPath outside the project', async () => {
     toolUseId: 'tu-2',
   })
   assert.equal(result.isError, true)
-  assert.match(result.content, /outside project|blocked/i)
+  assert.match(result.content, /outside project|已拦截|blocked/i)
 })
 
 test('team_orchestrate passes fromWave through and reports the next wave value', async () => {

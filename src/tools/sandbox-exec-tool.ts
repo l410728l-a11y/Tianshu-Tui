@@ -37,7 +37,7 @@ export const SANDBOX_EXEC_TOOL: Tool = {
     const code = String(params.input.code ?? '')
     if (!code.trim()) {
       return {
-        content: '[sandbox_exec] error: empty code',
+        content: '[sandbox_exec] 错误：代码为空',
         isError: true,
       }
     }
@@ -51,7 +51,7 @@ export const SANDBOX_EXEC_TOOL: Tool = {
     })
 
     const isError = result.exitCode !== 0
-    const header = `[sandbox_exec] exit=${result.exitCode}`
+    const header = `[sandbox_exec] 退出码=${result.exitCode}`
     const body = isError
       ? `${header}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`
       : `${header}\n${result.stdout}`

@@ -208,9 +208,9 @@ describe('buildAssemblyFailureResult（结果装配兜底）', () => {
     assert.match(r.content, /不是命令失败/, '不得伪装成命令本身的失败')
   })
 
-  it('无输出时显式标注 (no output)', () => {
+  it('无输出时显式标注 (无输出)', () => {
     const r = buildAssemblyFailureResult('boom', 1, '')
-    assert.match(r.content, /\(no output\)/)
+    assert.match(r.content, /\(无输出\)/)
   })
 })
 
@@ -229,7 +229,7 @@ describe('BASH_TOOL timeout cleanup', () => {
       await wait(700)
 
       assert.equal(result.isError, true)
-      assert.match(result.content, /Command timed out/)
+      assert.match(result.content, /命令超时/)
       assert.equal(existsSync(marker), false)
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -316,7 +316,7 @@ describe('BASH_TOOL 空 stdout 的成功命令 → confirmed empty(不是 "Exit 
     }
   })
 
-  it('exit 非零且无 stdout 时仍保留 "Exit code: N" 以免正文为空', async () => {
+  it('exit 非零且无 stdout 时仍保留 "退出码：N" 以免正文为空', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'rivet-bash-exit1-'))
     try {
       const result = await BASH_TOOL.execute({
@@ -324,7 +324,7 @@ describe('BASH_TOOL 空 stdout 的成功命令 → confirmed empty(不是 "Exit 
         toolUseId: 'bash-exit3-test',
         cwd: dir,
       })
-      assert.match(result.content, /Exit code: 3/, '失败且无输出时正文不能为空，需带退出码')
+      assert.match(result.content, /退出码：3/, '失败且无输出时正文不能为空，需带退出码')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -340,6 +340,7 @@ describe('BASH_TOOL 空 stdout 的成功命令 → confirmed empty(不是 "Exit 
       })
       assert.equal(result.isError, true)
       assert.equal(result.errorClass, 'environment')
+      assert.equal(result.errorKind, 'missing_dep')
       assert.match(result.content, /环境\/配置问题/, 'model 正文为标准化简洁体')
       assert.match(result.content, /command not found/, '含具体原因')
       assert.ok(result.uiContent && result.uiContent.length > 0, '完整原文保留在 uiContent 供 TUI 展示')

@@ -1,7 +1,7 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { createCcrHook, _RULES_FOR_TESTING, _fillTemplate, _isTestIntent, _STAR_FALLBACK_POOLS, type CcrTriggerEvent } from '../hooks/cognitive-capsule-router.js'
+import { createCcrHook, computeReadOnlyStreak, computeVerifyFailStreak, _RULES_FOR_TESTING, _fillTemplate, _isTestIntent, _STAR_FALLBACK_POOLS, type CcrTriggerEvent } from '../hooks/cognitive-capsule-router.js'
 import { extractPrinciplesFromRaw } from '../seed-capsule-store.js'
 import type { AdvisoryEntry } from '../advisory-bus.js'
 import type { EvidenceState } from '../evidence.js'
@@ -455,15 +455,42 @@ More text.
     const okRun = { tool: 'run_tests', status: 'success' as const, target: 'src/foo.test.ts' }
     const edit = { tool: 'edit_file', status: 'success' as const, target: 'src/foo.ts' }
 
-    it('fires on >=2 consecutive semantic verification failures', () => {
+    it('fires on >=2 consecutive semantic verification failures without edits (true loop)', () => {
+      const h = createHarness()
+      h.run(makeSnapshot({
+        turn: 4,
+        recentToolHistory: [failedRun, failedRun],
+      }))
+      assert.equal(h.submitted.length, 1)
+      assert.match(h.submitted[0]!.key, /ccr-天权-P7/)
+      assert.ok(h.submitted[0]!.content.includes('有效连败 2 次'))
+    })
+
+    it('does NOT fire on RED→edit→RED — TDD loop gets one dilution', () => {
       const h = createHarness()
       h.run(makeSnapshot({
         turn: 4,
         recentToolHistory: [failedRun, edit, failedRun],
       }))
-      assert.equal(h.submitted.length, 1)
-      assert.match(h.submitted[0]!.key, /ccr-天权-P7/)
-      assert.ok(h.submitted[0]!.content.includes('连续失败 2 次'))
+      assert.equal(h.submitted.filter(e => e.key.includes('P7')).length, 0)
+    })
+
+    it('does NOT fire on RED→read→RED — diagnostic gap gets one dilution (H1)', () => {
+      const h = createHarness()
+      h.run(makeSnapshot({
+        turn: 4,
+        recentToolHistory: [failedRun, { tool: 'read_file', status: 'success' as const, target: 'src/foo.ts' }, failedRun],
+      }))
+      assert.equal(h.submitted.filter(e => e.key.includes('P7')).length, 0)
+    })
+
+    it('fires on RED→edit→RED→edit→RED — dilution is capped at one', () => {
+      const h = createHarness()
+      h.run(makeSnapshot({
+        turn: 4,
+        recentToolHistory: [failedRun, edit, failedRun, edit, failedRun],
+      }))
+      assert.equal(h.submitted.filter(e => e.key.includes('P7')).length, 1)
     })
 
     it('does not fire when a later verification succeeded', () => {
@@ -499,19 +526,129 @@ More text.
     })
   })
 
+  describe('computeVerifyFailStreak — 封顶稀释矩阵（计划瑶光复核版）', () => {
+    const RED = { tool: 'run_tests', status: 'failed' as const, target: 't.test.ts' }
+    const RED_TEST_RED = { tool: 'run_tests', status: 'failed' as const, target: 't.test.ts', errorClass: 'test_red' }
+    const GREEN = { tool: 'run_tests', status: 'success' as const, target: 't.test.ts' }
+    const BASH_FAIL = { tool: 'bash', status: 'failed' as const, target: 'npm test' }
+    const EDIT = { tool: 'edit_file', status: 'success' as const, target: 'src/a.ts' }
+    const PATCH = { tool: 'apply_patch', status: 'success' as const, target: 'src/a.ts' }
+    const READ = { tool: 'read_file', status: 'success' as const, target: 'src/a.ts' }
+    const TIMEOUT = { tool: 'run_tests', status: 'failed' as const, target: 't', errorClass: 'timeout' }
+
+    it('RED→edit→RED = 1（TDD 豁免一次）', () => {
+      assert.equal(computeVerifyFailStreak([RED, EDIT, RED]), 1)
+    })
+
+    it('RED→RED 无编辑 = 2（真死循环）', () => {
+      assert.equal(computeVerifyFailStreak([RED, RED]), 2)
+    })
+
+    it('RED→edit→RED→edit→RED = 2（稀释封顶 1）', () => {
+      assert.equal(computeVerifyFailStreak([RED, EDIT, RED, EDIT, RED]), 2)
+    })
+
+    it('RED→edit→RED→GREEN = 0（成功重置）', () => {
+      assert.equal(computeVerifyFailStreak([RED, EDIT, RED, GREEN]), 0)
+    })
+
+    it('timeout 失败跳过保持：RED(timeout)→RED = 1', () => {
+      assert.equal(computeVerifyFailStreak([TIMEOUT, RED]), 1)
+    })
+
+    it('混合验证工具：bash(fail)→edit→run_tests(test_red) = 1', () => {
+      assert.equal(computeVerifyFailStreak([BASH_FAIL, EDIT, RED_TEST_RED]), 1)
+    })
+
+    it('取证间隔也豁免一次：RED→read_file→RED = 1（诊断循环，H1 修复）', () => {
+      assert.equal(computeVerifyFailStreak([RED, READ, RED]), 1)
+    })
+
+    it('取证豁免封顶 1：RED→read→RED→read→RED = 2（读两次仍不改代码，触发）', () => {
+      assert.equal(computeVerifyFailStreak([RED, READ, RED, READ, RED]), 2)
+    })
+
+    it('编辑与取证豁免独立封顶：RED→edit→RED→read→RED = 1（TDD+诊断，活跃工作）', () => {
+      assert.equal(computeVerifyFailStreak([RED, EDIT, RED, READ, RED]), 1)
+    })
+
+    it('同一间隔夹编辑+只读只算编辑豁免：RED→read→edit→RED = 1', () => {
+      assert.equal(computeVerifyFailStreak([RED, READ, EDIT, RED]), 1)
+    })
+
+    it('apply_patch 也是编辑：RED→patch→RED = 1', () => {
+      assert.equal(computeVerifyFailStreak([RED, PATCH, RED]), 1)
+    })
+
+    it('test_red 不进 skip 名单：纯重跑 test_red×2 = 2（真死循环检测保留）', () => {
+      assert.equal(computeVerifyFailStreak([RED_TEST_RED, RED_TEST_RED]), 2)
+    })
+
+    it('长 TDD 链：RED→edit→RED→edit→RED→edit→RED = 3（持续触发）', () => {
+      assert.equal(computeVerifyFailStreak([RED, EDIT, RED, EDIT, RED, EDIT, RED]), 3)
+    })
+  })
+
+  describe('computeReadOnlyStreak — PRODUCTIVE_TOOLS 单一事实源（A2）', () => {
+    const read = { tool: 'read_file', status: 'success' as const, target: 'src/a.ts' }
+
+    it('apply_patch 打断只读 streak（含 check_only 预检——按纪律预检不算空转）', () => {
+      assert.equal(computeReadOnlyStreak([read, read, { tool: 'apply_patch', status: 'success' as const, target: 'src/a.ts' }, read]), 1)
+    })
+
+    it('ast_edit 打断只读 streak（含 dryRun 预览）', () => {
+      assert.equal(computeReadOnlyStreak([read, read, { tool: 'ast_edit', status: 'success' as const, target: 'src/a.ts' }, read]), 1)
+    })
+
+    it('plan_submit 打断只读 streak（规划产出是有意义动作）', () => {
+      assert.equal(computeReadOnlyStreak([read, { tool: 'plan_submit', status: 'success' as const, target: 'plan' }, read, read]), 2)
+    })
+
+    it('纯只读不打断', () => {
+      assert.equal(computeReadOnlyStreak([read, { tool: 'grep', status: 'success' as const, target: 'x' }, read]), 3)
+    })
+  })
+
   describe('P6: 天璇 — investigation stall (read-only + low momentum)', () => {
-    const reads = Array.from({ length: 7 }, (_, i) => ({
+    const makeReads = (n: number) => Array.from({ length: n }, (_, i) => ({
       tool: 'read_file', status: 'success' as const, target: `src/f${i}.ts`,
     }))
+    const reads = makeReads(7)
 
-    it('fires when turn>5, momentum low, >=6 read-only, no edits', () => {
+    it('diagnostic 态阈值抬到 10：纯只读 10 连击才触发（A1 阈值分级）', () => {
+      const h = createHarness()
+      h.run(makeSnapshot({
+        turn: 8,
+        sensorium: makeSensorium({ momentum: 0.2 }),
+        recentToolHistory: makeReads(10),
+      }))
+      assert.equal(h.submitted.length, 1)
+      assert.match(h.submitted[0]!.key, /ccr-天璇-P6/)
+    })
+
+    it('diagnostic 态 streak 6-9 不触发——正常取证批次不误罚（M2 修复）', () => {
       const h = createHarness()
       h.run(makeSnapshot({
         turn: 8,
         sensorium: makeSensorium({ momentum: 0.2 }),
         recentToolHistory: reads,
       }))
-      assert.equal(h.submitted.length, 1)
+      assert.equal(h.submitted.filter(e => e.key.includes('P6')).length, 0)
+    })
+
+    it('build 态（窗口内有产出工具）保持阈值 6：干着干着卡进读循环才是真停滞', () => {
+      const h = createHarness()
+      h.run(makeSnapshot({
+        turn: 8,
+        sensorium: makeSensorium({ momentum: 0.2 }),
+        // 窗口 8：前 2 个产出 + 后 6 个只读 → 只读占比 0.75 < 0.8 → build
+        recentToolHistory: [
+          { tool: 'bash', status: 'success' as const, target: 'npm run build' },
+          { tool: 'bash', status: 'success' as const, target: 'npm run lint' },
+          ...makeReads(6),
+        ],
+      }))
+      assert.equal(h.submitted.filter(e => e.key.includes('P6')).length, 1)
       assert.match(h.submitted[0]!.key, /ccr-天璇-P6/)
     })
 
@@ -520,7 +657,7 @@ More text.
       h.run(makeSnapshot({
         turn: 8,
         sensorium: makeSensorium({ momentum: 0.7 }),
-        recentToolHistory: reads,
+        recentToolHistory: makeReads(10),
       }))
       assert.equal(h.submitted.filter(e => e.key.includes('P6')).length, 0)
     })
@@ -572,11 +709,13 @@ More text.
       type Entry = { tool: string; status: 'success' | 'failed'; target: string }
       const history: Entry[] = []
 
-      for (let turn = 1; turn <= 10; turn++) {
-        if (turn <= 8) {
+      // A1 阈值分级后：纯只读排查（diagnostic 态）需要 streak≥10 才触发 P6，
+      // 回放延长到 10 轮只读 + 2 轮验证失败。
+      for (let turn = 1; turn <= 12; turn++) {
+        if (turn <= 10) {
           history.push({ tool: turn % 2 === 0 ? 'grep' : 'read_file', status: 'success', target: `src/f${turn}.ts` })
         }
-        if (turn === 9 || turn === 10) {
+        if (turn === 11 || turn === 12) {
           history.push({ tool: 'run_tests', status: 'failed', target: 'src/foo.test.ts' })
         }
         h.run(makeSnapshot({
@@ -589,11 +728,11 @@ More text.
       const ccrEntries = h.submitted.filter(e => e.key.startsWith('ccr-'))
       assert.ok(ccrEntries.some(e => e.key.includes('P6')), '排查停滞（天璇）至少触发一次')
       assert.ok(ccrEntries.some(e => e.key.includes('P7')), '验证失败膨胀（天权）至少触发一次')
-      // 防刷屏上界：10 轮内 CCR 触发不超过 3 次（星域冷却生效）
-      assert.ok(ccrEntries.length <= 3, `anti-spam bound: got ${ccrEntries.length} CCR triggers in 10 turns`)
+      // 防刷屏上界：12 轮内 CCR 触发不超过 3 次（星域冷却生效）
+      assert.ok(ccrEntries.length <= 3, `anti-spam bound: got ${ccrEntries.length} CCR triggers in 12 turns`)
       // 任意连续 6 轮窗口内不超过 2 次
       const triggerTurns = h.triggerEvents.map(e => e.turn)
-      for (let start = 1; start <= 5; start++) {
+      for (let start = 1; start <= 7; start++) {
         const inWindow = triggerTurns.filter(t => t >= start && t < start + 6).length
         assert.ok(inWindow <= 2, `6-turn window starting at ${start} has ${inWindow} triggers`)
       }

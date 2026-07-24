@@ -75,7 +75,7 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const rawQuery = params.input.query
       if (typeof rawQuery !== 'string' || rawQuery.trim().length === 0) {
-        return { content: 'Error: query must be a non-empty string.', isError: true }
+        return { content: '错误：query 必须是非空字符串。', isError: true }
       }
       const query = rawQuery.trim()
       const rawCount = params.input.count
@@ -91,17 +91,18 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
         const hardErrors = errors.filter(e => e.message !== 'no results')
         if (hardErrors.length > 0) {
           const detail = hardErrors.map(e => `${e.backend}: ${e.message}`).join('; ')
-          return { content: `Search failed (${detail})`, isError: true }
+          // detail 转发后端原文（可能含 HTTP 503 等）——中文前缀+变量，可不打标。
+          return { content: `搜索失败（${detail}）`, isError: true }
         }
-        return { content: `No search results found for: "${query}"` }
+        return { content: `未找到与「${query}」相关的搜索结果` }
       }
 
       const formatted = results
         .map((r, i) => `${i + 1}. [${r.title}](${r.url})\n   ${r.snippet}`)
         .join('\n\n')
 
-      const via = backend ? ` (via ${backend})` : ''
-      return { content: `Web search results for "${query}"${via}:\n\n${formatted}` }
+      const via = backend ? `（经 ${backend}）` : ''
+      return { content: `「${query}」的网页搜索结果${via}：\n\n${formatted}` }
     },
 
     requiresApproval(): boolean {

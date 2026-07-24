@@ -75,7 +75,7 @@ describe('WEB_FETCH_TOOL', () => {
       cwd: '/',
     })
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Invalid URL'))
+    assert.ok(result.content.includes('无效 URL'))
   })
 
   it('rejects non-http protocols', async () => {
@@ -85,7 +85,7 @@ describe('WEB_FETCH_TOOL', () => {
       cwd: '/',
     })
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Unsupported protocol'))
+    assert.ok(result.content.includes('不支持的协议'))
   })
 
   it('requires approval', () => {

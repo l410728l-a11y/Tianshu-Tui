@@ -76,7 +76,7 @@ test('buildWorkerDetailContent includes header, result, and transcript', async (
   assert.ok(title.includes('T1'))
   assert.ok(content.includes('wo_team:T1'))
   assert.ok(content.includes('reviewer'))
-  assert.ok(content.includes('tianquan'))
+  assert.ok(content.includes('tianquan') || content.includes('天权'))
   assert.ok(content.includes('Found the issue.'))
   assert.ok(content.includes('src/x.ts'))
   assert.ok(content.includes('The bug is on line 42.'))

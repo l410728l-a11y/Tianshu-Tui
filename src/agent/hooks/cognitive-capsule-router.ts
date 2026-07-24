@@ -18,6 +18,7 @@ import type { AdvisoryEntry, AdvisoryExpectation } from '../advisory-bus.js'
 import type { EvidenceState } from '../evidence.js'
 import type { Sensorium } from '../sensorium.js'
 import type { VigorState } from '../vigor.js'
+import { classifyActivityMode, PRODUCTIVE_TOOLS, type ActivityMode } from '../convergence-detector.js'
 import { extractPrinciples, getCapsuleByStar, type ExtractedPrinciple } from '../seed-capsule-store.js'
 
 interface AdvisoryBusLike {
@@ -111,14 +112,23 @@ interface RouteState {
   momentum: number
   /** 队尾连续只读（非产出类）工具数 — 排查场景不依赖 filesModified。 */
   readOnlyStreak: number
-  /** 队尾连续验证失败数（run_tests/bash 语义失败；中间的读/改不打断）。 */
+  /** 队尾有效验证连败数（run_tests/bash 语义失败；TDD 编辑/取证间隔各封顶稀释一次）。 */
   verifyFailStreak: number
+  /** 会话活动模式（convergence 的 classifyActivityMode 单一事实源）——
+   *  A1 接线（2026-07-23 信号互扰治理）：诊断态下惩罚信号做阈值分级而非
+   *  完全豁免，保底检测不死。 */
+  activityMode: ActivityMode
 }
 
-/** 产出类工具 — 与 convergence-detector 的 productiveTools 语义一致。 */
-const PRODUCTIVE_TOOLS = new Set(['edit_file', 'write_file', 'hash_edit', 'run_tests', 'bash', 'deliver_task', 'delegate_task', 'delegate_batch'])
+// 产出类工具集合从 convergence-detector 导入（A2 单一事实源）——此前本文件
+// 自持副本已与 convergence 侧漂移分叉（缺 apply_patch/ast_edit），两套判据
+// 对同一轨迹给出矛盾的"空转"结论。
 /** 验证类工具 — 失败流水从这两个工具的 status/errorClass 提取。 */
 const VERIFY_TOOLS = new Set(['run_tests', 'bash'])
+/** 编辑类工具 — TDD 稀释判定用（两次验证失败之间夹编辑 = 在响应 RED 反馈）。
+ *  注意与 isTestIntent 中 2026-07-04 删除的 EDIT_TOOLS 分支无关——那是压制
+ *  机制（编辑≠测试意图），这里是 streak 计数的编辑间隔统计。 */
+const EDIT_TOOLS = new Set(['edit_file', 'write_file', 'hash_edit', 'apply_patch', 'ast_edit'])
 
 type HistoryEntry = { tool: string; target: string; status?: 'success' | 'failed' | 'running'; errorClass?: string }
 
@@ -133,24 +143,53 @@ export function computeReadOnlyStreak(history: ReadonlyArray<HistoryEntry>): num
 }
 
 /**
- * 队尾连续验证失败数。语义：从队尾回看，验证工具（run_tests/bash）的语义失败
- * （非 environment/timeout）计入流水；中间的读取/编辑不打断——「改一下再跑还是红」
- * 正是要抓的验证轮次膨胀模式。遇到一次验证成功即停。
+ * 队尾有效验证连败数（TDD 编辑间隔、诊断取证间隔各封顶稀释一次）。
+ *
+ * 语义：从队尾回看，验证工具（run_tests/bash）的语义失败（非 environment/
+ * timeout）计入流水，遇到一次验证成功即停。两次失败之间的间隔按性质稀释：
+ * - 夹编辑 = agent 在响应 RED 反馈（TDD 循环）——稀释一次
+ * - 只夹只读取证（read/grep 等）= agent 在诊断中复现（RED→定位→复跑）——稀释一次
+ * 两类豁免各封顶 1，同一间隔同时有编辑和只读时只算编辑豁免（不双记）。
+ * 「改了一次还红」「读了一轮再复现还红」是正常工作流；「改了两三次还红」
+ * 「读了两轮仍不改代码纯复跑」已是方向性信号，实打实计数。
+ *
+ * effective = raw − min(编辑间隔数, 1) − min(取证间隔数, 1)：
+ *   RED→edit→RED             = 1（TDD，不触发 P7）
+ *   RED→read→RED             = 1（诊断复现，不触发——H1 修复）
+ *   RED→RED（纯重跑）          = 2（真死循环，触发）
+ *   RED→edit→RED→edit→RED    = 2（改两次还红，触发）
+ *   RED→read→RED→read→RED    = 2（读两轮仍不改代码，触发）
+ *   RED→edit→RED→read→RED    = 1（TDD+诊断，活跃工作，不触发）
+ *
+ * 历史备注：旧实现「编辑不打断」是 2026-07-04 触发面修复的有意设计（抓验证
+ * 轮次膨胀），对 TDD RED→edit→RED 误报——2026-07-23 改为编辑封顶稀释
+ * （.rivet/plans/verifyfailstreak-*.md 瑶光复核版）；同日信号互扰治理 A1
+ * 补上取证间隔稀释（docs/superpowers/specs/2026-07-23-cvm-signal-interference-design.md H1）。
  */
 export function computeVerifyFailStreak(history: ReadonlyArray<HistoryEntry>): number {
-  let streak = 0
+  let raw = 0
+  let editGaps = 0
+  let probeGaps = 0
+  let pendingEdit = false
+  let pendingProbe = false
   for (let i = history.length - 1; i >= 0; i--) {
     const h = history[i]!
-    if (!VERIFY_TOOLS.has(h.tool)) continue
+    if (EDIT_TOOLS.has(h.tool)) { pendingEdit = true; continue }
+    if (!VERIFY_TOOLS.has(h.tool)) { pendingProbe = true; continue }
     if (h.status === 'failed') {
       // environment/timeout 是环境问题，不是语义失败，不计入
       if (h.errorClass === 'environment' || h.errorClass === 'timeout') continue
-      streak++
+      // pending* = 本次失败与更靠队尾的已计入失败之间夹过编辑/只读取证
+      if (raw > 0 && pendingEdit) editGaps++
+      else if (raw > 0 && pendingProbe) probeGaps++
+      pendingEdit = false
+      pendingProbe = false
+      raw++
       continue
     }
     if (h.status === 'success') break
   }
-  return streak
+  return Math.max(0, raw - Math.min(editGaps, 1) - Math.min(probeGaps, 1))
 }
 
 /**
@@ -173,7 +212,7 @@ const RULES: RouteRule[] = [
     match: s => s.verifyFailStreak >= 2,
     busPriority: 0.65,
     poolKeyFilter: new Set(['Q3', 'X3']),
-    promptTemplate: '【天权】验证连续失败 {verify_fail_streak} 次。停止同方向变体重试——换维度（不同证据路径/更小复现）或先用探针确认前提。瑶光胶囊有 RED→GREEN 方法论可 recall。',
+    promptTemplate: '【天权】验证有效连败 {verify_fail_streak} 次（TDD 编辑/诊断取证间隔已各豁免一次）。停止同方向变体重试——换维度（不同证据路径/更小复现）或先用探针确认前提。瑶光胶囊有 RED→GREEN 方法论可 recall。',
     // 最后一个工具就是失败的测试 — 这正是要提醒的时刻，不做测试意图让位
     recallStar: '瑶光',
     // 核销：换维度后仍应回到验证——2 轮内出现验证尝试即采纳
@@ -216,7 +255,11 @@ const RULES: RouteRule[] = [
   {
     id: 'P6',
     star: '天璇',
-    match: s => s.turn > 5 && s.momentum < 0.35 && s.readOnlyStreak >= 6 && s.filesModified === 0,
+    // A1 阈值分级（2026-07-23 信号互扰治理 M2）：诊断态（窗口几乎全只读 =
+    // 用户就是让排查）正常取证批次会轻松打到 streak 6——阈值抬到 10；
+    // build 态（窗口内有产出工具，干着干着卡进读循环）保持 6，这才是真停滞。
+    match: s => s.turn > 5 && s.momentum < 0.35 && s.filesModified === 0
+      && s.readOnlyStreak >= (s.activityMode === 'diagnostic' ? 10 : 6),
     busPriority: 0.55,
     poolKeyFilter: new Set(['X1', 'X3', 'X4']),
     promptTemplate: '【天璇】排查已连续 {readonly_streak} 次只读且预测动量偏低——当前证据维度可能挖穿了。换一层抽象或换一个证据路径（日志/git 历史/小复现），天璇胶囊有跨域换视角方法论可 recall。',
@@ -387,6 +430,7 @@ export function createCcrHook(opts: CcrHookOptions): PreTurnRuntimeHook {
       momentum: sensorium.quality?.momentum === 'no-data' ? 1.0 : (sensorium.momentum ?? 1.0),
       readOnlyStreak: computeReadOnlyStreak(recentToolHistory),
       verifyFailStreak: computeVerifyFailStreak(recentToolHistory),
+      activityMode: classifyActivityMode(recentToolHistory, evidence.filesModified.size),
     }
   }
 
@@ -489,6 +533,8 @@ export function createCcrHook(opts: CcrHookOptions): PreTurnRuntimeHook {
             momentum: state.momentum,
             readOnlyStreak: state.readOnlyStreak,
             verifyFailStreak: state.verifyFailStreak,
+            // Wave C 共现标定：诊断态=1（dimValues 只收 number）
+            activityModeDiagnostic: state.activityMode === 'diagnostic' ? 1 : 0,
           },
           dynamicPool,
         })

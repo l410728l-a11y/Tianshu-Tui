@@ -44,6 +44,14 @@ export type AdvisoryExpectation =
   | { kind: 'verify_attempted'; withinTurns?: number }
   | { kind: 'file_touched'; paths: string[]; withinTurns?: number }
   | { kind: 'pattern_absent'; path: string; needles: string[]; withinTurns?: number }
+  | {
+      /** 改道核销（B1/M4，2026-07-23 信号互扰治理）：观察窗内出现前置对照窗
+       *  （送达前 3 轮）未见过的 (工具族×文件面) 粗签名 → adopted。前置窗
+       *  无事件时任意工具事件即 adopted（与 tool_appears tools:[] 的
+       *  "打破无工具僵局"语义一致）。 */
+      kind: 'course_changed'
+      withinTurns?: number
+    }
 
 /**
  * Phase 2 投递通道（2026-07-04 生命周期设计）：
@@ -132,6 +140,15 @@ const MAX_ADVISORIES_PER_TURN = 3
 const MAX_PER_CATEGORY = 2
 /** W2 SR 有界携带：SR 被 cap 拦截后最多 requeue 次数（跨轮延迟送达上限） */
 const SR_CARRY_LIMIT = 2
+
+/** A4 互斥对（2026-07-23 信号互扰治理 H4；机制回收自 V4 桌面变体）：
+ *  同一 render 周期内语义冲突的两个信号同时在场时，确定度低的一方（loser）
+ *  让位丢弃。首个已知冲突：lossy-observation（观测确实被截断——事实）胜过
+ *  readonly-spiral（"信息可能已足够，开始行动"——启发式）。观测有损时
+ *  "已足够"不成立，同轮双发会同时催"继续交叉验证"和"停止读取"。 */
+const MUTEX_PAIRS: ReadonlyArray<{ winner: string; loser: string }> = [
+  { winner: 'lossy-observation', loser: 'readonly-spiral' },
+]
 
 // ─── F-fix（session 803d897d）：纪律抗习惯化重锚 ─────────────────────
 // execute 阶段 field habituation（alpha=0.35）让 activeDomain 纪律约 4 轮后
@@ -358,8 +375,10 @@ export class AdvisoryBus {
   private statusSink: ((entries: AdvisoryEntry[]) => void) | null = null
   /** system-reminder 通道待送内容（drainSystemReminders 取走）。
    *  Wave 1 SR 账本修正：改为 `{key, content}` 对，供调用方回调确认送达/丢弃。
-   *  W2 通道分级：增加 srClass 字段供调用方透传给 SessionContext。 */
-  private systemReminderOut: Array<{ key: string; content: string; srClass: SrClass }> = []
+   *  W2 通道分级：增加 srClass 字段供调用方透传给 SessionContext。
+   *  A3（信号互扰治理 H6）：增加 priority——drain 按优先级降序出队，
+   *  discipline 每用户轮 1 条的额度归最高优先级信号，不再插入序先到先得。 */
+  private systemReminderOut: Array<{ key: string; content: string; srClass: SrClass; priority: number }> = []
   /** Wave 1：等待回调确认的 SR 条目（render 产出但尚未经 SessionContext 确认）。 */
   private srPendingDelivery = new Map<string, AdvisoryEntry>()
   /** W2：key → requeue 携带次数（跨轮延迟送达追踪，超 SR_CARRY_LIMIT 则 dropped）。 */
@@ -480,11 +499,13 @@ export class AdvisoryBus {
   }
 
   /** Phase 2 (Wave 1)：取走 system-reminder 通道的待送内容，含 key 供调用方回调确认。
-   *  W2 通道分级：增加 srClass 字段供调用方透传给 SessionContext。 */
-  drainSystemReminders(): Array<{ key: string; content: string; srClass: SrClass }> {
+   *  W2 通道分级：增加 srClass 字段供调用方透传给 SessionContext。
+   *  A3：按 priority 降序出队（stable sort，同优先级保持提交序）——
+   *  discipline 配额竞争由优先级裁决，不再是 Map 插入序先到先得。 */
+  drainSystemReminders(): Array<{ key: string; content: string; srClass: SrClass; priority: number }> {
     const out = this.systemReminderOut
     this.systemReminderOut = []
-    return out
+    return out.sort((a, b) => b.priority - a.priority)
   }
 
   /** Wave 1：调用方确认 SR 已成功送达（经 SessionContext 放行）。 */
@@ -523,8 +544,11 @@ export class AdvisoryBus {
       }
       this.srCarryCount.set(key, carryCount)
     }
-    // 回注 systemReminderOut 供下轮 drain 重试
-    this.systemReminderOut.push({ key, content, srClass })
+    // 回注 systemReminderOut 供下轮 drain 重试。
+    // A3：priority 从 srPendingDelivery 恢复（条目在 confirm 前一直在 map 里），
+    // 停放条目与新条目在下轮 drain 共同参与优先级排序。
+    const priority = this.srPendingDelivery.get(key)?.priority ?? 0.5
+    this.systemReminderOut.push({ key, content, srClass, priority })
     if (!skipCarry) this.ledgerSrCarried++
   }
 
@@ -678,6 +702,14 @@ export class AdvisoryBus {
 
     let all = [...this.alive, ...this.entries, ...promoted, ...carried.map(c => c.entry)]
     const deferralsByKey = new Map(carried.map(c => [c.entry.key, c.deferrals]))
+
+    // ── A4 互斥对：语义冲突信号同场时 loser 让位（跨通道，在 SR 分流前生效）──
+    for (const pair of MUTEX_PAIRS) {
+      if (all.some(e => e.key === pair.winner) && all.some(e => e.key === pair.loser)) {
+        this.recordDropped(all.filter(e => e.key === pair.loser).map(e => e.key))
+        all = all.filter(e => e.key !== pair.loser)
+      }
+    }
 
     // ── P1b 习惯化对抗（constitutional 豁免） ──
     if (this.habituation) {
@@ -872,12 +904,21 @@ export class AdvisoryBus {
       }
       for (const e of srDeduped.values()) {
         // Wave 1：不预记 rendered/delivered——由 turn-step-producer 回调确认
-        // P3 补全：render 侧也去重——同 key 已在 systemReminderOut 停放等待时跳过。
-        // requeueSr 侧也做了一次，双保险。P2 放大了停放窗口：discipline 条目可能
-        // 在整个用户轮剩余时长停在 systemReminderOut 中。
-        if (this.systemReminderOut.some(o => o.key === e.key)) continue
+        // A3（H6 陈旧文案修复）：同 key 已停放时不再跳过，而是用新内容刷新——
+        // hook 每轮重算的文案（如"还剩 N 轮"预算数字）以最新一次为准，
+        // 旧行为保留陈旧停放内容会把过期数字注入下一用户轮。
+        // P2 放大了停放窗口：discipline 条目可能在整个用户轮剩余时长停在
+        // systemReminderOut 中，刷新语义在长停放下尤其重要。
+        const parked = this.systemReminderOut.find(o => o.key === e.key)
+        if (parked) {
+          parked.content = this.applyTone(e)
+          parked.srClass = e.srClass ?? 'discipline'
+          parked.priority = e.priority
+          this.srPendingDelivery.set(e.key, e)
+          continue
+        }
         this.srPendingDelivery.set(e.key, e)
-        this.systemReminderOut.push({ key: e.key, content: this.applyTone(e), srClass: e.srClass ?? 'discipline' })
+        this.systemReminderOut.push({ key: e.key, content: this.applyTone(e), srClass: e.srClass ?? 'discipline', priority: e.priority })
       }
       this.ledgerSrSubmitted += srDeduped.size
     }

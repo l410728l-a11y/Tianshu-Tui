@@ -215,7 +215,7 @@ export function buildSessionRoutes(
       // from SSE/stream issues. See docs/dev/render-debug-playbook.md.
       const __dbg = process.env.RIVET_DEBUG_RENDER === '1'
       const __t0 = __dbg ? Date.now() : 0
-      const data = (body ?? {}) as { cwd?: string; title?: string; prompt?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string }
+      const data = (body ?? {}) as { cwd?: string; title?: string; prompt?: string; missionId?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string }
       if (data.approvalMode !== undefined && !isApprovalMode(data.approvalMode)) {
         return { status: 400, body: { error: 'Invalid "approvalMode"' } }
       }
@@ -223,6 +223,8 @@ export function buildSessionRoutes(
         cwd: data.cwd,
         title: data.title,
         prompt: data.prompt,
+        // P1 — 显式关联已有 Mission（桌面端「同任务再开一个会话」）。
+        missionId: typeof data.missionId === 'string' && data.missionId.trim() ? data.missionId : undefined,
         approvalMode: data.approvalMode as ApprovalMode | undefined,
         isolatedWorktree: data.isolatedWorktree === true,
         model: typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined,
@@ -757,8 +759,11 @@ export function buildSessionRoutes(
     }, apiToken),
 
     // Worker log — 失败钻取(W2):活动流 + 终态结果 + 转录尾部。
+    // ?full=1 拉完整转录(不截 50 条尾部,正文上限放宽,工具帧带参数摘要)。
     'GET /sessions/:id/workers/:workerId/log': withAuth(async (_body, params) => {
-      const log = await manager.getWorkerLog(params!.id!, decodeURIComponent(params!.workerId!))
+      const log = await manager.getWorkerLog(params!.id!, decodeURIComponent(params!.workerId!), {
+        full: params?.full === '1',
+      })
       if (!log) return { status: 404, body: { error: 'Session not found' } }
       return { status: 200, body: log }
     }, apiToken),

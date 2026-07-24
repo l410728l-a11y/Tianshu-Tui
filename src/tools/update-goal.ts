@@ -48,11 +48,11 @@ export function createUpdateGoalTool(
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const tracker = getTracker()
       if (!tracker) {
-        return { content: 'No active goal to update.', isError: true }
+        return { content: '当前没有可更新的目标。', isError: true }
       }
       if (tracker.getStatus() !== 'active') {
         return {
-          content: `Goal is currently ${tracker.getStatus()}, cannot update via update_goal.`,
+          content: `目标当前状态为 ${tracker.getStatus()}，无法通过 update_goal 更新。`,
           isError: true,
         }
       }
@@ -61,7 +61,11 @@ export function createUpdateGoalTool(
       const reason = typeof params.input.reason === 'string' ? params.input.reason : undefined
 
       if (status !== 'paused' && status !== 'blocked' && status !== 'complete') {
-        return { content: `Invalid status "${status}". Allowed: paused, blocked, complete.`, isError: true }
+        return {
+          content: `无效状态「${status}」。允许：paused、blocked、complete。`,
+          isError: true,
+          errorKind: 'format_error',
+        }
       }
 
       try {
@@ -80,9 +84,9 @@ export function createUpdateGoalTool(
             saveGoalState(getSessionDir(sessionInfo.cwd), sessionInfo.sessionId, tracker)
           } catch { /* best-effort */ }
         }
-        return { content: `Goal status updated to ${status}.` }
+        return { content: `目标状态已更新为 ${status}。` }
       } catch (e) {
-        return { content: `Transition failed: ${(e as Error).message}`, isError: true }
+        return { content: `状态转换失败：${(e as Error).message}`, isError: true }
       }
     },
 

@@ -301,6 +301,12 @@ export class AgentLoop {
   private lastConvergenceEmitVerifyFailStreak = 0
   /** 上次发射时的收敛 score — 冷却期内 score 显著下降（>0.15）时打破冷却。 */
   private lastConvergenceEmitScore = 1.0
+  /** B1c/M4（2026-07-23 信号互扰治理）：L2+ 警告后连续产出 N 轮 → 清
+   *  priorWarningAtL2Plus 旧账。此前台账只有用户干预会清——纯自主长跑中
+   *  一旦 L2 发射,几十轮产出之后的任何跌分都能拿陈旧警告直接 L3 熔断。 */
+  private readonly convergenceWarningClearProductiveTurns = 5
+  private turnHadProductiveTool = false
+  private productiveTurnStreak = 0
   /** W1（20b9714e 复盘）：阶段相对轮数基线。phaseClass 变更时重置，收敛文案
    *  用 turn - phaseStartTurn 而非会话全局轮数——消灭"连续 90 轮未收敛"这类
    *  会话越长越吓人的假数字。 */
@@ -998,6 +1004,8 @@ export class AgentLoop {
       if (PRODUCTIVE_TOOLS.has(name)) {
         this.convergenceEmitRepeatCount = 0
         this.convergenceEmitCooldownTurns = this.convergenceEmitBaseCooldownTurns
+        // B1c：turn 级产出标志,由 runConvergenceCheck 在下个 turn 边界结算
+        this.turnHadProductiveTool = true
       }
       // F-fix (session 803d897d): field habituation moves discipline text out of
       // focus after ~4 turns while a heavy turn can run 20+ tool calls. Re-anchor
@@ -1016,8 +1024,9 @@ export class AgentLoop {
 
   bindSessionDomain(taskDescription: string): void {
     if (this.sessionDomain !== undefined) return
-    // domainKeywordRouting 默认 true：Auto 按消息 matchDomain，未命中回退天枢；
-    // 显式 false 时固定落到 DEFAULT_DOMAIN。
+    // domainKeywordRouting 默认 true：Auto 按消息在 DOMAIN_AUTO_POOL（五个均衡
+    // 工程域 + 自定义域）内 matchDomain，未命中回退天权（DEFAULT_DOMAIN）；
+    // 显式 false 时固定落到 DEFAULT_DOMAIN。池外特化域仅手动/钉定/委派进入。
     this.sessionDomain = isStarSoulEnabled()
       ? buildActiveDomain(taskDescription, {
           keywordRouting: this.config.domainKeywordRouting !== false,
@@ -2177,6 +2186,19 @@ export class AgentLoop {
       this.evidence.getState().filesModified.size,
     )
 
+    // B1c/M4：turn 边界结算上一轮产出 → 维护连续产出计数;达 N 轮且有未清
+    // 警告时清台账（镜像下方 userMessageConsumed 清账路径）。清账后若再触发
+    // L3,走"先警告一轮再熔断"的 grace-turn,而不是拿陈旧警告直接 abort。
+    this.productiveTurnStreak = this.turnHadProductiveTool ? this.productiveTurnStreak + 1 : 0
+    this.turnHadProductiveTool = false
+    if (this.lastConvergenceEmitLevel >= 2 && this.productiveTurnStreak >= this.convergenceWarningClearProductiveTurns) {
+      debugLog(`[convergence] turn=${turn} prior-warning cleared (${this.productiveTurnStreak} productive turns since emit)`)
+      this.lastConvergenceEmitTurn = -Infinity
+      this.lastConvergenceEmitLevel = 0
+      this.lastConvergenceMsgKey = ''
+      this.lastConvergenceEmitVerifyFailStreak = 0
+    }
+
     // Grace-turn precondition for the score abort: a convergence warning at L2+
     // must have been delivered in a strictly earlier turn, so the model had at
     // least one turn to act on the guidance. Captured before this turn's kick
@@ -2300,6 +2322,9 @@ export class AgentLoop {
           this.lastConvergenceMsgKey = msgKey
           this.lastConvergenceEmitVerifyFailStreak = verifyFailStreak
           this.lastConvergenceEmitScore = convergenceCheck.score
+          // B1c：新警告要求 N 轮全新产出才可清账——发射即重置计数
+          this.productiveTurnStreak = 0
+          this.turnHadProductiveTool = false
 
           // Level 2: inject user guidance as a system-visible nudge
           callbacks.onPhaseChange?.('convergence-warning', {
@@ -2327,17 +2352,18 @@ export class AgentLoop {
             category: 'discipline',
             content: convergenceCheck.injectedMessage +
               ` ${renderRouteAnnotation(STALL_ROUTE_TABLE[this.consecutiveNoToolTurns >= 2 ? 'no-tool-stall' : 'strategy-stall'])}`,
-            // 谓词映射表（P1a + W3）：
+            // 谓词映射表（P1a + W3 + B1b）：
             // - 无工具僵局变体：任意工具调用即打破僵局。
             // - 诊断态变体（W3）："核实后收束"的行为签名 = 后续轮出现认知型
             //   工具调用（read/grep/glob 等）。核实了 → adopted 续命；直接
             //   无工具脑补结论 → 谓词失败计 ignored，与 efficacy 环双轨咬合。
-            // - 其余 build 变体没有单一行为签名，不设谓词，只计送达。
+            // - build 变体（B1b/M4，2026-07-23 信号互扰治理）：改道 = 换文件面
+            //   /换工具族——course_changed 粗签名核销，填补此前刻意留空的核销位。
             expect: this.consecutiveNoToolTurns >= 2
               ? { kind: 'tool_appears', tools: [], withinTurns: 1 }
               : activityMode === 'diagnostic'
                 ? { kind: 'tool_appears', tools: ['read_file', 'grep', 'glob', 'list_dir', 'bash'], withinTurns: 2 }
-                : undefined,
+                : { kind: 'course_changed', withinTurns: 2 },
           })
 
           // When convergence is detected, append the delivery gate hint so the

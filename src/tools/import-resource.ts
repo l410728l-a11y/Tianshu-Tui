@@ -2,12 +2,22 @@ import { stat, lstat, symlink, mkdir, cp, readFile, rm, readdir, writeFile } fro
 import { basename, join, resolve, extname } from 'path'
 import { execFile } from 'child_process'
 import { existsSync } from 'fs'
-import type { Tool, ToolCallParams } from './types.js'
+import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import type { ArtifactStore } from '../artifact/store.js'
 import { expandHome } from '../platform.js'
 import { relativePosix } from '../path-format.js'
-import { httpFetchGuarded } from './net/http-fetch.js'
+import { httpFetchGuarded, type HttpFetchResult } from './net/http-fetch.js'
+
+type HttpFetchFn = (url: string, ...rest: unknown[]) => Promise<HttpFetchResult>
+let httpFetchForTests: HttpFetchFn | null = null
+
+/** @internal 测试注入点——生产路径保持 null。 */
+export function setHttpFetchForTests(fn: HttpFetchFn | null): void {
+  httpFetchForTests = fn
+}
 import { extractDocumentText, isExtractableDocument, EXTRACTION_CAVEAT } from './doc-extract.js'
+import { cloneWithFallback } from './github-mirror-fallback.js'
+import { loadConfig } from '../config/manager.js'
 
 const IMPORT_DIR = '.rivet/external'
 const PREVIEW_BYTES = 4000
@@ -91,17 +101,17 @@ async function buildResult(
   artifactStore?: ArtifactStore,
 ): Promise<{ content: string; uiContent: string }> {
   const relPath = relativePosix(cwd, localPath)
-  let header = `Imported: ${source}\nLocal: ${relPath}\nType: ${stats.type}`
-  if (stats.size !== undefined) header += `\nSize: ${(stats.size / 1024).toFixed(1)} KB`
-  if (stats.files !== undefined) header += `\nFiles: ~${stats.files}`
+  let header = `已导入：${source}\n本地路径：${relPath}\n类型：${stats.type}`
+  if (stats.size !== undefined) header += `\n大小：${(stats.size / 1024).toFixed(1)} KB`
+  if (stats.files !== undefined) header += `\n文件数：约 ${stats.files}`
 
   let preview = ''
   if (stats.type === 'file' && isTextFile(localPath)) {
     try {
       const content = await readFile(localPath, 'utf-8')
       preview = content.length > PREVIEW_BYTES
-        ? `\n\n── Preview (first ${PREVIEW_BYTES} chars) ──\n${content.slice(0, PREVIEW_BYTES)}\n... (${content.length} total chars)`
-        : `\n\n── Content ──\n${content}`
+        ? `\n\n── 预览（前 ${PREVIEW_BYTES} 字符）──\n${content.slice(0, PREVIEW_BYTES)}\n...（共 ${content.length} 字符）`
+        : `\n\n── 内容 ──\n${content}`
     } catch { /* binary / unreadable */ }
   } else if (stats.type === 'file' && isExtractableDocument(localPath)) {
     // Binary office document (PDF/DOCX/PPTX/…) — extract text via system
@@ -117,27 +127,27 @@ async function buildResult(
             tool: 'import_resource',
             target: source,
             rawContent: marked,
-            summary: `Extracted text (${extraction.engine}) from ${basename(localPath)} — ${extraction.text.length} chars`,
+            summary: `从 ${basename(localPath)} 抽取文本（${extraction.engine}）— ${extraction.text.length} 字符`,
             sections: [],
           })
-          artifactNote = `\nFull extracted text: read_section(artifactId="${artifactId}")\n[artifact:${artifactId}]`
+          artifactNote = `\n完整抽取文本：read_section(artifactId="${artifactId}")\n[artifact:${artifactId}]`
         } catch { /* artifact persistence is best-effort */ }
       }
       const truncated = extraction.text.length > PREVIEW_BYTES
       const body = truncated
-        ? `${extraction.text.slice(0, PREVIEW_BYTES)}\n... (${extraction.text.length} total chars)`
+        ? `${extraction.text.slice(0, PREVIEW_BYTES)}\n...（共 ${extraction.text.length} 字符）`
         : extraction.text
-      preview = `\n\n── Extracted text (engine: ${extraction.engine}) ──\n${EXTRACTION_CAVEAT}\n${body}${artifactNote}`
+      preview = `\n\n── 抽取文本（引擎：${extraction.engine}）──\n${EXTRACTION_CAVEAT}\n${body}${artifactNote}`
     } else {
-      preview = `\n\n(Binary document imported. ${extraction.suggestion})`
+      preview = `\n\n（已导入二进制文档。${extraction.suggestion}）`
     }
   } else if (stats.type === 'file' && isImageFile(localPath)) {
-    preview = '\n\n(Image file — imported but not viewable as text. Use file_info for metadata.)'
+    preview = '\n\n（图片文件——已导入但无法以文本查看。可用 file_info 查看元数据。）'
   }
 
   return {
     uiContent: header + preview,
-    content: `${header}${preview}\n\nThis resource is now accessible at project-local path: ${relPath}\nUse read_file, grep, glob with this path.`,
+    content: `${header}${preview}\n\n该资源现可通过项目内路径访问：${relPath}\n请使用 read_file、grep、glob 配合此路径。`,
   }
 }
 
@@ -172,7 +182,7 @@ export const IMPORT_RESOURCE_TOOL: Tool = {
 
   async execute(params: ToolCallParams) {
     const rawSource = (params.input.source as string)?.trim()
-    if (!rawSource) return { content: 'Error: source is required', isError: true }
+    if (!rawSource) return { content: '错误：source 为必填项', isError: true }
 
     const importDir = await ensureImportDir(params.cwd)
 
@@ -196,7 +206,7 @@ async function handleLocalImport(cwd: string, importDir: string, source: string,
   try {
     await lstat(resolved)
   } catch {
-    return { content: `Error: path does not exist: ${resolved}`, isError: true, uiContent: `Not found: ${resolved}` }
+    return { content: `错误：路径不存在：${resolved}`, isError: true, uiContent: `未找到：${resolved}` }
   }
 
   const ls = await lstat(resolved)
@@ -208,7 +218,7 @@ async function handleLocalImport(cwd: string, importDir: string, source: string,
   if (ls.isDirectory()) {
     await symlink(resolved, targetPath, 'junction')
     const result = await buildResult(source, targetPath, cwd, { type: 'directory', files: await countFiles(resolved, 3) })
-    return { ...result, content: result.content + '\n\n(Linked as junction — no disk copy)' }
+    return { ...result, content: result.content + '\n\n（以 junction 链接——未复制到磁盘）' }
   }
 
   try {
@@ -225,18 +235,19 @@ async function handleGitHubImport(
   importDir: string,
   gh: { owner: string; repo: string; ref?: string; subpath?: string },
   explicitRef?: string,
-): Promise<{ content: string; uiContent: string; isError?: boolean }> {
+): Promise<Pick<ToolResult, 'content' | 'uiContent' | 'isError' | 'errorKind'>> {
   const ref = explicitRef ?? gh.ref
   if (ref !== undefined && !isSafeGitRef(ref)) {
     return {
-      content: `Error: invalid git ref "${ref}". A branch/tag/commit must not start with "-" or contain whitespace/control characters.`,
+      content: `错误：无效的 git ref "${ref}"。branch/tag/commit 不得以 "-" 开头，也不得包含空白或控制字符。`,
       isError: true,
-      uiContent: `Invalid ref: ${ref}`,
+      uiContent: `无效 ref：${ref}`,
     }
   }
   const repoUrl = `https://github.com/${gh.owner}/${gh.repo}.git`
   const targetName = importTargetName(`${gh.owner}/${gh.repo}`)
   const targetPath = join(importDir, targetName)
+  let mirrorNotice: string | undefined
 
   const execAsync = (cmd: string, args: string[], opts: { cwd?: string; timeout: number }) =>
     new Promise<void>((resolveExec, reject) => {
@@ -248,18 +259,35 @@ async function handleGitHubImport(
   } else {
     try { await rm(targetPath, { recursive: true, force: true }) } catch { /* not existing is fine */ }
     try {
-      // `--` terminates option parsing before the positional repo/target args.
-      const args = ['clone', '--depth', '1']
-      if (ref) args.push('--branch', ref)
-      args.push('--', repoUrl, targetPath)
-      await execAsync('git', args, { timeout: 120_000 })
+      const mirrorConfig = loadConfig({ cwd }).mirrors
+      const decision = await cloneWithFallback({
+        originalUrl: repoUrl,
+        config: mirrorConfig,
+        cwd,
+        cloneFn: async (url, timeoutMs) => {
+          const args = ['clone', '--depth', '1']
+          if (ref) args.push('--branch', ref)
+          args.push('--', url, targetPath)
+          await execAsync('git', args, { timeout: timeoutMs })
+        },
+        fallbackTimeoutMs: mirrorConfig.fallbackTimeoutSec * 1000,
+        fallbackMemoryMinutes: mirrorConfig.fallbackMemoryMinutes,
+      })
+      if (decision.reason !== 'direct' && decision.mirrorId) {
+        const mirrorName = decision.mirrorId
+        mirrorNotice = `[mirror] 已通过 ${mirrorName} 镜像拉取（直连失败）`
+      }
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code
       if (code === 'ENOENT') {
-        return { content: `Error: git is not installed or not on PATH — cannot clone ${repoUrl}. Install git and retry.`, isError: true, uiContent: `git not found` }
+        return { content: `错误：未安装 git 或不在 PATH 中——无法 clone ${repoUrl}。请安装 git 后重试。`, isError: true, uiContent: `未找到 git`, errorKind: 'missing_dep' }
       }
       const msg = err instanceof Error ? err.message : String(err)
-      return { content: `Error cloning ${repoUrl}: ${msg}`, isError: true, uiContent: `Clone failed: ${gh.owner}/${gh.repo}` }
+      // ENOENT might be buried in the aggregate error message
+      if (msg.includes('ENOENT')) {
+        return { content: `错误：未安装 git 或不在 PATH 中——无法 clone ${repoUrl}。请安装 git 后重试。`, isError: true, uiContent: `未找到 git`, errorKind: 'missing_dep' }
+      }
+      return { content: `clone ${repoUrl} 时出错：${msg}`, isError: true, uiContent: `克隆失败：${gh.owner}/${gh.repo}` }
     }
   }
 
@@ -272,19 +300,23 @@ async function handleGitHubImport(
   const effectivePath = gh.subpath ? join(targetPath, gh.subpath) : targetPath
 
   if (gh.subpath && !existsSync(effectivePath)) {
-    return { content: `Error: subpath '${gh.subpath}' not found in ${gh.owner}/${gh.repo}`, isError: true, uiContent: `Subpath not found: ${gh.subpath}` }
+    return { content: `错误：在 ${gh.owner}/${gh.repo} 中未找到子路径 '${gh.subpath}'`, isError: true, uiContent: `未找到子路径：${gh.subpath}` }
   }
 
   let ls: Awaited<ReturnType<typeof lstat>> | undefined
   if (existsSync(effectivePath)) {
     try { ls = await lstat(effectivePath) } catch { /* ignore */ }
   }
-  return await buildResult(
+  const result = await buildResult(
     `github.com/${gh.owner}/${gh.repo}${gh.subpath ? `/${gh.subpath}` : ''}`,
     effectivePath,
     cwd,
     { type: ls?.isDirectory() ? 'directory' : ls?.isFile() ? 'file' : 'directory', files: await countFiles(targetPath, 3) },
   )
+  if (mirrorNotice) {
+    result.content = `${mirrorNotice}\n${result.content}`
+  }
+  return result
 }
 
 async function handleUrlImport(cwd: string, importDir: string, url: string, artifactStore?: ArtifactStore): Promise<{ content: string; uiContent: string; isError?: boolean }> {
@@ -298,27 +330,28 @@ async function handleUrlImport(cwd: string, importDir: string, url: string, arti
   const targetPath = join(importDir, targetName)
 
   try {
-    const { status, bytes } = await httpFetchGuarded(url, undefined, { timeoutMs: 60_000 })
+    const fetchFn = httpFetchForTests ?? httpFetchGuarded
+    const { status, bytes } = await fetchFn(url, undefined, { timeoutMs: 60_000 })
     if (status >= 400) {
-      return { content: `Error downloading ${url}: HTTP ${status}`, isError: true, uiContent: `Download failed: ${url}` }
+      return { content: `下载 ${url} 时出错：HTTP ${status}`, isError: true, uiContent: `下载失败：${url}` }
     }
     if (bytes.length === 0) {
-      return { content: `Error: download produced empty file from ${url}`, isError: true, uiContent: `Empty download: ${url}` }
+      return { content: `错误：从 ${url} 下载得到空文件`, isError: true, uiContent: `空下载：${url}` }
     }
     await writeFile(targetPath, bytes)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    return { content: `Error downloading ${url}: ${msg}`, isError: true, uiContent: `Download failed: ${url}` }
+    return { content: `下载 ${url} 时出错：${msg}`, isError: true, uiContent: `下载失败：${url}` }
   }
 
   let s: Awaited<ReturnType<typeof stat>>
   try {
     s = await stat(targetPath)
   } catch {
-    return { content: `Error: download produced empty file from ${url}`, isError: true, uiContent: `Empty download: ${url}` }
+    return { content: `错误：从 ${url} 下载得到空文件`, isError: true, uiContent: `空下载：${url}` }
   }
   if (s.size === 0) {
-    return { content: `Error: download produced empty file from ${url}`, isError: true, uiContent: `Empty download: ${url}` }
+    return { content: `错误：从 ${url} 下载得到空文件`, isError: true, uiContent: `空下载：${url}` }
   }
 
   return await buildResult(url, targetPath, cwd, { type: 'file', size: s.size }, artifactStore)

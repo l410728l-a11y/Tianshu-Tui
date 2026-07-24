@@ -89,7 +89,7 @@ describe('plan tool close — evidence gate', () => {
     )
 
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('blocked'))
+    assert.ok(result.content.includes('被拦截'))
     assert.ok(result.content.includes('run npm run typecheck'), 'includes shortestNextStep')
     assert.equal(read(), before, 'file must not be written when blocked')
   })
@@ -118,7 +118,7 @@ describe('plan tool close — evidence gate', () => {
     assert.ok(written.includes('> **Status: EXECUTED**'), 'EXECUTED marker written on real GREEN')
     assert.ok(written.includes('npm test'), 'real verified command recorded in closure')
     assert.ok(written.includes('- [x] step one'), 'checkboxes closed')
-    assert.ok(result.content.includes('marked EXECUTED'))
+    assert.ok(result.content.includes('已标记 EXECUTED'))
   })
 
   it('allows an honest RED close (checkpoint) without EXECUTED marker', async () => {
@@ -147,7 +147,7 @@ describe('plan tool close — evidence gate', () => {
     const written = read()
     assert.ok(!written.includes('npm test'), 'claimed-but-unbacked command must not be recorded')
     assert.ok(written.includes('未传入显式验证命令'), 'closure records the real (empty) set')
-    assert.ok(result.content.includes('Evidence:'), 'mismatch noted in tool output')
+    assert.ok(result.content.includes('证据：'), 'mismatch noted in tool output')
   })
 
   it('degrades to legacy trust-claimed behavior when no gate is wired (backward compat)', async () => {
@@ -171,8 +171,8 @@ describe('plan tool close — evidence gate', () => {
       { assessDelivery: () => makeGate({ state: 'RED', isBlocked: true, canDeliver: false, verificationCount: 0 }) },
     )
     assert.ok(!result.isError)
-    assert.ok(result.content.includes('preview'))
-    assert.ok(result.content.includes('blocked'))
+    assert.ok(result.content.includes('预览'))
+    assert.ok(result.content.includes('被拦截'))
     assert.equal(read(), before, 'preview never writes')
   })
 })
@@ -228,15 +228,15 @@ describe('plan close — 闭环即解锁(自动退出 plan mode)', () => {
     }),
   })
 
-  it('闭环(gate-GREEN EXECUTED)调用 exitPlanMode', async () => {
+  it('闭环(gate-GREEN EXECUTED)不再调用 exitPlanMode（close 语义已解耦）', async () => {
     let exited = 0
     const result = await close(
       { apply: true, deliveryState: 'GREEN', verifiedCommands: ['npm test'] },
       { ...greenGate(), exitPlanMode: () => { exited++ } },
     )
     assert.ok(!result.isError, result.content)
-    assert.equal(exited, 1)
-    assert.ok(result.content.includes('已自动退出计划模式'))
+    assert.equal(exited, 0)
+    assert.ok(!result.content.includes('已自动退出计划模式'))
   })
 
   it('非闭环(诚实 RED checkpoint)不调用 exitPlanMode', async () => {

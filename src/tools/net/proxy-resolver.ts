@@ -15,8 +15,35 @@ export interface ProxyResolverOptions {
   noProxy?: string
 }
 
+import { execSync } from 'node:child_process'
+
 function envCaseInsensitive(key: string): string | undefined {
   return process.env[key] ?? process.env[key.toLowerCase()]
+}
+
+/** Read Windows system proxy from registry (HKCU Internet Settings).
+ *  Returns undefined on non-Windows or when no proxy is configured.
+ *  Format: "host:port" or "http=host:port;https=host:port". */
+function readWindowsSystemProxy(): string | undefined {
+  if (process.platform !== 'win32') return undefined
+  try {
+    const stdout = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer 2>nul',
+      { encoding: 'utf8', timeout: 3000, windowsHide: true },
+    )
+    // Output: "    ProxyServer    REG_SZ    host:port"
+    const match = stdout.match(/REG_SZ\s+(.+)/)
+    if (match?.[1]) return match[1].trim()
+    // Also check ProxyEnable
+    const enable = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable 2>nul',
+      { encoding: 'utf8', timeout: 3000, windowsHide: true },
+    )
+    if (!/0x1/.test(enable)) return undefined
+  } catch {
+    // reg query fails when the key doesn't exist — no proxy configured
+  }
+  return undefined
 }
 
 /**
@@ -67,10 +94,11 @@ export function resolveProxyForUrl(url: string, opts?: ProxyResolverOptions): st
 
   // 回退到环境变量
   if (parsed.protocol === 'https:') {
-    return envCaseInsensitive('HTTPS_PROXY') ?? envCaseInsensitive('HTTP_PROXY')
+    return envCaseInsensitive('HTTPS_PROXY') ?? envCaseInsensitive('HTTP_PROXY') ?? readWindowsSystemProxy()
   }
   if (parsed.protocol === 'http:') {
-    return envCaseInsensitive('HTTP_PROXY') ?? envCaseInsensitive('HTTPS_PROXY')
+    return envCaseInsensitive('HTTP_PROXY') ?? envCaseInsensitive('HTTPS_PROXY') ?? readWindowsSystemProxy()
   }
-  return undefined
+  // Non-HTTP protocols: try generic proxy env vars then Windows fallback
+  return readWindowsSystemProxy()
 }

@@ -67,7 +67,7 @@ describe('create_spreadsheet', () => {
       })
 
       assert.equal(result.isError, undefined)
-      assert.ok(result.content.includes('Created html spreadsheet'))
+      assert.ok(result.content.includes('已创建 html 电子表格'))
       assert.ok(result.content.includes(destination))
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -82,6 +82,6 @@ describe('create_spreadsheet', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /rows is required/)
+    assert.match(result.content, /rows 为必填项/)
   })
 })

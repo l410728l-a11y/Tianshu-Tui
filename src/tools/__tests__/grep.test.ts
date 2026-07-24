@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { GREP_TOOL } from '../grep.js'
+import { GREP_TOOL, GREP_EMPTY_RESULT } from '../grep.js'
 import { resetResolvedEnvCache } from '../resolved-env.js'
 
 describe('GREP_TOOL', () => {
@@ -86,7 +86,7 @@ describe('GREP_TOOL', () => {
 
   it('returns no matches message when nothing found', async () => {
     const result = await GREP_TOOL.execute(makeParams({ pattern: 'ZZZ_NOT_EXIST', path: 'src' }))
-    assert.ok(result.content.includes('No matches found'))
+    assert.ok(result.content.includes(GREP_EMPTY_RESULT))
   })
 
   it('rejects parent directory traversal in search path', async () => {
@@ -105,12 +105,12 @@ describe('GREP_TOOL', () => {
     for (const input of [{ path: 'src' }, { pattern: '' }, { pattern: '   ' }, { pattern: null }]) {
       const result = await GREP_TOOL.execute(makeParams(input))
       assert.equal(result.isError, true, JSON.stringify(input))
-      assert.match(result.content, /pattern is required/i)
+      assert.match(result.content, /需要提供 pattern/)
     }
 
     const result = await GREP_TOOL.execute(makeParams({ path: 'src', context_lines: 2 }))
     assert.equal(result.isError, true)
-    assert.match(result.content, /input keys: context_lines, path/i)
+    assert.match(result.content, /input keys：context_lines, path/)
   })
 
   it('enforces max_results globally', async () => {
@@ -143,7 +143,7 @@ describe('GREP_TOOL', () => {
     const result = await GREP_TOOL.execute(makeParams({ pattern: 'ERROR', path: 'logs/app.log', max_results: 10 }))
 
     assert.equal(result.isError, undefined)
-    assert.ok(result.content.includes('Suggested next reads:'))
+    assert.ok(result.content.includes('建议的下一步读取：'))
     assert.ok(result.content.includes('read_file(file_path="logs/app.log"'))
     assert.ok(result.content.includes('limit<=80'))
     assert.ok(!result.content.includes('scan the whole project'))
@@ -177,7 +177,7 @@ describe('GREP_TOOL', () => {
       assert.ok(!result.isError, `grep must not error, got: ${result.content}`)
       assert.match(
         result.content!,
-        /\[grep\] ripgrep \(rg\) not found or failed; using slow fallback/,
+        /\[grep\] 未找到 ripgrep \(rg\) 或其执行失败；已使用慢速回退/,
       )
       assert.ok(result.content.includes('hit.ts'))
       assert.ok(result.content.includes('FALLBACK_NEEDLE'))

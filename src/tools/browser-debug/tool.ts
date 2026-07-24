@@ -6,7 +6,11 @@ import { join } from 'node:path'
 import { writeFile } from 'node:fs/promises'
 import type { Tool, ToolCallParams, ToolResult } from '../types.js'
 import { rivetHome } from '../../config/paths.js'
-import { isHostAllowed } from '../browser.js'
+import {
+  isHostAllowed,
+  BROWSER_NAVIGATED_PREFIX,
+  BROWSER_SCREENSHOT_OF_PREFIX,
+} from '../browser.js'
 import {
   getOrCreateSession,
   getSession,
@@ -110,10 +114,10 @@ function parseNavUrl(raw: string): { url: URL } | { error: string } {
   try {
     url = new URL(raw)
   } catch {
-    return { error: `Invalid URL: ${raw}` }
+    return { error: `无效 URL：${raw}` }
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return { error: `Unsupported protocol: ${url.protocol}. Only http/https allowed.` }
+    return { error: `不支持的协议：${url.protocol}。仅允许 http/https。` }
   }
   return { url }
 }
@@ -159,17 +163,17 @@ function formatStatus(session: BrowserDebugSession): string {
   const errCount = session.log.getConsole('error').length
   const urls = safePageUrls(session)
   const lines = [
-    `session: ${session.sessionKey}`,
-    `mode: ${session.mode}${session.connectUrl ? ` (${session.connectUrl})` : ''}`,
-    `headless: ${session.headless}`,
-    `url: ${session.driver.currentUrl()}`,
-    `pages: ${urls.length} open${urls.length > 1 ? ` (active last): ${urls.join(' | ')}` : ''}`,
-    `console: ${consoleTotal} message(s) (${errCount} error(s))`,
-    `network: ${net.length} request(s) (${failed} failed/4xx/5xx)`,
+    `会话：${session.sessionKey}`,
+    `模式：${session.mode}${session.connectUrl ? `（${session.connectUrl}）` : ''}`,
+    `无头：${session.headless}`,
+    `url：${session.driver.currentUrl()}`,
+    `页面：${urls.length} 个已打开${urls.length > 1 ? `（末个为活动）：${urls.join(' | ')}` : ''}`,
+    `控制台：${consoleTotal} 条消息（${errCount} 条错误）`,
+    `网络：${net.length} 条请求（${failed} 条失败/4xx/5xx）`,
   ]
-  if (session.userDataDir) lines.push(`profile: ${session.userDataDir}`)
+  if (session.userDataDir) lines.push(`配置目录：${session.userDataDir}`)
   if (session.mode === 'connect') {
-    lines.push('note: close disconnects from Chrome without quitting it')
+    lines.push('说明：close 会断开与 Chrome 的连接，但不会退出浏览器')
   }
   return lines.join('\n')
 }
@@ -295,26 +299,26 @@ API 联调技巧：
 
       if (action === 'close') {
         const session = getSession(sessionKey)
-        if (!session) return { content: `No browser session was open for ${sessionKey}.` }
+        if (!session) return { content: `会话 ${sessionKey} 没有打开的浏览器会话。` }
         const mode = session.mode
         await closeSession(sessionKey)
         return {
           content: mode === 'connect'
-            ? `Disconnected from Chrome (session ${sessionKey}, browser left running).`
-            : `Browser session closed (${sessionKey}).`,
+            ? `已断开与 Chrome 的连接（会话 ${sessionKey}，浏览器仍在运行）。`
+            : `浏览器会话已关闭（${sessionKey}）。`,
         }
       }
 
       if (action === 'status') {
         const session = getSession(sessionKey)
-        if (!session) return { content: `No browser session open for ${sessionKey}.`, isError: true }
+        if (!session) return { content: `会话 ${sessionKey} 没有打开的浏览器会话。`, isError: true }
         return { content: formatStatus(session) }
       }
 
       if (action === 'await_login') {
         if (connectUrl && !isCdpUrlAllowed(connectUrl, allowlist())) {
           return {
-            content: `browser_debug blocked: CDP endpoint "${connectUrl}" is not loopback and not allowlisted.`,
+            content: `browser_debug 已拦截：CDP 端点 "${connectUrl}" 不是回环地址且未在许可名单中。`,
             isError: true,
           }
         }
@@ -322,21 +326,21 @@ API 联调技巧：
           const session = await ensureSession(sessionKey, headless, connectUrl)
           if (!headless) await session.driver.bringToFront().catch(() => {})
         } catch (err) {
-          return { content: `browser_debug failed to open: ${(err as Error).message}`, isError: true }
+          return { content: `browser_debug 打开失败：${(err as Error).message}`, isError: true }
         }
         const msg =
           (typeof params.input.message === 'string' && params.input.message.trim()) ||
-          'Complete login / manual steps in the browser window, then reply to continue.'
+          '请在浏览器窗口完成登录/手动步骤，然后回复以继续。'
         return {
-          content: '[Awaiting manual login — the user will reply once done.]',
-          uiContent: `${msg}\n\n(OAuth popups / new tabs are tracked automatically; the persistent profile keeps your session for later browser_debug actions.)`,
+          content: '[等待手动登录——用户完成后会回复。]',
+          uiContent: `${msg}\n\n（OAuth 弹窗/新标签页会自动跟踪；持久化配置会为后续 browser_debug 操作保留登录态。）`,
           endTurn: true,
         }
       }
 
       if (NAV_ACTIONS.has(action)) {
         const rawUrl = params.input.url as string | undefined
-        if (!rawUrl) return { content: `${action} requires a "url".`, isError: true }
+        if (!rawUrl) return { content: `${action} 需要 "url"。`, isError: true }
         const parsed = parseNavUrl(rawUrl)
         if ('error' in parsed) return { content: parsed.error, isError: true }
 
@@ -344,16 +348,16 @@ API 联调技巧：
         if (!isDebugHostAllowed(parsed.url.hostname, list)) {
           return {
             content:
-              `browser_debug blocked: host "${parsed.url.hostname}" is not loopback and not on the allowlist (fail-closed). ` +
+              `browser_debug 已拦截：主机 "${parsed.url.hostname}" 不是回环地址且不在许可名单中（fail-closed）。` +
               (list.length === 0
-                ? 'Only localhost is reachable — set RIVET_BROWSER_ALLOWLIST for other hosts.'
-                : `Allowed: ${list.join(', ')}.`),
+                ? '当前仅 localhost 可访问——其他主机请设置 RIVET_BROWSER_ALLOWLIST。'
+                : `已允许：${list.join(', ')}。`),
             isError: true,
           }
         }
         if (connectUrl && !isCdpUrlAllowed(connectUrl, list)) {
           return {
-            content: `browser_debug blocked: CDP endpoint "${connectUrl}" is not loopback and not allowlisted.`,
+            content: `browser_debug 已拦截：CDP 端点 "${connectUrl}" 不是回环地址且未在许可名单中。`,
             isError: true,
           }
         }
@@ -366,21 +370,22 @@ API 联调技巧：
           const finalUrl = session.driver.currentUrl()
           const netCount = session.log.getNetwork().length
           const errCount = session.log.getConsole('error').length
-          const modeHint = session.mode === 'connect' ? ' (connected via CDP)' : ''
+          const modeHint = session.mode === 'connect' ? '（已通过 CDP 连接）' : ''
           return {
             content:
-              `Navigated to ${finalUrl}${modeHint}. Captured ${netCount} network request(s), ${errCount} console error(s). ` +
-              `Use network with url_filter="/api/" failed_only=true include_body=true for API errors.`,
+              // URL 后用 ASCII `. ` 分隔——browser-mirror / walkthrough 的 \S+ 提取依赖此边界。
+              `${BROWSER_NAVIGATED_PREFIX} ${finalUrl}${modeHint}. 已捕获 ${netCount} 条网络请求、${errCount} 条控制台错误。` +
+              `使用 network 并设 url_filter="/api/" failed_only=true include_body=true 可查看 API 错误。`,
           }
         } catch (err) {
-          return { content: `browser_debug navigation failed: ${(err as Error).message}`, isError: true }
+          return { content: `browser_debug 导航失败：${(err as Error).message}`, isError: true }
         }
       }
 
       const session = getSession(sessionKey)
       if (!session) {
         return {
-          content: `No browser session open for ${sessionKey}. Use action="open" with a url first.`,
+          content: `会话 ${sessionKey} 没有打开的浏览器会话。请先用 action="open" 并提供 url。`,
           isError: true,
         }
       }
@@ -390,7 +395,7 @@ API 联调技巧：
           case 'console': {
             const level = params.input.level as ConsoleLevel | undefined
             const entries = session.log.getConsole(level).slice(-CONSOLE_TAIL)
-            if (entries.length === 0) return { content: '(no console output)' }
+            if (entries.length === 0) return { content: '（无控制台输出）' }
             return { content: entries.map(formatConsoleLine).join('\n') }
           }
           case 'network': {
@@ -398,35 +403,35 @@ API 联调技巧：
             const includeBody = params.input.include_body === true
             const entries = session.log.getNetwork(query).slice(-NETWORK_TAIL)
             if (entries.length === 0) {
-              return { content: query.failedOnly ? '(no matching failed requests)' : '(no matching network activity)' }
+              return { content: query.failedOnly ? '（无匹配的失败请求）' : '（无匹配的网络活动）' }
             }
             return { content: formatNetworkResults(entries, includeBody) }
           }
           case 'network_detail': {
             const requestId = params.input.request_id as string | undefined
-            if (!requestId) return { content: 'network_detail requires "request_id".', isError: true }
+            if (!requestId) return { content: 'network_detail 需要 "request_id"。', isError: true }
             const entry = session.log.getByRequestId(requestId)
             if (!entry) {
-              return { content: `No request with id "${requestId}". Run action="network" to list ids.`, isError: true }
+              return { content: `没有 id 为 "${requestId}" 的请求。请先运行 action="network" 列出 id。`, isError: true }
             }
             return { content: formatNetworkDetail(entry) }
           }
           case 'clear_logs': {
             session.log.clear()
-            return { content: 'Console and network logs cleared.' }
+            return { content: '控制台与网络日志已清除。' }
           }
           case 'snapshot': {
             const selector = params.input.selector as string | undefined
             const text = await withLiveLogs(session, params.onOutput, () => session.driver.snapshot(selector))
             const trimmed = text.slice(0, SNAPSHOT_MAX)
             return {
-              content: trimmed + (text.length > SNAPSHOT_MAX ? '\n… (truncated)' : ''),
+              content: trimmed + (text.length > SNAPSHOT_MAX ? '\n…（已截断）' : ''),
               lossiness: text.length > SNAPSHOT_MAX ? 'truncated' : undefined,
             }
           }
           case 'eval': {
             const expression = params.input.expression as string | undefined
-            if (!expression) return { content: 'eval requires an "expression".', isError: true }
+            if (!expression) return { content: 'eval 需要 "expression"。', isError: true }
             const result = await withLiveLogs(session, params.onOutput, () =>
               session.driver.evaluate(expression),
             )
@@ -434,69 +439,70 @@ API 联调技巧：
           }
           case 'click': {
             const selector = params.input.selector as string | undefined
-            if (!selector) return { content: 'click requires a "selector".', isError: true }
+            if (!selector) return { content: 'click 需要 "selector"。', isError: true }
             await withLiveLogs(session, params.onOutput, () => session.driver.click(selector))
-            return { content: `Clicked ${selector}.` }
+            return { content: `已点击 ${selector}。` }
           }
           case 'type': {
             const selector = params.input.selector as string | undefined
             const text = params.input.text as string | undefined
             if (!selector || text === undefined) {
-              return { content: 'type requires "selector" and "text".', isError: true }
+              return { content: 'type 需要 "selector" 和 "text"。', isError: true }
             }
             const submit = params.input.submit === true
             await withLiveLogs(session, params.onOutput, async () => {
               await session.driver.type(selector, text)
               if (submit) await session.driver.press(selector, 'Enter')
             })
-            return { content: `Typed into ${selector}${submit ? ' and pressed Enter' : ''}.` }
+            return { content: `已向 ${selector} 输入文本${submit ? '并按下 Enter' : ''}。` }
           }
           case 'press': {
             const selector = params.input.selector as string | undefined
             const key = params.input.key as string | undefined
-            if (!key) return { content: 'press requires a "key" (e.g. Enter, Tab, Escape).', isError: true }
+            if (!key) return { content: 'press 需要 "key"（如 Enter、Tab、Escape）。', isError: true }
             await withLiveLogs(session, params.onOutput, () => session.driver.press(selector, key))
-            return { content: selector ? `Pressed ${key} on ${selector}.` : `Pressed ${key}.` }
+            return { content: selector ? `已在 ${selector} 上按下 ${key}。` : `已按下 ${key}。` }
           }
           case 'select': {
             const selector = params.input.selector as string | undefined
             const value = params.input.value as string | undefined
             if (!selector || value === undefined) {
-              return { content: 'select requires "selector" and "value".', isError: true }
+              return { content: 'select 需要 "selector" 和 "value"。', isError: true }
             }
             const chosen = await withLiveLogs(session, params.onOutput, () =>
               session.driver.selectOption(selector, value),
             )
-            return { content: `Selected ${JSON.stringify(chosen)} in ${selector}.` }
+            return { content: `已在 ${selector} 中选择 ${JSON.stringify(chosen)}。` }
           }
           case 'hover': {
             const selector = params.input.selector as string | undefined
-            if (!selector) return { content: 'hover requires a "selector".', isError: true }
+            if (!selector) return { content: 'hover 需要 "selector"。', isError: true }
             await withLiveLogs(session, params.onOutput, () => session.driver.hover(selector))
-            return { content: `Hovered ${selector}.` }
+            return { content: `已悬停 ${selector}。` }
           }
           case 'scroll': {
             const selector = params.input.selector as string | undefined
             const to = params.input.to === 'top' ? 'top' : 'bottom'
             await withLiveLogs(session, params.onOutput, () => session.driver.scroll(selector, to))
-            return { content: selector ? `Scrolled ${selector} into view.` : `Scrolled to ${to}.` }
+            return { content: selector ? `已将 ${selector} 滚入视图。` : `已滚动到 ${to}。` }
           }
           case 'history': {
             const go = params.input.go as string | undefined
             if (go !== 'back' && go !== 'forward' && go !== 'reload') {
-              return { content: 'history requires "go": back | forward | reload.', isError: true }
+              return { content: 'history 需要 "go"：back | forward | reload。', isError: true }
             }
             if (go === 'reload') {
               await withLiveLogs(session, params.onOutput, () => session.driver.reload(signal))
-              return { content: `Reloaded ${session.driver.currentUrl()}.` }
+              return { content: `已重新加载 ${session.driver.currentUrl()}。` }
             }
             const moved = await withLiveLogs(session, params.onOutput, () =>
               go === 'back' ? session.driver.goBack(signal) : session.driver.goForward(signal),
             )
+            const goLabel = go === 'back' ? '后退' : '前进'
             return {
               content: moved
-                ? `Navigated ${go} to ${session.driver.currentUrl()}.`
-                : `No ${go} history to navigate to.`,
+                ? `已${goLabel}至 ${session.driver.currentUrl()}。`
+                : `没有可${goLabel}的历史记录。`,
             }
           }
           case 'wait': {
@@ -510,15 +516,15 @@ API 联调技巧：
               await withLiveLogs(session, params.onOutput, () =>
                 session.driver.waitForSelector(selector, timeoutMs, signal),
               )
-              return { content: `Element "${selector}" is visible (${timeoutMs}ms timeout).` }
+              return { content: `元素 "${selector}" 已可见（超时 ${timeoutMs}ms）。` }
             }
             if (state) {
               await withLiveLogs(session, params.onOutput, () =>
                 session.driver.waitForLoadState(state, timeoutMs, signal),
               )
-              return { content: `Reached load state "${state}" (${timeoutMs}ms timeout).` }
+              return { content: `已到达载入状态 "${state}"（超时 ${timeoutMs}ms）。` }
             }
-            return { content: 'wait requires a "selector" or a "state" (load/domcontentloaded/networkidle).', isError: true }
+            return { content: 'wait 需要 "selector" 或 "state"（load/domcontentloaded/networkidle）。', isError: true }
           }
           case 'cookies': {
             const urlFilter = typeof params.input.url_filter === 'string' && params.input.url_filter.trim()
@@ -536,44 +542,44 @@ API 联调技巧：
             const name = params.input.name as string | undefined
             const value = params.input.value as string | undefined
             if (!name || value === undefined) {
-              return { content: 'set_cookie requires "name" and "value".', isError: true }
+              return { content: 'set_cookie 需要 "name" 和 "value"。', isError: true }
             }
             const url = typeof params.input.url === 'string' ? params.input.url : undefined
             const domain = typeof params.input.domain === 'string' ? params.input.domain : undefined
             const path = typeof params.input.path === 'string' ? params.input.path : undefined
             if (!url && !domain) {
               const current = (() => { try { return new URL(session.driver.currentUrl()).origin } catch { return undefined } })()
-              if (!current) return { content: 'set_cookie needs "url" or "domain" (page has no usable URL).', isError: true }
+              if (!current) return { content: 'set_cookie 需要 "url" 或 "domain"（当前页面没有可用 URL）。', isError: true }
               await withLiveLogs(session, params.onOutput, () => session.driver.addCookie({ name, value, url: current }))
-              return { content: `Set cookie "${name}" for ${current}.` }
+              return { content: `已为 ${current} 设置 cookie "${name}"。` }
             }
             await withLiveLogs(session, params.onOutput, () =>
               session.driver.addCookie({ name, value, url, domain, path: path ?? (domain ? '/' : undefined) }),
             )
-            return { content: `Set cookie "${name}" for ${url ?? `${domain}${path ?? '/'}`}.` }
+            return { content: `已为 ${url ?? `${domain}${path ?? '/'}`} 设置 cookie "${name}"。` }
           }
           case 'clear_cookies': {
             await withLiveLogs(session, params.onOutput, () => session.driver.clearCookies())
-            return { content: 'All cookies cleared for this context.' }
+            return { content: '已清除此上下文的全部 cookie。' }
           }
           case 'set_storage': {
             const kind = params.input.kind === 'session' ? 'session' : 'local'
             const key = params.input.key as string | undefined
             const value = params.input.value as string | undefined
             if (!key || value === undefined) {
-              return { content: 'set_storage requires "key" and "value".', isError: true }
+              return { content: 'set_storage 需要 "key" 和 "value"。', isError: true }
             }
             await withLiveLogs(session, params.onOutput, () => session.driver.setStorage(kind, key, value))
-            return { content: `Set ${kind}Storage["${key}"].` }
+            return { content: `已设置 ${kind}Storage["${key}"]。` }
           }
           case 'clear_storage': {
             const kind = params.input.kind === 'session' ? 'session' : 'local'
             await withLiveLogs(session, params.onOutput, () => session.driver.clearStorage(kind))
-            return { content: `Cleared ${kind}Storage.` }
+            return { content: `已清除 ${kind}Storage。` }
           }
           case 'pages': {
             const urls = safePageUrls(session)
-            if (urls.length === 0) return { content: '(no open pages)' }
+            if (urls.length === 0) return { content: '（无打开的页面）' }
             const active = urls.length - 1
             return {
               content: urls
@@ -610,19 +616,19 @@ API 联调技巧：
                 const pngPath = rawPath.replace(/\.raw$/, '.png')
                 try {
                   await writeFile(pngPath, png)
-                  pngNote = `\nSaved: ${pngPath}`
+                  pngNote = `\n已保存：${pngPath}`
                 } catch { /* 落盘失败不影响截图结果 */ }
               }
             }
             return {
-              content: `Captured screenshot of ${session.driver.currentUrl()}` + (artifactId ? ` → artifact ${artifactId}` : '') + pngNote,
+              content: `${BROWSER_SCREENSHOT_OF_PREFIX} ${session.driver.currentUrl()}` + (artifactId ? ` → artifact ${artifactId}` : '') + pngNote,
             }
           }
           default:
-            return { content: `Unknown action: ${String(action)}`, isError: true }
+            return { content: `未知操作：${String(action)}`, isError: true }
         }
       } catch (err) {
-        return { content: `browser_debug ${action} failed: ${(err as Error).message}`, isError: true }
+        return { content: `browser_debug ${action} 失败：${(err as Error).message}`, isError: true }
       }
     },
 

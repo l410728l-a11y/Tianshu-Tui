@@ -27,14 +27,14 @@ describe('createWebFetchTool', () => {
     const tool = createWebFetchTool()
     const result = await tool.execute({ input: { url: 'not-a-url' }, toolUseId: 'tu_1', cwd: '/' } as any)
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Invalid URL'))
+    assert.ok(result.content.includes('无效 URL'))
   })
 
   it('rejects non-http protocols', async () => {
     const tool = createWebFetchTool()
     const result = await tool.execute({ input: { url: 'file:///etc/passwd' }, toolUseId: 'tu_2', cwd: '/' } as any)
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Unsupported protocol'))
+    assert.ok(result.content.includes('不支持的协议'))
   })
 
   it('requires approval', () => {
@@ -49,7 +49,7 @@ describe('createWebFetchTool', () => {
     })
     const result = await tool.execute({ input: { url: 'https://example.com/file.pdf' }, toolUseId: 'tu_bin', cwd: '/' } as any)
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Binary content'))
+    assert.ok(result.content.includes('二进制内容'))
     assert.ok(result.content.includes('import_resource'))
   })
 

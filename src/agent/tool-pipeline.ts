@@ -13,7 +13,7 @@ import { validatePath, validatePathSafe } from '../tools/path-validate.js'
 import { grantPath } from '../tools/path-grants.js'
 import { dirname, join, resolve as resolvePath, isAbsolute } from 'node:path'
 import { getSessionDir } from './session-persist.js'
-import { classifyFailure, classifyTestRun, isTransient } from './failure-classifier.js'
+import { classifyFailure, classifyToolFailure, classifyTestRun, isTransient, resolveErrorKind, type FailureClass } from './failure-classifier.js'
 import { extractClaimsFromToolResult } from '../context/claim-extractor.js'
 import { appendProjectMemory, compactProjectMemory } from '../context/project-memory-writer.js'
 import { detectConflicts } from '../context/conflict-detect.js'
@@ -420,6 +420,10 @@ export interface ToolExecResult {
    *  trailing multimodal user message — but ONLY when the active model
    *  declares supportsVision (dropped otherwise, matching legacy behavior). */
   images?: string[]
+  /** 结构化失败分类（ToolResult.errorKind / errorClass 桥接后的解析值）——
+   *  仅失败结果携带。postTool hook 层（vigor failureClass）优先消费此值，
+   *  消息文案中文化后文本正则失灵时的失效防线。 */
+  errorKind?: FailureClass
 }
 
 function truncateSuccessfulToolResult(content: string, config: AgentConfig): string {
@@ -1333,7 +1337,7 @@ export async function executeToolUse(
         rawToolResult = r
         return { content: r.content, isError: r.isError }
      },
-      classify: (content) => classifyFailure(content).class,
+      classify: (content) => resolveErrorKind(rawToolResult ?? undefined) ?? classifyFailure(content).class,
       isConcurrencySafe: toolDef?.isConcurrencySafe() ?? false,
    })
 
@@ -1487,7 +1491,7 @@ export async function executeToolUse(
     if (!harnessResult.isError) {
       outputClass = 'success'
     } else {
-      const fc = classifyFailure(harnessResult.content)
+      const fc = classifyToolFailure(rawToolResult, harnessResult.content)
       outputClass = isTransient(fc.class) ? 'error-transient' : 'error'
     }
     const fp = fingerprintToolCall(tu.name, tu.input, outputClass)
@@ -1788,7 +1792,7 @@ export async function executeToolUse(
     if (!harnessResult.isError) {
       deps.repairHintTracker.recordSuccess(tu.name)
    } else {
-      const failureClass = classifyFailure(harnessResult.content)
+      const failureClass = classifyToolFailure(rawToolResult, harnessResult.content)
       deps.repairHintTracker.recordFailure(tu.name, failureClass.class)
       if (deps.config.contextClaimStore && deps.sessionId && failureClass.class !== 'unknown') {
         const proposal = createAntibodyProposal(failureClass, {
@@ -1804,7 +1808,7 @@ export async function executeToolUse(
 
     // Activity status: notify TUI when tool is blocked by critical failure
     if (harnessResult.isError && callbacks.onPhaseChange) {
-      const failureClass = classifyFailure(harnessResult.content)
+      const failureClass = classifyToolFailure(rawToolResult, harnessResult.content)
       if (BLOCKED_CLASSES.has(failureClass.class)) {
         callbacks.onPhaseChange('blocked', {
           tool: tu.name,
@@ -1911,7 +1915,7 @@ export async function executeToolUse(
       if (rawToolResult.verification && rawToolResult.verification.status !== 'passed') {
         const failures = classifyTestRun(harnessResult.content)
         if (failures.length > 0 && failures[0]!.confidence >= 0.7) {
-          const failureClass = classifyFailure(harnessResult.content)
+          const failureClass = classifyToolFailure(rawToolResult, harnessResult.content)
           deps.repairHintTracker.recordFailure(tu.name, failureClass.class)
           let diagnosedContent = `${finalContent}\n\nDiagnosis: ${failures[0]!.suggestion}`
           if (!harnessResult.isError) {
@@ -1924,12 +1928,12 @@ export async function executeToolUse(
           diagnosedContent = await artifactIntercept(diagnosedContent, tu.name, tu.input, deps.artifactStore, harnessResult.isError, diagThreshold, diagBudgetFrac, deps.config.contextWindow)
           const diagEvictedId = extractArtifactId(diagnosedContent)
           if (diagEvictedId) deps.artifactIdsEvicted?.push(diagEvictedId)
-          return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? diagnosedContent + starSig : diagnosedContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+          return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? diagnosedContent + starSig : diagnosedContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, errorKind: harnessResult.isError ? resolveErrorKind(rawToolResult) : undefined }
        }
      }
    }
 
-    return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? finalContent + starSig : finalContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, endTurn: rawToolResult?.endTurn === true ? true : undefined, images: rawToolResult?.images }
+    return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? finalContent + starSig : finalContent, is_error: harnessResult.isError }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, endTurn: rawToolResult?.endTurn === true ? true : undefined, images: rawToolResult?.images, errorKind: harnessResult.isError ? resolveErrorKind(rawToolResult) : undefined }
  } catch (err) {
     // AbortError: user cancelled — not a tool failure.
     // Skip failure recording so immune/doom-loop signals aren't polluted.
@@ -1979,7 +1983,7 @@ export async function executeToolUse(
       typeof tu.input?.file_path === 'string' ? tu.input.file_path as string : toolTargetFromInput(tu.name, tu.input),
     )
     callbacks.onToolResult(tu.id, tu.name, msg, true)
-    return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? msg + starSig : msg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk }
+    return { toolResult: { type: 'tool_result', tool_use_id: tu.id, content: starSig ? msg + starSig : msg, is_error: true }, traceStore, importGraph, lastConflictCheckCount, checkpointCreated, latestRisk, errorKind: caughtFailureClass }
   }
 }
 

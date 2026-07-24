@@ -39,6 +39,10 @@ function parseGrepPattern(input: Record<string, unknown>): string | null {
   return trimmed.length > 0 ? trimmed : null
 }
 
+/** 空结果 sentinel——search-pod-hook 靠 includes(此串) 识别「可信排除」，
+ *  改文案必须与 hook 同步（用常量共享，禁止两边各自手抄）。 */
+export const GREP_EMPTY_RESULT = '未找到匹配。'
+
 export const GREP_TOOL: Tool = {
   definition: {
     name: 'grep',
@@ -74,7 +78,7 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
     const pattern = parseGrepPattern(params.input)
     if (pattern === null) {
       const keys = Object.keys(params.input).sort()
-      const keySummary = keys.length > 0 ? keys.join(', ') : '(none)'
+      const keySummary = keys.length > 0 ? keys.join(', ') : '(无)'
       const patternType = typeof params.input.pattern
       // Foreign keys (file_path, section, command, ...) are the fingerprint of
       // streaming argument pollution: a parallel tool_call's args got grafted
@@ -83,11 +87,11 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
       const knownKeys = new Set(['pattern', 'path', 'glob', 'max_results', 'literal', 'context_lines'])
       const foreignKeys = keys.filter(k => !knownKeys.has(k))
       const pollutionHint = foreignKeys.length > 0
-        ? ` Input contains foreign keys (${foreignKeys.join(', ')}) — likely streaming tool_call argument pollution, not a malformed grep call.`
+        ? ` Input 含有无关键（${foreignKeys.join(', ')}）——可能是流式 tool_call 参数污染，而非格式错误的 grep 调用。`
         : ''
       return {
-        content: `Error: pattern is required (non-empty string). Received input keys: ${keySummary}. pattern type: ${patternType}.` +
-          (keys.length === 0 ? ' Input is empty — arguments may have failed to parse during streaming.' : '') +
+        content: `错误：需要提供 pattern（非空字符串）。收到的 input keys：${keySummary}。pattern 类型：${patternType}。` +
+          (keys.length === 0 ? ' Input 为空——参数可能在流式传输期间解析失败。' : '') +
           pollutionHint,
         isError: true,
       }
@@ -104,7 +108,7 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
 
     const validated = validatePathSafe(params.cwd, searchPath)
     if (!validated.ok) {
-      return { content: `Error: ${validated.error}`, isError: true }
+      return { content: `错误：${validated.error}`, isError: true }
     }
     const absPath = validated.path
 
@@ -117,17 +121,17 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
     // Native fallback
     const regex = buildRegex(pattern, literal)
     if (!regex) {
-      return { content: `Error: Invalid pattern: ${pattern}`, isError: true }
+      return { content: `错误：无效的模式：${pattern}`, isError: true, errorKind: 'syntax_error' }
     }
 
     try {
       const results = await nativeSearch(absPath, regex, glob, maxResults, params.cwd, contextLines)
       if (results.length === 0) {
-        return { content: '[grep] ripgrep (rg) not found or failed; using slow fallback.\nNo matches found.' }
+        return { content: `[grep] 未找到 ripgrep (rg) 或其执行失败；已使用慢速回退。\n${GREP_EMPTY_RESULT}` }
       }
-      const FALLBACK_PREFIX = '[grep] ripgrep (rg) not found or failed; using slow fallback.\n'
+      const FALLBACK_PREFIX = '[grep] 未找到 ripgrep (rg) 或其执行失败；已使用慢速回退。\n'
       const text = results.length > maxResults
-        ? FALLBACK_PREFIX + results.slice(0, maxResults).join('\n') + '\n... (truncated)'
+        ? FALLBACK_PREFIX + results.slice(0, maxResults).join('\n') + '\n...（已截断）'
         : FALLBACK_PREFIX + results.join('\n')
       let hintedText = appendLogRangeHints(text, searchPath)
       hintedText = await appendHashEditHints(hintedText, absPath, params.cwd, params.sessionId)
@@ -149,14 +153,14 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
         })
         const truncated = truncateContent(hintedText, modelCap.maxChars, modelCap.headChars, modelCap.tailChars)
         return {
-          content: `${truncated}\n\n${summary}\nUse read_section(artifactId="${artifactId}", section="L1-L500") for the full match list.\n[artifact:${artifactId}]`,
+          content: `${truncated}\n\n${summary}\n使用 read_section(artifactId="${artifactId}", section="L1-L500") 获取完整匹配列表。\n[artifact:${artifactId}]`,
         }
       }
 
       return { content: truncateContent(hintedText, modelCap.maxChars, modelCap.headChars, modelCap.tailChars) }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
-      return { content: `Error: ${message}`, isError: true }
+      return { content: `错误：${message}`, isError: true }
     }
   },
 
@@ -189,7 +193,7 @@ function appendLogRangeHints(content: string, searchPath: string): string {
     if (hints.length >= 5) break
   }
   if (hints.length === 0) return content
-  return `${content}\n\nSuggested next reads:\n${hints.join('\n')}`
+  return `${content}\n\n建议的下一步读取：\n${hints.join('\n')}`
 }
 
 /**
@@ -236,7 +240,7 @@ async function appendHashEditHints(content: string, absPath: string, cwd: string
   if (hints.length === 0) return content
 
   const relPath = relativePosix(cwd, absPath)
-  return `${content}\n\nhash_edit anchors for ${relPath}:\n${hints.join('\n')}`
+  return `${content}\n\nhash_edit 锚点（${relPath}）：\n${hints.join('\n')}`
 }
 
 /**
@@ -280,7 +284,7 @@ async function tryRipgrep(
   sessionId?: string,
 ): Promise<ToolResult | null> {
   if (typeof pattern !== 'string' || pattern.length === 0) {
-    return Promise.resolve({ content: 'Error: pattern is required (non-empty string)', isError: true })
+    return Promise.resolve({ content: '错误：需要提供 pattern（非空字符串）', isError: true })
   }
 
   return new Promise((resolve) => {
@@ -355,7 +359,7 @@ async function tryRipgrep(
       clearTimeout(timer)
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort)
       if (code === 1) {
-        resolve({ content: 'No matches found.' })
+        resolve({ content: GREP_EMPTY_RESULT })
         return
       }
       if (code !== 0) {
@@ -363,7 +367,7 @@ async function tryRipgrep(
         return
       }
       const lines = stdout.split('\n').filter(l => l.length > 0).slice(0, maxResults)
-      const suffix = lineCount >= maxResults ? '\n... (truncated)' : ''
+      const suffix = lineCount >= maxResults ? '\n...（已截断）' : ''
       const text = lines.join('\n') + suffix
       let hintedText = appendLogRangeHints(text, searchPath)
 
@@ -389,7 +393,7 @@ async function tryRipgrep(
             })
             const truncated = truncateContent(hintedText, modelCap.maxChars, modelCap.headChars, modelCap.tailChars)
             resolve({
-              content: `${truncated}\n\n${summary}\nUse read_section(artifactId="${artifactId}", section="L1-L500") for the full match list.\n[artifact:${artifactId}]`,
+              content: `${truncated}\n\n${summary}\n使用 read_section(artifactId="${artifactId}", section="L1-L500") 获取完整匹配列表。\n[artifact:${artifactId}]`,
             })
           } catch {
             resolve({ content: truncateContent(hintedText, modelCap.maxChars, modelCap.headChars, modelCap.tailChars) })

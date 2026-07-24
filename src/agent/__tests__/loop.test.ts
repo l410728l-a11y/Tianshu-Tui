@@ -248,16 +248,17 @@ describe('AgentLoop — multi-turn tool_use', () => {
       }),
     } as unknown as StreamClient
 
-    // 关键词路由是被测特性（默认开，未命中回退天枢）；显式传 true 使意图自明。
+    // 关键词路由是被测特性（默认开，auto 池内匹配，未命中回退天权）；显式传 true 使意图自明。
+    // 2026-07-23 auto 池收窄后改用池内域（开阳/天梁）验证"绑定一次、后续消息不换域"。
     const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: registry, maxTurns: 2, contextWindow: 1_000_000, domainKeywordRouting: true, compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' } }, session, TEST_CWD)
 
-    await agent.run('探索一个新的实验性 POC', makeCallbacks())
-    await agent.run('修复内存泄漏', makeCallbacks())
+    await agent.run('对账插桩定位这个偏差', makeCallbacks())
+    await agent.run('按计划实现用户注册', makeCallbacks())
 
     assert.equal(seenContexts.length, 2)
-    assert.match(seenContexts[0]!, /<star-domain name="破军"/)
-    assert.match(seenContexts[1]!, /<star-domain name="破军"/)
-    assert.doesNotMatch(seenContexts[1]!, /name="天府"/)
+    assert.match(seenContexts[0]!, /<star-domain name="开阳"/)
+    assert.match(seenContexts[1]!, /<star-domain name="开阳"/)
+    assert.doesNotMatch(seenContexts[1]!, /name="天梁"/)
   })
 
 
@@ -1574,6 +1575,50 @@ describe('AgentLoop — convergence emission cooldown', () => {
     assert.ok(shifts <= 2, `cooldown=3 should cap emissions at 2 over turns 14..19, got ${shifts}`)
   })
 
+  // ── B1b/M4（2026-07-23 信号互扰治理）：convergence advisory 的 expect 三分支 ──
+  // build 变体从 expect: undefined 接上 course_changed——改道建议不再发后不管。
+
+  function captureSubmits(agent: ReturnType<typeof stuckLoop>) {
+    const entries: Array<{ key: string; expect?: { kind: string; tools?: string[] } }> = []
+    const orig = agent.advisoryBus.submit.bind(agent.advisoryBus)
+    agent.advisoryBus.submit = (e: Parameters<typeof orig>[0]) => {
+      entries.push(e as (typeof entries)[number])
+      return orig(e)
+    }
+    return entries
+  }
+
+  it('build 变体（filesModified>0）携带 course_changed 核销谓词 (B1b/M4)', async () => {
+    const agent = stuckLoop()
+    agent.evidence.trackFileModified('src/x.ts') // activityMode 短路为 build
+    const submits = captureSubmits(agent)
+    await agent.runConvergenceCheck(14, 'plan', true, false, makeCallbacks())
+    const conv = submits.find(e => e.key === 'convergence')
+    assert.ok(conv, 'expected a convergence advisory emission')
+    assert.equal(conv.expect?.kind, 'course_changed', 'build 变体必须携带 course_changed 谓词')
+  })
+
+  it('对照:diagnostic 变体仍是认知工具 tool_appears（不受 B1b 影响）', async () => {
+    const agent = stuckLoop() // 全只读历史 + filesModified=0 → diagnostic
+    const submits = captureSubmits(agent)
+    await agent.runConvergenceCheck(14, 'plan', true, false, makeCallbacks())
+    const conv = submits.find(e => e.key === 'convergence')
+    assert.ok(conv, 'expected a convergence advisory emission')
+    assert.equal(conv.expect?.kind, 'tool_appears')
+    assert.ok((conv.expect?.tools?.length ?? 0) > 0, 'diagnostic 变体带认知工具清单')
+  })
+
+  it('对照:no-tool 变体仍是 tool_appears tools:[]（不受 B1b 影响）', async () => {
+    const agent = stuckLoop()
+    agent.consecutiveNoToolTurns = 2
+    const submits = captureSubmits(agent)
+    await agent.runConvergenceCheck(14, 'plan', true, false, makeCallbacks())
+    const conv = submits.find(e => e.key === 'convergence')
+    assert.ok(conv, 'expected a convergence advisory emission')
+    assert.equal(conv.expect?.kind, 'tool_appears')
+    assert.deepEqual(conv.expect?.tools, [], 'no-tool 变体 tools:[] = 任意工具打破僵局')
+  })
+
   it('wording uses phase-relative turns, not the global session turn (W1, 20b9714e)', async () => {
     const agent = stuckLoop()
     let reason = ''
@@ -1882,6 +1927,81 @@ describe('AgentLoop — convergence score-abort grace turn', () => {
     await agent.runConvergenceCheck(23, 'execute', true, true, cb)  // user spoke → reset
     const after = await agent.runConvergenceCheck(24, 'execute', true, false, cb)
     assert.equal(after.action, 'proceed', 'post-intervention L3 hit must get a fresh grace turn, not an instant abort')
+  })
+
+  // ── B1c/M4（2026-07-23 信号互扰治理）：持续产出清 priorWarningAtL2Plus 旧账 ──
+  // 此前警告台账只有用户干预会清——纯自主长跑中一旦 L2 发射,几十轮产出之后的
+  // 任何跌分都能拿这笔陈旧警告直接 L3 熔断,跳过"先警告一轮"的 grace-turn。
+
+  const healthyHistory = () => Array.from({ length: 8 }, (_, i) => (
+    { tool: 'edit_file', status: 'success', target: `f${i}.ts` }
+  ))
+  const degenerateState = (agent: ReturnType<typeof degenerateAgent>) => {
+    agent.recentToolHistory = Array.from({ length: 8 }, () => (
+      { tool: 'read_file', status: 'success', target: 'same.ts' }
+    )) as unknown as typeof agent.recentToolHistory
+    agent.recentTextFingerprints = ['分析中', '分析中', '分析中']
+    agent.convergenceScoreHistory = [0.50, 0.40, 0.30, 0.20, 0.10, 0.04]
+  }
+
+  it('连续 5 轮产出清警告旧账 → 之后的 L3 重新获得 grace turn (B1c/M4, 原缺陷复现)', async () => {
+    const agent = degenerateAgent()
+    let aborts = 0
+    const cb = { ...makeCallbacks(), onAbort: () => { aborts++ } }
+
+    const first = await agent.runConvergenceCheck(22, 'execute', true, false, cb) // L2 警告 + demote
+    assert.equal(first.action, 'proceed')
+
+    // 5 轮真实产出（PRODUCTIVE_TOOLS）——改道已被行为证实
+    for (let t = 23; t <= 27; t++) {
+      agent.recordToolHistory('edit_file', { file_path: `src/f${t}.ts` }, false, 'ok')
+      agent.recentToolHistory = healthyHistory() as unknown as typeof agent.recentToolHistory
+      await agent.runConvergenceCheck(t, 'execute', true, false, cb)
+    }
+
+    // 再次跌分触发 L3——旧账已清,必须先警告一轮而不是拿 6 轮前的警告直接熔断
+    degenerateState(agent)
+    const later = await agent.runConvergenceCheck(28, 'execute', true, false, cb)
+    assert.equal(later.action, 'proceed', '旧账已清 → L3 demote 为 kick,重新给一次 grace turn')
+    assert.equal(aborts, 0)
+  })
+
+  it('对照:5 轮全为只读（无产出）→ 台账保留,L3 照常熔断（保底检测不死）', async () => {
+    const agent = degenerateAgent()
+    let aborts = 0
+    const cb = { ...makeCallbacks(), onAbort: () => { aborts++ } }
+
+    await agent.runConvergenceCheck(22, 'execute', true, false, cb) // L2 警告 + demote
+    for (let t = 23; t <= 27; t++) {
+      agent.recordToolHistory('grep', { pattern: 'x' }, false, 'ok') // 非 PRODUCTIVE
+      agent.recentToolHistory = healthyHistory() as unknown as typeof agent.recentToolHistory
+      await agent.runConvergenceCheck(t, 'execute', true, false, cb)
+    }
+    degenerateState(agent)
+    const later = await agent.runConvergenceCheck(28, 'execute', true, false, cb)
+    assert.equal(later.action, 'abort', '无产出 → 陈旧警告仍有效 → 熔断保底')
+    assert.equal(aborts, 1)
+  })
+
+  it('对照:产出 4 轮后断裂重计 → 台账未清,L3 仍熔断', async () => {
+    const agent = degenerateAgent()
+    const cb = makeCallbacks()
+
+    await agent.runConvergenceCheck(22, 'execute', true, false, cb) // L2 警告 + demote
+    for (let t = 23; t <= 26; t++) { // 只有 4 轮产出
+      agent.recordToolHistory('edit_file', { file_path: `src/f${t}.ts` }, false, 'ok')
+      agent.recentToolHistory = healthyHistory() as unknown as typeof agent.recentToolHistory
+      await agent.runConvergenceCheck(t, 'execute', true, false, cb)
+    }
+    // 第 5 轮空转 → 计数断裂归零
+    await agent.runConvergenceCheck(27, 'execute', true, false, cb)
+    // 再产出 1 轮（streak=1,不足 5）
+    agent.recordToolHistory('edit_file', { file_path: 'src/g.ts' }, false, 'ok')
+    await agent.runConvergenceCheck(28, 'execute', true, false, cb)
+
+    degenerateState(agent)
+    const later = await agent.runConvergenceCheck(29, 'execute', true, false, cb)
+    assert.equal(later.action, 'abort', '断裂重计后不足 5 轮 → 台账保留 → 熔断')
   })
 })
 

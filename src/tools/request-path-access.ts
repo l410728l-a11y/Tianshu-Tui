@@ -37,7 +37,7 @@ export const REQUEST_PATH_ACCESS_TOOL: Tool = {
   async execute(params) {
     const raw = params.input.path
     if (typeof raw !== 'string' || raw.trim().length === 0) {
-      return { content: 'Error: path is required', isError: true }
+      return { content: '错误：path 必填', isError: true }
     }
     const mode: GrantMode = params.input.mode === 'read' ? 'read' : 'write'
     const remember = params.input.remember === true
@@ -53,9 +53,9 @@ export const REQUEST_PATH_ACCESS_TOOL: Tool = {
     }
 
     const grant = grantPath(root, mode, { persist: remember, cwd: params.cwd })
-    const lifetime = remember ? 'persisted for this workspace (survives restarts)' : 'this session only'
+    const lifetime = remember ? '已为本工作区持久化（重启后仍有效）' : '仅本会话'
     return {
-      content: `Granted ${grant.mode} access to: ${grant.root}\nScope: this directory and everything under it — ${lifetime}.\nFile tools and bash can now ${grant.mode === 'write' ? 'read and write' : 'read'} paths there.`,
+      content: `已授予 ${grant.mode} 访问：${grant.root}\n范围：该目录及其下全部路径 — ${lifetime}。\n文件工具与 bash 现在可以在此${grant.mode === 'write' ? '读写' : '读取'}路径。`,
     }
   },
 

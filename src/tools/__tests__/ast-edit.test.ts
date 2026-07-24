@@ -98,7 +98,7 @@ describe('ast-edit pattern replace', () => {
       lang: 'TypeScript',
       dryRun: true,
     })
-    assert.ok(out.includes('0 change') || out.includes('0 file') || out.includes('no change'),
+    assert.ok(out.includes('0 处更改') || out.includes('0 个文件') || out.includes('无改动'),
       `expected no-change message, got: ${out}`)
   })
 
@@ -137,7 +137,7 @@ describe('ast-edit error handling', () => {
       lang: 'TypeScript',
       dryRun: true,
     })
-    assert.ok(out.includes('error') || out.includes('parse'), `expected parse warning, got: ${out}`)
+    assert.ok(out.includes('错误') || out.includes('解析'), `expected parse warning, got: ${out}`)
   })
 })
 
@@ -153,7 +153,7 @@ describe('ast-edit multi-file', () => {
     })
     // Should mention both files or have multiple changes
     assert.ok(
-      out.includes('sample.ts') || out.includes('other.ts') || out.includes('2 file'),
+      out.includes('sample.ts') || out.includes('other.ts') || out.includes('2 个文件'),
       `expected multi-file output, got: ${out}`,
     )
   })
@@ -228,7 +228,7 @@ describe('ast-edit onFileWrite', () => {
     } as unknown as ToolCallParams)
     const after = await readFile(target, 'utf-8')
     assert.equal(after, before, 'file must be unchanged when post-edit syntax check fails')
-    assert.ok(result.content.includes('NOT written') || result.content.includes('syntax error'),
+    assert.ok(result.content.includes('未写入') || result.content.includes('语法错误'),
       `expected post-edit syntax gate error in output, got: ${result.content}`)
   })
 

@@ -76,6 +76,10 @@ describe('isCollapsibleTool', () => {
   it('returns true for semantic_search', () => {
     assert.equal(isCollapsibleTool('semantic_search'), true)
   })
+  it('returns true for ast_grep', () => {
+    assert.equal(isCollapsibleTool('ast_grep'), true)
+    assert.equal(classifyCollapsibleKind('ast_grep'), 'search')
+  })
 
   // 1b. G2 扩展：read_policy / read_section / file_info
   it('returns true for G2-extended read tools', () => {
@@ -140,6 +144,10 @@ describe('entryDisplayName', () => {
     const name = entryDisplayName('grep', { pattern: 'TODO', path: 'src/' })
     assert.ok(name.includes('"TODO"'))
     assert.ok(name.includes('src/'))
+  })
+  it('extracts pattern for ast_grep', () => {
+    const name = entryDisplayName('ast_grep', { pattern: 'fn $F' })
+    assert.ok(name.includes('fn $F'))
   })
   it('falls back to toolName for unknown tools', () => {
     assert.equal(entryDisplayName('unknown_tool', {}), 'unknown_tool')
@@ -237,6 +245,15 @@ describe('computeGroupStats', () => {
     const stats = computeGroupStats(group)
     assert.equal(stats.searchCount, 1)
     assert.equal(stats.readFilePaths.length, 2)
+  })
+
+  it('counts ast_grep as search', () => {
+    const group = makeGroup([
+      { id: '1', kind: 'search', completed: true },
+      { id: '2', kind: 'search', displayName: 'fn $F', completed: true },
+    ])
+    const stats = computeGroupStats(group)
+    assert.equal(stats.searchCount, 2)
   })
 })
 

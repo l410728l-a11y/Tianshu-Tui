@@ -19,6 +19,9 @@ export interface TurnBudgetHookDeps {
   getMaxTurns: () => number
   /** 当前 run 的 orchestrator 循环轮数(每 run 从 0 重计) */
   getRunTurn: () => number
+  /** A4（信号互扰治理 H2）：活跃 goal continuation / 未核销 high 义务在场。
+   *  true 时预算文案合并为"先核销再收束"。缺省视为无活跃续轮。 */
+  hasActiveContinuation?: () => boolean
 }
 
 export function createTurnBudgetHook(deps: TurnBudgetHookDeps): PreTurnRuntimeHook {
@@ -41,12 +44,15 @@ export function createTurnBudgetHook(deps: TurnBudgetHookDeps): PreTurnRuntimeHo
       if (remaining > threshold) return
 
       firedAtRunTurn = runTurn
+      const guidance = deps.hasActiveContinuation?.()
+        ? '当前有未核销的目标/义务——用剩余轮次先核销(验证/交付已完成部分),核销不完的落 checkpoint/文档,不要开启与目标无关的新支线。'
+        : '现在收敛:优先验证并交付已完成的部分、把未竟工作落 checkpoint/文档,不要开新支线。'
       deps.advisoryBus.submit({
         key: 'turn-budget',
         priority: 0.7,
         category: 'discipline',
         tier: 'operational',
-        content: `轮数预算即将耗尽:还剩 ${remaining} 轮(maxTurns=${maxTurns})之后 run 被强制截断。现在收敛:优先验证并交付已完成的部分、把未竟工作落 checkpoint/文档,不要开新支线。`,
+        content: `轮数预算即将耗尽:还剩 ${remaining} 轮(maxTurns=${maxTurns})之后 run 被强制截断。${guidance}`,
         ttl: 2,
         // 采纳 = 预警后 2 轮内出现验证动作(收敛而非继续铺开)
         expect: { kind: 'verify_attempted', withinTurns: 2 },

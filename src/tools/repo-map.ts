@@ -37,10 +37,10 @@ function isConfigFile(name: string): boolean {
 }
 
 function annotateFile(name: string): string | null {
-  if (ENTRY_FILES.has(name)) return 'entry'
-  if (isTestFile(name) || name === '__tests__') return 'test'
-  if (isConfigFile(name)) return 'config'
-  if (isDocFile(name)) return 'doc'
+  if (ENTRY_FILES.has(name)) return '入口'
+  if (isTestFile(name) || name === '__tests__') return '测试'
+  if (isConfigFile(name)) return '配置'
+  if (isDocFile(name)) return '文档'
   return null
 }
 
@@ -93,7 +93,7 @@ async function buildTree(dir: string, depth: number, fileCount: { n: number; tot
     if (entry.isDir) {
       const children = await buildTree(join(dir, entry.name), depth + 1, fileCount, maxFiles, maxDepth, projectRoot, includeSilent)
       if (children.length > 0) {
-        const annotation = entry.name === '__tests__' ? 'test' : undefined
+        const annotation = entry.name === '__tests__' ? '测试' : undefined
         nodes.push({ name: entry.name, isDir: true, children, annotation })
       }
     } else {
@@ -172,7 +172,7 @@ export const REPO_MAP_TOOL: Tool = {
       // Security: ensure resolved path is within cwd (trailing sep prevents prefix injection)
       const safeCwd = resolve(params.cwd) + '/'
       if (!root.startsWith(safeCwd) && root !== resolve(params.cwd)) {
-        return { content: 'Error: path must be within the project directory', isError: true }
+        return { content: '错误：path 必须位于项目目录内', isError: true }
       }
     }
 
@@ -180,10 +180,10 @@ export const REPO_MAP_TOOL: Tool = {
     try {
       s = await stat(root)
     } catch {
-      return { content: `Error: Directory not found: ${root}`, isError: true }
+      return { content: `错误：目录不存在：${root}`, isError: true, errorKind: 'probe_miss' as const }
     }
     if (!s.isDirectory()) {
-      return { content: `Error: Not a directory: ${root}`, isError: true }
+      return { content: `错误：不是目录：${root}`, isError: true }
     }
 
     const includeSilent = Boolean(subPath && classifyPath(relativePosix(params.cwd, root)).silent)
@@ -211,9 +211,9 @@ export const REPO_MAP_TOOL: Tool = {
 
     const omitted = fileCount.total > maxFiles ? fileCount.total - maxFiles : 0
     const truncated = omitted > 0
-      ? `\n... (truncated: ${omitted} files omitted; use repo_map({path: "..."}) or glob/grep for targeted ranges)`
+      ? `\n...（已截断：省略 ${omitted} 个文件；可用 repo_map({path: "..."}) 或 glob/grep 做定向查看）`
       : ''
-    const summary = `${fileCount.n} files in tree, ${dirCount} directories`
+    const summary = `树中 ${fileCount.n} 个文件，${dirCount} 个目录`
 
     return {
       content: `${header}\n${lines.join('\n')}${truncated}\n${summary}`,

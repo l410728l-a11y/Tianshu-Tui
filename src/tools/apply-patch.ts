@@ -88,7 +88,7 @@ export async function applyPatch(cwd: string, input: ApplyPatchInput, abortSigna
     if (result.status === 0) return { ok: true, error: '' }
     const errTrimmed = result.stderr.trim()
     const outTrimmed = result.stdout.trim()
-    return { ok: false, error: errTrimmed || outTrimmed || `git apply exited with status ${result.status}` }
+    return { ok: false, error: errTrimmed || outTrimmed || `git apply 以状态码 ${result.status} 退出` }
   } finally {
     try {
       await unlink(patchFile)
@@ -121,7 +121,7 @@ export const APPLY_PATCH_TOOL: Tool = {
   async execute(params: ToolCallParams) {
     const diff = params.input.diff
     if (typeof diff !== 'string' || diff.trim().length === 0) {
-      return { content: 'apply_patch requires a non-empty "diff" string.', isError: true }
+      return { content: 'apply_patch 需要非空的 "diff" 字符串。', isError: true }
     }
 
     // Pointer-regurgitation guard: the arg processor collapses large diffs in
@@ -129,9 +129,9 @@ export const APPLY_PATCH_TOOL: Tool = {
     // that pointer back as the diff — applying it is meaningless and confusing.
     if (diff.trimStart().startsWith(APPLY_PATCH_POINTER_PREFIX)) {
       return {
-        content: `Error: the "diff" is a collapsed history pointer ("${APPLY_PATCH_POINTER_PREFIX} …"), not a real unified diff. `
-          + 'That placeholder only appears in past messages after a large patch was applied — it is never valid input. '
-          + 'Provide the actual unified diff, or use read_file / git diff to inspect the current state first.',
+        content: `错误："diff" 是折叠后的历史指针（"${APPLY_PATCH_POINTER_PREFIX} …"），不是真正的 unified diff。`
+          + '该占位符只在大 patch 应用后的历史消息中出现——从来不是合法输入。'
+          + '请提供实际的 unified diff，或先用 read_file / git diff 查看当前状态。',
         isError: true,
       }
     }
@@ -171,7 +171,7 @@ export const APPLY_PATCH_TOOL: Tool = {
 
     if (!result.ok) {
       for (const t of targets) incrementEditFailCount(t.abs)
-      return { content: `Patch failed: ${result.error}`, isError: true }
+      return { content: `补丁应用失败：${result.error}`, isError: true }
     }
 
     // Post-apply structural verification: git apply --3way can leave conflict
@@ -184,9 +184,10 @@ export const APPLY_PATCH_TOOL: Tool = {
         await rollbackTargets(params.cwd, targets)
         for (const t of targets) incrementEditFailCount(t.abs)
         return {
-          content: `Patch applied but introduced a fatal error in ${fatal.rel}:\n${fatal.message}\n\n`
-            + 'The patch has been automatically rolled back. Fix the diff (check for context drift / conflict markers) and retry.',
+          content: `补丁已应用，但在 ${fatal.rel} 中引入了致命错误：\n${fatal.message}\n\n`
+            + '补丁已自动回滚。请修复 diff（检查上下文漂移/冲突标记）后重试。',
           isError: true,
+          errorKind: 'syntax_error',
         }
       }
       for (const t of targets) {
@@ -201,8 +202,8 @@ export const APPLY_PATCH_TOOL: Tool = {
     // to keep the UI responsive for huge patches.
     return {
       content: checkOnly
-        ? 'Patch applies cleanly (check-only; no files modified).'
-        : 'Patch applied successfully.',
+        ? '补丁可干净应用（仅校验；未修改文件）。'
+        : '补丁应用成功。',
       uiContent: truncateDiffForUi(normalizedDiff.trim()),
     }
   },
@@ -266,7 +267,7 @@ async function applyPatchViaClient(
       }
     }
     return {
-      content: 'Patch applied successfully.',
+      content: '补丁应用成功。',
       uiContent: truncateDiffForUi(normalizedDiff.trim()),
     }
   } catch {
@@ -332,5 +333,5 @@ function truncateDiffForUi(diff: string, maxLines = APPLY_PATCH_MAX_UI_LINES): s
   const lines = diff.split('\n')
   if (lines.length <= maxLines) return diff
   const hidden = lines.length - maxLines
-  return [...lines.slice(0, maxLines), `… (${hidden} more diff lines, Ctrl+O)`].join('\n')
+  return [...lines.slice(0, maxLines), `…（另有 ${hidden} 行 diff，Ctrl+O）`].join('\n')
 }

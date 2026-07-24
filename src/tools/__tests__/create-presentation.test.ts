@@ -60,7 +60,7 @@ describe('create_presentation', () => {
       })
 
       assert.equal(result.isError, undefined)
-      assert.ok(result.content.includes('Created ppt presentation'))
+      assert.ok(result.content.includes('已创建 ppt 演示文稿'))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -74,7 +74,7 @@ describe('create_presentation', () => {
     })
 
     assert.equal(result.isError, true)
-    assert.match(result.content, /slides must be a non-empty array/)
+    assert.match(result.content, /slides 必须为非空数组/)
   })
 
   it('escapes HTML in slide content', () => {

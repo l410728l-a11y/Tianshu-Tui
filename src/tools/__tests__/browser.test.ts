@@ -50,7 +50,7 @@ test('navigation to a non-allowlisted host is rejected (fail-closed), driver nev
   })
   const res = await tool.execute(params({ action: 'screenshot', url: 'https://evil.com/x' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /not on the allowlist/)
+  assert.match(res.content, /不在许可名单/)
   assert.equal(built, false, 'must not launch a browser for a blocked host')
 })
 
@@ -58,7 +58,7 @@ test('empty allowlist denies everything', async () => {
   const tool = createBrowserTool({ enabled: true, allowlist: () => [] })
   const res = await tool.execute(params({ action: 'screenshot', url: 'https://example.com' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /No hosts are allowlisted/)
+  assert.match(res.content, /未配置任何许可主机/)
 })
 
 test('screenshot of an allowlisted host saves a screenshot artifact', async () => {
@@ -92,7 +92,7 @@ test('invalid protocol is rejected', async () => {
   const tool = createBrowserTool({ enabled: true, allowlist: () => ['example.com'] })
   const res = await tool.execute(params({ action: 'screenshot', url: 'file:///etc/passwd' }))
   assert.equal(res.isError, true)
-  assert.match(res.content, /Unsupported protocol/)
+  assert.match(res.content, /不支持的协议/)
 })
 
 test('tool is disabled by default', () => {

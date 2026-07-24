@@ -16,6 +16,27 @@ export interface FormatDiffInput {
 
 const DEFAULT_MAX_LINES = 50
 
+/** diff 统计信息（adds/dels 不含文件头，hunks 为 @@ 头数量） */
+export interface DiffStats {
+  adds: number
+  dels: number
+  hunks: number
+}
+
+/** 从 diff 文本提取统计：添加行数、删除行数、hunk 数。 */
+export function computeDiffStats(content: string): DiffStats {
+  const lines = content.split('\n')
+  let adds = 0
+  let dels = 0
+  let hunks = 0
+  for (const line of lines) {
+    if (line.startsWith('@@')) { hunks++; continue }
+    if (line.startsWith('+') && !line.startsWith('+++')) { adds++; continue }
+    if (line.startsWith('-') && !line.startsWith('---')) { dels++; continue }
+  }
+  return { adds, dels, hunks }
+}
+
 type DiffLineType = 'add' | 'del' | 'hunk' | 'context' | 'meta' | 'header'
 
 /**
@@ -90,13 +111,7 @@ export function formatDiff(input: FormatDiffInput, theme: RivetTheme): string[] 
   const maxLines = input.maxLines ?? DEFAULT_MAX_LINES
   const allLines = input.content.split('\n')
 
-  // 统计
-  let adds = 0
-  let dels = 0
-  for (const line of allLines) {
-    if (line.startsWith('+') && !line.startsWith('+++')) adds++
-    else if (line.startsWith('-') && !line.startsWith('---')) dels++
-  }
+  const stats = computeDiffStats(input.content)
 
   const lineNumbers = computeLineNumbers(allLines)
   const gutterWidth = lineNumbers
@@ -114,7 +129,7 @@ export function formatDiff(input: FormatDiffInput, theme: RivetTheme): string[] 
   const lines: string[] = []
 
   // Summary header
-  lines.push(color(`diff: +${adds} −${dels}${truncated ? ` (${allLines.length} total, showing ${maxLines})` : ''}`, theme.secondary))
+  lines.push(color(`diff: +${stats.adds} −${stats.dels}${truncated ? ` (${allLines.length} total, showing ${maxLines})` : ''}`, theme.secondary))
 
   // Content
   for (const row of displayRows) {
